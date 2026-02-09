@@ -572,23 +572,23 @@ def start_background_jobs():
         return
 
     # Token refresh: runs every 12 hours at :00 minutes
-    scheduler.add_job(
-        refresh_tokens_for_all_users,
-        CronTrigger( minute='29'),
-        id='token_refresh',
-        replace_existing=True,
-        max_instances=1
-    )
-
-    # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
-    scheduler.add_job(
-        refresh_ghl_data_for_all_users,
-        CronTrigger(minute='09'),
-        id='ghl_refresh',
-        replace_existing=True,
-        max_instances=2
-
-    )
+    # scheduler.add_job(
+    #     refresh_tokens_for_all_users,
+    #     CronTrigger( minute='29'),
+    #     id='token_refresh',
+    #     replace_existing=True,
+    #     max_instances=1
+    # )
+    #
+    # # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
+    # scheduler.add_job(
+    #     refresh_ghl_data_for_all_users,
+    #     CronTrigger(minute='09'),
+    #     id='ghl_refresh',
+    #     replace_existing=True,
+    #     max_instances=2
+    #
+    # )
 
     # Meta data refresh: runs hourly at :25 (staggered)
     scheduler.add_job(
