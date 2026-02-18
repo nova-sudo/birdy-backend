@@ -630,7 +630,7 @@ async def populate_cache_for_existing_groups():
             logger.info("🔄 Starting cache population for existing client groups...")
             db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
             client_groups_collection = db["client_groups"]
- 
+
             # Find all groups that don't have cache OR have empty cache
             groups_needing_cache = await client_groups_collection.find({
                 "$or": [
@@ -736,6 +736,7 @@ async def populate_cache_for_existing_groups():
 
         except Exception as e:
             logger.error(f"Error in startup cache population: {e}", exc_info=True)
+
 
 
 # Utility function to convert MongoDB documents to JSON-serializable format
@@ -5517,3 +5518,145 @@ async def get_facebook_leads_filtered(
         except Exception as e:
             logger.error(f"Error fetching filtered leads: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {str(e)}")
+
+
+# Add these three endpoints to your main.py
+# Place them near your other integration endpoints (e.g. after /api/hotprospector/connect)
+
+# ============================================================
+# REMOVE INTEGRATION ENDPOINTS
+# ============================================================
+
+@app.delete("/api/integrations/gohighlevel/remove")
+async def remove_gohighlevel_integration(
+    response: Response,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove GoHighLevel integration for the current user.
+    Deletes agency token AND all subaccount tokens from MongoDB.
+    Also clears the gohighlevel_tokens cookie.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.gohighlevel": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Clear the cookie
+            response.delete_cookie(
+                key="gohighlevel_tokens",
+                path="/",
+                domain=COOKIE_DOMAIN,
+                samesite=COOKIE_SAMESITE,
+                secure=COOKIE_SECURE,
+            )
+
+            logger.info(f"✅ Removed GoHighLevel integration for user: {current_user}")
+            return {"success": True, "message": "GoHighLevel integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing GHL integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+
+@app.delete("/api/integrations/facebook/remove")
+async def remove_facebook_integration(
+    response: Response,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove Meta (Facebook) integration for the current user.
+    Deletes the access token from MongoDB and clears the facebook_tokens cookie.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.facebook": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Clear the cookie
+            response.delete_cookie(
+                key="facebook_tokens",
+                path="/",
+                domain=COOKIE_DOMAIN,
+                samesite=COOKIE_SAMESITE,
+                secure=COOKIE_SECURE,
+            )
+
+            logger.info(f"✅ Removed Meta integration for user: {current_user}")
+            return {"success": True, "message": "Meta integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing Facebook integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+
+@app.delete("/api/integrations/hotprospector/remove")
+async def remove_hotprospector_integration(
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove HotProspector integration for the current user.
+    Deletes API credentials from MongoDB.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.hotprospector": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            logger.info(f"✅ Removed HotProspector integration for user: {current_user}")
+            return {"success": True, "message": "HotProspector integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing HotProspector integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
