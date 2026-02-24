@@ -572,13 +572,13 @@ def start_background_jobs():
         return
 
     # Token refresh: runs every 12 hours at :00 minutes
-    scheduler.add_job(
-        refresh_tokens_for_all_users,
-        CronTrigger( minute='32'),
-        id='token_refresh',
-        replace_existing=True,
-        max_instances=1
-    )
+    # scheduler.add_job(
+    #     refresh_tokens_for_all_users,
+    #     CronTrigger( minute='32'),
+    #     id='token_refresh',
+    #     replace_existing=True,
+    #     max_instances=1
+    # )
 
     # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
     # scheduler.add_job(
@@ -907,7 +907,6 @@ class ClientGroupRequest(BaseModel):
     name: str
     ghl_location_id: str | None
     meta_ad_account_id: str | None
-    ad_account_currency: str | None
     hotprospector_group_id: str | None
     notes: str | None = ""
 
@@ -3379,7 +3378,6 @@ async def create_client_group_optimized(
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
-                    request.ad_account_currency,
                     mongo_client
                 )
                 # Fetch Meta campaign/adset/ad data
@@ -3388,7 +3386,6 @@ async def create_client_group_optimized(
                     request.meta_ad_account_id,
                     current_user,
                     mongo_client,
-                    request.ad_account_currency,
                     is_initial_load=True
                 )
                 await fetch_and_cache_adset_insights(
@@ -3396,14 +3393,12 @@ async def create_client_group_optimized(
                         request.meta_ad_account_id,  # 2nd: ad account ID
                         current_user,  # 3rd: user ID
                         mongo_client,  # 4th: mongo client
-                        request.ad_account_currency,
                         is_initial_load=True  # 5th: initial load flag
                 )
                 await fetch_and_cache_ad_insights(
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
-                    request.ad_account_currency,
                     mongo_client
                 )
                 # Fetch ALL Meta leads into database
@@ -3412,7 +3407,6 @@ async def create_client_group_optimized(
                     request.meta_ad_account_id,
                     current_user,
                     mongo_client,
-                    request.ad_account_currency,
                     is_initial_load=True
                 )
 
