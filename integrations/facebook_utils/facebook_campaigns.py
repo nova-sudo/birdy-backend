@@ -15,6 +15,7 @@ from typing import List, Dict, Tuple, Optional
 import httpx
 import os
 from integrations.facebook_utils.facebook import get_facebook_token
+from utils.currency_exchange import currency_service
 
 logger = logging.getLogger(__name__)
 
@@ -444,20 +445,17 @@ async def create_campaign_insights_indexes(mongo_client):
 
 
 async def fetch_and_cache_campaign_insights(
+        ad_account_currency: str,
         group_id: str,
         meta_ad_account_id: str,
         user_id: str,
         mongo_client,
         is_initial_load: bool = True
 ):
-    """
-    Fetch Facebook campaign insights and update cache with accurate counts.
-
-    UPDATED: Now calculates and updates metrics directly during save.
-    """
     try:
         from integrations.facebook_utils.facebook_campaigns import FacebookCampaignFetcher
         from integrations.facebook_utils.facebook import get_facebook_token
+        from utils.currency_exchange import CurrencyService
 
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         client_groups_collection = db["client_groups"]
@@ -471,6 +469,19 @@ async def fetch_and_cache_campaign_insights(
             f"🔄 Starting campaign insights fetch for '{client_group_name}' "
             f"(account: {meta_ad_account_id})"
         )
+
+        # Get user's default currency
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
+            )
+        except ValueError as e:
+            logger.error(f"Failed to get user currency: {e}")
+            raise
+        except RuntimeError as e:
+            logger.error(f"Database error getting user currency: {e}")
+            raise
 
         # Get token
         token = await get_facebook_token(user_id, mongo_client)
@@ -500,7 +511,7 @@ async def fetch_and_cache_campaign_insights(
         if insights:
             insight_docs = []
 
-            # Track metrics while building documents
+            # Track metrics while building documents (in ad account currency)
             total_spend = 0.0
             total_impressions = 0
             total_clicks = 0
@@ -578,10 +589,32 @@ async def fetch_and_cache_campaign_insights(
             )
 
             # ============================================
-            # 🔥 UPDATE CACHE with calculated metrics
+            # 🔥 CONVERT TO USER CURRENCY & UPDATE CACHE
             # ============================================
-            avg_cpm = (total_spend / total_impressions * 1000) if total_impressions > 0 else 0
-            avg_cpc = (total_spend / total_clicks) if total_clicks > 0 else 0
+
+            # Convert spend to user's currency
+            try:
+                total_spend_user_currency = CurrencyService.convert(
+                    total_spend,
+                    from_currency=ad_account_currency,
+                    to_currency=user_currency
+                )
+
+                logger.info(
+                    f"💱 Converted spend: {total_spend:.2f} {ad_account_currency} ➡️ "
+                    f"{total_spend_user_currency:.2f} {user_currency}"
+                )
+            except ValueError as e:
+                logger.error(f"Currency conversion failed: {e}")
+                # Fall back to original currency if conversion fails
+                total_spend_user_currency = total_spend
+                logger.warning(
+                    f"⚠️ Using original currency {ad_account_currency} due to conversion error"
+                )
+
+            # Calculate metrics using converted spend
+            avg_cpm = (total_spend_user_currency / total_impressions * 1000) if total_impressions > 0 else 0
+            avg_cpc = (total_spend_user_currency / total_clicks) if total_clicks > 0 else 0
             avg_ctr = (total_clicks / total_impressions * 100) if total_impressions > 0 else 0
 
             await client_groups_collection.update_one(
@@ -591,14 +624,16 @@ async def fetch_and_cache_campaign_insights(
                         "facebook_cache.total_campaigns": len(unique_campaigns),
                         "facebook_cache.total_campaign_insights": total_saved,
                         "facebook_cache.metrics.campaign_insights": {
-                            "total_spend": round(total_spend, 2),
+                            "total_spend": round(total_spend_user_currency, 2),
                             "total_impressions": total_impressions,
                             "total_clicks": total_clicks,
                             "total_reach": total_reach,
                             "total_results": total_results,
                             "avg_cpm": round(avg_cpm, 2),
                             "avg_cpc": round(avg_cpc, 2),
-                            "avg_ctr": round(avg_ctr, 2)
+                            "avg_ctr": round(avg_ctr, 2),
+                            "currency": user_currency,  # Track which currency metrics are in
+                            "original_currency": ad_account_currency  # Keep original for reference
                         },
                         "last_campaign_insights_refresh": datetime.utcnow()
                     }
@@ -607,7 +642,8 @@ async def fetch_and_cache_campaign_insights(
 
             logger.info(
                 f"📊 Updated cache: {len(unique_campaigns)} campaigns, "
-                f"${total_spend:.2f} spend, {total_impressions} impressions"
+                f"${total_spend_user_currency:.2f} {user_currency} spend, "
+                f"{total_impressions} impressions"
             )
 
         else:

@@ -26,6 +26,9 @@ from integrations.hotprospector import (
     get_client_group_mapping , # NEW IMPORT
 
 )
+from utils.currency_exchange import (
+  CurrencyService
+)
 from integrations.facebook_utils.facebook_leads import (
     fetch_and_cache_facebook_leads_FIXED,
     create_facebook_leads_indexes
@@ -55,6 +58,8 @@ from datetime import timedelta
 import asyncio
 
 from contextlib import asynccontextmanager
+
+from utils.currency_exchange import currency_service
 
 
 # Load environment variables
@@ -203,15 +208,52 @@ async def refresh_meta_data_for_all_users():
                         meta_ad_account_id = group["meta_ad_account_id"]
                         group_name = group.get("name", "Unknown Group")
 
+                        # ✅ CHECK FOR REQUIRED ad_account_currency
+                        ad_account_currency = group.get("ad_account_currency")
+
+                        if not ad_account_currency:
+                            logger.warning(
+                                f"⚠️ Group '{group_name}' missing 'ad_account_currency', "
+                                f"fetching from Meta API..."
+                            )
+                            try:
+                                import httpx
+                                async with httpx.AsyncClient() as client:
+                                    url = f"https://graph.facebook.com/v18.0/{meta_ad_account_id}"
+                                    params = {"fields": "currency", "access_token": access_token}
+                                    resp = await client.get(url, params=params)
+                                    data = resp.json()
+                                    ad_account_currency = data.get("currency")
+
+                                if ad_account_currency:
+                                    await client_groups_collection.update_one(
+                                        {"id": group_id},
+                                        {"$set": {"ad_account_currency": ad_account_currency}}
+                                    )
+                                    logger.info(
+                                        f"✅ Fetched and saved currency '{ad_account_currency}' "
+                                        f"for '{group_name}'"
+                                    )
+                                else:
+                                    logger.error(
+                                        f"❌ Could not fetch currency for '{group_name}', skipping..."
+                                    )
+                                    failure_count += 1
+                                    continue
+
+                            except Exception as e:
+                                logger.error(
+                                    f"❌ Error fetching currency for '{group_name}': {e}, skipping..."
+                                )
+                                failure_count += 1
+                                continue
+
                         try:
                             logger.info(
                                 f"  🔄 Updating TODAY's data for '{group_name}' "
-                                f"(account: {meta_ad_account_id})"
+                                f"(account: {meta_ad_account_id}, currency: {ad_account_currency})"
                             )
 
-                            # ============================================
-                            # STEP 1: UPDATE TODAY'S INSIGHTS (parallel)
-                            # ============================================
                             from integrations.facebook_utils.meta_incremental_refresh import (
                                 update_todays_campaign_insights,
                                 update_todays_adset_insights,
@@ -226,7 +268,8 @@ async def refresh_meta_data_for_all_users():
                                     user_id,
                                     group_id,
                                     group_name,
-                                    mongo_client
+                                    mongo_client,
+                                    ad_account_currency
                                 ),
                                 update_todays_adset_insights(
                                     meta_ad_account_id,
@@ -234,7 +277,8 @@ async def refresh_meta_data_for_all_users():
                                     user_id,
                                     group_id,
                                     group_name,
-                                    mongo_client
+                                    mongo_client,
+                                    ad_account_currency
                                 ),
                                 update_todays_ad_insights(
                                     meta_ad_account_id,
@@ -242,14 +286,14 @@ async def refresh_meta_data_for_all_users():
                                     user_id,
                                     group_id,
                                     group_name,
-                                    mongo_client
+                                    mongo_client,
+                                    ad_account_currency
                                 )
                             ]
 
                             insights_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-                            campaign_count = insights_results[0] if not isinstance(insights_results[0],
-                                                                                   Exception) else 0
+                            campaign_count = insights_results[0] if not isinstance(insights_results[0], Exception) else 0
                             adset_count = insights_results[1] if not isinstance(insights_results[1], Exception) else 0
                             ad_count = insights_results[2] if not isinstance(insights_results[2], Exception) else 0
 
@@ -263,7 +307,7 @@ async def refresh_meta_data_for_all_users():
                                 group_id,
                                 group_name,
                                 mongo_client,
-                                max_concurrent_ads=5
+                                ad_account_currency
                             )
 
                             # Save new leads to database
@@ -335,15 +379,47 @@ async def refresh_meta_data_for_all_users():
                     failure_count += len(groups)
                     logger.error(f"❌ Error refreshing Meta data for user {user_id}: {e}", exc_info=True)
 
+            # ============================================
+            # 🎉 FINAL SUMMARY
+            # ============================================
             elapsed = (datetime.utcnow() - start_time).total_seconds()
-            logger.info(
-                f"✅ INCREMENTAL Meta refresh completed in {elapsed:.2f}s - "
-                f"Success: {success_count}, Failed: {failure_count}"
-            )
+
+            total_groups = success_count + failure_count
+            summary_lines = [
+                "=" * 70,
+                "🎉 INCREMENTAL META DATA REFRESH COMPLETED",
+                "=" * 70,
+                f"⏱️  Duration: {elapsed:.2f} seconds",
+                f"📊 Total Groups: {total_groups}",
+                f"✅ Successful: {success_count}",
+                f"❌ Failed: {failure_count}",
+                f"📈 Success Rate: {(success_count / total_groups * 100):.1f}%" if total_groups > 0 else "📈 Success Rate: N/A",
+                "=" * 70
+            ]
+
+            for line in summary_lines:
+                logger.info(line)
+
+            if success_count > 0 and failure_count == 0:
+                logger.info(
+                    f"🎊 ALL GROUPS REFRESHED SUCCESSFULLY! "
+                    f"{success_count} group{'s' if success_count != 1 else ''} updated with today's data."
+                )
+            elif success_count > 0 and failure_count > 0:
+                logger.warning(
+                    f"⚠️  PARTIAL SUCCESS: {success_count} groups updated successfully, "
+                    f"but {failure_count} groups failed. Check errors above."
+                )
+            elif success_count == 0 and failure_count > 0:
+                logger.error(
+                    f"❌ ALL GROUPS FAILED! {failure_count} groups could not be refreshed. "
+                    f"Check errors above for details."
+                )
+            else:
+                logger.info("ℹ️  No groups were processed.")
 
         except Exception as e:
             logger.error(f"❌ Critical error in Meta refresh job: {e}", exc_info=True)
-
 async def refresh_hp_data_for_all_users():
     """
     SEQUENTIAL: Refresh Hot Prospector data ONE USER AT A TIME
@@ -591,13 +667,13 @@ def start_background_jobs():
     # )
 
     # Meta data refresh: runs hourly at :25 (staggered)
-    scheduler.add_job(
-        refresh_meta_data_for_all_users,
-        CronTrigger(minute='19'),
-        id='meta_refresh',
-        replace_existing=True,
-        max_instances=1
-    )
+    # scheduler.add_job(
+    #     refresh_meta_data_for_all_users,
+    #     CronTrigger(minute='19'),
+    #     id='meta_refresh',
+    #     replace_existing=True,
+    #     max_instances=1
+    # )
 
     # # HP data refresh: runs hourly at :45 (staggered)
     # scheduler.add_job(
@@ -890,6 +966,7 @@ class RegisterRequest(BaseModel):
     name: str
     email: str
     password: str
+    default_currency: str
 
 class LoginRequest(BaseModel):
     email: str
@@ -907,6 +984,7 @@ class ClientGroupRequest(BaseModel):
     ghl_location_id: str | None
     meta_ad_account_id: str | None
     hotprospector_group_id: str | None
+    ad_account_currency: str | None
     notes: str | None = ""
 
 async def generate_tokens(email: str):
@@ -1092,6 +1170,37 @@ async def check_auth(current_user: str = Depends(get_current_user)):
         "user": current_user
     }
 
+@app.get("/api/user/currency")
+async def get_user_currency(current_user: str = Depends(get_current_user)):
+    logger.info(f"📡 GET /api/user/currency called by user: {current_user}")
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            logger.info(f"🔍 Looking up user: {current_user}")
+            user = await users_collection.find_one(
+                {"user_id": current_user},
+                {"default_currency": 1}
+            )
+
+            logger.info(f"📄 DB result for {current_user}: {user}")
+
+            if not user:
+                logger.warning(f"❌ User not found in DB: {current_user}")
+                raise HTTPException(status_code=404, detail="User not found")
+
+            currency = user.get("default_currency")
+            logger.info(f"✅ Returning currency for {current_user}: {currency}")
+
+            return {"default_currency": currency}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"❌ Error fetching currency for {current_user}: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to fetch currency: {str(e)}")
+
 # Register endpoint
 @app.post("/api/register")
 async def register_user(request: RegisterRequest, response: Response):
@@ -1109,6 +1218,7 @@ async def register_user(request: RegisterRequest, response: Response):
                 "password": hashed_password,
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
+                "default_currency": request.default_currency,
                 "integrations": {}
             }
             await users_collection.insert_one(user_doc)
@@ -3197,6 +3307,7 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
                     "name": 1,
                     "ghl_location_id": 1,
                     "meta_ad_account_id": 1,
+                    "ad_account_currency": 1,
                     "notes": 1,
                     "created_at": 1,
                     "updated_at": 1,
@@ -3231,6 +3342,33 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
                 group_data["facebook"] = group.get("facebook_cache", {})
                 group_data["hotprospector"] = group.get("hotprospector_cache", {})
 
+                # ✅ Fix nested metrics.insights currency conversion gap
+                facebook_cache = group.get("facebook_cache", {})
+                metrics = facebook_cache.get("metrics", {})
+                insights = metrics.get("insights", {})
+
+                ad_account_currency = group.get("ad_account_currency")
+                converted_currency = facebook_cache.get("currency")  # user's currency saved by fetch_and_cache_meta_data
+
+                if insights and ad_account_currency and converted_currency and ad_account_currency != converted_currency:
+                    from utils.currency_exchange import CurrencyService
+                    spend_fields = ["spend", "cpm", "cpc", "cpp", "cost_per_result"]
+                    converted_insights = insights.copy()
+
+                    for field in spend_fields:
+                        if field in converted_insights and converted_insights[field] is not None:
+                            try:
+                                converted_insights[field] = CurrencyService.convert(
+                                    amount=float(converted_insights[field]),
+                                    from_currency=ad_account_currency,
+                                    to_currency=converted_currency
+                                )
+                            except Exception:
+                                pass
+
+                    # Write back converted insights into group_data
+                    group_data["facebook"]["metrics"]["insights"] = converted_insights
+
                 # Remove cache keys from response
                 group_data.pop("gohighlevel_cache", None)
                 group_data.pop("facebook_cache", None)
@@ -3257,7 +3395,6 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
         except Exception as e:
             logger.error(f"Error fetching client groups for user {current_user}: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch client groups: {str(e)}")
-
 
 @app.post("/api/client-groups")
 async def create_client_group_optimized(
@@ -3340,6 +3477,7 @@ async def create_client_group_optimized(
                 "id": group_id,
                 "user_id": current_user,
                 "name": request.name,
+                "ad_account_currency":request.ad_account_currency,
                 "ghl_location_id": request.ghl_location_id,
                 "meta_ad_account_id": request.meta_ad_account_id,
                 "notes": request.notes or "",
@@ -3377,10 +3515,12 @@ async def create_client_group_optimized(
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
-                    mongo_client
+                    mongo_client,
+                    request.ad_account_currency
                 )
                 # Fetch Meta campaign/adset/ad data
                 await fetch_and_cache_campaign_insights(
+                    request.ad_account_currency,
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
@@ -3388,6 +3528,7 @@ async def create_client_group_optimized(
                     is_initial_load=True
                 )
                 await fetch_and_cache_adset_insights(
+                        request.ad_account_currency,
                         group_id,  # 1st: group ID
                         request.meta_ad_account_id,  # 2nd: ad account ID
                         current_user,  # 3rd: user ID
@@ -3395,6 +3536,7 @@ async def create_client_group_optimized(
                         is_initial_load=True  # 5th: initial load flag
                 )
                 await fetch_and_cache_ad_insights(
+                    request.ad_account_currency,
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
@@ -3402,6 +3544,7 @@ async def create_client_group_optimized(
                 )
                 # Fetch ALL Meta leads into database
                 await fetch_and_cache_facebook_leads_FIXED(
+                    request.ad_account_currency,
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
@@ -3793,12 +3936,33 @@ async def fetch_and_cache_meta_data(
         group_id: str,
         meta_ad_account_id: str,
         user_id: str,
-        mongo_client
+        mongo_client,
+        ad_account_currency: str
 ):
-    """Fetch Meta data and save FULL details to cache"""
+    """
+    Fetch Meta data and save FULL details to cache with currency conversion.
+
+    Converts all monetary values from ad account currency to user's default currency.
+    """
     try:
+        from utils.currency_exchange import CurrencyService
+
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         client_groups_collection = db["client_groups"]
+
+        # Get user's default currency with fallback
+        user_currency = None
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning(
+                f"⚠️ Could not get user currency: {e}. "
+                f"Using ad account currency {ad_account_currency} as fallback."
+            )
+            user_currency = ad_account_currency  # Use ad account currency as fallback
 
         # Get Facebook ad accounts
         facebook_ad_accounts_data = await get_facebook_data(
@@ -3818,28 +3982,189 @@ async def fetch_and_cache_meta_data(
             logger.warning(f"Failed to fetch Meta data for {meta_ad_account_id}")
             return
 
-        # 🔥 SAVE FULL DATA: campaigns, adsets, ads, leads, AND metrics
-        await client_groups_collection.update_one(
+        # ============================================
+        # 🔥 CONVERT CURRENCY in meta_data
+        # ============================================
+
+        def convert_spend_fields(item):
+            """Convert spend-related fields in a single item (campaign/adset/ad)"""
+            if not item:
+                return item
+
+            converted_item = item.copy()
+
+            # Fields that commonly contain spend amounts in Facebook ads
+            spend_fields = [
+                'spend',
+                'daily_budget',
+                'lifetime_budget',
+                'budget_remaining',
+                'cost_per_result',
+                'cpm',
+                'cpc',
+                'cpp'
+            ]
+
+            for field in spend_fields:
+                if field in converted_item and converted_item[field] is not None:
+                    try:
+                        original_amount = float(converted_item[field])
+
+                        # Only convert if currencies are different
+                        if user_currency != ad_account_currency:
+                            # Use CurrencyService.convert() method
+                            converted_amount = CurrencyService.convert(
+                                amount=original_amount,
+                                from_currency=ad_account_currency,
+                                to_currency=user_currency
+                            )
+
+                            converted_item[field] = converted_amount
+
+                            # Store original for reference
+                            converted_item[f'{field}_original'] = original_amount
+
+                            logger.debug(
+                                f"💱 Converted {field}: {original_amount:.2f} {ad_account_currency} "
+                                f"→ {converted_amount:.2f} {user_currency}"
+                            )
+                        else:
+                            # Same currency, no conversion needed
+                            converted_item[field] = original_amount
+                            logger.debug(f"💱 No conversion needed for {field} (same currency)")
+
+                    except (ValueError, TypeError) as e:
+                        logger.warning(f"Failed to convert {field} value {converted_item[field]}: {e}")
+                        # Keep original value if conversion fails
+                        pass
+
+            return converted_item
+
+        # Track totals for logging
+        total_campaigns = 0
+        total_adsets = 0
+        total_ads = 0
+        total_spend_before = 0.0
+        total_spend_after = 0.0
+
+        # Convert campaigns
+        if 'campaigns' in meta_data and meta_data['campaigns']:
+            converted_campaigns = []
+            for campaign in meta_data['campaigns']:
+                # Track spend before conversion
+                if 'spend' in campaign and campaign['spend'] is not None:
+                    try:
+                        total_spend_before += float(campaign['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+                converted_campaign = convert_spend_fields(campaign)
+                converted_campaigns.append(converted_campaign)
+
+                # Track spend after conversion
+                if 'spend' in converted_campaign and converted_campaign['spend'] is not None:
+                    try:
+                        total_spend_after += float(converted_campaign['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+            meta_data['campaigns'] = converted_campaigns
+            total_campaigns = len(converted_campaigns)
+            logger.info(
+                f"💱 Converted currency for {total_campaigns} campaigns. "
+                f"Total spend: {total_spend_before:.2f} {ad_account_currency} → "
+                f"{total_spend_after:.2f} {user_currency}"
+            )
+
+        # Convert adsets
+        if 'adsets' in meta_data and meta_data['adsets']:
+            converted_adsets = []
+            adset_spend_before = 0.0
+            adset_spend_after = 0.0
+
+            for adset in meta_data['adsets']:
+                if 'spend' in adset and adset['spend'] is not None:
+                    try:
+                        adset_spend_before += float(adset['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+                converted_adset = convert_spend_fields(adset)
+                converted_adsets.append(converted_adset)
+
+                if 'spend' in converted_adset and converted_adset['spend'] is not None:
+                    try:
+                        adset_spend_after += float(converted_adset['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+            meta_data['adsets'] = converted_adsets
+            total_adsets = len(converted_adsets)
+            logger.info(
+                f"💱 Converted currency for {total_adsets} adsets. "
+                f"Total spend: {adset_spend_before:.2f} {ad_account_currency} → "
+                f"{adset_spend_after:.2f} {user_currency}"
+            )
+
+        # Convert ads
+        if 'ads' in meta_data and meta_data['ads']:
+            converted_ads = []
+            ad_spend_before = 0.0
+            ad_spend_after = 0.0
+
+            for ad in meta_data['ads']:
+                if 'spend' in ad and ad['spend'] is not None:
+                    try:
+                        ad_spend_before += float(ad['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+                converted_ad = convert_spend_fields(ad)
+                converted_ads.append(converted_ad)
+
+                if 'spend' in converted_ad and converted_ad['spend'] is not None:
+                    try:
+                        ad_spend_after += float(converted_ad['spend'])
+                    except (ValueError, TypeError):
+                        pass
+
+            meta_data['ads'] = converted_ads
+            total_ads = len(converted_ads)
+            logger.info(
+                f"💱 Converted currency for {total_ads} ads. "
+                f"Total spend: {ad_spend_before:.2f} {ad_account_currency} → "
+                f"{ad_spend_after:.2f} {user_currency}"
+            )
+
+        # Convert top-level metrics if present
+        if 'metrics' in meta_data and meta_data['metrics']:
+            meta_data['metrics'] = convert_spend_fields(meta_data.get('metrics', {}))
+            logger.info(f"💱 Converted currency for top-level metrics")
+
+        # Add currency metadata to meta_data
+        meta_data['currency'] = user_currency
+        meta_data['original_currency'] = ad_account_currency
+
+        # 🔥 SAVE FULL DATA: campaigns, adsets, ads, leads, AND metrics (all converted)
+        update_result = await client_groups_collection.update_one(
             {"id": group_id},
             {
                 "$set": {
-                    "facebook_cache": meta_data,  # Now includes campaigns/adsets/ads arrays!
+                    "facebook_cache": meta_data,  # Now includes converted campaigns/adsets/ads!
                     "last_meta_refresh": datetime.utcnow()
                 }
             }
         )
 
         logger.info(
-            f"✅ Cached Meta data for group {group_id}: "
-            f"{len(meta_data.get('campaigns', []))} campaigns, "
-            f"{len(meta_data.get('adsets', []))} adsets, "
-            f"{len(meta_data.get('ads', []))} ads"
+            f"✅ Cached Meta data for group {group_id} in {user_currency} "
+            f"(matched: {update_result.matched_count}, modified: {update_result.modified_count}): "
+            f"{total_campaigns} campaigns, {total_adsets} adsets, {total_ads} ads"
         )
 
     except Exception as e:
-        logger.error(f"Error caching Meta data: {e}")
+        logger.error(f"❌ Error caching Meta data: {e}", exc_info=True)
         raise
-
 
 
 async def fetch_and_cache_hp_data(

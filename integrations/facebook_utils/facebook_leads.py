@@ -59,6 +59,7 @@ async def create_facebook_leads_indexes(mongo_client):
 
 
 async def fetch_and_cache_facebook_leads_FIXED(
+        ad_account_currency: str,
         group_id: str,
         meta_ad_account_id: str,
         user_id: str,
@@ -67,17 +68,28 @@ async def fetch_and_cache_facebook_leads_FIXED(
 ):
     """
     UPDATED: Fetch Facebook leads and update cache with accurate count.
-
-    Now calculates and updates metrics directly during save.
+    Now calculates metrics, converts currency to user's default, and updates cache.
     """
     try:
-        # Import the staged leads fetcher from main.py
-
         from integrations.facebook_utils.facebook import get_facebook_token
+        from utils.currency_exchange import CurrencyService
 
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         facebook_leads_collection = db["facebook_leads"]
         client_groups_collection = db["client_groups"]
+
+        # Get user's default currency
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
+            )
+        except ValueError as e:
+            logger.error(f"Failed to get user currency: {e}")
+            raise
+        except RuntimeError as e:
+            logger.error(f"Database error getting user currency: {e}")
+            raise
 
         # Get Facebook token
         token = await get_facebook_token(user_id, mongo_client)
@@ -115,13 +127,22 @@ async def fetch_and_cache_facebook_leads_FIXED(
         )
 
         # ============================================
-        # Save to database AND count
+        # Save to database AND calculate metrics
         # ============================================
         total_saved = 0
+        total_spend_on_leads = 0.0
 
         if all_leads:
             lead_docs = []
+
             for lead in all_leads:
+                # Track spend if available in lead data
+                try:
+                    lead_spend = float(lead.get("spend", 0) or 0)
+                    total_spend_on_leads += lead_spend
+                except (ValueError, TypeError):
+                    pass
+
                 lead_docs.append({
                     "user_id": user_id,
                     "ad_account_id": meta_ad_account_id,
@@ -157,20 +178,57 @@ async def fetch_and_cache_facebook_leads_FIXED(
         )
 
         # ============================================
-        # 🔥 UPDATE CACHE with actual saved count
+        # 🔥 CONVERT TO USER CURRENCY & UPDATE CACHE
         # ============================================
+
+        # Convert spend to user's currency if there's any spend data
+        total_spend_user_currency = 0.0
+        if total_spend_on_leads > 0:
+            try:
+                total_spend_user_currency = CurrencyService.convert(
+                    amount=total_spend_on_leads,
+                    from_currency=ad_account_currency,
+                    to_currency=user_currency
+                )
+
+                logger.info(
+                    f"💱 Converted lead spend: {total_spend_on_leads:.2f} {ad_account_currency} ➡️ "
+                    f"{total_spend_user_currency:.2f} {user_currency}"
+                )
+            except ValueError as e:
+                logger.error(f"Currency conversion failed: {e}")
+                # Fall back to original currency if conversion fails
+                total_spend_user_currency = total_spend_on_leads
+                logger.warning(
+                    f"⚠️ Using original currency {ad_account_currency} due to conversion error"
+                )
+
+        # Calculate cost per lead
+        cost_per_lead = (total_spend_user_currency / total_saved) if total_saved > 0 else 0
+
         await client_groups_collection.update_one(
             {"id": group_id},
             {
                 "$set": {
                     "facebook_cache.total_leads": total_saved,
                     "facebook_cache.metrics.total_leads": total_saved,
+                    "facebook_cache.metrics.leads_metrics": {
+                        "total_leads": total_saved,
+                        "total_spend": round(total_spend_user_currency, 2),
+                        "cost_per_lead": round(cost_per_lead, 2),
+                        "currency": user_currency,
+                        "original_currency": ad_account_currency
+                    },
                     "last_meta_refresh": datetime.utcnow()
                 }
             }
         )
 
-        logger.info(f"📊 Updated cache: {total_saved} leads")
+        logger.info(
+            f"📊 Updated cache: {total_saved} leads, "
+            f"${total_spend_user_currency:.2f} {user_currency} spend, "
+            f"${cost_per_lead:.2f} cost per lead"
+        )
 
     except Exception as e:
         logger.error(
