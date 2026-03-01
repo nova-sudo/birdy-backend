@@ -1,4 +1,3 @@
-
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
@@ -68,7 +67,6 @@ async def fetch_and_cache_facebook_leads_FIXED(
 ):
     """
     UPDATED: Fetch Facebook leads and update cache with accurate count.
-    Now calculates metrics, converts currency to user's default, and updates cache.
     """
     try:
         from integrations.facebook_utils.facebook import get_facebook_token
@@ -134,7 +132,6 @@ async def fetch_and_cache_facebook_leads_FIXED(
 
         if all_leads:
             lead_docs = []
-
             for lead in all_leads:
                 # Track spend if available in lead data
                 try:
@@ -243,9 +240,7 @@ async def stage1_get_all_ad_ids(
 ) -> List[str]:
     """
     STAGE 1: Get ALL ad IDs from the account.
-
     Handles pagination to get complete list.
-
     Returns: List of ad IDs
     """
     all_ad_ids = []
@@ -255,9 +250,9 @@ async def stage1_get_all_ad_ids(
             # Initial request
             url = f"https://graph.facebook.com/v23.0/{ad_account_id}/ads"
             params = {
-                "fields": "id",  # Only need IDs
+                "fields": "id",
                 "access_token": access_token,
-                "limit": 500,  # Max per page
+                "limit": 500,
                 "date_preset": "maximum"
             }
 
@@ -321,8 +316,10 @@ async def stage2_get_all_leads_for_ad(
 ) -> List[dict]:
     """
     STAGE 2: Get ALL leads for a specific ad.
-
-    Uses the clean endpoint: /{ad_id}?fields=leads&date_preset=maximum
+    Requests the full set of lead fields:
+      created_time, id, ad_id, form_id, field_data,
+      ad_name, adset_id, adset_name, campaign_id, campaign_name,
+      is_organic, platform
 
     Returns: List of leads for this ad
     """
@@ -333,7 +330,8 @@ async def stage2_get_all_leads_for_ad(
             # Initial request - REMOVED campaign_name and adset_name
             url = f"https://graph.facebook.com/v23.0/{ad_id}"
             params = {
-                "fields": "leads,name",  # 🔥 FIXED: Only request ad-level fields
+                # 🔥 UPDATED: Request all desired lead sub-fields via nested field expansion
+                "fields": "name,leads{created_time,id,ad_id,form_id,field_data,ad_name,adset_id,adset_name,campaign_id,campaign_name,is_organic,platform}",
                 "date_preset": "maximum",
                 "access_token": access_token
             }
@@ -353,14 +351,13 @@ async def stage2_get_all_leads_for_ad(
 
             # 🔥 NOTE: Campaign/adset info comes from the lead's field_data
             # not from the ad object itself
-
             leads_data = ad_data.get("leads", {})
-
             # Process first page of leads
             first_leads = leads_data.get("data", [])
             for lead in first_leads:
-                lead["ad_name"] = ad_name
-                # campaign_name and platform come from lead's own data
+                # Ensure ad_name fallback from parent ad object if not on lead itself
+                if not lead.get("ad_name"):
+                    lead["ad_name"] = ad_name
                 all_leads.append(lead)
 
             logger.info(
@@ -370,7 +367,6 @@ async def stage2_get_all_leads_for_ad(
             # Get pagination URL
             paging = leads_data.get("paging", {})
             next_url = paging.get("next")
-
             page = 1
 
             # Paginate through remaining leads
@@ -396,7 +392,8 @@ async def stage2_get_all_leads_for_ad(
 
                     # Add ad metadata to leads
                     for lead in more_leads:
-                        lead["ad_name"] = ad_name
+                        if not lead.get("ad_name"):
+                            lead["ad_name"] = ad_name
                         all_leads.append(lead)
 
                     logger.info(
@@ -438,17 +435,6 @@ async def fetch_all_facebook_leads_staged(
 
     Stage 1: Get all ad IDs
     Stage 2: Fetch leads for each ad (with controlled concurrency)
-
-    Args:
-        ad_account_id: Meta ad account ID
-        access_token: Facebook access token
-        user_id: User ID
-        client_group_id: Client group ID
-        client_group_name: Client group name
-        max_concurrent_ads: Max ads to fetch in parallel (default: 5)
-
-    Returns:
-        (total_leads_count, all_leads_list)
     """
     start_time = datetime.utcnow()
 
@@ -514,7 +500,7 @@ async def fetch_all_facebook_leads_staged(
     normalized_leads = []
 
     for lead in all_leads:
-        # Parse field_data
+        # Parse field_data key-value pairs
         field_data = {}
         for field in lead.get("field_data", []):
             field_name = field.get("name", "")
@@ -523,19 +509,36 @@ async def fetch_all_facebook_leads_staged(
                 field_data[field_name] = field_values[0]
 
         normalized_lead = {
-            "lead_id": lead.get("id"),
-            "ad_name": lead.get("ad_name", ""),
-            "adset_name": lead.get("adset_name", ""),
-            "platform": lead.get("platform", ""),
-            "created_time": lead.get("created_time", ""),
-            "full_name": field_data.get("full_name", ""),
-            "email": field_data.get("email", ""),
-            "phone_number": field_data.get("phone_number", ""),
-            "field_data": field_data,
-            "client_group_id": client_group_id,
-            "client_group_name": client_group_name,
-            "user_id": user_id,
-            "ad_account_id": ad_account_id
+            # Core identifiers
+            "lead_id":        lead.get("id"),
+            "ad_id":          lead.get("ad_id", ""),
+            "form_id":        lead.get("form_id", ""),
+            "adset_id":       lead.get("adset_id", ""),
+            "campaign_id":    lead.get("campaign_id", ""),
+
+            # Names
+            "ad_name":        lead.get("ad_name", ""),
+            "adset_name":     lead.get("adset_name", ""),
+            "campaign_name":  lead.get("campaign_name", ""),
+
+            # Meta flags
+            "platform":       lead.get("platform", ""),
+            "is_organic":     lead.get("is_organic", False),
+
+            # Timing
+            "created_time":   lead.get("created_time", ""),
+
+            # Parsed contact fields
+            "full_name":      field_data.get("full_name", ""),
+            "email":          field_data.get("email", ""),
+            "phone_number":   field_data.get("phone_number", ""),
+
+            # Raw field_data and context
+            "field_data":         field_data,
+            "client_group_id":    client_group_id,
+            "client_group_name":  client_group_name,
+            "user_id":            user_id,
+            "ad_account_id":      ad_account_id,
         }
 
         normalized_leads.append(normalized_lead)
@@ -563,7 +566,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
 ):
     """
     PRODUCTION-READY: Drop-in replacement for existing function.
-
     Uses staged approach for reliability and clarity.
     """
     try:
@@ -572,7 +574,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
         facebook_leads_collection = db["facebook_leads"]
         client_groups_collection = db["client_groups"]
 
-        # Get Facebook token
         from integrations.facebook_utils.facebook import get_facebook_token
         token = await get_facebook_token(user_id, mongo_client)
 
@@ -580,7 +581,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
             logger.warning(f"No Facebook token for user {user_id}")
             return
 
-        # Get client group info
         client_group = await client_groups_collection.find_one({"id": group_id})
         client_group_name = client_group.get("name") if client_group else "Unknown Group"
 
@@ -589,9 +589,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
             f"(account: {meta_ad_account_id})"
         )
 
-        # ============================================
-        # Clear existing if initial load
-        # ============================================
         if is_initial_load:
             delete_result = await facebook_leads_collection.delete_many({
                 "user_id": user_id,
@@ -599,21 +596,15 @@ async def fetch_and_cache_facebook_leads_STAGED(
             })
             logger.info(f"🗑️ Deleted {delete_result.deleted_count} existing leads")
 
-        # ============================================
-        # Fetch all leads using staged approach
-        # ============================================
         total_leads, all_leads = await fetch_all_facebook_leads_staged(
             meta_ad_account_id,
             token["access_token"],
             user_id,
             group_id,
             client_group_name,
-            max_concurrent_ads=5  # Process 5 ads in parallel
+            max_concurrent_ads=5
         )
 
-        # ============================================
-        # Save to database in batches
-        # ============================================
         if all_leads:
             lead_docs = []
             for lead in all_leads:
@@ -628,7 +619,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
                     "updated_at": datetime.now()
                 })
 
-            # Insert in batches
             batch_size = 500
             for i in range(0, len(lead_docs), batch_size):
                 batch = lead_docs[i:i + batch_size]
@@ -644,9 +634,6 @@ async def fetch_and_cache_facebook_leads_STAGED(
                 except Exception as e:
                     logger.error(f"Error saving batch: {str(e)}")
 
-        # ============================================
-        # Update client group cache
-        # ============================================
         await client_groups_collection.update_one(
             {"id": group_id},
             {
@@ -668,4 +655,3 @@ async def fetch_and_cache_facebook_leads_STAGED(
             exc_info=True
         )
         raise
-

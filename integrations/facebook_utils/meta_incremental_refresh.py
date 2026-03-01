@@ -29,7 +29,6 @@ async def fetch_todays_facebook_leads_incremental(
         client_group_id: str,
         client_group_name: str,
         mongo_client,
-        ad_account_currency: str,
         max_concurrent_ads: int = 5
 ) -> Tuple[int, List[dict]]:
     """
@@ -601,19 +600,13 @@ async def update_todays_campaign_insights(
         user_id: str,
         client_group_id: str,
         client_group_name: str,
-        mongo_client,
-        ad_account_currency: str  # ✅ ADD THIS PARAMETER
 ) -> int:
     """
     INCREMENTAL: Update only TODAY's campaign insight records.
-    NOW WITH CURRENCY CONVERSION.
 
     Strategy:
     1. Get all campaign IDs
     2. Fetch insights with date_preset=today (single day)
-    3. Convert monetary values to user's currency
-    4. If no data for today, fallback to last_7d and fill gaps
-    5. Upsert records for today's date
 
     Returns:
         Number of insights updated
@@ -1029,7 +1022,6 @@ async def update_todays_adset_insights(
 ) -> int:
     """
     INCREMENTAL: Update only TODAY's adset insight records.
-    NOW WITH CURRENCY CONVERSION.
 
     With fallback to last_7d if no data for today.
     """
@@ -1218,7 +1210,6 @@ async def update_todays_ad_insights(
 ) -> int:
     """
     INCREMENTAL: Update only TODAY's ad insight records.
-    NOW WITH CURRENCY CONVERSION.
 
     With fallback to last_7d if no data for today.
     """

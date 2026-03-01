@@ -5011,8 +5011,7 @@ async def get_ghl_contacts_paginated_v2(
         current_user: str = Depends(get_current_user)
 ):
     """
-    UPDATED: Fetch GHL contacts (works with new /contacts/search data structure)
-
+    UPDATED: Fetch GHL contacts with currency conversion on opportunities
     Returns contacts in DESCENDING order (newest first)
     """
     async with get_mongo_client() as mongo_client:
@@ -5022,6 +5021,15 @@ async def get_ghl_contacts_paginated_v2(
 
             db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
             contacts_collection = db["ghl_contacts"]
+            users_collection = db["users"]
+
+            # ✅ Fetch user's default currency
+            user_doc = await users_collection.find_one(
+                {"user_id": current_user},
+                {"default_currency": 1}
+            )
+            user_currency = user_doc.get("default_currency") if user_doc else None
+            logger.info(f"👤 User [{current_user}] default currency: {user_currency}")
 
             # Parse group IDs
             group_ids = [g.strip() for g in groups.split(',') if g.strip()] if groups else []
@@ -5056,6 +5064,7 @@ async def get_ghl_contacts_paginated_v2(
 
             # Get total count
             total_contacts = await contacts_collection.count_documents(query)
+            logger.info(f"📊 Total contacts found: {total_contacts} for user [{current_user}]")
 
             if total_contacts == 0:
                 return {
@@ -5088,8 +5097,53 @@ async def get_ghl_contacts_paginated_v2(
             ).sort("contact_data.dateAdded", -1).skip(skip).limit(limit)
 
             contact_docs = await cursor.to_list(length=limit)
+            logger.info(f"📄 Page {page}: fetched {len(contact_docs)} contacts | user_currency={user_currency}")
 
-            # Format contacts - extract ALL fields from contact_data
+            # ✅ Helper: convert opportunity — GBP is the default source currency
+            def convert_opportunity(opp: dict) -> dict:
+                if not user_currency or not opp:
+                    logger.debug(f"⚠️ Skipping — user_currency={user_currency}, opp_empty={not opp}")
+                    return opp
+
+                opp = opp.copy()
+                monetary_fields = ["monetaryValue", "value", "amount"]
+                opp_id = opp.get("id", "unknown")
+
+                # ✅ GBP is the default opportunity currency
+                opp_currency = "GBP"
+
+                logger.info(f"💱 Opportunity [{opp_id}] — from={opp_currency}, to={user_currency}")
+
+                if opp_currency == user_currency:
+                    logger.info(f"✅ Opportunity [{opp_id}] — no conversion needed (same currency)")
+                    opp["display_currency"] = user_currency
+                    return opp
+
+                from utils.currency_exchange import CurrencyService
+                for field in monetary_fields:
+                    if field in opp and opp[field] is not None:
+                        try:
+                            original = float(opp[field])
+                            converted = CurrencyService.convert(
+                                amount=original,
+                                from_currency=opp_currency,
+                                to_currency=user_currency
+                            )
+                            opp[f"{field}_original"] = original
+                            opp[f"{field}_original_currency"] = opp_currency
+                            opp[field] = converted
+                            logger.info(
+                                f"✅ Opportunity [{opp_id}] {field}: "
+                                f"{opp_currency} {original} → {user_currency} {converted}"
+                            )
+                        except (ValueError, TypeError, Exception) as e:
+                            logger.error(f"❌ Opportunity [{opp_id}] failed to convert {field}: {e}")
+
+                opp["display_currency"] = user_currency
+                opp["original_currency"] = opp_currency
+                return opp
+
+            # Format contacts
             contacts = []
             for doc in contact_docs:
                 contact = doc.get("contact_data", {})
@@ -5111,7 +5165,14 @@ async def get_ghl_contacts_paginated_v2(
                     last_name = (contact.get("lastName") or "").strip()
                     contact_name = f"{first_name} {last_name}".strip() if first_name or last_name else "Unknown"
 
-                # Extract ALL fields from the contact data
+                # ✅ Convert opportunities
+                raw_opportunities = contact.get("opportunities") or []
+                logger.info(
+                    f"📋 Contact [{contact.get('id')}] '{contact_name}' "
+                    f"has {len(raw_opportunities)} opportunities"
+                )
+                converted_opportunities = [convert_opportunity(opp) for opp in raw_opportunities]
+
                 formatted_contact = {
                     # Basic info
                     "contactId": contact.get("id"),
@@ -5156,18 +5217,20 @@ async def get_ghl_contacts_paginated_v2(
                     "followers": contact.get("followers") or [],
                     "assignedTo": contact.get("assignedTo") or "",
 
-                    # Opportunities
-                    "opportunities": contact.get("opportunities") or [],
+                    # ✅ Converted opportunities
+                    "opportunities": converted_opportunities,
 
                     # Attribution
                     "attributionSource": contact.get("attributionSource") or {},
                     "lastAttributionSource": contact.get("lastAttributionSource") or {},
+
+                    # ✅ Currency metadata
+                    "display_currency": user_currency,
                 }
 
                 contacts.append(formatted_contact)
 
             elapsed = time.time() - start_time
-
             logger.info(
                 f"⚡ Fetched page {page} (newest first): {len(contacts)} contacts "
                 f"in {elapsed:.3f}s"
@@ -5186,7 +5249,8 @@ async def get_ghl_contacts_paginated_v2(
                     "sort_order": "newest_first",
                     "date_filtered": bool(start_date or end_date),
                     "start_date": start_date,
-                    "end_date": end_date
+                    "end_date": end_date,
+                    "display_currency": user_currency,
                 },
                 "message": f"Retrieved {len(contacts)} contacts (newest first)" +
                            (f" from {start_date} to {end_date}" if (start_date or end_date) else ""),
@@ -5197,7 +5261,10 @@ async def get_ghl_contacts_paginated_v2(
             }
 
         except Exception as e:
-            logger.error(f"Error fetching paginated contacts: {str(e)}", exc_info=True)
+            logger.error(
+                f"❌ Error fetching paginated contacts for user {current_user}: {str(e)}",
+                exc_info=True
+            )
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to fetch contacts: {str(e)}"

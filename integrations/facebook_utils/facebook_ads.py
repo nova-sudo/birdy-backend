@@ -498,7 +498,6 @@ async def fetch_and_cache_ad_insights(
 ):
     """
     Fetch Facebook ad insights and update cache with accurate counts.
-    UPDATED: Now calculates metrics, converts currency to user's default, and updates cache.
     """
     try:
         from integrations.facebook_utils.facebook_ads import FacebookAdsFetcher
@@ -559,7 +558,6 @@ async def fetch_and_cache_ad_insights(
         if insights:
             insight_docs = []
 
-            # Track metrics while building documents (in ad account currency)
             total_spend = 0.0
             total_impressions = 0
             total_clicks = 0
@@ -642,7 +640,6 @@ async def fetch_and_cache_ad_insights(
             )
 
             # ============================================
-            # 🔥 CONVERT TO USER CURRENCY & UPDATE CACHE
             # ============================================
 
             # Convert spend to user's currency

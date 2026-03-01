@@ -511,7 +511,6 @@ async def fetch_and_cache_campaign_insights(
         if insights:
             insight_docs = []
 
-            # Track metrics while building documents (in ad account currency)
             total_spend = 0.0
             total_impressions = 0
             total_clicks = 0
@@ -589,7 +588,6 @@ async def fetch_and_cache_campaign_insights(
             )
 
             # ============================================
-            # 🔥 CONVERT TO USER CURRENCY & UPDATE CACHE
             # ============================================
 
             # Convert spend to user's currency
