@@ -710,32 +710,31 @@ async def update_todays_campaign_insights(
             currency_fields = ['spend', 'cpc', 'cpm', 'cpp']
 
             for insight in all_insights:
-                for field in currency_fields:
-                    if field in insight and insight[field] is not None:
-                        try:
-                            original_value = float(insight[field])
+                converted_fields = {}
+                conversion_failed = False
+            for field in currency_fields:
+                if field in insight and insight[field] is not None:
+                    try:
+                        original_value = float(insight[field])
+                        converted_value = CurrencyService.convert(
+                        amount = original_value,
+                        from_currency = ad_account_currency,
+                        to_currency = user_currency,
+                        )
+                        converted_fields[field] = converted_value
+                        converted_fields[f"{field}_original"] = original_value
+                    except (ValueError, TypeError) as e:\
+                        logger.warning(f"Failed to convert {field}: {e}")
+                    conversion_failed = True
+                    break
+                if conversion_failed:
+                    insight["currency"] = ad_account_currency
+                    insight["original_currency"] = ad_account_currency
+                    continue
 
-                            converted_value = CurrencyService.convert(
-                                amount=original_value,
-                                from_currency=ad_account_currency,
-                                to_currency=user_currency
-                            )
-
-                            insight[field] = converted_value
-                            insight[f'{field}_original'] = original_value
-
-                            if field == 'spend':
-                                total_original_spend += original_value
-                                total_converted_spend += converted_value
-
-                            converted_count += 1
-
-                        except (ValueError, TypeError) as e:
-                            logger.warning(f"Failed to convert {field}: {e}")
-
-                # Add currency metadata
-                insight['currency'] = user_currency
-                insight['original_currency'] = ad_account_currency
+            insight.update(converted_fields)
+            insight["currency"] = user_currency
+            insight["original_currency"] = ad_account_currency
 
             if total_original_spend > 0:
                 logger.info(

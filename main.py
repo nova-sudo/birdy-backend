@@ -3508,6 +3508,11 @@ async def create_client_group_optimized(
 
             # Fetch Meta data (unchanged)
             if request.meta_ad_account_id:
+                if not request.ad_account_currency:
+                    raise HTTPException(
+                    status_code=400,
+                    detail = "ad_account_currency is required when meta_ad_account_id is provided",
+                    )
                 await fetch_and_cache_meta_data(
                     group_id,
                     request.meta_ad_account_id,
@@ -3934,7 +3939,7 @@ async def fetch_and_cache_meta_data(
         meta_ad_account_id: str,
         user_id: str,
         mongo_client,
-        ad_account_currency: str
+        ad_account_currency: str | None = None
 ):
     """
     Fetch Meta data and save FULL details to cache with currency conversion.
@@ -3978,6 +3983,8 @@ async def fetch_and_cache_meta_data(
         if not meta_data:
             logger.warning(f"Failed to fetch Meta data for {meta_ad_account_id}")
             return
+        if not ad_account_currency:
+            ad_account_currency = meta_data.get("currency")
 
         # ============================================
         # 🔥 CONVERT CURRENCY in meta_data
@@ -4135,12 +4142,12 @@ async def fetch_and_cache_meta_data(
 
         # Convert nested metrics.insights monetary fields
         if meta_data.get("metrics"):
-                    converted_metrics = meta_data["metrics"].copy()
-                    insights = converted_metrics.get("insights")
+            converted_metrics = meta_data["metrics"].copy()
+            insights = converted_metrics.get("insights")
         if isinstance(insights, dict):
-                     converted_metrics["insights"] = convert_spend_fields(insights)
-                     meta_data["metrics"] = converted_metrics
-                     logger.info("💱 Converted currency for metrics.insights")
+            converted_metrics["insights"] = convert_spend_fields(insights)
+            meta_data["metrics"] = converted_metrics
+            logger.info("💱 Converted currency for metrics.insights")
 
         # Add currency metadata to meta_data
         meta_data['currency'] = user_currency

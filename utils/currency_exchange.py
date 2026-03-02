@@ -2,7 +2,7 @@
 from currency_converter import CurrencyConverter
 from typing import Optional
 import os
-from pymongo import MongoClient
+from motor.motor_asyncio import AsyncIOMotorClient
 import logging
 
 logger = logging.getLogger(__name__)
@@ -23,13 +23,13 @@ class CurrencyService:
     @staticmethod
     def _get_users_collection():
         if CurrencyService._users_collection is None:
-            CurrencyService._mongo_client = MongoClient(os.getenv("MONGODB_URI"))
+            CurrencyService._mongo_client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
             CurrencyService._db = CurrencyService._mongo_client[os.getenv("MONGODB_DB", "birdyai")]
             CurrencyService._users_collection = CurrencyService._db["users"]
         return CurrencyService._users_collection
 
     @staticmethod
-    def get_user_currency(user_id: str) -> str:
+    async def get_user_currency(user_id: str) -> str:
         """
         Get user's default currency from database.
 
@@ -47,7 +47,7 @@ class CurrencyService:
             users_collection = CurrencyService._get_users_collection()
 
             # ✅ FIX: Query by 'user_id' field (which stores the email)
-            user = users_collection.find_one({"user_id": user_id})
+            user = await users_collection.find_one({"user_id": user_id})
 
             if not user:
                 error_msg = f"User not found with user_id: {user_id}"
