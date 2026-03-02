@@ -79,9 +79,9 @@ class CurrencyService:
             # Re-raise ValueError as-is
             raise
         except Exception as e:
-            error_msg = f"Database error while fetching currency for user {user_id}: {str(e)}"
+            error_msg = f"Database error while fetching currency for user {user_id}: {e!r}"
             logger.error(f"❌ {error_msg}", exc_info=True)
-            raise RuntimeError(error_msg)
+            raise RuntimeError(error_msg) from e
 
     @staticmethod
     def convert(amount: float, from_currency: str, to_currency: str) -> float:

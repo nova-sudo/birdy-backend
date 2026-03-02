@@ -1,12 +1,10 @@
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
-import asyncio
 import logging
 from datetime import datetime
 from typing import List, Tuple
 import httpx
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -196,6 +194,7 @@ async def fetch_and_cache_facebook_leads_FIXED(
                 logger.error(f"Currency conversion failed: {e}")
                 # Fall back to original currency if conversion fails
                 total_spend_user_currency = total_spend_on_leads
+                user_currency = ad_account_currency
                 logger.warning(
                     f"⚠️ Using original currency {ad_account_currency} due to conversion error"
                 )

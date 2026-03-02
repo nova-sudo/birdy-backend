@@ -595,12 +595,14 @@ async def _fetch_leads_for_ad_date_range(
 # ============================================
 
 async def update_todays_campaign_insights(
-        ad_account_id: str,
-        access_token: str,
-        user_id: str,
-        client_group_id: str,
-        client_group_name: str,
-) -> int:
+         ad_account_id: str,
+         access_token: str,
+         user_id: str,
+         client_group_id: str,
+         client_group_name: str,
+         mongo_client,
+         ad_account_currency: str
+ ) -> int:
     """
     INCREMENTAL: Update only TODAY's campaign insight records.
 

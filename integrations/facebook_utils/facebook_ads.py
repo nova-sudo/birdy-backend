@@ -658,6 +658,7 @@ async def fetch_and_cache_ad_insights(
                 logger.error(f"Currency conversion failed: {e}")
                 # Fall back to original currency if conversion fails
                 total_spend_user_currency = total_spend
+                user_currency = ad_account_currency
                 logger.warning(
                     f"⚠️ Using original currency {ad_account_currency} due to conversion error"
                 )
