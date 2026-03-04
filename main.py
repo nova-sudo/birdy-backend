@@ -911,6 +911,10 @@ class ClientGroupRequest(BaseModel):
     hotprospector_group_id: str | None
     notes: str | None = ""
 
+class SaveViewRequest(BaseModel):
+    page: str          # "campaigns" | "contacts" | "clients"
+    visible_columns: list  # list of column id strings
+
 async def generate_tokens(email: str):
     logger.debug(f"Generating tokens for {email} with event loop: {asyncio.get_event_loop()}")
     try:
@@ -5655,3 +5659,50 @@ async def remove_hotprospector_integration(
         except Exception as e:
             logger.error(f"Error removing HotProspector integration for {current_user}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+@app.get("/api/user/views")
+async def get_user_views(current_user: str = Depends(get_current_user)):
+    """
+    Return saved column-visibility views for the current user.
+    Response: { "campaigns": [...], "contacts": [...], "clients": [...] }
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            user_doc = await db["users"].find_one(
+                {"user_id": current_user},
+                {"saved_views": 1}
+            )
+            return user_doc.get("saved_views", {}) if user_doc else {}
+        except Exception as e:
+            logger.error(f"Error fetching views for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/user/views")
+async def save_user_view(
+    request: SaveViewRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Persist the visible-column list for one page.
+    Body: { "page": "campaigns", "visible_columns": ["name", "spend", ...] }
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {
+                    "$set": {
+                        f"saved_views.{request.page}": request.visible_columns,
+                        "updated_at": datetime.now()
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"✅ Saved '{request.page}' view for {current_user}: {len(request.visible_columns)} columns")
+            return {"success": True, "page": request.page, "saved_columns": len(request.visible_columns)}
+        except Exception as e:
+            logger.error(f"Error saving view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
