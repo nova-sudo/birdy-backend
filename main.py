@@ -754,6 +754,7 @@ def mongo_to_dict(obj):
 
 @app.on_event("startup")
 async def startup_event():
+
     """Run once when server starts"""
     async with get_mongo_client() as client:
         # Create indexes
