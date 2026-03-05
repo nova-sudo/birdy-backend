@@ -307,7 +307,8 @@ async def refresh_meta_data_for_all_users():
                                 group_id,
                                 group_name,
                                 mongo_client,
-                                ad_account_currency
+                                ad_account_currency,
+                                max_concurrent_ads= 5
                             )
 
                             # Save new leads to database
@@ -650,23 +651,23 @@ def start_background_jobs():
     # Token refresh: runs every 12 hours at :00 minutes
     # scheduler.add_job(
     #     refresh_tokens_for_all_users,
-    #     CronTrigger( minute='29'),
+    #     CronTrigger( minute='32'),
     #     id='token_refresh',
     #     replace_existing=True,
     #     max_instances=1
     # )
-    #
-    # # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
+
+    # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
     # scheduler.add_job(
     #     refresh_ghl_data_for_all_users,
-    #     CronTrigger(minute='09'),
+    #     CronTrigger(minute='34'),
     #     id='ghl_refresh',
     #     replace_existing=True,
     #     max_instances=2
     #
     # )
-
-    # Meta data refresh: runs hourly at :25 (staggered)
+    #
+    # # Meta data refresh: runs hourly at :25 (staggered)
     # scheduler.add_job(
     #     refresh_meta_data_for_all_users,
     #     CronTrigger(minute='19'),
@@ -814,6 +815,7 @@ async def populate_cache_for_existing_groups():
             logger.error(f"Error in startup cache population: {e}", exc_info=True)
 
 
+
 # Utility function to convert MongoDB documents to JSON-serializable format
 def mongo_to_dict(obj):
     if isinstance(obj, dict):
@@ -829,6 +831,7 @@ def mongo_to_dict(obj):
 
 @app.on_event("startup")
 async def startup_event():
+
     """Run once when server starts"""
     async with get_mongo_client() as client:
         # Create indexes
@@ -986,6 +989,10 @@ class ClientGroupRequest(BaseModel):
     hotprospector_group_id: str | None
     ad_account_currency: str | None
     notes: str | None = ""
+
+class SaveViewRequest(BaseModel):
+    page: str          # "campaigns" | "contacts" | "clients"
+    visible_columns: list  # list of column id strings
 
 async def generate_tokens(email: str):
     logger.debug(f"Generating tokens for {email} with event loop: {asyncio.get_event_loop()}")
@@ -3393,6 +3400,7 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
             logger.error(f"Error fetching client groups for user {current_user}: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch client groups: {str(e)}")
 
+
 @app.post("/api/client-groups")
 async def create_client_group_optimized(
         request: ClientGroupRequest,
@@ -4173,6 +4181,7 @@ async def fetch_and_cache_meta_data(
     except Exception as e:
         logger.error(f"❌ Error caching Meta data: {e}", exc_info=True)
         raise
+
 
 
 async def fetch_and_cache_hp_data(
@@ -5239,6 +5248,7 @@ async def get_ghl_contacts_paginated_v2(
                 contacts.append(formatted_contact)
 
             elapsed = time.time() - start_time
+
             logger.info(
                 f"⚡ Fetched page {page} (newest first): {len(contacts)} contacts "
                 f"in {elapsed:.3f}s"
@@ -5911,3 +5921,192 @@ async def get_facebook_leads_filtered(
         except Exception as e:
             logger.error(f"Error fetching filtered leads: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {str(e)}")
+
+
+# Add these three endpoints to your main.py
+# Place them near your other integration endpoints (e.g. after /api/hotprospector/connect)
+
+# ============================================================
+# REMOVE INTEGRATION ENDPOINTS
+# ============================================================
+
+@app.delete("/api/integrations/gohighlevel/remove")
+async def remove_gohighlevel_integration(
+    response: Response,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove GoHighLevel integration for the current user.
+    Deletes agency token AND all subaccount tokens from MongoDB.
+    Also clears the gohighlevel_tokens cookie.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.gohighlevel": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Clear the cookie
+            response.delete_cookie(
+                key="gohighlevel_tokens",
+                path="/",
+                domain=COOKIE_DOMAIN,
+                samesite=COOKIE_SAMESITE,
+                secure=COOKIE_SECURE,
+            )
+
+            logger.info(f"✅ Removed GoHighLevel integration for user: {current_user}")
+            return {"success": True, "message": "GoHighLevel integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing GHL integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+
+@app.delete("/api/integrations/facebook/remove")
+async def remove_facebook_integration(
+    response: Response,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove Meta (Facebook) integration for the current user.
+    Deletes the access token from MongoDB and clears the facebook_tokens cookie.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.facebook": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            # Clear the cookie
+            response.delete_cookie(
+                key="facebook_tokens",
+                path="/",
+                domain=COOKIE_DOMAIN,
+                samesite=COOKIE_SAMESITE,
+                secure=COOKIE_SECURE,
+            )
+
+            logger.info(f"✅ Removed Meta integration for user: {current_user}")
+            return {"success": True, "message": "Meta integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing Facebook integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+
+@app.delete("/api/integrations/hotprospector/remove")
+async def remove_hotprospector_integration(
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Permanently remove HotProspector integration for the current user.
+    Deletes API credentials from MongoDB.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            users_collection = db["users"]
+
+            result = await users_collection.update_one(
+                {"user_id": current_user},
+                {
+                    "$unset": {
+                        "integrations.hotprospector": ""
+                    },
+                    "$set": {
+                        "updated_at": datetime.now()
+                    }
+                }
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            logger.info(f"✅ Removed HotProspector integration for user: {current_user}")
+            return {"success": True, "message": "HotProspector integration removed successfully"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error removing HotProspector integration for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to remove integration: {str(e)}")
+
+@app.get("/api/user/views")
+async def get_user_views(current_user: str = Depends(get_current_user)):
+    """
+    Return saved column-visibility views for the current user.
+    Response: { "campaigns": [...], "contacts": [...], "clients": [...] }
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            user_doc = await db["users"].find_one(
+                {"user_id": current_user},
+                {"saved_views": 1}
+            )
+            return user_doc.get("saved_views", {}) if user_doc else {}
+        except Exception as e:
+            logger.error(f"Error fetching views for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.patch("/api/user/views")
+async def save_user_view(
+    request: SaveViewRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Persist the visible-column list for one page.
+    Body: { "page": "campaigns", "visible_columns": ["name", "spend", ...] }
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {
+                    "$set": {
+                        f"saved_views.{request.page}": request.visible_columns,
+                        "updated_at": datetime.now()
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"✅ Saved '{request.page}' view for {current_user}: {len(request.visible_columns)} columns")
+            return {"success": True, "page": request.page, "saved_columns": len(request.visible_columns)}
+        except Exception as e:
+            logger.error(f"Error saving view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
