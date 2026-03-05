@@ -1,12 +1,10 @@
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 import os
-import asyncio
 import logging
 from datetime import datetime
 from typing import List, Tuple
 import httpx
-import os
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +56,7 @@ async def create_facebook_leads_indexes(mongo_client):
 
 
 async def fetch_and_cache_facebook_leads_FIXED(
+        ad_account_currency: str,
         group_id: str,
         meta_ad_account_id: str,
         user_id: str,
@@ -66,15 +65,27 @@ async def fetch_and_cache_facebook_leads_FIXED(
 ):
     """
     UPDATED: Fetch Facebook leads and update cache with accurate count.
-
-    Now calculates and updates metrics directly during save.
     """
     try:
         from integrations.facebook_utils.facebook import get_facebook_token
+        from utils.currency_exchange import CurrencyService
 
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         facebook_leads_collection = db["facebook_leads"]
         client_groups_collection = db["client_groups"]
+
+        # Get user's default currency
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
+            )
+        except ValueError as e:
+            logger.error(f"Failed to get user currency: {e}")
+            raise
+        except RuntimeError as e:
+            logger.error(f"Database error getting user currency: {e}")
+            raise
 
         # Get Facebook token
         token = await get_facebook_token(user_id, mongo_client)
@@ -112,13 +123,21 @@ async def fetch_and_cache_facebook_leads_FIXED(
         )
 
         # ============================================
-        # Save to database AND count
+        # Save to database AND calculate metrics
         # ============================================
         total_saved = 0
+        total_spend_on_leads = 0.0
 
         if all_leads:
             lead_docs = []
             for lead in all_leads:
+                # Track spend if available in lead data
+                try:
+                    lead_spend = float(lead.get("spend", 0) or 0)
+                    total_spend_on_leads += lead_spend
+                except (ValueError, TypeError):
+                    pass
+
                 lead_docs.append({
                     "user_id": user_id,
                     "ad_account_id": meta_ad_account_id,
@@ -154,20 +173,58 @@ async def fetch_and_cache_facebook_leads_FIXED(
         )
 
         # ============================================
-        # 🔥 UPDATE CACHE with actual saved count
+        # 🔥 CONVERT TO USER CURRENCY & UPDATE CACHE
         # ============================================
+
+        # Convert spend to user's currency if there's any spend data
+        total_spend_user_currency = 0.0
+        if total_spend_on_leads > 0:
+            try:
+                total_spend_user_currency = CurrencyService.convert(
+                    amount=total_spend_on_leads,
+                    from_currency=ad_account_currency,
+                    to_currency=user_currency
+                )
+
+                logger.info(
+                    f"💱 Converted lead spend: {total_spend_on_leads:.2f} {ad_account_currency} ➡️ "
+                    f"{total_spend_user_currency:.2f} {user_currency}"
+                )
+            except ValueError as e:
+                logger.error(f"Currency conversion failed: {e}")
+                # Fall back to original currency if conversion fails
+                total_spend_user_currency = total_spend_on_leads
+                user_currency = ad_account_currency
+                logger.warning(
+                    f"⚠️ Using original currency {ad_account_currency} due to conversion error"
+                )
+
+        # Calculate cost per lead
+        cost_per_lead = (total_spend_user_currency / total_saved) if total_saved > 0 else 0
+
         await client_groups_collection.update_one(
             {"id": group_id},
             {
                 "$set": {
                     "facebook_cache.total_leads": total_saved,
                     "facebook_cache.metrics.total_leads": total_saved,
+                    "facebook_cache.metrics.leads_metrics": {
+                        "total_leads": total_saved,
+                        "total_spend": round(total_spend_user_currency, 2),
+                        "cost_per_lead": round(cost_per_lead, 2),
+                        "currency": user_currency,
+                        "original_currency": ad_account_currency
+                    },
                     "last_meta_refresh": datetime.utcnow()
                 }
             }
         )
 
-        logger.info(f"📊 Updated cache: {total_saved} leads")
+        logger.info(
+            f"📊 Updated cache: {total_saved} leads, "
+            f"${total_spend_user_currency:.2f} {user_currency} spend, "
+            f"${cost_per_lead:.2f} cost per lead"
+        )
 
     except Exception as e:
         logger.error(
@@ -189,6 +246,7 @@ async def stage1_get_all_ad_ids(
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # Initial request
             url = f"https://graph.facebook.com/v23.0/{ad_account_id}/ads"
             params = {
                 "fields": "id",
@@ -204,6 +262,7 @@ async def stage1_get_all_ad_ids(
                 page += 1
                 logger.info(f"📄 Fetching ad IDs page {page}")
 
+                # Fetch page
                 if page == 1:
                     response = await client.get(url, params=params)
                 else:
@@ -222,6 +281,7 @@ async def stage1_get_all_ad_ids(
                     logger.info(f"✅ No more ads at page {page}")
                     break
 
+                # Extract ad IDs
                 ad_ids = [ad["id"] for ad in ads]
                 all_ad_ids.extend(ad_ids)
 
@@ -230,6 +290,7 @@ async def stage1_get_all_ad_ids(
                     f"(total: {len(all_ad_ids)})"
                 )
 
+                # Check for next page
                 paging = data.get("paging", {})
                 next_url = paging.get("next")
 
@@ -237,6 +298,7 @@ async def stage1_get_all_ad_ids(
                     logger.info(f"✅ Reached last page at page {page}")
                     break
 
+                # Small delay
                 await asyncio.sleep(0.1)
 
             logger.info(f"✅ STAGE 1 COMPLETE: Got {len(all_ad_ids)} total ad IDs")
@@ -264,6 +326,7 @@ async def stage2_get_all_leads_for_ad(
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # Initial request - REMOVED campaign_name and adset_name
             url = f"https://graph.facebook.com/v23.0/{ad_id}"
             params = {
                 # 🔥 UPDATED: Request all desired lead sub-fields via nested field expansion
@@ -272,6 +335,7 @@ async def stage2_get_all_leads_for_ad(
                 "access_token": access_token
             }
 
+            # Get ad info and first page of leads
             response = await client.get(url, params=params)
 
             if response.status_code != 200:
@@ -284,9 +348,11 @@ async def stage2_get_all_leads_for_ad(
             ad_data = response.json()
             ad_name = ad_data.get("name", "")
 
+            # 🔥 NOTE: Campaign/adset info comes from the lead's field_data
+            # not from the ad object itself
             leads_data = ad_data.get("leads", {})
+            # Process first page of leads
             first_leads = leads_data.get("data", [])
-
             for lead in first_leads:
                 # Ensure ad_name fallback from parent ad object if not on lead itself
                 if not lead.get("ad_name"):
@@ -297,10 +363,12 @@ async def stage2_get_all_leads_for_ad(
                 f"  📊 Ad {ad_id}: Got {len(first_leads)} leads (page 1)"
             )
 
+            # Get pagination URL
             paging = leads_data.get("paging", {})
             next_url = paging.get("next")
             page = 1
 
+            # Paginate through remaining leads
             while next_url:
                 page += 1
 
@@ -321,6 +389,7 @@ async def stage2_get_all_leads_for_ad(
                         logger.info(f"  ✅ No more leads at page {page}")
                         break
 
+                    # Add ad metadata to leads
                     for lead in more_leads:
                         if not lead.get("ad_name"):
                             lead["ad_name"] = ad_name
@@ -330,9 +399,11 @@ async def stage2_get_all_leads_for_ad(
                         f"  📊 Ad {ad_id}: Got {len(more_leads)} leads (page {page})"
                     )
 
+                    # Get next page
                     next_paging = page_data.get("paging", {})
                     next_url = next_paging.get("next")
 
+                    # Small delay
                     await asyncio.sleep(0.1)
 
                 except Exception as e:
@@ -368,7 +439,9 @@ async def fetch_all_facebook_leads_staged(
 
     logger.info(f"🚀 Starting staged Facebook leads fetch for {ad_account_id}")
 
-    # STAGE 1
+    # ============================================
+    # STAGE 1: Get all ad IDs
+    # ============================================
     logger.info("📋 STAGE 1: Fetching all ad IDs...")
     ad_ids = await stage1_get_all_ad_ids(ad_account_id, access_token)
 
@@ -378,11 +451,14 @@ async def fetch_all_facebook_leads_staged(
 
     logger.info(f"✅ STAGE 1 COMPLETE: {len(ad_ids)} ads to process")
 
-    # STAGE 2
+    # ============================================
+    # STAGE 2: Fetch leads for each ad (with concurrency control)
+    # ============================================
     logger.info(f"📋 STAGE 2: Fetching leads from {len(ad_ids)} ads...")
 
     all_leads = []
 
+    # Process ads in batches to control concurrency
     for i in range(0, len(ad_ids), max_concurrent_ads):
         batch = ad_ids[i:i + max_concurrent_ads]
         batch_num = (i // max_concurrent_ads) + 1
@@ -393,6 +469,7 @@ async def fetch_all_facebook_leads_staged(
             f"({len(batch)} ads)"
         )
 
+        # Fetch leads for this batch in parallel
         tasks = [
             stage2_get_all_leads_for_ad(ad_id, access_token)
             for ad_id in batch
@@ -400,6 +477,7 @@ async def fetch_all_facebook_leads_staged(
 
         batch_results = await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Collect results
         for j, result in enumerate(batch_results):
             if isinstance(result, Exception):
                 logger.error(f"❌ Error in batch {batch_num}, ad {j}: {result}")
@@ -411,11 +489,12 @@ async def fetch_all_facebook_leads_staged(
             f"{sum(len(r) for r in batch_results if not isinstance(r, Exception))} leads"
         )
 
+        # Small delay between batches
         if i + max_concurrent_ads < len(ad_ids):
             await asyncio.sleep(0.5)
 
     # ============================================
-    # Normalize leads — now includes all requested fields
+    # Process and normalize leads
     # ============================================
     normalized_leads = []
 
