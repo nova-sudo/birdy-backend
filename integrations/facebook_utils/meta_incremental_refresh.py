@@ -196,7 +196,7 @@ async def fetch_todays_facebook_leads_incremental(
                 "client_group_id": client_group_id,
                 "client_group_name": client_group_name,
                 "user_id": user_id,
-                "ad_account_id": ad_account_id
+                "ad_account_id": ad_account_id,
             }
 
             normalized_leads.append(normalized_lead)
@@ -595,32 +595,47 @@ async def _fetch_leads_for_ad_date_range(
 # ============================================
 
 async def update_todays_campaign_insights(
-        ad_account_id: str,
-        access_token: str,
-        user_id: str,
-        client_group_id: str,
-        client_group_name: str,
-        mongo_client
-) -> int:
+         ad_account_id: str,
+         access_token: str,
+         user_id: str,
+         client_group_id: str,
+         client_group_name: str,
+         mongo_client,
+         ad_account_currency: str
+ ) -> int:
     """
     INCREMENTAL: Update only TODAY's campaign insight records.
 
     Strategy:
     1. Get all campaign IDs
     2. Fetch insights with date_preset=today (single day)
-    3. If no data for today, fallback to last_7d and fill gaps
-    4. Upsert records for today's date
 
     Returns:
         Number of insights updated
     """
     try:
+        from utils.currency_exchange import CurrencyService
+
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         insights_collection = db["facebook_campaign_insights"]
 
         today_str = date.today().isoformat()
 
         logger.info(f"🔄 Updating today's campaign insights ({today_str})")
+
+        # ✅ GET USER CURRENCY WITH FALLBACK
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, "
+                f"Ad account currency: {ad_account_currency}"
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning(
+                f"⚠️ Could not get user currency: {e}. "
+                f"Using ad account currency {ad_account_currency} as fallback."
+            )
+            user_currency = ad_account_currency
 
         # ============================================
         # STEP 1: Get all campaign IDs
@@ -684,6 +699,57 @@ async def update_todays_campaign_insights(
                 )
 
         # ============================================
+        # ✅ CONVERT CURRENCIES BEFORE SAVING
+        # ============================================
+        if all_insights and user_currency != ad_account_currency:
+            converted_count = 0
+            total_original_spend = 0.0
+            total_converted_spend = 0.0
+
+            # Fields to convert
+            currency_fields = ['spend', 'cpc', 'cpm', 'cpp']
+
+            for insight in all_insights:
+                converted_fields = {}
+                conversion_failed = False
+            for field in currency_fields:
+                if field in insight and insight[field] is not None:
+                    try:
+                        original_value = float(insight[field])
+                        converted_value = CurrencyService.convert(
+                        amount = original_value,
+                        from_currency = ad_account_currency,
+                        to_currency = user_currency,
+                        )
+                        converted_fields[field] = converted_value
+                        converted_fields[f"{field}_original"] = original_value
+                    except (ValueError, TypeError) as e:\
+                        logger.warning(f"Failed to convert {field}: {e}")
+                    conversion_failed = True
+                    break
+                if conversion_failed:
+                    insight["currency"] = ad_account_currency
+                    insight["original_currency"] = ad_account_currency
+                    continue
+
+            insight.update(converted_fields)
+            insight["currency"] = user_currency
+            insight["original_currency"] = ad_account_currency
+
+            if total_original_spend > 0:
+                logger.info(
+                    f"💱 Converted {len(all_insights)} campaign insights: "
+                    f"${total_original_spend:.2f} {ad_account_currency} → "
+                    f"${total_converted_spend:.2f} {user_currency}"
+                )
+        elif all_insights:
+            # Same currency, just add metadata
+            for insight in all_insights:
+                insight['currency'] = user_currency
+                insight['original_currency'] = ad_account_currency
+            logger.info(f"💱 Same currency ({user_currency}), no conversion needed")
+
+        # ============================================
         # STEP 3: Upsert today's records
         # ============================================
         from pymongo import UpdateOne
@@ -704,6 +770,8 @@ async def update_todays_campaign_insights(
                             "client_group_id": client_group_id,
                             "client_group_name": client_group_name,
                             "insight_data": insight,
+                            "currency": insight.get('currency'),  # ✅ ADDED
+                            "original_currency": insight.get('original_currency'),  # ✅ ADDED
                             "updated_at": datetime.now()
                         },
                         "$setOnInsert": {
@@ -720,7 +788,7 @@ async def update_todays_campaign_insights(
             total_updated = result.upserted_count + result.modified_count
 
             logger.info(
-                f"✅ Updated {total_updated} campaign insights for {today_str} "
+                f"✅ Updated {total_updated} campaign insights for {today_str} in {user_currency} "
                 f"({result.upserted_count} new, {result.modified_count} updated)"
             )
 
@@ -731,7 +799,6 @@ async def update_todays_campaign_insights(
     except Exception as e:
         logger.error(f"❌ Error updating today's campaign insights: {str(e)}", exc_info=True)
         return 0
-
 
 async def _get_all_campaign_ids(ad_account_id: str, access_token: str) -> List[str]:
     """Get all campaign IDs (light query, no pagination needed for most accounts)"""
@@ -951,7 +1018,8 @@ async def update_todays_adset_insights(
         user_id: str,
         client_group_id: str,
         client_group_name: str,
-        mongo_client
+        mongo_client,
+        ad_account_currency: str  # ✅ ADD THIS PARAMETER
 ) -> int:
     """
     INCREMENTAL: Update only TODAY's adset insight records.
@@ -959,12 +1027,28 @@ async def update_todays_adset_insights(
     With fallback to last_7d if no data for today.
     """
     try:
+        from utils.currency_exchange import CurrencyService
+
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         insights_collection = db["facebook_adset_insights"]
 
         today_str = date.today().isoformat()
 
         logger.info(f"🔄 Updating today's adset insights ({today_str})")
+
+        # ✅ GET USER CURRENCY WITH FALLBACK
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, "
+                f"Ad account currency: {ad_account_currency}"
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning(
+                f"⚠️ Could not get user currency: {e}. "
+                f"Using ad account currency {ad_account_currency} as fallback."
+            )
+            user_currency = ad_account_currency
 
         # Get all adset IDs
         adset_ids = await _get_all_adset_ids(ad_account_id, access_token)
@@ -1022,6 +1106,48 @@ async def update_todays_adset_insights(
                     f"in last 7 days"
                 )
 
+        # ============================================
+        # ✅ CONVERT CURRENCIES BEFORE SAVING
+        # ============================================
+        if all_insights and user_currency != ad_account_currency:
+            total_original_spend = 0.0
+            total_converted_spend = 0.0
+            currency_fields = ['spend', 'cpc', 'cpm', 'cpp']
+
+            for insight in all_insights:
+                for field in currency_fields:
+                    if field in insight and insight[field] is not None:
+                        try:
+                            original_value = float(insight[field])
+                            converted_value = CurrencyService.convert(
+                                amount=original_value,
+                                from_currency=ad_account_currency,
+                                to_currency=user_currency
+                            )
+                            insight[field] = converted_value
+                            insight[f'{field}_original'] = original_value
+
+                            if field == 'spend':
+                                total_original_spend += original_value
+                                total_converted_spend += converted_value
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Failed to convert {field}: {e}")
+
+                insight['currency'] = user_currency
+                insight['original_currency'] = ad_account_currency
+
+            if total_original_spend > 0:
+                logger.info(
+                    f"💱 Converted {len(all_insights)} adset insights: "
+                    f"${total_original_spend:.2f} {ad_account_currency} → "
+                    f"${total_converted_spend:.2f} {user_currency}"
+                )
+        elif all_insights:
+            for insight in all_insights:
+                insight['currency'] = user_currency
+                insight['original_currency'] = ad_account_currency
+            logger.info(f"💱 Same currency ({user_currency}), no conversion needed")
+
         # Upsert today's records
         from pymongo import UpdateOne
 
@@ -1044,6 +1170,8 @@ async def update_todays_adset_insights(
                             "campaign_id": insight.get("campaign_id"),
                             "campaign_name": insight.get("campaign_name"),
                             "insight_data": insight,
+                            "currency": insight.get('currency'),  # ✅ ADDED
+                            "original_currency": insight.get('original_currency'),  # ✅ ADDED
                             "updated_at": datetime.now()
                         },
                         "$setOnInsert": {
@@ -1060,7 +1188,7 @@ async def update_todays_adset_insights(
             total_updated = result.upserted_count + result.modified_count
 
             logger.info(
-                f"✅ Updated {total_updated} adset insights for {today_str}"
+                f"✅ Updated {total_updated} adset insights for {today_str} in {user_currency}"
             )
 
             return total_updated
@@ -1078,7 +1206,8 @@ async def update_todays_ad_insights(
         user_id: str,
         client_group_id: str,
         client_group_name: str,
-        mongo_client
+        mongo_client,
+        ad_account_currency: str  # ✅ ADD THIS PARAMETER
 ) -> int:
     """
     INCREMENTAL: Update only TODAY's ad insight records.
@@ -1086,12 +1215,28 @@ async def update_todays_ad_insights(
     With fallback to last_7d if no data for today.
     """
     try:
+        from utils.currency_exchange import CurrencyService
+
         db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
         insights_collection = db["facebook_ad_insights"]
 
         today_str = date.today().isoformat()
 
         logger.info(f"🔄 Updating today's ad insights ({today_str})")
+
+        # ✅ GET USER CURRENCY WITH FALLBACK
+        try:
+            user_currency = CurrencyService.get_user_currency(user_id)
+            logger.info(
+                f"💱 User currency: {user_currency}, "
+                f"Ad account currency: {ad_account_currency}"
+            )
+        except (ValueError, RuntimeError) as e:
+            logger.warning(
+                f"⚠️ Could not get user currency: {e}. "
+                f"Using ad account currency {ad_account_currency} as fallback."
+            )
+            user_currency = ad_account_currency
 
         # Get all ad IDs
         ad_ids = await _get_all_ad_ids(ad_account_id, access_token)
@@ -1149,6 +1294,48 @@ async def update_todays_ad_insights(
                     f"in last 7 days"
                 )
 
+        # ============================================
+        # ✅ CONVERT CURRENCIES BEFORE SAVING
+        # ============================================
+        if all_insights and user_currency != ad_account_currency:
+            total_original_spend = 0.0
+            total_converted_spend = 0.0
+            currency_fields = ['spend', 'cpc', 'cpm', 'cpp']
+
+            for insight in all_insights:
+                for field in currency_fields:
+                    if field in insight and insight[field] is not None:
+                        try:
+                            original_value = float(insight[field])
+                            converted_value = CurrencyService.convert(
+                                amount=original_value,
+                                from_currency=ad_account_currency,
+                                to_currency=user_currency
+                            )
+                            insight[field] = converted_value
+                            insight[f'{field}_original'] = original_value
+
+                            if field == 'spend':
+                                total_original_spend += original_value
+                                total_converted_spend += converted_value
+                        except (ValueError, TypeError) as e:
+                            logger.warning(f"Failed to convert {field}: {e}")
+
+                insight['currency'] = user_currency
+                insight['original_currency'] = ad_account_currency
+
+            if total_original_spend > 0:
+                logger.info(
+                    f"💱 Converted {len(all_insights)} ad insights: "
+                    f"${total_original_spend:.2f} {ad_account_currency} → "
+                    f"${total_converted_spend:.2f} {user_currency}"
+                )
+        elif all_insights:
+            for insight in all_insights:
+                insight['currency'] = user_currency
+                insight['original_currency'] = ad_account_currency
+            logger.info(f"💱 Same currency ({user_currency}), no conversion needed")
+
         # Upsert today's records
         from pymongo import UpdateOne
 
@@ -1173,6 +1360,8 @@ async def update_todays_ad_insights(
                             "campaign_id": insight.get("campaign_id"),
                             "campaign_name": insight.get("campaign_name"),
                             "insight_data": insight,
+                            "currency": insight.get('currency'),  # ✅ ADDED
+                            "original_currency": insight.get('original_currency'),  # ✅ ADDED
                             "updated_at": datetime.now()
                         },
                         "$setOnInsert": {
@@ -1189,7 +1378,7 @@ async def update_todays_ad_insights(
             total_updated = result.upserted_count + result.modified_count
 
             logger.info(
-                f"✅ Updated {total_updated} ad insights for {today_str}"
+                f"✅ Updated {total_updated} ad insights for {today_str} in {user_currency}"
             )
 
             return total_updated
@@ -1199,7 +1388,6 @@ async def update_todays_ad_insights(
     except Exception as e:
         logger.error(f"❌ Error updating today's ad insights: {str(e)}", exc_info=True)
         return 0
-
 
 async def _get_all_adset_ids(ad_account_id: str, access_token: str) -> List[str]:
     """Get all adset IDs"""
