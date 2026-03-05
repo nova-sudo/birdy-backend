@@ -154,7 +154,7 @@ async def refresh_meta_data_for_all_users():
 
         try:
             logger.info("🔄 Starting INCREMENTAL Meta data refresh (today only)")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Get all unique users with Meta ad accounts
@@ -355,7 +355,7 @@ async def refresh_hp_data_for_all_users():
 
         try:
             logger.info("🔄 Starting SEQUENTIAL Hot Prospector data refresh job")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Get all unique users with GHL locations (HP uses GHL location)
@@ -563,6 +563,64 @@ async def fetch_hp_leads_with_calls_for_group(
         return ghl_location_id, 0, 0
 
 
+async def evaluate_all_alerts():
+    """Evaluate all active alerts every 15 minutes."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+            alerts = await db["alerts"].find({"status": {"$in": ["active", "triggered"]}}).to_list(None)
+
+            if not alerts:
+                logger.info("✅ No active alerts to evaluate")
+                return
+
+            logger.info(f"🔔 Evaluating {len(alerts)} alerts...")
+
+            for alert in alerts:
+                try:
+                    # Skip snoozed alerts
+                    snoozed_until = alert.get("snoozed_until")
+                    if snoozed_until and datetime.utcnow() < snoozed_until:
+                        continue
+
+                    eval_result = await evaluate_alert(alert, mongo_client)
+
+                    update = {
+                        "last_evaluated_at": datetime.utcnow(),
+                        "last_eval_result": eval_result,
+                        "current_value": eval_result.get("current_value", 0.0),
+                        "progress_pct": eval_result.get("progress_pct", 0.0),
+                        "updated_at": datetime.utcnow(),
+                    }
+
+                    if eval_result["triggered"]:
+                        update["status"] = "triggered"
+                        update["last_triggered_at"] = datetime.utcnow()
+                        await db["alerts"].update_one({"id": alert["id"]},
+                                                      {"$set": update, "$inc": {"trigger_count": 1}})
+                        await db["alert_notifications"].insert_one({
+                            "alert_id": alert["id"],
+                            "user_id": alert["user_id"],
+                            "message": eval_result["message"],
+                            "current_value": eval_result["current_value"],
+                            "triggered_at": datetime.utcnow(),
+                            "read": False
+                        })
+                        logger.info(f"🚨 Alert triggered: {alert['name']} — {eval_result['message']}")
+                    else:
+                        if alert.get("status") == "triggered":
+                            update["status"] = "active"
+                        await db["alerts"].update_one({"id": alert["id"]}, {"$set": update})
+
+                except Exception as e:
+                    logger.error(f"❌ Error evaluating alert {alert.get('id')}: {e}")
+
+            logger.info(f"✅ Alert evaluation complete ({len(alerts)} alerts checked)")
+
+        except Exception as e:
+            logger.error(f"❌ Critical error in alert evaluation job: {e}", exc_info=True)
+
 def start_background_jobs():
     """Start all background refresh jobs with proper scheduling for serverless"""
 
@@ -579,6 +637,14 @@ def start_background_jobs():
     #     replace_existing=True,
     #     max_instances=1
     # )
+
+    scheduler.add_job(
+        evaluate_all_alerts,
+        CronTrigger(minute="30"),
+        id="alert_evaluation",
+        replace_existing=True,
+        max_instances=1
+    )
 
     # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
     # scheduler.add_job(
@@ -628,7 +694,7 @@ async def populate_cache_for_existing_groups():
     async with get_mongo_client() as mongo_client:
         try:
             logger.info("🔄 Starting cache population for existing client groups...")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Find all groups that don't have cache OR have empty cache
@@ -938,7 +1004,7 @@ async def refresh_tokens_for_all_users():
     async with get_mongo_client() as mongo_client:
         try:
             logger.info("🔄 Starting token refresh job for all users")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             users_cursor = users_collection.find({
@@ -1103,7 +1169,7 @@ async def check_auth(current_user: str = Depends(get_current_user)):
 async def register_user(request: RegisterRequest, response: Response):
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
             existing_user = await users_collection.find_one({"user_id": request.email})
             if existing_user:
@@ -1139,7 +1205,7 @@ async def login_user(request: LoginRequest, response: Response):
     async with get_mongo_client() as mongo_client:
         try:
             logger.debug(f"Starting login for user {request.email}, rememberMe: {request.rememberMe}")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             # Verify user credentials
@@ -1600,7 +1666,7 @@ async def save_facebook_data(user_id: str, account_id: str, data: dict, data_typ
             "updated_at": datetime.now(),
             "created_at": datetime.now()
         }
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         await db["users"].update_one(
             {"user_id": user_id},
             {
@@ -1617,7 +1683,7 @@ async def save_facebook_data(user_id: str, account_id: str, data: dict, data_typ
         raise HTTPException(status_code=500, detail=f"Failed to save {data_type} data: {str(e)}")
 
 async def get_facebook_data(user_id: str, account_id: str, data_type: str, mongo_client: AsyncIOMotorClient):
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     user_doc = await db["users"].find_one({"user_id": user_id})
     if (
         user_doc
@@ -1703,7 +1769,7 @@ async def get_facebook_leads_paginated(
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             leads_collection = db["facebook_leads"]
 
             # Parse group IDs
@@ -1884,7 +1950,7 @@ async def get_all_hotprospector_leads(
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # ============================================
@@ -2219,7 +2285,7 @@ async def refresh_hotprospector_leads(current_user: str = Depends(get_current_us
             )
 
             # Clear cache
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             leads_collection = db["hotprospector_leads"]
             await leads_collection.delete_many({"user_id": current_user})
             logger.info(f"Cleared all cached leads for user {current_user}")
@@ -2385,7 +2451,7 @@ async def get_hotprospector_members(current_user: str = Depends(get_current_user
     async with get_mongo_client() as mongo_client:
         try:
             # Check cache first
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             user_doc = await users_collection.find_one(
@@ -2777,7 +2843,7 @@ async def fetch_ghl_contacts_for_group(
                 contact_count = result
 
                 # Update user doc with new count
-                db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+                db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
                 await db["users"].update_one(
                     {"user_id": current_user},
                     {
@@ -2819,7 +2885,7 @@ async def refresh_ghl_data_for_all_users():
 
         try:
             logger.info("🔄 Starting SEQUENTIAL GHL data refresh job")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Get all unique users with GHL locations
@@ -2940,7 +3006,7 @@ async def force_full_ghl_refresh(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Verify group belongs to user
@@ -3013,7 +3079,7 @@ async def get_ghl_refresh_status(current_user: str = Depends(get_current_user)):
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
             contacts_collection = db["ghl_contacts"]
 
@@ -3062,7 +3128,7 @@ async def get_ghl_refresh_status(current_user: str = Depends(get_current_user)):
 async def refresh_ghl_data_for_user(user_id: str):
     """Refresh GHL data for a specific user"""
     async with get_mongo_client() as mongo_client:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
 
         groups = await client_groups_collection.find(
@@ -3191,7 +3257,7 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # Fetch client groups with all cached data
@@ -3280,7 +3346,7 @@ async def create_client_group_optimized(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             if not request.name:
@@ -3478,7 +3544,7 @@ async def get_client_group_tag_metrics(
         try:
 
             # Verify group belongs to user
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             group = await client_groups_collection.find_one({
@@ -3533,7 +3599,7 @@ async def get_ghl_contacts_sorted_endpoint(
 
 
             # Verify group belongs to user
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             group = await client_groups_collection.find_one({
@@ -3608,7 +3674,7 @@ async def refresh_ghl_incremental(
 
 
             # Verify group belongs to user
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             group = await client_groups_collection.find_one({
@@ -3692,7 +3758,7 @@ async def get_client_group_status(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             group = await client_groups_collection.find_one(
@@ -3741,7 +3807,7 @@ async def fetch_and_cache_multiple_ghl_locations(
         dict: {"total_locations": int, "successful": int, "failed": int}
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
 
         # Get all client groups for this user with GHL locations
@@ -3803,7 +3869,7 @@ async def fetch_and_cache_meta_data(
 ):
     """Fetch Meta data and save FULL details to cache"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
 
         # Get Facebook ad accounts
@@ -3856,7 +3922,7 @@ async def fetch_and_cache_hp_data(
 ):
     """Fetch Hot Prospector data and save to cache"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
 
         # Get HP credentials
@@ -3936,7 +4002,7 @@ async def get_client_group_comprehensive(group_id: str, current_user: str = Depe
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             # ============================================
@@ -4513,7 +4579,7 @@ async def update_client_group_notes(
             body = await request.json()
             notes = body.get("notes", "")
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
             result = await client_groups_collection.update_one(
@@ -4637,7 +4703,7 @@ async def prefetch_marketing_data(
     """NEW ENDPOINT: Prefetch all marketing data in the background"""
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups = await db["client_groups"].find(
                 {"user_id": current_user},
                 {"meta_ad_account_id": 1}
@@ -4701,7 +4767,7 @@ async def get_ghl_contacts_paginated_v2(
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             contacts_collection = db["ghl_contacts"]
 
             # Parse group IDs
@@ -4920,7 +4986,7 @@ async def fetch_and_cache_ghl_data_optimized(
         is_initial_load: If True, fetch all. If False, incremental update
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         contacts_collection = db["ghl_contacts"]
         client_groups_collection = db["client_groups"]
 
@@ -5244,7 +5310,7 @@ async def get_ghl_contacts_sorted(
     """
     Fetch GHL contacts in DESCENDING chronological order (newest first).
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     contacts_collection = db["ghl_contacts"]
 
     query = {
@@ -5284,7 +5350,7 @@ async def get_tag_metrics_from_cache(
 
     Returns: {"tag_name": count, ...}
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     client_groups_collection = db["client_groups"]
 
     group = await client_groups_collection.find_one(
@@ -5312,7 +5378,7 @@ async def get_campaign_insights(
     """Get campaign insights with date filtering"""
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             insights_collection = db["facebook_campaign_insights"]
 
             # Build query
@@ -5356,7 +5422,7 @@ async def get_adset_insights(
     """Get adset insights with date filtering"""
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             insights_collection = db["facebook_adset_insights"]
 
             query = {"user_id": current_user}
@@ -5395,7 +5461,7 @@ async def get_ad_insights(
     """Get ad insights with date filtering"""
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             insights_collection = db["facebook_ad_insights"]
 
             query = {"user_id": current_user}
@@ -5440,7 +5506,7 @@ async def get_facebook_leads_filtered(
             import time
             start_time = time.time()
 
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             leads_collection = db["facebook_leads"]
 
             # Build query
@@ -5538,7 +5604,7 @@ async def remove_gohighlevel_integration(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             result = await users_collection.update_one(
@@ -5586,7 +5652,7 @@ async def remove_facebook_integration(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             result = await users_collection.update_one(
@@ -5633,7 +5699,7 @@ async def remove_hotprospector_integration(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             result = await users_collection.update_one(
@@ -5668,7 +5734,7 @@ async def get_user_views(current_user: str = Depends(get_current_user)):
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             user_doc = await db["users"].find_one(
                 {"user_id": current_user},
                 {"saved_views": 1}
@@ -5690,7 +5756,7 @@ async def save_user_view(
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             await db["users"].update_one(
                 {"user_id": current_user},
                 {
@@ -5706,3 +5772,456 @@ async def save_user_view(
         except Exception as e:
             logger.error(f"Error saving view for {current_user}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+        
+# ============================================================
+# ALERT SYSTEM — paste this block into main.py
+# ============================================================
+
+from pydantic import BaseModel
+from typing import Optional, List
+from datetime import datetime, timedelta
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
+
+# ── Pydantic models ──────────────────────────────────────────
+
+class AlertCondition(BaseModel):
+    """
+    Examples:
+      metric="spend",        operator="gt",  value=500
+      metric="lead_count",   operator="pct_drop", value=30, period="week"
+      metric="ctr",          operator="lt",  value=1.5
+    """
+    metric: str                    # spend | lead_count | ctr | cpc | cpm | roas | roi
+    operator: str                  # gt | lt | eq | pct_drop | pct_rise
+    value: float
+    period: Optional[str] = "week" # day | week | month  (used for pct operators)
+
+class CreateAlertRequest(BaseModel):
+    name: str
+    description: Optional[str] = ""
+    condition: AlertCondition
+    target_group_ids: Optional[List[str]] = []  # empty = global (all groups)
+    notification_channels: Optional[List[str]] = ["in_app"]  # in_app | email
+
+class UpdateAlertRequest(BaseModel):
+    name: Optional[str] = None
+    description: Optional[str] = None
+    condition: Optional[AlertCondition] = None
+    target_group_ids: Optional[List[str]] = None
+    notification_channels: Optional[List[str]] = None
+    status: Optional[str] = None  # active | paused
+
+class SnoozeAlertRequest(BaseModel):
+    hours: int = 24  # snooze for N hours
+
+# ── Helpers ──────────────────────────────────────────────────
+
+METRIC_LABELS = {
+    "spend":       "Total Spend",
+    "lead_count":  "Lead Count",
+    "ctr":         "CTR (%)",
+    "cpc":         "CPC ($)",
+    "cpm":         "CPM ($)",
+    "roas":        "ROAS",
+    "roi":         "ROI",
+    "impressions": "Impressions",
+    "clicks":      "Clicks",
+}
+
+OPERATOR_LABELS = {
+    "gt":       ">",
+    "lt":       "<",
+    "eq":       "=",
+    "pct_drop": "↓ %",
+    "pct_rise": "↑ %",
+}
+
+def format_condition_display(condition: dict) -> str:
+    op  = OPERATOR_LABELS.get(condition.get("operator", ""), condition.get("operator", ""))
+    val = condition.get("value", 0)
+    if condition.get("operator") in ("pct_drop", "pct_rise"):
+        return f"{op} {val}%"
+    return f"{op} {val}"
+
+async def evaluate_alert(alert: dict, mongo_client) -> dict:
+    """
+    Evaluate whether an alert condition is currently triggered.
+    Returns {"triggered": bool, "current_value": float, "message": str}
+    """
+    condition = alert.get("condition", {})
+    metric    = condition.get("metric", "")
+    operator  = condition.get("operator", "")
+    threshold = float(condition.get("value", 0))
+    user_id   = alert.get("user_id")
+    group_ids = alert.get("target_group_ids", [])
+
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+    current_value = 0.0
+    message = ""
+
+    try:
+        # ── Fetch client groups — data lives at facebook.metrics.insights ──
+        groups_query = {"user_id": user_id}
+        if group_ids:
+            groups_query["id"] = {"$in": group_ids}
+
+        client_groups = await db["client_groups"].find(groups_query).to_list(None)
+
+        if not client_groups:
+            return {
+                "triggered": False,
+                "current_value": 0.0,
+                "progress_pct": 0.0,
+                "threshold": threshold,
+                "message": "No client groups found for this alert"
+            }
+
+        # Sum across all targeted groups from facebook.metrics.insights
+        total_spend       = 0.0
+        total_impressions = 0.0
+        total_clicks      = 0.0
+        total_leads       = 0.0
+
+        for g in client_groups:
+            # Data is stored in facebook_cache (not facebook)
+            fb = g.get("facebook_cache") or g.get("facebook") or {}
+            insights = fb.get("metrics", {}).get("insights", {})
+            total_spend       += float(insights.get("spend", 0) or 0)
+            total_impressions += float(insights.get("impressions", 0) or 0)
+            total_clicks      += float(insights.get("clicks", 0) or 0)
+            total_leads       += float(fb.get("total_leads", 0) or 0)
+
+        if metric == "lead_count":
+            current_value = total_leads
+        elif metric == "spend":
+            current_value = total_spend
+        elif metric == "impressions":
+            current_value = total_impressions
+        elif metric == "clicks":
+            current_value = total_clicks
+        elif metric == "ctr":
+            current_value = (total_clicks / total_impressions * 100) if total_impressions else 0.0
+        elif metric == "cpc":
+            current_value = (total_spend / total_clicks) if total_clicks else 0.0
+        elif metric == "cpm":
+            current_value = (total_spend / total_impressions * 1000) if total_impressions else 0.0
+
+        # ── Evaluate operator ────────────────────────────────
+        triggered    = False
+        progress_pct = 0.0   # 0-100: how close we are to triggering
+
+        if operator == "gt":
+            triggered    = current_value > threshold
+            progress_pct = min(100.0, (current_value / threshold * 100)) if threshold > 0 else (100.0 if current_value > 0 else 0.0)
+            message      = f"{METRIC_LABELS.get(metric, metric)} is {current_value:.2f}, threshold is > {threshold}"
+
+        elif operator == "lt":
+            # Progress toward trigger = how close current_value is to falling below threshold
+            # 100% = exactly at threshold (about to trigger), 0% = far above
+            if threshold > 0:
+                progress_pct = min(100.0, max(0.0, (1 - (current_value - threshold) / threshold) * 100))
+            else:
+                progress_pct = 100.0 if current_value <= threshold else 0.0
+            triggered = current_value < threshold
+            message   = f"{METRIC_LABELS.get(metric, metric)} is {current_value:.2f}, threshold is < {threshold}"
+
+        elif operator == "eq":
+            triggered    = abs(current_value - threshold) < 0.01
+            diff         = abs(current_value - threshold)
+            progress_pct = max(0.0, 100.0 - (diff / max(threshold, 1) * 100))
+            message      = f"{METRIC_LABELS.get(metric, metric)} is {current_value:.2f}, target is {threshold}"
+
+        elif operator in ("pct_drop", "pct_rise"):
+            # Compare lead counts between current and previous period
+            period_days = {"day": 1, "week": 7, "month": 30}.get(condition.get("period", "week"), 7)
+            now    = datetime.utcnow()
+            base_q = {"user_id": user_id}
+            if group_ids:
+                base_q["client_group_id"] = {"$in": group_ids}
+            curr_q = {**base_q, "lead_data.created_time": {"$gte": (now - timedelta(days=period_days)).isoformat()}}
+            prev_q = {**base_q, "lead_data.created_time": {
+                "$gte": (now - timedelta(days=period_days * 2)).isoformat(),
+                "$lt":  (now - timedelta(days=period_days)).isoformat()
+            }}
+            curr_val = float(await db["facebook_leads"].count_documents(curr_q))
+            prev_val = float(await db["facebook_leads"].count_documents(prev_q))
+
+            pct_change = ((curr_val - prev_val) / prev_val * 100) if prev_val > 0 else 0.0
+            current_value = pct_change
+
+            if operator == "pct_drop":
+                triggered    = pct_change <= -threshold
+                # progress = how close the drop is to the threshold drop
+                progress_pct = min(100.0, (abs(min(pct_change, 0)) / threshold * 100)) if threshold > 0 else 0.0
+                message      = f"{METRIC_LABELS.get(metric, metric)} changed {pct_change:+.1f}% vs previous {condition.get('period', 'week')} (threshold: ↓{threshold}%)"
+            else:
+                triggered    = pct_change >= threshold
+                progress_pct = min(100.0, (pct_change / threshold * 100)) if threshold > 0 else 0.0
+                message      = f"{METRIC_LABELS.get(metric, metric)} changed {pct_change:+.1f}% vs previous {condition.get('period', 'week')} (threshold: ↑{threshold}%)"
+
+        return {
+            "triggered":     triggered,
+            "current_value": current_value,
+            "progress_pct":  round(progress_pct, 1),
+            "threshold":     threshold,
+            "message":       message,
+        }
+
+    except Exception as e:
+        logger.error(f"Error evaluating alert {alert.get('id')}: {e}")
+        return {"triggered": False, "current_value": 0.0, "message": str(e)}
+
+
+# ── CRUD endpoints ────────────────────────────────────────────
+
+@app.get("/api/alerts")
+async def list_alerts(current_user: str = Depends(get_current_user)):
+    """Return all alerts for the current user, split by status."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+        alerts = await db["alerts"].find({"user_id": current_user}).sort("created_at", -1).to_list(None)
+
+        result = []
+        for a in alerts:
+            d = mongo_to_dict(a)
+            d["condition_display"] = format_condition_display(d.get("condition", {}))
+            d["metric_label"]      = METRIC_LABELS.get(d.get("condition", {}).get("metric", ""), "Unknown")
+            # Ensure progress fields always present (may be 0 until first evaluate)
+            d.setdefault("current_value", 0.0)
+            d.setdefault("progress_pct",  0.0)
+            result.append(d)
+
+        active    = [a for a in result if a.get("status") == "active"]
+        triggered = [a for a in result if a.get("status") == "triggered"]
+        paused    = [a for a in result if a.get("status") == "paused"]
+
+        return {
+            "alerts": result,
+            "active": active,
+            "triggered": triggered,
+            "paused": paused,
+            "counts": {
+                "total": len(result),
+                "active": len(active),
+                "triggered": len(triggered),
+                "paused": len(paused),
+            }
+        }
+
+
+@app.post("/api/alerts")
+async def create_alert(request: CreateAlertRequest, current_user: str = Depends(get_current_user)):
+    """Create a new alert."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        alert_id = f"alert_{current_user}_{int(datetime.utcnow().timestamp() * 1000)}"
+
+        # Fetch target group names for display
+        group_names = []
+        if request.target_group_ids:
+            groups = await db["client_groups"].find(
+                {"id": {"$in": request.target_group_ids}, "user_id": current_user},
+                {"name": 1, "id": 1}
+            ).to_list(None)
+            group_names = [g["name"] for g in groups]
+
+        alert_doc = {
+            "id": alert_id,
+            "user_id": current_user,
+            "name": request.name,
+            "description": request.description or "",
+            "condition": request.condition.model_dump(),
+            "target_group_ids": request.target_group_ids or [],
+            "target_group_names": group_names,
+            "notification_channels": request.notification_channels or ["in_app"],
+            "status": "active",   # active | paused | triggered
+            "last_triggered_at": None,
+            "last_evaluated_at": None,
+            "trigger_count": 0,
+            "snoozed_until": None,
+            "created_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+
+        await db["alerts"].insert_one(alert_doc)
+        logger.info(f"✅ Created alert {alert_id} for user {current_user}")
+
+        return {"success": True, "alert": mongo_to_dict(alert_doc), "message": "Alert created successfully"}
+
+
+@app.patch("/api/alerts/{alert_id}")
+async def update_alert(
+    alert_id: str,
+    request: UpdateAlertRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """Update an existing alert."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        alert = await db["alerts"].find_one({"id": alert_id, "user_id": current_user})
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        update_fields = {"updated_at": datetime.utcnow()}
+
+        if request.name is not None:
+            update_fields["name"] = request.name
+        if request.description is not None:
+            update_fields["description"] = request.description
+        if request.condition is not None:
+            update_fields["condition"] = request.condition.model_dump()
+        if request.target_group_ids is not None:
+            update_fields["target_group_ids"] = request.target_group_ids
+            if request.target_group_ids:
+                groups = await db["client_groups"].find(
+                    {"id": {"$in": request.target_group_ids}, "user_id": current_user},
+                    {"name": 1}
+                ).to_list(None)
+                update_fields["target_group_names"] = [g["name"] for g in groups]
+            else:
+                update_fields["target_group_names"] = []
+        if request.notification_channels is not None:
+            update_fields["notification_channels"] = request.notification_channels
+        if request.status is not None:
+            update_fields["status"] = request.status
+
+        await db["alerts"].update_one({"id": alert_id}, {"$set": update_fields})
+        updated = await db["alerts"].find_one({"id": alert_id})
+
+        return {"success": True, "alert": mongo_to_dict(updated), "message": "Alert updated"}
+
+
+@app.delete("/api/alerts/{alert_id}")
+async def delete_alert(alert_id: str, current_user: str = Depends(get_current_user)):
+    """Delete an alert."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        result = await db["alerts"].delete_one({"id": alert_id, "user_id": current_user})
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        return {"success": True, "message": "Alert deleted"}
+
+
+@app.post("/api/alerts/{alert_id}/snooze")
+async def snooze_alert(
+    alert_id: str,
+    request: SnoozeAlertRequest,
+    current_user: str = Depends(get_current_user)
+):
+    """Snooze a triggered alert for N hours."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        alert = await db["alerts"].find_one({"id": alert_id, "user_id": current_user})
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        snooze_until = datetime.utcnow() + timedelta(hours=request.hours)
+
+        await db["alerts"].update_one(
+            {"id": alert_id},
+            {"$set": {
+                "status": "paused",
+                "snoozed_until": snooze_until,
+                "updated_at": datetime.utcnow()
+            }}
+        )
+
+        return {
+            "success": True,
+            "message": f"Alert snoozed until {snooze_until.isoformat()}",
+            "snoozed_until": snooze_until.isoformat()
+        }
+
+
+@app.post("/api/alerts/{alert_id}/evaluate")
+async def evaluate_alert_now(alert_id: str, current_user: str = Depends(get_current_user)):
+    """Manually trigger evaluation of a single alert."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        alert = await db["alerts"].find_one({"id": alert_id, "user_id": current_user})
+        if not alert:
+            raise HTTPException(status_code=404, detail="Alert not found")
+
+        eval_result = await evaluate_alert(alert, mongo_client)
+
+        update = {
+            "last_evaluated_at": datetime.utcnow(),
+            "last_eval_result":  eval_result,
+            "current_value":     eval_result.get("current_value", 0.0),
+            "progress_pct":      eval_result.get("progress_pct", 0.0),
+            "updated_at":        datetime.utcnow(),
+        }
+
+        if eval_result["triggered"]:
+            update["status"] = "triggered"
+            update["last_triggered_at"] = datetime.utcnow()
+            update["$inc"] = {"trigger_count": 1}
+
+            # Save notification
+            await db["alert_notifications"].insert_one({
+                "alert_id": alert_id,
+                "user_id": current_user,
+                "message": eval_result["message"],
+                "current_value": eval_result["current_value"],
+                "triggered_at": datetime.utcnow(),
+                "read": False
+            })
+        else:
+            # Reset to active if it was triggered and is now OK
+            if alert.get("status") == "triggered":
+                update["status"] = "active"
+
+        # Handle $inc separately
+        inc = update.pop("$inc", None)
+        await db["alerts"].update_one({"id": alert_id}, {"$set": update})
+        if inc:
+            await db["alerts"].update_one({"id": alert_id}, {"$inc": inc})
+
+        return {
+            "success": True,
+            "alert_id": alert_id,
+            "evaluation": eval_result
+        }
+
+
+@app.get("/api/alerts/notifications")
+async def get_alert_notifications(
+    unread_only: bool = True,
+    current_user: str = Depends(get_current_user)
+):
+    """Get in-app notifications for triggered alerts."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+        query = {"user_id": current_user}
+        if unread_only:
+            query["read"] = False
+
+        notifications = await db["alert_notifications"].find(query).sort("triggered_at", -1).limit(50).to_list(None)
+
+        return {
+            "notifications": [mongo_to_dict(n) for n in notifications],
+            "unread_count": await db["alert_notifications"].count_documents({"user_id": current_user, "read": False})
+        }
+
+
+@app.post("/api/alerts/notifications/mark-read")
+async def mark_notifications_read(current_user: str = Depends(get_current_user)):
+    """Mark all notifications as read."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+        await db["alert_notifications"].update_many(
+            {"user_id": current_user, "read": False},
+            {"$set": {"read": True}}
+        )
+        return {"success": True}
