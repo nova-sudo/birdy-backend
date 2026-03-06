@@ -511,7 +511,7 @@ async def fetch_and_cache_adset_insights(
 
         # Get user's default currency
         try:
-            user_currency = CurrencyService.get_user_currency(user_id)
+            user_currency = await CurrencyService.get_user_currency(user_id)
             logger.info(
                 f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
             )

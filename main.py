@@ -4033,7 +4033,7 @@ async def fetch_and_cache_meta_data(
         # Get user's default currency with fallback
         user_currency = None
         try:
-            user_currency = CurrencyService.get_user_currency(user_id)
+            user_currency = await CurrencyService.get_user_currency(user_id)
             logger.info(
                 f"💱 User currency: {user_currency}, Ad account currency: {ad_account_currency}"
             )

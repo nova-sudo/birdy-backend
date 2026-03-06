@@ -625,7 +625,7 @@ async def update_todays_campaign_insights(
 
         # ✅ GET USER CURRENCY WITH FALLBACK
         try:
-            user_currency = CurrencyService.get_user_currency(user_id)
+            user_currency = await CurrencyService.get_user_currency(user_id)
             logger.info(
                 f"💱 User currency: {user_currency}, "
                 f"Ad account currency: {ad_account_currency}"
@@ -1038,7 +1038,7 @@ async def update_todays_adset_insights(
 
         # ✅ GET USER CURRENCY WITH FALLBACK
         try:
-            user_currency = CurrencyService.get_user_currency(user_id)
+            user_currency = await CurrencyService.get_user_currency(user_id)
             logger.info(
                 f"💱 User currency: {user_currency}, "
                 f"Ad account currency: {ad_account_currency}"
@@ -1226,7 +1226,7 @@ async def update_todays_ad_insights(
 
         # ✅ GET USER CURRENCY WITH FALLBACK
         try:
-            user_currency = CurrencyService.get_user_currency(user_id)
+            user_currency = await CurrencyService.get_user_currency(user_id)
             logger.info(
                 f"💱 User currency: {user_currency}, "
                 f"Ad account currency: {ad_account_currency}"
