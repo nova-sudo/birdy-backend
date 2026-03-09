@@ -922,6 +922,10 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
+    global _mongo_client
+    if _mongo_client:
+        _mongo_client.close()
+        logger.info("🛑 Singleton MongoDB connection closed")
     scheduler.shutdown()
     logger.info("🛑 Background jobs stopped")
 
@@ -948,27 +952,41 @@ def set_cookie(response, key, value, max_age):
 
 @asynccontextmanager
 async def get_mongo_client():
-    client = None
+    """
+    OPTIMIZED: Reuses a global MongoDB client instance (Singleton pattern).
+    Benefits:
+    - Reduced connection overhead (no new TCP/TLS handshakes per request)
+    - Reuses internal connection pool
+    - Measurably faster API response times
+    """
+    global _mongo_client
+
+    if _mongo_client is None:
+        async with _mongo_client_lock:
+            if _mongo_client is None:
+                try:
+                    loop = asyncio.get_event_loop()
+                    mongo_uri = os.getenv("MONGODB_URI")
+                    if not mongo_uri:
+                        logger.error("MONGODB_URI environment variable is not set")
+                        raise HTTPException(status_code=500, detail="MongoDB configuration error: MONGODB_URI is not set")
+
+                    logger.info(f"⚡ Creating Singleton MongoDB client with event loop: {loop}")
+                    _mongo_client = AsyncIOMotorClient(mongo_uri, io_loop=loop)
+                    # Ping once to ensure initial connection is healthy
+                    await _mongo_client.admin.command("ping")
+                    logger.info("✅ Singleton MongoDB connection established successfully")
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    logger.error(f"❌ Unexpected error in MongoDB client setup: {str(e)}", exc_info=True)
+                    raise HTTPException(status_code=500, detail=f"Unexpected error setting up MongoDB client: {str(e)}")
+
     try:
-        loop = asyncio.get_event_loop()
-        mongo_uri = os.getenv("MONGODB_URI")
-        if not mongo_uri:
-            logger.error("MONGODB_URI environment variable is not set")
-            raise HTTPException(status_code=500, detail="MongoDB configuration error: MONGODB_URI is not set")
-        logger.debug(f"Creating MongoDB client with event loop: {loop}, URI: {mongo_uri[:10]}... (redacted)")
-        client = AsyncIOMotorClient(mongo_uri, io_loop=loop)
-        await client.admin.command("ping")
-        logger.debug("MongoDB connection established successfully")
-        yield client
-    except HTTPException:
-        raise
+        yield _mongo_client
     except Exception as e:
-        logger.error(f"Unexpected error in MongoDB client setup: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Unexpected error setting up MongoDB client: {str(e)}")
-    finally:
-        if client:
-            logger.debug("Closing MongoDB client")
-            client.close()
+        # Re-raise any exceptions that occur during yield
+        raise
 
 # CORS middleware
 app.add_middleware(
