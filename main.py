@@ -58,6 +58,9 @@ from datetime import timedelta
 import asyncio
 
 from contextlib import asynccontextmanager
+from billing import router as billing_router
+from billing_middleware import check_client_limit
+from dependencies import get_mongo_client, get_current_user,  generate_tokens
 
 from utils.currency_exchange import currency_service
 
@@ -73,6 +76,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 scheduler = AsyncIOScheduler()
+app.include_router(billing_router)
 
 _mongo_client = None
 _mongo_client_lock = asyncio.Lock()
@@ -946,30 +950,6 @@ def set_cookie(response, key, value, max_age):
     )
 
 
-@asynccontextmanager
-async def get_mongo_client():
-    client = None
-    try:
-        loop = asyncio.get_event_loop()
-        mongo_uri = os.getenv("MONGODB_URI")
-        if not mongo_uri:
-            logger.error("MONGODB_URI environment variable is not set")
-            raise HTTPException(status_code=500, detail="MongoDB configuration error: MONGODB_URI is not set")
-        logger.debug(f"Creating MongoDB client with event loop: {loop}, URI: {mongo_uri[:10]}... (redacted)")
-        client = AsyncIOMotorClient(mongo_uri, io_loop=loop)
-        await client.admin.command("ping")
-        logger.debug("MongoDB connection established successfully")
-        yield client
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in MongoDB client setup: {str(e)}", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Unexpected error setting up MongoDB client: {str(e)}")
-    finally:
-        if client:
-            logger.debug("Closing MongoDB client")
-            client.close()
-
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -996,42 +976,6 @@ if not JWT_REFRESH_SECRET or not isinstance(JWT_REFRESH_SECRET, str) or JWT_REFR
 
 # Log JWT module info for debugging
 logger.info(f"JWT module: {pyjwt.__file__}, version: {pyjwt.__version__}")
-
-async def get_current_user(request: Request):
-    async with get_mongo_client() as mongo_client:
-        token = request.cookies.get("auth_token")
-        if not token:
-            raise HTTPException(status_code=401, detail="No authentication token provided")
-        try:
-            payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-            email = payload.get("sub")
-            if not email:
-                raise HTTPException(status_code=401, detail="Invalid token")
-            return email
-        except pyjwt.ExpiredSignatureError:
-            logger.info("Access token expired, checking refresh token")
-            refresh_token = request.cookies.get("refresh_token")
-            if not refresh_token:
-                logger.info("No refresh token provided, requiring re-authentication")
-                raise HTTPException(status_code=401, detail="Access token expired, please log in again")
-            try:
-                refresh_payload = pyjwt.decode(refresh_token, JWT_REFRESH_SECRET, algorithms=[JWT_ALGORITHM])
-                email = refresh_payload.get("sub")
-                if not email or refresh_payload.get("type") != "refresh":
-                    raise HTTPException(status_code=401, detail="Invalid refresh token")
-                access_token, new_refresh_token = await generate_tokens(email)
-                request.state.new_tokens = {
-                    "auth_token": access_token,
-                    "refresh_token": new_refresh_token
-                }
-                return email
-            except pyjwt.PyJWTError as e:
-                logger.error(f"Refresh token decode error: {str(e)}")
-                raise HTTPException(status_code=401, detail="Invalid refresh token")
-        except pyjwt.PyJWTError as e:
-            logger.error(f"JWT decode error: {str(e)}")
-            raise HTTPException(status_code=401, detail="Invalid authentication token")
-
 
 
 # Pydantic models
@@ -1064,20 +1008,6 @@ class SaveViewRequest(BaseModel):
     page: str          # "campaigns" | "contacts" | "clients"
     visible_columns: list  # list of column id strings
 
-async def generate_tokens(email: str):
-    logger.debug(f"Generating tokens for {email} with event loop: {asyncio.get_event_loop()}")
-    try:
-        exp_timestamp = int((datetime.utcnow() + timedelta(minutes=JWT_EXPIRY_MINUTES)).timestamp())
-        access_payload = {"sub": email, "exp": exp_timestamp, "type": "access"}
-        access_token = pyjwt.encode(access_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-        refresh_exp_timestamp = int((datetime.utcnow() + timedelta(days=JWT_REFRESH_EXPIRY_DAYS)).timestamp())
-        refresh_payload = {"sub": email, "exp": refresh_exp_timestamp, "type": "refresh"}
-        refresh_token = pyjwt.encode(refresh_payload, JWT_REFRESH_SECRET, algorithm=JWT_ALGORITHM)
-        logger.debug(f"Generated tokens for {email}: access_token={access_token[:10]}..., refresh_token={refresh_token[:10]}...")
-        return access_token, refresh_token
-    except Exception as e:
-        logger.error(f"Error generating JWT tokens for {email}: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate tokens: {str(e)}")
 
 
 async def refresh_tokens_for_all_users():
@@ -3485,6 +3415,7 @@ async def create_client_group_optimized(
     - Smart data organization (user > client_group > contacts)
     """
     async with get_mongo_client() as mongo_client:
+        await check_client_limit(current_user, mongo_client)
         try:
             db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
