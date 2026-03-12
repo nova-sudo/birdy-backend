@@ -3,17 +3,10 @@ billing_middleware.py
 ----------------------
 Dependency helpers for enforcing subscription limits.
 
-Usage in main.py:
-  from billing_middleware import check_client_limit
-
-  @app.post("/api/client-groups")
-  async def create_client_group(
-      request: ClientGroupRequest,
-      current_user: str = Depends(get_current_user),
-  ):
-      async with get_mongo_client() as mongo_client:
-          await check_client_limit(current_user, mongo_client)
-          ...
+Plan rules:
+  - Starter: max 3 clients,  NO extra slots
+  - Growth:  max 10 clients, NO extra slots
+  - Scale:   max 25 clients, CAN purchase extra slots at $10/mo each
 """
 
 import os
@@ -28,6 +21,9 @@ PLAN_LIMITS = {
     "scale":   25,
 }
 
+# Only Scale plan users can purchase extra client slots
+EXTRA_CLIENTS_ALLOWED_PLANS = {"scale"}
+
 
 async def _get_subscription_and_count(current_user: str, mongo_client):
     """Return (subscription_doc, current_client_count)."""
@@ -35,7 +31,7 @@ async def _get_subscription_and_count(current_user: str, mongo_client):
 
     user = await db["users"].find_one(
         {"user_id": current_user},
-        projection={"subscription": 1, "_id": 0}   # ← keyword arg, single projection dict
+        projection={"subscription": 1, "_id": 0}
     )
     sub   = user.get("subscription") if user else None
     count = await db["client_groups"].count_documents({"user_id": current_user})
@@ -63,7 +59,10 @@ async def require_active_subscription(current_user: str, mongo_client) -> dict:
 async def check_client_limit(current_user: str, mongo_client):
     """
     Raise 402 if the user is at or over their client group limit.
-    Call this directly inside your endpoint before creating a new client group.
+
+    Limit logic:
+      - Starter / Growth: base limit only — extra_clients_paid is ignored
+      - Scale: base limit (25) + extra_clients_paid purchased slots
     """
     sub, count = await _get_subscription_and_count(current_user, mongo_client)
 
@@ -76,24 +75,40 @@ async def check_client_limit(current_user: str, mongo_client):
             }
         )
 
-    plan_id     = sub.get("plan_id", "starter")
-    base_limit  = PLAN_LIMITS.get(plan_id, 0)
-    extra_paid  = sub.get("extra_clients_paid", 0)
+    plan_id    = sub.get("plan_id", "starter")
+    base_limit = PLAN_LIMITS.get(plan_id, 0)
+
+    # Extra slots only apply on Scale plan
+    extra_paid  = sub.get("extra_clients_paid", 0) if plan_id in EXTRA_CLIENTS_ALLOWED_PLANS else 0
     total_limit = base_limit + extra_paid
 
     if count >= total_limit:
+        if plan_id in EXTRA_CLIENTS_ALLOWED_PLANS:
+            msg = (
+                f"You've reached your client limit ({total_limit}). "
+                f"Add extra client slots ($10/mo each) from the Billing page to continue."
+            )
+        else:
+            msg = (
+                f"You've reached your {plan_id.title()} plan limit of {total_limit} clients. "
+                f"Upgrade to a higher plan to add more clients."
+            )
+
         raise HTTPException(
             status_code=402,
             detail={
                 "code": "CLIENT_LIMIT_REACHED",
-                "message": (
-                    f"You've reached your client limit ({total_limit}). "
-                    f"Upgrade your plan or add extra client slots to continue."
-                ),
+                "message": msg,
                 "current_count": count,
                 "limit": total_limit,
                 "plan": plan_id,
+                "can_add_extra_slots": plan_id in EXTRA_CLIENTS_ALLOWED_PLANS,
             }
         )
 
     return True
+
+
+def can_purchase_extra_slots(plan_id: str) -> bool:
+    """Returns True only if the plan supports extra client slots."""
+    return plan_id in EXTRA_CLIENTS_ALLOWED_PLANS

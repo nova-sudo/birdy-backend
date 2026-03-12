@@ -1,15 +1,7 @@
 """
-paddle_billing.py  (v5 — final, all imports verified)
--------------------------------------------------------
+paddle_billing.py
+-----------------
 Uses the official Paddle Python SDK (pip install paddle-python-sdk).
-
-Import verification sources:
-  - Client, Environment, Options  → README: https://github.com/PaddleHQ/paddle-python-sdk
-  - Secret, Verifier              → Paddle webhook docs
-  - UpdateSubscription            → UPGRADING.md: paddle_billing.Resources.Subscriptions.Operations
-  - SubscriptionUpdateItem        → UPGRADING.md: paddle_billing.Resources.Subscriptions.Operations.Update.SubscriptionUpdateItem
-  - proration_billing_mode        → Raw string "prorated_immediately" used directly —
-                                    ProrationType path not in public docs, string is safe.
 """
 
 import json
@@ -21,9 +13,6 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
-# ── Official Paddle Python SDK ─────────────────────────────────────────────────
-# pip install paddle-python-sdk
-# All import paths verified against official README and UPGRADING.md
 from paddle_billing import Client, Environment, Options
 from paddle_billing.Notifications import Secret, Verifier
 from paddle_billing.Resources.Subscriptions.Operations import UpdateSubscription
@@ -39,7 +28,7 @@ router = APIRouter()
 
 PADDLE_API_KEY        = os.getenv("PADDLE_API_KEY", "")
 PADDLE_WEBHOOK_SECRET = os.getenv("PADDLE_WEBHOOK_SECRET", "")
-PADDLE_ENVIRONMENT    = os.getenv("PADDLE_ENVIRONMENT", "sandbox")  # "sandbox" | "production"
+PADDLE_ENVIRONMENT    = os.getenv("PADDLE_ENVIRONMENT", "sandbox")
 
 PADDLE_PRICE_STARTER      = os.getenv("PADDLE_PRICE_STARTER", "")
 PADDLE_PRICE_GROWTH       = os.getenv("PADDLE_PRICE_GROWTH", "")
@@ -52,6 +41,9 @@ PLAN_METADATA = {
     PADDLE_PRICE_SCALE:   {"id": "scale",   "name": "Scale",   "max_clients": 25, "base_price": 497},
 }
 
+# Only Scale plan supports extra client slots
+EXTRA_CLIENTS_ALLOWED_PLANS = {"scale"}
+
 # ── SDK client ─────────────────────────────────────────────────────────────────
 
 def _paddle() -> Client:
@@ -59,8 +51,7 @@ def _paddle() -> Client:
         return Client(PADDLE_API_KEY, options=Options(Environment.SANDBOX))
     return Client(PADDLE_API_KEY)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Helpers ────────────────────────────────────────────────────────────────────
 
 def _plan_meta(price_id: str) -> dict:
     return PLAN_METADATA.get(price_id, {"id": "unknown", "name": "Unknown", "max_clients": 0})
@@ -68,7 +59,10 @@ def _plan_meta(price_id: str) -> dict:
 
 async def _get_sub(user_id: str, mongo_client) -> Optional[dict]:
     db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
-    user = await db["users"].find_one({"user_id": user_id}, {"subscription": 1, "_id": 0})
+    user = await db["users"].find_one(
+        {"user_id": user_id},
+        projection={"subscription": 1, "_id": 0}
+    )
     return user.get("subscription") if user else None
 
 
@@ -93,8 +87,8 @@ async def billing_status(current_user: str = Depends(get_current_user)):
     user_id = current_user
 
     async with get_mongo_client() as mc:
-        sub    = await _get_sub(user_id, mc)
-        count  = await _client_count(user_id, mc)
+        sub   = await _get_sub(user_id, mc)
+        count = await _client_count(user_id, mc)
 
         if not sub or sub.get("status") not in ("active", "trialing", "past_due"):
             return {
@@ -104,20 +98,25 @@ async def billing_status(current_user: str = Depends(get_current_user)):
                 "client_count": count,
                 "client_limit": 0,
                 "extra_clients_paid": 0,
+                "can_add_extra_slots": False,
                 "current_period_end": None,
                 "cancel_at_period_end": False,
                 "paddle_customer_id": None,
-                "_user_id": user_id,   # frontend passes this as Paddle.js customData
+                "_user_id": user_id,
             }
 
-        meta = _plan_meta(sub.get("price_id", ""))
+        meta       = _plan_meta(sub.get("price_id", ""))
+        plan_id    = meta["id"]
+        extra_paid = sub.get("extra_clients_paid", 0) if plan_id in EXTRA_CLIENTS_ALLOWED_PLANS else 0
+
         return {
             "subscribed": True,
             "plan": meta,
             "status": sub.get("status"),
             "client_count": count,
-            "client_limit": meta["max_clients"] + sub.get("extra_clients_paid", 0),
-            "extra_clients_paid": sub.get("extra_clients_paid", 0),
+            "client_limit": meta["max_clients"] + extra_paid,
+            "extra_clients_paid": extra_paid,
+            "can_add_extra_slots": plan_id in EXTRA_CLIENTS_ALLOWED_PLANS,
             "current_period_end": sub.get("current_period_end"),
             "cancel_at_period_end": sub.get("cancel_at_period_end", False),
             "paddle_customer_id": sub.get("paddle_customer_id"),
@@ -134,25 +133,20 @@ async def portal_url(current_user: str = Depends(get_current_user)):
 
     async with get_mongo_client() as mc:
         sub = await _get_sub(user_id, mc)
-
         if not sub or not sub.get("paddle_subscription_id"):
             raise HTTPException(status_code=400, detail="No active subscription found")
-
         sub_id = sub["paddle_subscription_id"]
 
     try:
-        paddle       = _paddle()
-        paddle_sub   = paddle.subscriptions.get(sub_id)
-        mgmt_urls    = getattr(paddle_sub, "management_urls", None)
-        portal_url_  = getattr(mgmt_urls, "portal_overview", None) if mgmt_urls else None
+        paddle      = _paddle()
+        paddle_sub  = paddle.subscriptions.get(sub_id)
+        mgmt_urls   = getattr(paddle_sub, "management_urls", None)
+        portal_url_ = getattr(mgmt_urls, "portal_overview", None) if mgmt_urls else None
 
         if not portal_url_:
             raise HTTPException(
                 status_code=500,
-                detail=(
-                    "Portal URL not available. Make sure your Paddle API key has "
-                    "'Customer portal session (Write)' permission."
-                ),
+                detail="Portal URL not available. Make sure your Paddle API key has 'Customer portal session (Write)' permission.",
             )
 
         return {"portal_url": portal_url_}
@@ -178,18 +172,24 @@ async def change_plan(body: ChangePlanRequest, current_user: str = Depends(get_c
     if body.new_price_id not in PLAN_METADATA:
         raise HTTPException(status_code=400, detail="Invalid price ID")
 
+    new_meta = _plan_meta(body.new_price_id)
+
+    # Extra slots only allowed on Scale plan
+    if body.extra_clients > 0 and new_meta["id"] not in EXTRA_CLIENTS_ALLOWED_PLANS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Extra client slots are only available on the Scale plan. You are switching to {new_meta['name']}."
+        )
+
     async with get_mongo_client() as mc:
         sub = await _get_sub(user_id, mc)
-
         if not sub or not sub.get("paddle_subscription_id"):
             raise HTTPException(status_code=400, detail="No active subscription found")
-
         sub_id = sub["paddle_subscription_id"]
 
     try:
         paddle = _paddle()
 
-        # Build the complete items list
         items = [SubscriptionUpdateItem(price_id=body.new_price_id, quantity=1)]
         if body.extra_clients > 0 and PADDLE_PRICE_EXTRA_CLIENT:
             items.append(SubscriptionUpdateItem(price_id=PADDLE_PRICE_EXTRA_CLIENT, quantity=body.extra_clients))
@@ -202,7 +202,6 @@ async def change_plan(body: ChangePlanRequest, current_user: str = Depends(get_c
             ),
         )
 
-        new_meta = _plan_meta(body.new_price_id)
         return {"success": True, "message": f"Plan changed to {new_meta['name']}", "new_plan": new_meta}
 
     except HTTPException:
@@ -214,14 +213,7 @@ async def change_plan(body: ChangePlanRequest, current_user: str = Depends(get_c
 
 # ── POST /api/billing/webhook ─────────────────────────────────────────────────
 
-# Thin wrapper so the Paddle SDK Verifier can read .headers and .body
-# from an object whose .body is already-read bytes (not a coroutine).
 class _VerifierRequest:
-    """
-    Satisfies paddle_billing.Notifications.Requests.Request protocol.
-    The SDK expects request.body to be bytes and request.headers to be
-    a dict-like mapping.
-    """
     def __init__(self, headers: dict, body: bytes):
         self.headers = headers
         self.body    = body
@@ -229,9 +221,8 @@ class _VerifierRequest:
 
 @router.post("/api/billing/webhook")
 async def paddle_webhook(request: Request):
-    raw_body = await request.body()  # read once, reuse below
+    raw_body = await request.body()
 
-    # ── Signature verification ────────────────────────────────────────────────
     if PADDLE_WEBHOOK_SECRET:
         try:
             is_valid = Verifier().verify(
@@ -269,34 +260,18 @@ async def paddle_webhook(request: Request):
 
 
 async def _upsert_subscription(data: dict, mc):
-    """
-    Parse a Paddle subscription webhook payload and persist to MongoDB.
-
-    Paddle subscription object key fields:
-      id                          → sub_xxx
-      customer_id                 → ctm_xxx
-      status                      → active | trialing | past_due | canceled | paused
-      custom_data                 → dict you set via Paddle.js customData (contains user_id)
-      items[].price.id            → price ID for each item
-      items[].quantity            → quantity
-      next_billed_at              → RFC 3339 next billing date
-      current_billing_period.ends_at → end of current period
-      scheduled_change.action     → "cancel" | "pause" when a change is scheduled
-    """
     sub_id      = data.get("id")
     customer_id = data.get("customer_id")
     status      = data.get("status")
 
-    # Resolve user_id via customData (set in Paddle.js checkout call)
     custom_data = data.get("custom_data") or {}
     user_id     = custom_data.get("user_id")
 
     if not user_id:
-        # Fallback: look up by Paddle customer_id already stored
         db   = mc[os.getenv("MONGODB_DB", "birdyaidev")]
         user = await db["users"].find_one(
             {"subscription.paddle_customer_id": customer_id},
-            {"user_id": 1},
+            projection={"user_id": 1, "_id": 0},
         )
         user_id = user.get("user_id") if user else None
 
@@ -304,7 +279,6 @@ async def _upsert_subscription(data: dict, mc):
         logger.error(f"Cannot resolve user for sub {sub_id} / customer {customer_id}")
         return
 
-    # Parse items: each has price.id and quantity
     price_id  = None
     extra_qty = 0
     for item in data.get("items", []):
@@ -317,14 +291,13 @@ async def _upsert_subscription(data: dict, mc):
 
     meta = _plan_meta(price_id or "")
 
-    # next billing date
-    period_end = data.get("next_billed_at") or (
-        (data.get("current_billing_period") or {}).get("ends_at")
-    )
+    # Only store extra_qty if plan supports it
+    if meta["id"] not in EXTRA_CLIENTS_ALLOWED_PLANS:
+        extra_qty = 0
 
-    # scheduled cancellation?
-    sched           = data.get("scheduled_change") or {}
-    cancel_at_end   = sched.get("action") == "cancel"
+    period_end    = data.get("next_billed_at") or ((data.get("current_billing_period") or {}).get("ends_at"))
+    sched         = data.get("scheduled_change") or {}
+    cancel_at_end = sched.get("action") == "cancel"
 
     sub_doc = {
         "paddle_subscription_id": sub_id,
@@ -341,7 +314,7 @@ async def _upsert_subscription(data: dict, mc):
     }
 
     await _save_sub(user_id, sub_doc, mc)
-    logger.info(f"✅ sub {sub_id} → user {user_id} ({meta['name']}, {status})")
+    logger.info(f"✅ sub {sub_id} → user {user_id} ({meta['name']}, {status}, extra_slots={extra_qty})")
 
 
 async def _cancel_subscription(data: dict, mc):
@@ -350,7 +323,7 @@ async def _cancel_subscription(data: dict, mc):
     db   = mc[os.getenv("MONGODB_DB", "birdyaidev")]
     user = await db["users"].find_one(
         {"subscription.paddle_subscription_id": sub_id},
-        {"user_id": 1},
+        projection={"user_id": 1, "_id": 0},
     )
     if not user:
         logger.warning(f"No user found for canceled sub {sub_id}")
