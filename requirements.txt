@@ -8,3 +8,4 @@ bcrypt==4.2.0
 PyJWT==2.9.0
 apscheduler==3.10.4
 CurrencyConverter==0.18.15
+paddle-python-sdk
