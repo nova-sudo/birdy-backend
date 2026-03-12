@@ -4,20 +4,21 @@ billing_middleware.py
 Dependency helpers for enforcing subscription limits.
 
 Usage in main.py:
-  from billing.billing_middleware import require_active_subscription, check_client_limit
+  from billing_middleware import check_client_limit
 
   @app.post("/api/client-groups")
   async def create_client_group(
       request: ClientGroupRequest,
       current_user: str = Depends(get_current_user),
-      _: None = Depends(check_client_limit),   # ← add this
   ):
-      ...
+      async with get_mongo_client() as mongo_client:
+          await check_client_limit(current_user, mongo_client)
+          ...
 """
 
 import os
 import logging
-from fastapi import HTTPException, Request, Depends
+from fastapi import HTTPException
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +35,7 @@ async def _get_subscription_and_count(current_user: str, mongo_client):
 
     user = await db["users"].find_one(
         {"user_id": current_user},
-        {"user_id": current_user},
-        {"subscription": 1}
+        projection={"subscription": 1, "_id": 0}   # ← keyword arg, single projection dict
     )
     sub   = user.get("subscription") if user else None
     count = await db["client_groups"].count_documents({"user_id": current_user})
@@ -63,7 +63,7 @@ async def require_active_subscription(current_user: str, mongo_client) -> dict:
 async def check_client_limit(current_user: str, mongo_client):
     """
     Raise 402 if the user is at or over their client group limit.
-    Call this as a Depends() before creating a new client group.
+    Call this directly inside your endpoint before creating a new client group.
     """
     sub, count = await _get_subscription_and_count(current_user, mongo_client)
 
@@ -76,10 +76,10 @@ async def check_client_limit(current_user: str, mongo_client):
             }
         )
 
-    plan_id      = sub.get("plan_id", "starter")
-    base_limit   = PLAN_LIMITS.get(plan_id, 0)
-    extra_paid   = sub.get("extra_clients_paid", 0)
-    total_limit  = base_limit + extra_paid
+    plan_id     = sub.get("plan_id", "starter")
+    base_limit  = PLAN_LIMITS.get(plan_id, 0)
+    extra_paid  = sub.get("extra_clients_paid", 0)
+    total_limit = base_limit + extra_paid
 
     if count >= total_limit:
         raise HTTPException(
