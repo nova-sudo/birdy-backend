@@ -355,7 +355,7 @@ async def save_adset_insights_to_db(
     """
     try:
         import os
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_adset_insights"]
 
         if not insights:
@@ -419,7 +419,7 @@ async def create_adset_insights_indexes(mongo_client):
     """
     try:
         import os
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_adset_insights"]
 
         # Compound unique index
@@ -496,7 +496,7 @@ async def fetch_and_cache_adset_insights(
         from integrations.facebook_utils.facebook import get_facebook_token
         from utils.currency_exchange import CurrencyService
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
         insights_collection = db["facebook_adset_insights"]
 
