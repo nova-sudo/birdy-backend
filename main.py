@@ -1182,7 +1182,7 @@ async def get_user_currency(current_user: str = Depends(get_current_user)):
     logger.debug("GET /api/user/currency called")
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             user = await users_collection.find_one(

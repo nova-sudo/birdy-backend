@@ -81,7 +81,7 @@ class FacebookIntegration:
 async def save_facebook_token(user_id: str, tokens: dict, mongo_client: AsyncIOMotorClient):
     """Save Meta access token to MongoDB"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         users_collection = db["users"]
         token_doc = {
             "access_token": tokens.get("access_token"),
@@ -107,7 +107,7 @@ async def save_facebook_token(user_id: str, tokens: dict, mongo_client: AsyncIOM
 async def get_facebook_token(user_id: str, mongo_client: AsyncIOMotorClient):
     """Retrieve Meta access token from MongoDB"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         users_collection = db["users"]
         user_doc = await users_collection.find_one({"user_id": user_id})
         if user_doc and user_doc.get("integrations", {}).get("facebook"):

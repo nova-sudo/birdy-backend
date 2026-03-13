@@ -43,7 +43,7 @@ async def fetch_todays_facebook_leads_incremental(
         (new_leads_count, new_leads_list)
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["facebook_leads"]
 
         # ============================================
@@ -447,7 +447,7 @@ async def _fetch_last_7d_leads_with_gap_detection(
     try:
         from datetime import timedelta
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["facebook_leads"]
 
         logger.info("📋 Fetching last_7d leads from API...")
@@ -616,7 +616,7 @@ async def update_todays_campaign_insights(
     try:
         from utils.currency_exchange import CurrencyService
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_campaign_insights"]
 
         today_str = date.today().isoformat()
@@ -880,7 +880,7 @@ async def _fetch_last_7d_campaign_insights_with_gap_detection(
     try:
         from datetime import timedelta
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_campaign_insights"]
 
         # ============================================
@@ -1029,7 +1029,7 @@ async def update_todays_adset_insights(
     try:
         from utils.currency_exchange import CurrencyService
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_adset_insights"]
 
         today_str = date.today().isoformat()
@@ -1217,7 +1217,7 @@ async def update_todays_ad_insights(
     try:
         from utils.currency_exchange import CurrencyService
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_ad_insights"]
 
         today_str = date.today().isoformat()
@@ -1531,7 +1531,7 @@ async def _fetch_last_7d_adset_insights_with_gap_detection(
     try:
         from datetime import timedelta
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_adset_insights"]
 
         logger.info("📋 Fetching adset last_7d from API...")
@@ -1660,7 +1660,7 @@ async def _fetch_last_7d_ad_insights_with_gap_detection(
     try:
         from datetime import timedelta
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         insights_collection = db["facebook_ad_insights"]
 
         logger.info("📋 Fetching ad last_7d from API...")

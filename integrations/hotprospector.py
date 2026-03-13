@@ -376,7 +376,7 @@ async def save_hotprospector_leads_to_collection(
     KEY CHANGE: Now saves call_logs and call_logs_count in the cache
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["hotprospector_leads"]
 
         # Delete existing leads for this user and GHL location
@@ -457,7 +457,7 @@ async def get_hotprospector_leads_from_collection(
     KEY CHANGE: Call logs are now included in cached lead_data
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["hotprospector_leads"]
 
         # Build query
@@ -537,7 +537,7 @@ async def save_hotprospector_credentials(
 ):
     """Save Hot Prospector API credentials to MongoDB"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         users_collection = db["users"]
 
         credentials_doc = {
@@ -569,7 +569,7 @@ async def save_hotprospector_credentials(
 async def get_hotprospector_credentials(user_id: str, mongo_client: AsyncIOMotorClient):
     """Retrieve Hot Prospector credentials from MongoDB"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         users_collection = db["users"]
 
         user_doc = await users_collection.find_one(
@@ -599,7 +599,7 @@ async def get_client_group_mapping(user_id: str, mongo_client: AsyncIOMotorClien
         Dict mapping ghl_location_id -> "Group1, Group2, Group3"
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         client_groups_collection = db["client_groups"]
 
         # Find all client groups for this user that have a ghl_location_id

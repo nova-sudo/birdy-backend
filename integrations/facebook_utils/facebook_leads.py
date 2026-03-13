@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 async def create_facebook_leads_indexes(mongo_client):
     """Create optimized indexes for Facebook leads collection"""
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["facebook_leads"]
 
         # Unique index
@@ -70,7 +70,7 @@ async def fetch_and_cache_facebook_leads_FIXED(
         from integrations.facebook_utils.facebook import get_facebook_token
         from utils.currency_exchange import CurrencyService
 
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         facebook_leads_collection = db["facebook_leads"]
         client_groups_collection = db["client_groups"]
 
@@ -569,7 +569,7 @@ async def fetch_and_cache_facebook_leads_STAGED(
     """
     try:
         import os
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         facebook_leads_collection = db["facebook_leads"]
         client_groups_collection = db["client_groups"]
 
