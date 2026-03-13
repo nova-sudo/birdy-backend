@@ -1177,33 +1177,6 @@ async def check_auth(current_user: str = Depends(get_current_user)):
         "user": current_user
     }
 
-@app.get("/api/user/currency")
-async def get_user_currency(current_user: str = Depends(get_current_user)):
-    logger.debug("GET /api/user/currency called")
-    async with get_mongo_client() as mongo_client:
-        try:
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
-            users_collection = db["users"]
-
-            user = await users_collection.find_one(
-                {"user_id": current_user},
-                {"default_currency": 1}
-            )
-
-
-            if not user:
-                logger.warning(f"❌ User not found in DB: {current_user}")
-                raise HTTPException(status_code=404, detail="User not found")
-
-            currency = user.get("default_currency")
-            logger.debug("Returning default currency for authenticated user")
-            return {"default_currency": currency}
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            logger.error(f"❌ Error fetching currency for {current_user}: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Failed to fetch currency: {str(e)}")
 
 # Register endpoint
 @app.post("/api/register")
@@ -1250,7 +1223,6 @@ async def login_user(request: LoginRequest, response: Response):
             db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
-            # Verify user credentials
             logger.debug(f"Querying user with email {request.email}")
             user_doc = await users_collection.find_one({"user_id": request.email})
 
@@ -1369,10 +1341,8 @@ async def login_user(request: LoginRequest, response: Response):
             logger.debug(f"Generating JWT tokens for {request.email}")
             access_token, refresh_token = await generate_tokens(request.email)
 
-            # Calculate max_age based on remember_me
             access_token_max_age = (JWT_EXPIRY_MINUTES * 60) if not request.rememberMe else (30 * 24 * 60 * 60)
-            refresh_token_max_age = (JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60) if not request.rememberMe else (
-                        90 * 24 * 60 * 60)
+            refresh_token_max_age = (JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60) if not request.rememberMe else (90 * 24 * 60 * 60)
 
             logger.debug(
                 f"Setting cookies: access_token_max_age={access_token_max_age}, "
@@ -1382,18 +1352,17 @@ async def login_user(request: LoginRequest, response: Response):
             set_cookie(response, "auth_token", access_token, access_token_max_age)
             set_cookie(response, "refresh_token", refresh_token, refresh_token_max_age)
 
-            # logger.info(
-            #     f"✅ User logged in successfully: {request.email}, "
-            #     f"refreshed {len(expired_tokens)} expired tokens"
-            # )
+            # ✅ Read default_currency from the user doc
+            default_currency = user_doc.get("default_currency")
+            logger.info(f"✅ User [{request.email}] logged in | default_currency={default_currency}")
 
             return {
                 "message": "Login successful",
                 "user": {
                     "email": request.email,
-                    "name": user_doc["name"]
-                },
-                # "tokens_refreshed": len(expired_tokens)
+                    "name": user_doc.get("name"),
+                    "default_currency": default_currency,
+                }
             }
 
         except HTTPException:
