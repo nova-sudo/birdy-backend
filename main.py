@@ -1220,7 +1220,7 @@ async def login_user(request: LoginRequest, response: Response):
     async with get_mongo_client() as mongo_client:
         try:
             logger.debug(f"Starting login for user {request.email}, rememberMe: {request.rememberMe}")
-            db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             users_collection = db["users"]
 
             logger.debug(f"Querying user with email {request.email}")
