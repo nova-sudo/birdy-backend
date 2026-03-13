@@ -634,7 +634,7 @@ class GHLIntegration:
 
 async def ensure_integrations_initialized(user_id: str, mongo_client: AsyncIOMotorClient):
     """Ensure user document has integrations structure"""
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     users_collection = db["users"]
 
     await users_collection.update_one(
@@ -664,7 +664,7 @@ async def save_agency_token(user_id: str, tokens: dict, mongo_client: AsyncIOMot
     """Save agency tokens to MongoDB"""
     await ensure_integrations_initialized(user_id, mongo_client)
 
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     users_collection = db["users"]
 
     token_doc = {
@@ -708,7 +708,7 @@ async def save_subaccount_token(
     Save subaccount token with ONLY contact count (not full array)
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         users_collection = db["users"]
 
         # Calculate expiration
@@ -881,7 +881,7 @@ async def get_subaccount_contacts(
         List of contact data
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         contacts_collection = db["ghl_contacts"]
 
         # Build query based on provided filters
@@ -927,7 +927,7 @@ async def get_contacts_by_client_group(
     Returns: (contacts_list, total_count)
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         contacts_collection = db["ghl_contacts"]
 
         query = {
@@ -978,7 +978,7 @@ async def get_user_contacts_summary(user_id: str, mongo_client):
     }
     """
     try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         contacts_collection = db["ghl_contacts"]
 
         # Aggregation pipeline to get hierarchical summary
@@ -1050,7 +1050,7 @@ async def create_contacts_indexes(mongo_client):
     Create indexes for efficient hierarchical queries
     user > client_group > contacts
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     contacts_collection = db["ghl_contacts"]
 
     # Index 1: Primary hierarchy lookup (user > client_group)
@@ -1096,7 +1096,7 @@ async def get_location_contacts(
     """
     Retrieve contacts for a specific location from separate collection.
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     contacts_collection = db["ghl_contacts"]
 
     contact_docs = await contacts_collection.find({
@@ -1108,7 +1108,7 @@ async def get_location_contacts(
 
 async def get_agency_token(user_id: str, mongo_client: AsyncIOMotorClient):
     """Retrieve agency token from MongoDB"""
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     users_collection = db["users"]
 
     user_doc = await users_collection.find_one(
@@ -1128,7 +1128,7 @@ async def create_contacts_indexes(mongo_client):
     """
     Create indexes for the new contacts collection
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     contacts_collection = db["ghl_contacts"]
 
     # Compound index for efficient querying
@@ -1151,7 +1151,7 @@ async def get_subaccount_tokens(user_id: str, mongo_client: AsyncIOMotorClient):
     NOTE: This now returns tokens WITHOUT contacts array.
     Use get_location_contacts() separately to fetch contacts.
     """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
     users_collection = db["users"]
 
     user_doc = await users_collection.find_one(

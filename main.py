@@ -1235,6 +1235,106 @@ async def login_user(request: LoginRequest, response: Response):
                 logger.warning(f"Password mismatch for user {request.email}")
                 raise HTTPException(status_code=401, detail="Invalid email or password")
 
+            # # ============================================
+            # # CHECK AND REFRESH EXPIRED TOKENS (if needed)
+            # # ============================================
+            # expired_tokens = []
+            #
+            # # Check agency token expiration
+            # logger.debug(f"Checking agency token for user {request.email}")
+            # agency_token = await get_agency_token(request.email, mongo_client)
+            #
+            # if agency_token and agency_token.get("refresh_token"):
+            #     expires_at = agency_token.get("expires_at")
+            #
+            #     # Check if expired or expires within 5 minutes
+            #     if expires_at:
+            #         time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            #         if time_until_expiry < 300:  # Less than 5 minutes
+            #             expired_tokens.append(("agency", None))
+            #             logger.info(f"⚠️ Agency token expired or expiring soon for {request.email}")
+            #     else:
+            #         # No expiry date, consider it expired
+            #         expired_tokens.append(("agency", None))
+            #
+            # # Check location tokens
+            # logger.debug(f"Checking subaccount tokens for user {request.email}")
+            # subaccount_tokens = await get_subaccount_tokens(request.email, mongo_client)
+            #
+            # for location_id, token_data in subaccount_tokens.items():
+            #     refresh_token = token_data.get("refresh_token")
+            #     expires_at = token_data.get("expires_at")
+            #
+            #     if refresh_token and expires_at:
+            #         time_until_expiry = (expires_at - datetime.now()).total_seconds()
+            #         if time_until_expiry < 300:  # Less than 5 minutes
+            #             expired_tokens.append(("location", location_id))
+            #             logger.info(f"⚠️ Token expired or expiring soon for location {location_id}")
+            #     elif refresh_token and not expires_at:
+            #         # No expiry date, consider it expired
+            #         expired_tokens.append(("location", location_id))
+            #
+            # # Refresh only expired tokens
+            # if expired_tokens:
+            #     logger.info(f"🔄 Refreshing {len(expired_tokens)} expired tokens for {request.email}")
+            #
+            #     for token_type, location_id in expired_tokens:
+            #         try:
+            #             if token_type == "agency":
+            #                 refresh_token = agency_token.get("refresh_token")
+            #                 logger.debug(f"Refreshing agency token for user {request.email}")
+            #                 success, result = await ghl_integration.refresh_agency_token(refresh_token)
+            #
+            #                 if success:
+            #                     await save_agency_token(request.email, result, mongo_client)
+            #                     logger.info(f"✅ Refreshed agency token for user {request.email}")
+            #                 else:
+            #                     logger.error(f"❌ Failed to refresh agency token: {result.get('error')}")
+            #
+            #             elif token_type == "location":
+            #                 token_data = subaccount_tokens.get(location_id, {})
+            #                 refresh_token = token_data.get("refresh_token")
+            #
+            #                 if refresh_token:
+            #                     logger.debug(f"Refreshing token for location {location_id}")
+            #                     success, result = await ghl_integration.refresh_location_token(
+            #                         location_id,
+            #                         refresh_token
+            #                     )
+            #
+            #                     if success:
+            #                         location_details = await fetch_location_details(
+            #                             location_id,
+            #                             result.get("access_token")
+            #                         )
+            #
+            #                         success_contacts, contacts = await ghl_integration.fetch_location_contacts(
+            #                             location_id,
+            #                             result.get("access_token")
+            #                         )
+            #
+            #                         if not success_contacts:
+            #                             logger.warning(f"Failed to fetch contacts for location {location_id}")
+            #                             contacts = []
+            #
+            #                         await save_subaccount_token(
+            #                             request.email,
+            #                             location_id,
+            #                             result,
+            #                             mongo_client,
+            #                             location_details,
+            #                             contacts
+            #                         )
+            #                         logger.info(f"✅ Refreshed token for location {location_id}")
+            #                     else:
+            #                         logger.error(
+            #                             f"❌ Failed to refresh token for location {location_id}: {result.get('error')}")
+            #
+            #         except Exception as e:
+            #             logger.error(f"❌ Error refreshing token: {str(e)}", exc_info=True)
+            # else:
+            #     logger.info(f"✅ All tokens valid for user {request.email}, no refresh needed")
+
             # ============================================
             # GENERATE JWT TOKENS
             # ============================================
@@ -1270,6 +1370,7 @@ async def login_user(request: LoginRequest, response: Response):
         except Exception as e:
             logger.error(f"Error logging in user {request.email}: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to login user: {str(e)}")
+
 
 
 @app.post("/api/logout")

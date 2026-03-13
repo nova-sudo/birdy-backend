@@ -24,7 +24,7 @@ class CurrencyService:
     def _get_users_collection():
         if CurrencyService._users_collection is None:
             CurrencyService._mongo_client = AsyncIOMotorClient(os.getenv("MONGODB_URI"))
-            CurrencyService._db = CurrencyService._mongo_client[os.getenv("MONGODB_DB", "birdyai")]
+            CurrencyService._db = CurrencyService._mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             CurrencyService._users_collection = CurrencyService._db["users"]
         return CurrencyService._users_collection
 
