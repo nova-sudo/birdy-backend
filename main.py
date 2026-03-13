@@ -4266,13 +4266,18 @@ async def get_client_group_comprehensive(group_id: str, current_user: str = Depe
                 group.get("facebook_cache"),
                 group.get("last_ghl_refresh")
             ]):
-                oldest_refresh = min([
-                    group.get("last_ghl_refresh", datetime.min),
-                    group.get("last_meta_refresh", datetime.min),
-                    group.get("last_hp_refresh", datetime.min)
-                ])
-                cache_age = (datetime.utcnow() - oldest_refresh).total_seconds()
-                has_fresh_cache = cache_age < CACHE_DURATION_SECONDS
+                refresh_times = [
+                    t for t in [
+                        group.get("last_ghl_refresh"),
+                        group.get("last_meta_refresh"),
+                        group.get("last_hp_refresh"),
+                    ]
+                    if t is not None
+                ]
+                if refresh_times:
+                    oldest_refresh = min(refresh_times)
+                    cache_age = (datetime.utcnow() - oldest_refresh).total_seconds()
+                    has_fresh_cache = cache_age < CACHE_DURATION_SECONDS
 
             # Initialize response structure
             response_data = {
