@@ -254,13 +254,25 @@ async def refresh_meta_data_for_all_users():
 
                         try:
                             logger.info(
-                                f"  🔄 Updating TODAY's data for '{group_name}' "
+                                f"  🔄 Refreshing ALL presets for '{group_name}' "
                                 f"(account: {meta_ad_account_id}, currency: {ad_account_currency})"
                             )
 
-                            # ============================================
-                            # STEP 1: UPDATE TODAY'S INSIGHTS (parallel)
-                            # ============================================
+                            # ── STEP 1: Refresh all Meta date-preset buckets ──────────────
+                            await fetch_meta_all_presets_for_group(
+                                group_id,
+                                meta_ad_account_id,
+                                user_id,
+                                mongo_client,
+                                ad_account_currency
+                            )
+
+                            # Cool down 60s between preset fetch and granular
+                            # per-day rows — same rate limit window concern.
+                            logger.info("⏳ Cooling down 60s before granular insight fetch...")
+                            await asyncio.sleep(60)
+
+                            # ── STEP 2: Update today's granular per-day rows (incremental) ─
                             from integrations.facebook_utils.meta_incremental_refresh import (
                                 update_todays_campaign_insights,
                                 update_todays_adset_insights,
@@ -270,61 +282,33 @@ async def refresh_meta_data_for_all_users():
 
                             tasks = [
                                 update_todays_campaign_insights(
-                                    meta_ad_account_id,
-                                    access_token,
-                                    user_id,
-                                    group_id,
-                                    group_name,
-                                    mongo_client,
-                                    ad_account_currency
+                                    meta_ad_account_id, access_token, user_id,
+                                    group_id, group_name, mongo_client, ad_account_currency
                                 ),
                                 update_todays_adset_insights(
-                                    meta_ad_account_id,
-                                    access_token,
-                                    user_id,
-                                    group_id,
-                                    group_name,
-                                    mongo_client,
-                                    ad_account_currency
+                                    meta_ad_account_id, access_token, user_id,
+                                    group_id, group_name, mongo_client, ad_account_currency
                                 ),
                                 update_todays_ad_insights(
-                                    meta_ad_account_id,
-                                    access_token,
-                                    user_id,
-                                    group_id,
-                                    group_name,
-                                    mongo_client,
-                                    ad_account_currency
-                                )
+                                    meta_ad_account_id, access_token, user_id,
+                                    group_id, group_name, mongo_client, ad_account_currency
+                                ),
                             ]
-
                             insights_results = await asyncio.gather(*tasks, return_exceptions=True)
-
                             campaign_count = insights_results[0] if not isinstance(insights_results[0], Exception) else 0
-                            adset_count = insights_results[1] if not isinstance(insights_results[1], Exception) else 0
-                            ad_count = insights_results[2] if not isinstance(insights_results[2], Exception) else 0
+                            adset_count    = insights_results[1] if not isinstance(insights_results[1], Exception) else 0
+                            ad_count       = insights_results[2] if not isinstance(insights_results[2], Exception) else 0
 
-                            # ============================================
-                            # STEP 2: UPDATE TODAY'S LEADS (incremental)
-                            # ============================================
+                            # ── STEP 3: Incremental leads ─────────────────────────────────
                             new_leads_count, new_leads = await fetch_todays_facebook_leads_incremental(
-                                meta_ad_account_id,
-                                access_token,
-                                user_id,
-                                group_id,
-                                group_name,
-                                mongo_client,
-                                ad_account_currency,
-                                max_concurrent_ads= 5
+                                meta_ad_account_id, access_token, user_id,
+                                group_id, group_name, mongo_client, max_concurrent_ads=5
                             )
 
-                            # Save new leads to database
                             if new_leads:
                                 leads_collection = db["facebook_leads"]
-                                lead_docs = []
-
-                                for lead in new_leads:
-                                    lead_docs.append({
+                                lead_docs = [
+                                    {
                                         "user_id": user_id,
                                         "ad_account_id": meta_ad_account_id,
                                         "client_group_id": group_id,
@@ -332,46 +316,26 @@ async def refresh_meta_data_for_all_users():
                                         "lead_id": lead.get("lead_id"),
                                         "lead_data": lead,
                                         "created_at": datetime.now(),
-                                        "updated_at": datetime.now()
-                                    })
-
-                                if lead_docs:
-                                    try:
-                                        await leads_collection.insert_many(
-                                            lead_docs,
-                                            ordered=False
-                                        )
-                                        logger.info(f"  💾 Saved {len(lead_docs)} new leads")
-                                    except Exception as e:
-                                        logger.warning(f"  ⚠️ Some duplicate leads: {str(e)}")
-
-                            # ============================================
-                            # STEP 3: UPDATE CACHE
-                            # ============================================
-                            await client_groups_collection.update_one(
-                                {"id": group_id},
-                                {
-                                    "$set": {
-                                        "last_meta_refresh": datetime.utcnow(),
-                                        "last_meta_refresh_mode": "incremental_today"
-                                    },
-                                    "$inc": {
-                                        "facebook_cache.total_leads": new_leads_count
+                                        "updated_at": datetime.now(),
                                     }
-                                }
-                            )
+                                    for lead in new_leads
+                                ]
+                                try:
+                                    await leads_collection.insert_many(lead_docs, ordered=False)
+                                    logger.info(f"  💾 Saved {len(lead_docs)} new leads")
+                                except Exception as e:
+                                    logger.warning(f"  ⚠️ Some duplicate leads: {str(e)}")
 
                             logger.info(
-                                f"  ✅ Updated '{group_name}': "
-                                f"{campaign_count} campaigns, {adset_count} adsets, "
-                                f"{ad_count} ads, {new_leads_count} new leads"
+                                f"  ✅ Refreshed '{group_name}': all presets + "
+                                f"{campaign_count} campaign rows, {adset_count} adset rows, "
+                                f"{ad_count} ad rows, {new_leads_count} new leads"
                             )
-
                             success_count += 1
 
                         except Exception as e:
                             logger.error(
-                                f"  ❌ Error updating '{group_name}': {str(e)}",
+                                f"  ❌ Error refreshing '{group_name}': {str(e)}",
                                 exc_info=True
                             )
                             failure_count += 1
@@ -380,8 +344,8 @@ async def refresh_meta_data_for_all_users():
                     # 🔥 DELAY BETWEEN USERS
                     # ============================================
                     if user_index < len(users_with_groups):
-                        await asyncio.sleep(1)
-                        logger.info(f"⏳ Waiting 1s before next user...")
+                        await asyncio.sleep(10)
+                        logger.info(f"⏳ Waiting 10s before next user...")
 
                 except Exception as e:
                     failure_count += len(groups)
@@ -732,23 +696,23 @@ def start_background_jobs():
     )
 
     # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
-    # scheduler.add_job(
-    #     refresh_ghl_data_for_all_users,
-    #     CronTrigger(minute='34'),
-    #     id='ghl_refresh',
-    #     replace_existing=True,
-    #     max_instances=2
-    #
-    # )
+    scheduler.add_job(
+        refresh_ghl_data_for_all_users,
+        CronTrigger(minute='00'),
+        id='ghl_refresh',
+        replace_existing=True,
+        max_instances=2
+
+    )
     #
     # # Meta data refresh: runs hourly at :25 (staggered)
-    # scheduler.add_job(
-    #     refresh_meta_data_for_all_users,
-    #     CronTrigger(minute='19'),
-    #     id='meta_refresh',
-    #     replace_existing=True,
-    #     max_instances=1
-    # )
+    scheduler.add_job(
+        refresh_meta_data_for_all_users,
+        CronTrigger(minute='10'),
+        id='meta_refresh',
+        replace_existing=True,
+        max_instances=1
+    )
 
     # # HP data refresh: runs hourly at :45 (staggered)
     # scheduler.add_job(
@@ -3254,43 +3218,124 @@ async def fetch_hp_leads_for_group(
 # MAIN OPTIMIZED ENDPOINT WITH PARALLEL FETCHING
 # ============================================
 
-@app.get("/api/client-groups")
-async def get_client_groups(current_user: str = Depends(get_current_user)):
-    """
-    CACHE-OPTIMIZED: Fetch client groups from cached database data
 
-    Returns pre-computed metrics stored in MongoDB.
-    Data is refreshed hourly by background jobs.
-    Expected response time: <100ms
+@app.get("/api/client-groups")
+async def get_client_groups(
+    date_preset: Optional[str] = "maximum",
+    current_user: str = Depends(get_current_user)
+):
+    """
+    Return all client groups for the current user.
+
+    Meta metrics  -> served from facebook_cache.<preset_key> sub-document.
+    GHL contacts  -> total_contacts always lifetime (from gohighlevel_cache);
+                     new_contacts aggregated live from ghl_contacts filtered
+                     by contact_data.dateAdded for the requested window.
+
+    Accepted date_preset values:
+        maximum (default) | today | yesterday | this_week | this_week_mon_today |
+        this_week_sun_today | last_3d | last_7d | last_14d | last_28d | last_30d |
+        last_90d | this_month | last_month | this_quarter | last_quarter |
+        this_year | last_year
     """
     async with get_mongo_client() as mongo_client:
         try:
             import time
+            from datetime import date as _date, timedelta
+            from collections import Counter
             start_time = time.time()
 
             db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
             client_groups_collection = db["client_groups"]
 
-            # Fetch client groups with all cached data
+            # Resolve alias -> canonical cache key
+            resolved_preset = PRESET_ALIAS.get(date_preset or "maximum", "maximum")
+
+            # ── GHL: compute ISO date bounds for the window ───────────────
+            def _ghl_date_bounds(preset_key: str):
+                today = _date.today()
+                spec = GHL_PRESET_DATE_RANGE.get(preset_key)
+                if spec is None:
+                    return None, None
+                if isinstance(spec, tuple):
+                    start_days, end_days = spec
+                    return (
+                        (today - timedelta(days=start_days)).isoformat(),
+                        (today - timedelta(days=end_days)).isoformat(),
+                    )
+                if spec == "this_week_mon":
+                    s = today - timedelta(days=today.weekday())
+                    return s.isoformat(), today.isoformat()
+                if spec == "this_week_sun":
+                    s = today - timedelta(days=(today.weekday() + 1) % 7)
+                    return s.isoformat(), today.isoformat()
+                if spec == "this_month":
+                    return today.replace(day=1).isoformat(), today.isoformat()
+                if spec == "last_month":
+                    first_this = today.replace(day=1)
+                    last_prev  = first_this - timedelta(days=1)
+                    return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
+                if spec == "this_quarter":
+                    qm = ((today.month - 1) // 3) * 3 + 1
+                    return today.replace(month=qm, day=1).isoformat(), today.isoformat()
+                if spec == "last_quarter":
+                    qm = ((today.month - 1) // 3) * 3 + 1
+                    first_this_q = today.replace(month=qm, day=1)
+                    last_prev_q  = first_this_q - timedelta(days=1)
+                    pqm = ((last_prev_q.month - 1) // 3) * 3 + 1
+                    return last_prev_q.replace(month=pqm, day=1).isoformat(), last_prev_q.isoformat()
+                if spec == "this_year":
+                    return today.replace(month=1, day=1).isoformat(), today.isoformat()
+                if spec == "last_year":
+                    return _date(today.year - 1, 1, 1).isoformat(), _date(today.year - 1, 12, 31).isoformat()
+                return None, None
+
+            ghl_start, ghl_end = _ghl_date_bounds(resolved_preset)
+            is_all_time = ghl_start is None
+
+            # ── GHL: aggregate new_contacts + windowed tag_breakdown ──────
+            ghl_windowed: dict = {}
+            if not is_all_time:
+                contacts_col = db["ghl_contacts"]
+                pipeline = [
+                    {"$match": {
+                        "user_id": current_user,
+                        "contact_data.dateAdded": {
+                            "$gte": f"{ghl_start}T00:00:00.000Z",
+                            "$lte": f"{ghl_end}T23:59:59.999Z",
+                        }
+                    }},
+                    {"$group": {
+                        "_id": "$client_group_id",
+                        "new_contacts": {"$sum": 1},
+                        "all_tags":     {"$push": "$contact_data.tags"},
+                    }},
+                ]
+                for row in await contacts_col.aggregate(pipeline).to_list(None):
+                    tag_counter: Counter = Counter()
+                    for tag_list in row.get("all_tags", []):
+                        if isinstance(tag_list, list):
+                            for t in tag_list:
+                                if t:
+                                    tag_counter[t] += 1
+                    ghl_windowed[row["_id"]] = {
+                        "new_contacts":  row["new_contacts"],
+                        "tag_breakdown": dict(tag_counter.most_common()),
+                    }
+
+            # ── Fetch groups from DB ──────────────────────────────────────
             client_groups = await client_groups_collection.find(
                 {"user_id": current_user},
                 {
-                    "_id": 1,
-                    "id": 1,
-                    "name": 1,
-                    "ghl_location_id": 1,
-                    "meta_ad_account_id": 1,
-                    "ad_account_currency": 1,
-                    "notes": 1,
-                    "created_at": 1,
-                    "updated_at": 1,
-                    # Cached metrics
+                    "_id": 1, "id": 1, "name": 1,
+                    "ghl_location_id": 1, "meta_ad_account_id": 1,
+                    "ad_account_currency": 1, "notes": 1,
+                    "created_at": 1, "updated_at": 1,
                     "gohighlevel_cache": 1,
                     "facebook_cache": 1,
                     "hotprospector_cache": 1,
-                    "last_ghl_refresh": 1,
-                    "last_meta_refresh": 1,
-                    "last_hp_refresh": 1
+                    "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
+                    "status": 1,
                 }
             ).to_list(None)
 
@@ -3301,48 +3346,59 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
                         "total_groups": 0,
                         "total_ghl_locations": 0,
                         "total_meta_ad_accounts": 0,
-                        "total_hotprospector_enabled": 0
+                        "total_hotprospector_enabled": 0,
                     },
-                    "message": "No client groups found"
+                    "message": "No client groups found",
                 }
 
             result = []
             for group in client_groups:
                 group_data = mongo_to_dict(group)
+                gid = group_data.get("id") or ""
 
-                # Use cached data with fallback to empty
-                group_data["gohighlevel"] = group.get("gohighlevel_cache", {})
-                group_data["facebook"] = group.get("facebook_cache", {})
+                # ── GHL: merge lifetime cache + windowed counts ───────────
+                ghl_cache = group.get("gohighlevel_cache") or {}
+                if is_all_time:
+                    # All-time: serve the full cache as-is
+                    group_data["gohighlevel"] = ghl_cache
+                else:
+                    windowed = ghl_windowed.get(gid, {})
+                    # Build a merged view: lifetime total + windowed new count + windowed tags
+                    group_data["gohighlevel"] = {
+                        **ghl_cache,
+                        "metrics": {
+                            **(ghl_cache.get("metrics") or {}),
+                            # Windowed new contacts for this time window
+                            "total_contacts": windowed.get("new_contacts", 0),
+                            # Windowed tag breakdown (only contacts added in window)
+                            "tag_breakdown":  windowed.get("tag_breakdown", {}),
+                            # Always expose lifetime total separately
+                            "lifetime_total_contacts": (ghl_cache.get("metrics") or {}).get("total_contacts", 0),
+                        }
+                    }
+
+                # ── HP cache (unchanged) ──────────────────────────────────
                 group_data["hotprospector"] = group.get("hotprospector_cache", {})
 
-                # ✅ Fix nested metrics.insights currency conversion gap
-                facebook_cache = group.get("facebook_cache", {})
-                metrics = facebook_cache.get("metrics", {})
-                insights = metrics.get("insights", {})
+                # ── Meta: read preset sub-document ────────────────────────
+                facebook_cache = group.get("facebook_cache") or {}
+                preset_doc = facebook_cache.get(resolved_preset)
 
-                ad_account_currency = group.get("ad_account_currency")
-                converted_currency = facebook_cache.get("currency")  # user's currency saved by fetch_and_cache_meta_data
+                if preset_doc and isinstance(preset_doc, dict):
+                    group_data["facebook"] = {
+                        "ad_account_id": facebook_cache.get("ad_account_id", group.get("meta_ad_account_id", "")),
+                        "name":          facebook_cache.get("name", ""),
+                        "currency":      facebook_cache.get("currency", ""),
+                        "campaigns":     preset_doc.get("campaigns", []),
+                        "adsets":        preset_doc.get("adsets", []),
+                        "ads":           preset_doc.get("ads", []),
+                        "metrics":       preset_doc.get("metrics", {}),
+                        "date_preset":   resolved_preset,
+                    }
+                else:
+                    # Legacy flat structure - graceful fallback for old groups
+                    group_data["facebook"] = facebook_cache
 
-                if insights and ad_account_currency and converted_currency and ad_account_currency != converted_currency:
-                    from utils.currency_exchange import CurrencyService
-                    spend_fields = ["spend", "cpm", "cpc", "cpp", "cost_per_result"]
-                    converted_insights = insights.copy()
-
-                    for field in spend_fields:
-                        if field in converted_insights and converted_insights[field] is not None:
-                            try:
-                                converted_insights[field] = CurrencyService.convert(
-                                    amount=float(converted_insights[field]),
-                                    from_currency=ad_account_currency,
-                                    to_currency=converted_currency
-                                )
-                            except Exception:
-                                pass
-
-                    # Write back converted insights into group_data
-                    group_data["facebook"]["metrics"]["insights"] = converted_insights
-
-                # Remove cache keys from response
                 group_data.pop("gohighlevel_cache", None)
                 group_data.pop("facebook_cache", None)
                 group_data.pop("hotprospector_cache", None)
@@ -3350,25 +3406,36 @@ async def get_client_groups(current_user: str = Depends(get_current_user)):
                 result.append(group_data)
 
             elapsed = time.time() - start_time
-            logger.info(f"⚡ Retrieved {len(result)} cached client groups in {elapsed:.3f}s")
+            logger.info(
+                f"\u26a1 Served {len(result)} client groups "
+                f"[preset={resolved_preset}] in {elapsed:.3f}s"
+            )
 
             return {
                 "client_groups": result,
                 "meta": {
                     "total_groups": len(result),
-                    "total_ghl_locations": sum(1 for g in result if g.get("gohighlevel", {}).get("location_id")),
-                    "total_meta_ad_accounts": sum(1 for g in result if g.get("facebook", {}).get("ad_account_id")),
+                    "date_preset":  resolved_preset,
+                    "is_all_time":  is_all_time,
+                    "total_ghl_locations":         sum(1 for g in result if g.get("gohighlevel", {}).get("location_id")),
+                    "total_meta_ad_accounts":      sum(1 for g in result if g.get("facebook", {}).get("ad_account_id")),
                     "total_hotprospector_enabled": sum(
-                        1 for g in result if g.get("hotprospector", {}).get("metrics", {}).get("total_leads", 0) > 0
-                    )
+                        1 for g in result
+                        if g.get("hotprospector", {}).get("metrics", {}).get("total_leads", 0) > 0
+                    ),
                 },
-                "message": f"Successfully fetched {len(result)} client groups from cache"
+                "message": f"Successfully fetched {len(result)} client groups from cache",
             }
 
         except Exception as e:
-            logger.error(f"Error fetching client groups for user {current_user}: {str(e)}", exc_info=True)
-            raise HTTPException(status_code=500, detail=f"Failed to fetch client groups: {str(e)}")
-
+            logger.error(
+                f"Error fetching client groups for user {current_user}: {str(e)}",
+                exc_info=True
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch client groups: {str(e)}"
+            )
 
 @app.post("/api/client-groups")
 async def create_client_group_optimized(
@@ -3484,21 +3551,28 @@ async def create_client_group_optimized(
                     is_initial_load=True  # Full load on creation
                 )
 
-            # Fetch Meta data (unchanged)
+            # Fetch Meta data — ALL presets in one pass
             if request.meta_ad_account_id:
                 if not request.ad_account_currency:
                     raise HTTPException(
-                    status_code=400,
-                    detail = "ad_account_currency is required when meta_ad_account_id is provided",
+                        status_code=400,
+                        detail="ad_account_currency is required when meta_ad_account_id is provided",
                     )
-                await fetch_and_cache_meta_data(
+                # ── NEW: fetch every date preset and store as sub-documents ──
+                await fetch_meta_all_presets_for_group(
                     group_id,
                     request.meta_ad_account_id,
                     current_user,
                     mongo_client,
                     request.ad_account_currency
                 )
-                # Fetch Meta campaign/adset/ad data
+                # Cool down 60s before the per-day granular calls to avoid
+                # hitting the same ad account's rate limit back-to-back.
+                # The 17 sequential preset calls above saturate the account;
+                # Meta's rate limit window resets after ~1 minute.
+                logger.info("⏳ Cooling down 60s before granular insight fetch...")
+                await asyncio.sleep(60)
+                # Per-day granular rows for campaign/adset/ad insights (unchanged)
                 await fetch_and_cache_campaign_insights(
                     request.ad_account_currency,
                     group_id,
@@ -3508,12 +3582,12 @@ async def create_client_group_optimized(
                     is_initial_load=True
                 )
                 await fetch_and_cache_adset_insights(
-                        request.ad_account_currency,
-                        group_id,  # 1st: group ID
-                        request.meta_ad_account_id,  # 2nd: ad account ID
-                        current_user,  # 3rd: user ID
-                        mongo_client,  # 4th: mongo client
-                        is_initial_load=True  # 5th: initial load flag
+                    request.ad_account_currency,
+                    group_id,
+                    request.meta_ad_account_id,
+                    current_user,
+                    mongo_client,
+                    is_initial_load=True
                 )
                 await fetch_and_cache_ad_insights(
                     request.ad_account_currency,
@@ -4154,6 +4228,442 @@ async def fetch_and_cache_meta_data(
 
 
 
+# ============================================================
+# META PRESETS — fetches every allowed preset and stores each
+# as its own sub-document inside facebook_cache.<preset_key>
+# ============================================================
+
+# The full set of presets we want to cache. We use data_maximum
+# as the primary "all-time" bucket; the others are date windows.
+META_CACHE_PRESETS = [
+    "maximum",              # all-time (the only valid all-history preset in nested field syntax)
+    "today",
+    "yesterday",
+    "this_week_mon_today",
+    "this_week_sun_today",
+    "last_3d",
+    "last_7d",
+    "last_14d",
+    "last_28d",
+    "last_30d",
+    "this_month",
+    "last_month",
+    "this_quarter",
+    "last_quarter",
+    "this_year",
+    "last_year",
+    "last_90d",
+]
+
+# Mapping from frontend selector values → cache key stored in facebook_cache
+PRESET_ALIAS = {
+    "maximum":             "maximum",
+    "data_maximum":        "maximum",   # legacy alias → maximum
+    "today":               "today",
+    "yesterday":           "yesterday",
+    "this_week":           "this_week_mon_today",
+    "this_week_mon_today": "this_week_mon_today",
+    "this_week_sun_today": "this_week_sun_today",
+    "last_3d":             "last_3d",
+    "last_7d":             "last_7d",
+    "last_14d":            "last_14d",
+    "last_28d":            "last_28d",
+    "last_30d":            "last_30d",
+    "this_month":          "this_month",
+    "last_month":          "last_month",
+    "this_quarter":        "this_quarter",
+    "last_quarter":        "last_quarter",
+    "this_year":           "this_year",
+    "last_year":           "last_year",
+    "last_90d":            "last_90d",
+}
+
+# Map each preset → its GHL date window (start_days_ago, end_days_ago).
+# None means "all time" → no date filter on ghl_contacts.
+GHL_PRESET_DATE_RANGE = {
+    "maximum":             None,
+    "today":               (0, 0),
+    "yesterday":           (1, 1),
+    "this_week_mon_today": "this_week_mon",
+    "this_week_sun_today": "this_week_sun",
+    "last_3d":             (3, 0),
+    "last_7d":             (7, 0),
+    "last_14d":            (14, 0),
+    "last_28d":            (28, 0),
+    "last_30d":            (30, 0),
+    "this_month":          "this_month",
+    "last_month":          "last_month",
+    "this_quarter":        "this_quarter",
+    "last_quarter":        "last_quarter",
+    "this_year":           "this_year",
+    "last_year":           "last_year",
+    "last_90d":            (90, 0),
+}
+
+
+
+async def _fetch_meta_campaigns_for_preset(
+    ad_account_id: str,
+    access_token: str,
+    date_preset: str,
+) -> dict:
+    """
+    Fetch campaigns + aggregated metrics from Meta for one date_preset.
+    Returns a dict shaped like the existing fetch_meta_data_for_group return value
+    but WITHOUT leads (leads are preset-independent in the leads collection).
+    """
+    import httpx
+
+    fields = (
+        "name,status,"
+        f"insights.date_preset({date_preset})"
+        "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr},"
+        "adsets{name,status,"
+        f"insights.date_preset({date_preset})"
+        "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr}},"
+        "ads{name,status,creative{title,body,image_url},"
+        f"insights.date_preset({date_preset})"
+        "{actions,results,reach,spend,impressions,cpm,inline_link_clicks,cpc,clicks}}"
+    )
+
+    campaigns_list = []
+    adsets_list = []
+    ads_list = []
+    total_spend = 0.0
+    total_impressions = 0
+    total_clicks = 0
+    total_reach = 0
+    total_results = 0
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            url = f"https://graph.facebook.com/v23.0/{ad_account_id}/campaigns"
+            params = {"fields": fields, "access_token": access_token, "limit": 100}
+            next_url = None
+            page = 0
+
+            while True:
+                page += 1
+                if page == 1:
+                    resp = await client.get(url, params=params)
+                else:
+                    resp = await client.get(next_url)
+
+                if resp.status_code != 200:
+                    body = resp.text[:300]
+                    # Detect Meta rate limit (code 17 or HTTP 429)
+                    is_rate_limit = resp.status_code == 429 or (
+                        resp.status_code == 400 and '"code":17' in body
+                    )
+                    logger.warning(
+                        f"Meta API {resp.status_code} for preset={date_preset} "
+                        f"account={ad_account_id}: {body}"
+                    )
+                    if is_rate_limit:
+                        # Signal caller to retry with backoff
+                        return {"_rate_limited": True, "campaigns": [], "adsets": [], "ads": [],
+                                "date_preset": date_preset, "metrics": {"total_campaigns": 0,
+                                "total_adsets": 0, "total_ads": 0, "insights": {}}}
+                    break
+
+                data = resp.json()
+                campaigns = data.get("data", [])
+
+                for campaign in campaigns:
+                    c_insights = campaign.get("insights", {}).get("data", [])
+                    c_spend = c_imp = c_clicks = c_reach = c_results = 0
+
+                    if c_insights:
+                        ins = c_insights[0]
+                        try:
+                            c_spend   = float(ins.get("spend", 0) or 0)
+                            c_imp     = int(ins.get("impressions", 0) or 0)
+                            c_clicks  = int(ins.get("clicks", 0) or 0)
+                            c_reach   = int(ins.get("reach", 0) or 0)
+                            c_results = get_result_value(c_insights, "lead")
+                        except (ValueError, TypeError):
+                            pass
+
+                    total_spend      += c_spend
+                    total_impressions += c_imp
+                    total_clicks     += c_clicks
+                    total_reach      += c_reach
+                    total_results    += c_results
+
+                    campaigns_list.append({
+                        "id":          campaign.get("id"),
+                        "name":        campaign.get("name"),
+                        "status":      campaign.get("status", "").title(),
+                        "spend":       round(c_spend, 2),
+                        "impressions": c_imp,
+                        "clicks":      c_clicks,
+                        "reach":       c_reach,
+                        "results":     c_results,
+                        "cpm":  round(c_spend / c_imp * 1000, 2) if c_imp   > 0 else 0,
+                        "cpc":  round(c_spend / c_clicks, 2)     if c_clicks > 0 else 0,
+                        "ctr":  round(c_clicks / c_imp * 100, 2) if c_imp   > 0 else 0,
+                    })
+
+                    for adset in campaign.get("adsets", {}).get("data", []):
+                        a_ins = adset.get("insights", {}).get("data", [])
+                        a_spend = a_imp = a_clicks = a_reach = 0
+                        if a_ins:
+                            ins = a_ins[0]
+                            try:
+                                a_spend  = float(ins.get("spend", 0) or 0)
+                                a_imp    = int(ins.get("impressions", 0) or 0)
+                                a_clicks = int(ins.get("clicks", 0) or 0)
+                                a_reach  = int(ins.get("reach", 0) or 0)
+                            except (ValueError, TypeError):
+                                pass
+                        adsets_list.append({
+                            "id":          adset.get("id"),
+                            "name":        adset.get("name"),
+                            "campaign_id": campaign.get("id"),
+                            "status":      adset.get("status", "").title(),
+                            "spend":       round(a_spend, 2),
+                            "impressions": a_imp,
+                            "clicks":      a_clicks,
+                            "reach":       a_reach,
+                            "cpm":  round(a_spend / a_imp * 1000, 2) if a_imp    > 0 else 0,
+                            "cpc":  round(a_spend / a_clicks, 2)     if a_clicks > 0 else 0,
+                            "ctr":  round(a_clicks / a_imp * 100, 2) if a_imp    > 0 else 0,
+                        })
+
+                    for ad in campaign.get("ads", {}).get("data", []):
+                        ad_ins = ad.get("insights", {}).get("data", [])
+                        ad_spend = ad_imp = ad_clicks = ad_reach = ad_results = 0
+                        if ad_ins:
+                            ins = ad_ins[0]
+                            try:
+                                ad_spend   = float(ins.get("spend", 0) or 0)
+                                ad_imp     = int(ins.get("impressions", 0) or 0)
+                                ad_clicks  = int(ins.get("clicks", 0) or 0)
+                                ad_reach   = int(ins.get("reach", 0) or 0)
+                                ad_results = int(ins.get("results", 0) or 0)
+                            except (ValueError, TypeError):
+                                pass
+                        creative = ad.get("creative", {})
+                        ads_list.append({
+                            "id":            ad.get("id"),
+                            "name":          ad.get("name"),
+                            "campaign_id":   campaign.get("id"),
+                            "status":        ad.get("status", "").title(),
+                            "spend":         round(ad_spend, 2),
+                            "impressions":   ad_imp,
+                            "clicks":        ad_clicks,
+                            "reach":         ad_reach,
+                            "results":       ad_results,
+                            "cpm":  round(ad_spend / ad_imp * 1000, 2) if ad_imp    > 0 else 0,
+                            "cpc":  round(ad_spend / ad_clicks, 2)     if ad_clicks > 0 else 0,
+                            "ctr":  round(ad_clicks / ad_imp * 100, 2) if ad_imp    > 0 else 0,
+                            "creative_title": creative.get("title", ""),
+                            "creative_body":  creative.get("body", ""),
+                            "creative_image": creative.get("image_url", ""),
+                        })
+
+                next_url = data.get("paging", {}).get("next")
+                if not next_url:
+                    break
+                await asyncio.sleep(0.15)
+
+    except Exception as e:
+        logger.error(
+            f"Error fetching Meta preset={date_preset} for {ad_account_id}: {e}",
+            exc_info=True
+        )
+
+    avg_cpm = round(total_spend / total_impressions * 1000, 2) if total_impressions > 0 else 0
+    avg_cpc = round(total_spend / total_clicks, 2)             if total_clicks      > 0 else 0
+    avg_ctr = round(total_clicks / total_impressions * 100, 2) if total_impressions > 0 else 0
+
+    return {
+        "campaigns":  campaigns_list,
+        "adsets":     adsets_list,
+        "ads":        ads_list,
+        "date_preset": date_preset,
+        "metrics": {
+            "total_campaigns": len(campaigns_list),
+            "total_adsets":    len(adsets_list),
+            "total_ads":       len(ads_list),
+            "insights": {
+                "spend":            round(total_spend, 2),
+                "impressions":      total_impressions,
+                "clicks":           total_clicks,
+                "reach":            total_reach,
+                "results":          total_results,
+                "cpm":              avg_cpm,
+                "cpc":              avg_cpc,
+                "ctr":              avg_ctr,
+                "cost_per_result":  round(total_spend / total_results, 2) if total_results > 0 else 0,
+            }
+        }
+    }
+
+
+async def fetch_meta_all_presets_for_group(
+    group_id: str,
+    meta_ad_account_id: str,
+    user_id: str,
+    mongo_client,
+    ad_account_currency: str | None = None,
+    presets: list | None = None,
+):
+    """
+    Fetch ALL Meta date presets for a client group and store each one as
+    facebook_cache.<preset_key> in MongoDB.
+
+    This replaces fetch_and_cache_meta_data for both the creation flow
+    and the background refresh flow.
+
+    Structure saved to DB:
+        facebook_cache: {
+            "data_maximum": { campaigns, adsets, ads, metrics, ... },
+            "today":        { campaigns, adsets, ads, metrics, ... },
+            "last_7d":      { ... },
+            ...
+            "name":         "Ad Account Name",
+            "currency":     "USD",
+            "ad_account_id": "act_xxx",
+            "total_leads":  123,           # from leads collection (preset-agnostic)
+        }
+    """
+    from utils.currency_exchange import CurrencyService
+
+    if presets is None:
+        presets = META_CACHE_PRESETS
+
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+    client_groups_collection = db["client_groups"]
+
+    # ── get currencies ──────────────────────────────────────────────────────
+    try:
+        user_currency = await CurrencyService.get_user_currency(user_id)
+    except Exception:
+        user_currency = ad_account_currency
+
+    if not ad_account_currency:
+        # try to read from DB first
+        grp = await client_groups_collection.find_one({"id": group_id}, {"ad_account_currency": 1})
+        ad_account_currency = (grp or {}).get("ad_account_currency")
+
+    # ── token ───────────────────────────────────────────────────────────────
+    token = await get_facebook_token(user_id, mongo_client)
+    if not token or not token.get("access_token"):
+        logger.warning(f"No Facebook token for user {user_id}, skipping Meta preset fetch")
+        return
+    access_token = token["access_token"]
+
+    # ── currency converter helper ───────────────────────────────────────────
+    def _convert(item: dict) -> dict:
+        if not item or not ad_account_currency or not user_currency:
+            return item
+        if ad_account_currency == user_currency:
+            return item
+        spend_fields = ["spend", "cpm", "cpc", "cpp", "cost_per_result"]
+        out = item.copy()
+        for f in spend_fields:
+            if f in out and out[f] is not None:
+                try:
+                    out[f] = CurrencyService.convert(
+                        float(out[f]), from_currency=ad_account_currency, to_currency=user_currency
+                    )
+                except Exception:
+                    pass
+        return out
+
+    # ── fetch all presets SEQUENTIALLY to avoid rate limits ─────────────────
+    # Each preset = 1 API call. Sequential with a small delay is safe even for
+    # 100 groups because the scheduler processes groups one-at-a-time.
+    logger.info(
+        f"🔄 Fetching {len(presets)} Meta presets for group {group_id} "
+        f"(account {meta_ad_account_id})"
+    )
+
+    preset_data: dict[str, dict] = {}
+
+    for preset in presets:
+        # Retry up to 3 times on rate-limit (HTTP 400 code 17 / 429)
+        for attempt in range(3):
+            try:
+                result = await _fetch_meta_campaigns_for_preset(
+                    meta_ad_account_id, access_token, preset
+                )
+                # Check if the result is an error placeholder (400 returned inside)
+                if result.get("_rate_limited"):
+                    wait = 10 * (2 ** attempt)
+                    logger.warning(
+                        f"  ⏳ Rate limited on preset '{preset}', "
+                        f"waiting {wait}s (attempt {attempt + 1}/3)"
+                    )
+                    await asyncio.sleep(wait)
+                    continue
+
+                # Apply currency conversion
+                result["campaigns"] = [_convert(c) for c in result.get("campaigns", [])]
+                result["adsets"]    = [_convert(a) for a in result.get("adsets", [])]
+                result["ads"]       = [_convert(a) for a in result.get("ads", [])]
+                if result.get("metrics", {}).get("insights"):
+                    result["metrics"]["insights"] = _convert(result["metrics"]["insights"])
+
+                preset_data[preset] = result
+                logger.info(
+                    f"  ✅ Preset '{preset}': "
+                    f"{result['metrics']['insights'].get('spend', 0):.2f} "
+                    f"{user_currency or ad_account_currency} spend, "
+                    f"{result['metrics']['total_campaigns']} campaigns"
+                )
+                break  # success, move to next preset
+
+            except Exception as e:
+                logger.error(f"  ❌ Error fetching preset '{preset}' attempt {attempt + 1}: {e}")
+                if attempt < 2:
+                    await asyncio.sleep(5 * (attempt + 1))
+
+        # 1 second between every preset call to stay well under rate limits
+        await asyncio.sleep(1.0)
+
+    # ── get ad account meta info ────────────────────────────────────────────
+    facebook_ad_accounts_data = await get_facebook_data(user_id, "global", "adaccounts", mongo_client)
+    facebook_ad_accounts = (facebook_ad_accounts_data or {}).get("data", [])
+    account_info = next(
+        (acc for acc in facebook_ad_accounts if acc["id"] == meta_ad_account_id), {}
+    )
+
+    # ── build the facebook_cache document ──────────────────────────────────
+    # Top-level fields for backward compat + preset sub-documents
+    facebook_cache_update = {
+        "facebook_cache.ad_account_id": meta_ad_account_id,
+        "facebook_cache.name":          account_info.get("name", "Unknown Ad Account"),
+        "facebook_cache.currency":      user_currency,
+        "facebook_cache.original_currency": ad_account_currency,
+        "last_meta_refresh": datetime.utcnow(),
+        "last_meta_refresh_mode": "full_presets",
+    }
+
+    for preset_key, data in preset_data.items():
+        facebook_cache_update[f"facebook_cache.{preset_key}"] = data
+
+    # Also keep the old flat structure populated from maximum so that
+    # existing code that reads facebook_cache.metrics / facebook_cache.campaigns
+    # continues to work unchanged.
+    primary = preset_data.get("maximum") or {}
+    if primary:
+        facebook_cache_update["facebook_cache.metrics"]   = primary.get("metrics", {})
+        facebook_cache_update["facebook_cache.campaigns"] = primary.get("campaigns", [])
+        facebook_cache_update["facebook_cache.adsets"]    = primary.get("adsets", [])
+        facebook_cache_update["facebook_cache.ads"]       = primary.get("ads", [])
+
+    await client_groups_collection.update_one(
+        {"id": group_id},
+        {"$set": facebook_cache_update}
+    )
+
+    logger.info(
+        f"✅ Saved {len(preset_data)} Meta preset buckets for group {group_id}"
+    )
+
+
 async def fetch_and_cache_hp_data(
         group_id: str,
         ghl_location_id: str,
@@ -4403,14 +4913,31 @@ async def get_client_group_comprehensive(group_id: str, current_user: str = Depe
                     # Use cached data if available (1.5 days)
                     if has_fresh_cache and group.get("facebook_cache"):
                         cached = group["facebook_cache"]
+                        # Prefer data_maximum preset sub-doc; fall back to flat legacy structure
+                        primary_preset = (
+                            cached.get("data_maximum")
+                            or cached.get("maximum")
+                            or {}
+                        )
+                        if primary_preset:
+                            summary_insights = primary_preset.get("metrics", {}).get("insights", {})
+                            campaigns        = primary_preset.get("campaigns", [])
+                            adsets           = primary_preset.get("adsets", [])
+                            ads              = primary_preset.get("ads", [])
+                        else:
+                            # Legacy flat structure
+                            summary_insights = cached.get("metrics", {}).get("insights", {})
+                            campaigns        = cached.get("campaigns", [])
+                            adsets           = cached.get("adsets", [])
+                            ads              = cached.get("ads", [])
                         return {
                             "ad_account_id": meta_ad_account_id,
-                            "campaigns": [],
-                            "adsets": [],
-                            "ads": [],
-                            "leads": [],
-                            "summary": cached.get("metrics", {}).get("insights", {}),
-                            "from_cache": True
+                            "campaigns": campaigns,
+                            "adsets":    adsets,
+                            "ads":       ads,
+                            "leads":     [],
+                            "summary":   summary_insights,
+                            "from_cache": True,
                         }
 
                     # Fetch fresh data

@@ -18,6 +18,45 @@ from integrations.facebook_utils.facebook import get_facebook_token
 
 logger = logging.getLogger(__name__)
 
+async def _api_get_with_backoff(client, url, params=None, max_retries=4):
+    """
+    GET with exponential backoff on Meta rate-limit responses (code 17 / HTTP 429).
+    Returns (response_ok: bool, data: dict | None).
+    """
+    import random
+    for attempt in range(max_retries):
+        try:
+            if params is not None:
+                resp = await client.get(url, params=params)
+            else:
+                resp = await client.get(url)
+
+            if resp.status_code == 200:
+                return True, resp.json()
+
+            body = resp.text
+            is_rate_limit = resp.status_code == 429 or (
+                resp.status_code == 400 and ('"code":17' in body or '"code": 17' in body)
+            )
+
+            if is_rate_limit and attempt < max_retries - 1:
+                wait = (15 * (2 ** attempt)) + random.uniform(0, 3)
+                logger.warning(
+                    f"⏳ Rate limited (attempt {attempt+1}/{max_retries}). "
+                    f"Waiting {wait:.0f}s before retry..."
+                )
+                await asyncio.sleep(wait)
+                continue
+
+            logger.error(f"❌ API error {resp.status_code}: {body[:300]}")
+            return False, None
+
+        except Exception as e:
+            logger.error(f"❌ Request error: {e}")
+            return False, None
+
+    return False, None
+
 
 class FacebookAdSetFetcher:
     """
@@ -61,19 +100,12 @@ class FacebookAdSetFetcher:
                     page += 1
                     logger.info(f"📄 Fetching ad set IDs page {page}")
 
-                    # Fetch page
-                    if page == 1:
-                        response = await client.get(url, params=params)
-                    else:
-                        response = await client.get(next_url)
-
-                    if response.status_code != 200:
-                        logger.error(
-                            f"❌ Failed to fetch ad sets: {response.status_code} - {response.text}"
-                        )
+                    # Fetch page with rate-limit backoff
+                    fetch_url = url if page == 1 else next_url
+                    fetch_params = params if page == 1 else None
+                    ok, data = await _api_get_with_backoff(client, fetch_url, fetch_params)
+                    if not ok:
                         break
-
-                    data = response.json()
                     adsets = data.get("data", [])
 
                     if not adsets:
