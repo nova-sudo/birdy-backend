@@ -5523,7 +5523,7 @@ async def prefetch_marketing_data(
 @app.get("/api/contacts/ghl-paginated")
 async def get_ghl_contacts_paginated_v2(
         page: int = Query(default=1, ge=1),
-        limit: int = Query(default=100, ge=1, le=500),
+        limit: int = Query(default=15, ge=1, le=500),
         groups: str = Query(default=""),
         start_date: Optional[str] = Query(default=None),
         end_date: Optional[str] = Query(default=None),
