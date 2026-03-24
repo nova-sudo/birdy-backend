@@ -3608,6 +3608,15 @@ async def create_client_group_optimized(
                     mongo_client,
                     request.ad_account_currency
                 )
+                # Fetch ALL Meta leads into database
+                await fetch_and_cache_facebook_leads_FIXED(
+                    request.ad_account_currency,
+                    group_id,
+                    request.meta_ad_account_id,
+                    current_user,
+                    mongo_client,
+                    is_initial_load=True
+                )
                 # Cool down 60s before the per-day granular calls to avoid
                 # hitting the same ad account's rate limit back-to-back.
                 # The 17 sequential preset calls above saturate the account;
@@ -3623,6 +3632,8 @@ async def create_client_group_optimized(
                     mongo_client,
                     is_initial_load=True
                 )
+                logger.info("⏳ Cooling down 60s before granular insight fetch...")
+                await asyncio.sleep(60)
                 await fetch_and_cache_adset_insights(
                     request.ad_account_currency,
                     group_id,
@@ -3631,6 +3642,8 @@ async def create_client_group_optimized(
                     mongo_client,
                     is_initial_load=True
                 )
+                logger.info("⏳ Cooling down 60s before granular insight fetch...")
+                await asyncio.sleep(60)
                 await fetch_and_cache_ad_insights(
                     request.ad_account_currency,
                     group_id,
@@ -3638,23 +3651,6 @@ async def create_client_group_optimized(
                     current_user,
                     mongo_client
                 )
-                # Fetch ALL Meta leads into database
-                await fetch_and_cache_facebook_leads_FIXED(
-                    request.ad_account_currency,
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    is_initial_load=True
-                )
-                await update_preset_lead_counts(
-                    group_id,
-                    current_user,
-                    mongo_client,
-                )
-
-
-
             # Fetch HP data (unchanged)
             # if request.ghl_location_id:
             #     await fetch_and_cache_hp_data(
