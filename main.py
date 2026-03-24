@@ -2721,6 +2721,7 @@ async def fetch_meta_data_for_group(
                     "id": ad.get("id"),
                     "name": ad.get("name"),
                     "campaign_id": campaign.get("id"),
+                    "adset_id": ad.get("adset_id"),
                     "status": ad.get("status", "").title(),
                     "spend": round(ad_spend, 2),
                     "impressions": ad_impressions,
@@ -4536,6 +4537,7 @@ async def _fetch_meta_campaigns_for_preset(
                             "id":            ad.get("id"),
                             "name":          ad.get("name"),
                             "campaign_id":   campaign.get("id"),
+                            "adset_id": ad.get("adset_id"),
                             "status":        ad.get("status", "").title(),
                             "spend":         round(ad_spend, 2),
                             "impressions":   ad_imp,
@@ -5213,6 +5215,8 @@ async def get_client_group_comprehensive(group_id: str, current_user: str = Depe
                                     insight = ad_insights[0]
                                     ads_list.append({
                                         "id": ad.get("id"),
+                                        "campaign_id": campaign.get("id"),
+                                        "adset_id": ad.get("adset_id"),
                                         "name": ad.get("name"),
                                         "status": ad.get("status", "").title(),
                                         "spend": round(float(insight.get("spend", 0) or 0), 2),
@@ -7352,3 +7356,64 @@ async def backfill_lead_counts(current_user: str = Depends(get_current_user)):
                 results.append({"group": group["name"], "status": f"error: {e}"})
 
         return {"backfilled": len(results), "results": results}
+
+@app.post("/api/admin/backfill-ad-adset-ids")
+async def backfill_ad_adset_ids(current_user: str = Depends(get_current_user)):
+    """
+    One-time backfill: re-fetches all Meta preset cache for every client group
+    belonging to the current user, so that every ad object gets adset_id populated.
+    Runs fetch_meta_all_presets_for_group per group — same function used by the
+    normal refresh, but now with the adset_id fix in place.
+    """
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+        client_groups_collection = db["client_groups"]
+
+        groups = await client_groups_collection.find(
+            {
+                "user_id": current_user,
+                "meta_ad_account_id": {"$exists": True, "$ne": None}
+            }
+        ).to_list(None)
+
+        if not groups:
+            return {"status": "nothing_to_do", "message": "No groups with Meta ad accounts found."}
+
+        token = await get_facebook_token(current_user, mongo_client)
+        if not token or not token.get("access_token"):
+            raise HTTPException(status_code=401, detail="No valid Facebook token found.")
+
+        results = []
+        for group in groups:
+            group_id          = group["id"]
+            group_name        = group.get("name", "Unknown")
+            meta_ad_account_id = group["meta_ad_account_id"]
+            ad_account_currency = group.get("ad_account_currency")
+
+            try:
+                await fetch_meta_all_presets_for_group(
+                    group_id,
+                    meta_ad_account_id,
+                    current_user,
+                    mongo_client,
+                    ad_account_currency
+                )
+                results.append({"group": group_name, "status": "ok"})
+                logger.info(f"✅ Backfilled adset_ids for group '{group_name}'")
+            except Exception as e:
+                results.append({"group": group_name, "status": "error", "detail": str(e)})
+                logger.error(f"❌ Backfill failed for group '{group_name}': {e}")
+
+            # Respect rate limits between groups
+            await asyncio.sleep(5)
+
+        ok_count  = sum(1 for r in results if r["status"] == "ok")
+        err_count = sum(1 for r in results if r["status"] == "error")
+
+        return {
+            "status":    "complete",
+            "total":     len(groups),
+            "succeeded": ok_count,
+            "failed":    err_count,
+            "details":   results
+        }
