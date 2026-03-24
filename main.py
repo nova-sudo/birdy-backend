@@ -326,6 +326,12 @@ async def refresh_meta_data_for_all_users():
                                 except Exception as e:
                                     logger.warning(f"  ⚠️ Some duplicate leads: {str(e)}")
 
+                            await update_preset_lead_counts(
+                                group_id,
+                                user_id,
+                                mongo_client,
+                            )
+
                             logger.info(
                                 f"  ✅ Refreshed '{group_name}': all presets + "
                                 f"{campaign_count} campaign rows, {adset_count} adset rows, "
@@ -3389,6 +3395,7 @@ async def get_client_groups(
                         "ad_account_id": facebook_cache.get("ad_account_id", group.get("meta_ad_account_id", "")),
                         "name":          facebook_cache.get("name", ""),
                         "currency":      facebook_cache.get("currency", ""),
+                        "total_leads":   facebook_cache.get("total_leads", 0),
                         "campaigns":     preset_doc.get("campaigns", []),
                         "adsets":        preset_doc.get("adsets", []),
                         "ads":           preset_doc.get("ads", []),
@@ -3458,6 +3465,41 @@ async def create_client_group_optimized(
 
             if not request.name:
                 raise HTTPException(status_code=400, detail="Client group name is required")
+
+            # ============================================
+            # DUPLICATE CHECK
+            # ============================================
+            duplicate_filter = {"user_id": current_user}
+
+            if request.ghl_location_id and request.meta_ad_account_id:
+                duplicate_filter["$and"] = [
+                    {"ghl_location_id": request.ghl_location_id},
+                    {"meta_ad_account_id": request.meta_ad_account_id},
+                ]
+            elif request.ghl_location_id:
+                duplicate_filter["ghl_location_id"] = request.ghl_location_id
+            elif request.meta_ad_account_id:
+                duplicate_filter["meta_ad_account_id"] = request.meta_ad_account_id
+            else:
+                # No integrations at all — nothing meaningful to deduplicate on
+                duplicate_filter = None
+
+            if duplicate_filter:
+                existing = await client_groups_collection.find_one(
+                    duplicate_filter,
+                    {"name": 1, "id": 1}
+                )
+                if existing:
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"A client group named \"{existing.get('name')}\" already uses "
+                            f"{'this GHL location' if request.ghl_location_id else ''}"
+                            f"{' and ' if request.ghl_location_id and request.meta_ad_account_id else ''}"
+                            f"{'this Meta ad account' if request.meta_ad_account_id else ''}. "
+                            f"Each integration can only be linked to one client group at a time."
+                        )
+                    )
 
             # ============================================
             # STEP 1: Generate GHL location token if provided
@@ -3604,6 +3646,11 @@ async def create_client_group_optimized(
                     current_user,
                     mongo_client,
                     is_initial_load=True
+                )
+                await update_preset_lead_counts(
+                    group_id,
+                    current_user,
+                    mongo_client,
                 )
 
 
@@ -4235,6 +4282,51 @@ async def fetch_and_cache_meta_data(
 
 # The full set of presets we want to cache. We use data_maximum
 # as the primary "all-time" bucket; the others are date windows.
+def _preset_date_bounds(preset_key: str):
+    """
+    Return (start_iso, end_iso) date strings for a given preset key.
+    Returns (None, None) for 'maximum' (all-time — no date filter).
+    Mirrors the inline _ghl_date_bounds logic in get_client_groups.
+    """
+    from datetime import date as _date, timedelta as _td
+    today = _date.today()
+    spec = GHL_PRESET_DATE_RANGE.get(preset_key)
+    if spec is None:
+        return None, None
+    if isinstance(spec, tuple):
+        start_days, end_days = spec
+        return (
+            (today - _td(days=start_days)).isoformat(),
+            (today - _td(days=end_days)).isoformat(),
+        )
+    if spec == "this_week_mon":
+        s = today - _td(days=today.weekday())
+        return s.isoformat(), today.isoformat()
+    if spec == "this_week_sun":
+        s = today - _td(days=(today.weekday() + 1) % 7)
+        return s.isoformat(), today.isoformat()
+    if spec == "this_month":
+        return today.replace(day=1).isoformat(), today.isoformat()
+    if spec == "last_month":
+        first_this = today.replace(day=1)
+        last_prev  = first_this - _td(days=1)
+        return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
+    if spec == "this_quarter":
+        qm = ((today.month - 1) // 3) * 3 + 1
+        return today.replace(month=qm, day=1).isoformat(), today.isoformat()
+    if spec == "last_quarter":
+        qm = ((today.month - 1) // 3) * 3 + 1
+        first_this_q = today.replace(month=qm, day=1)
+        last_prev_q  = first_this_q - _td(days=1)
+        pqm = ((last_prev_q.month - 1) // 3) * 3 + 1
+        return last_prev_q.replace(month=pqm, day=1).isoformat(), last_prev_q.isoformat()
+    if spec == "this_year":
+        return today.replace(month=1, day=1).isoformat(), today.isoformat()
+    if spec == "last_year":
+        return _date(today.year - 1, 1, 1).isoformat(), _date(today.year - 1, 12, 31).isoformat()
+    return None, None
+
+
 META_CACHE_PRESETS = [
     "maximum",              # all-time (the only valid all-history preset in nested field syntax)
     "today",
@@ -4630,6 +4722,82 @@ async def fetch_meta_all_presets_for_group(
         (acc for acc in facebook_ad_accounts if acc["id"] == meta_ad_account_id), {}
     )
 
+    # ── count leads per preset window from facebook_leads collection ─────────
+    # Meta's campaign `results` field is only populated when the campaign
+    # objective is "Leads". For traffic/clicks objective accounts the results
+    # array is empty, so we always use the actual lead form submissions stored
+    # in our database as the authoritative count — counted per date window so
+    # that CPL is correct for every preset (e.g. last_7d spend / last_7d leads).
+    leads_collection = db["facebook_leads"]
+
+    # Lifetime count (preset-agnostic) — stored at facebook_cache top level
+    total_leads_count = await leads_collection.count_documents({
+        "user_id": user_id,
+        "client_group_id": group_id,
+    })
+    logger.info(f"📊 Lifetime lead count for group {group_id}: {total_leads_count}")
+
+    # Count leads for each preset window in a single aggregation pass.
+    # IMPORTANT: Meta stores created_time as "2025-03-15T10:23:45+0000" (with
+    # timezone suffix). Plain string comparison against "2025-03-15T00:00:00"
+    # is unreliable, so we use $expr + $dateFromString to parse the stored
+    # string into a real date before comparing against ISODate boundaries.
+    facet_stages = {}
+    for preset_key in preset_data.keys():
+        start_iso, end_iso = _preset_date_bounds(preset_key)
+        if start_iso is None:
+            # all-time — no date filter needed
+            facet_stages[preset_key] = [{"$count": "n"}]
+        else:
+            # Convert the stored created_time string to a date for comparison
+            facet_stages[preset_key] = [
+                {"$match": {"$expr": {"$and": [
+                    {"$gte": [
+                        {"$dateFromString": {
+                            "dateString": "$lead_data.created_time",
+                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                            "onNull":  {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                        }},
+                        {"$dateFromString": {"dateString": f"{start_iso}T00:00:00Z"}},
+                    ]},
+                    {"$lte": [
+                        {"$dateFromString": {
+                            "dateString": "$lead_data.created_time",
+                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                            "onNull":  {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                        }},
+                        {"$dateFromString": {"dateString": f"{end_iso}T23:59:59Z"}},
+                    ]},
+                ]}}},
+                {"$count": "n"},
+            ]
+
+    if facet_stages:
+        base_match = {"user_id": user_id, "client_group_id": group_id}
+        pipeline = [{"$match": base_match}, {"$facet": facet_stages}]
+        facet_result = await leads_collection.aggregate(pipeline).to_list(1)
+        facet_doc = facet_result[0] if facet_result else {}
+    else:
+        facet_doc = {}
+
+    # ── patch every preset's metrics with its windowed lead count + CPL ──────
+    for preset_key, data in preset_data.items():
+        insights = data.get("metrics", {}).get("insights", {})
+        spend = insights.get("spend", 0) or 0
+
+        # Extract this preset's lead count from facet result
+        bucket = facet_doc.get(preset_key, [])
+        preset_leads = bucket[0]["n"] if bucket else 0
+
+        insights["total_leads"]    = preset_leads
+        insights["cost_per_result"] = (
+            round(spend / preset_leads, 2) if preset_leads > 0 else 0
+        )
+        logger.info(
+            f"  📊 Preset '{preset_key}': {preset_leads} leads, "
+            f"spend={spend}, CPL={insights['cost_per_result']}"
+        )
+
     # ── build the facebook_cache document ──────────────────────────────────
     # Top-level fields for backward compat + preset sub-documents
     facebook_cache_update = {
@@ -4637,6 +4805,7 @@ async def fetch_meta_all_presets_for_group(
         "facebook_cache.name":          account_info.get("name", "Unknown Ad Account"),
         "facebook_cache.currency":      user_currency,
         "facebook_cache.original_currency": ad_account_currency,
+        "facebook_cache.total_leads":   total_leads_count,
         "last_meta_refresh": datetime.utcnow(),
         "last_meta_refresh_mode": "full_presets",
     }
@@ -5514,11 +5683,6 @@ async def prefetch_marketing_data(
         except Exception as e:
             logger.error(f"Prefetch error: {str(e)}")
             return {"message": "Prefetch failed", "error": str(e), "prefetched": 0}
-
-
-# Updated GET /api/contacts/ghl-paginated endpoint
-
-# Updated GET /api/contacts/ghl-paginated endpoint
 
 @app.get("/api/contacts/ghl-paginated")
 async def get_ghl_contacts_paginated_v2(
@@ -7065,3 +7229,130 @@ async def mark_notifications_read(current_user: str = Depends(get_current_user))
             {"$set": {"read": True}}
         )
         return {"success": True}
+
+async def update_preset_lead_counts(
+    group_id: str,
+    user_id: str,
+    mongo_client,
+    presets: list | None = None,
+):
+    if presets is None:
+        presets = META_CACHE_PRESETS
+
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+    client_groups_collection = db["client_groups"]
+    leads_collection = db["facebook_leads"]
+
+    total_leads_count = await leads_collection.count_documents({
+        "user_id": user_id,
+        "client_group_id": group_id,
+    })
+
+    facet_stages = {}
+    for preset_key in presets:
+        start_iso, end_iso = _preset_date_bounds(preset_key)
+        if start_iso is None:
+            facet_stages[preset_key] = [{"$count": "n"}]
+        else:
+            facet_stages[preset_key] = [
+                {"$match": {"$expr": {"$and": [
+                    {"$gte": [
+                        {"$dateFromString": {
+                            "dateString": "$lead_data.created_time",
+                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                            "onNull":  {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                        }},
+                        {"$dateFromString": {"dateString": f"{start_iso}T00:00:00Z"}},
+                    ]},
+                    {"$lte": [
+                        {"$dateFromString": {
+                            "dateString": "$lead_data.created_time",
+                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                            "onNull":  {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
+                        }},
+                        {"$dateFromString": {"dateString": f"{end_iso}T23:59:59Z"}},
+                    ]},
+                ]}}},
+                {"$count": "n"},
+            ]
+
+    base_match = {"user_id": user_id, "client_group_id": group_id}
+    pipeline = [{"$match": base_match}, {"$facet": facet_stages}]
+    facet_result = await leads_collection.aggregate(pipeline).to_list(1)
+    facet_doc = facet_result[0] if facet_result else {}
+
+    # Fetch all current spend values in one DB read
+    group_doc = await client_groups_collection.find_one(
+        {"id": group_id},
+        {"facebook_cache": 1}
+    )
+    facebook_cache = (group_doc or {}).get("facebook_cache", {})
+
+    update_fields = {
+        "facebook_cache.total_leads": total_leads_count,
+        "updated_at": datetime.utcnow(),
+    }
+
+    for preset_key in presets:
+        bucket = facet_doc.get(preset_key, [])
+        preset_leads = bucket[0]["n"] if bucket else 0
+
+        spend = (
+            facebook_cache
+            .get(preset_key, {})
+            .get("metrics", {})
+            .get("insights", {})
+            .get("spend", 0) or 0
+        )
+
+        cpl = round(spend / preset_leads, 2) if preset_leads > 0 else 0
+
+        update_fields[f"facebook_cache.{preset_key}.metrics.insights.total_leads"] = preset_leads
+        update_fields[f"facebook_cache.{preset_key}.metrics.insights.cost_per_result"] = cpl
+
+        logger.info(f"  📊 Updated preset '{preset_key}': {preset_leads} leads, CPL={cpl}")
+
+    # ← ADD THESE: also patch the flat legacy path so get_client_groups reads correct values
+    maximum_leads = facet_doc.get("maximum", [{}])
+    maximum_leads_count = maximum_leads[0]["n"] if maximum_leads else total_leads_count
+    maximum_spend = (
+        facebook_cache.get("maximum", {}).get("metrics", {}).get("insights", {}).get("spend", 0) or 0
+    )
+    maximum_cpl = round(maximum_spend / maximum_leads_count, 2) if maximum_leads_count > 0 else 0
+
+    update_fields["facebook_cache.metrics.insights.total_leads"] = maximum_leads_count
+    update_fields["facebook_cache.metrics.insights.cost_per_result"] = maximum_cpl
+    update_fields["facebook_cache.metrics.insights.results"] = maximum_leads_count  # so results field also shows leads
+
+    await client_groups_collection.update_one(
+        {"id": group_id},
+        {"$set": update_fields}
+    )
+
+    logger.info(f"✅ Updated lead counts for {len(presets)} presets on group {group_id} (lifetime: {total_leads_count})")
+
+@app.post("/api/admin/backfill-lead-counts")
+async def backfill_lead_counts(current_user: str = Depends(get_current_user)):
+    """One-time backfill: recalculate lead counts and CPL for all presets."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+        client_groups_collection = db["client_groups"]
+
+        groups = await client_groups_collection.find({
+            "user_id": current_user,
+            "meta_ad_account_id": {"$exists": True, "$ne": None}
+        }).to_list(None)
+
+        results = []
+        for group in groups:
+            try:
+                await update_preset_lead_counts(
+                    group["id"],
+                    current_user,
+                    mongo_client,
+                )
+                results.append({"group": group["name"], "status": "ok"})
+            except Exception as e:
+                results.append({"group": group["name"], "status": f"error: {e}"})
+
+        return {"backfilled": len(results), "results": results}
