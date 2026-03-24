@@ -3618,6 +3618,7 @@ async def create_client_group_optimized(
                     mongo_client,
                     is_initial_load=True
                 )
+                await update_preset_lead_counts(group_id, current_user, mongo_client)
                 # Cool down 60s before the per-day granular calls to avoid
                 # hitting the same ad account's rate limit back-to-back.
                 # The 17 sequential preset calls above saturate the account;
