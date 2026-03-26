@@ -23,12 +23,7 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ── JWT config (mirrors main.py) ──────────────────────────────────────────────
-JWT_SECRET          = os.getenv("JWT_SECRET")
-JWT_ALGORITHM       = "HS256"
-JWT_EXPIRY_MINUTES  = 600
-JWT_REFRESH_SECRET  = os.getenv("JWT_REFRESH_SECRET", (JWT_SECRET or "") + "_refresh")
-JWT_REFRESH_EXPIRY_DAYS = 30
+from core.config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRY_MINUTES, JWT_REFRESH_SECRET, JWT_REFRESH_EXPIRY_DAYS
 
 
 @asynccontextmanager

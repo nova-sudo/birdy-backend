@@ -112,40 +112,24 @@ class CurrencyService:
             )
 
     @staticmethod
-    def convert_from_user_currency(amount: float, user_id: str, to_currency: str) -> float:
+    async def convert_from_user_currency(amount: float, user_id: str, to_currency: str) -> float:
         """
         Convert amount FROM user's default currency to target currency.
-
-        Args:
-            amount: Amount to convert
-            user_id: User email/ID to get default currency from
-            to_currency: Target currency code
-
-        Returns:
-            Converted amount
         """
-        from_currency = CurrencyService.get_user_currency(user_id)
+        from_currency = await CurrencyService.get_user_currency(user_id)
         converted_amount = CurrencyService.convert(amount, from_currency, to_currency)
         logger.debug(
-            f"💱 Currency Conversion: {amount} {from_currency} ➡️ "
+            f"Currency Conversion: {amount} {from_currency} -> "
             f"{converted_amount} {to_currency}"
         )
         return converted_amount
 
     @staticmethod
-    def convert_to_user_currency(amount: float, from_currency: str, user_id: str) -> float:
+    async def convert_to_user_currency(amount: float, from_currency: str, user_id: str) -> float:
         """
         Convert amount TO user's default currency.
-
-        Args:
-            amount: Amount to convert
-            from_currency: Source currency code
-            user_id: User email/ID to get default currency from
-
-        Returns:
-            Converted amount
         """
-        to_currency = CurrencyService.get_user_currency(user_id)
+        to_currency = await CurrencyService.get_user_currency(user_id)
         return CurrencyService.convert(amount, from_currency, to_currency)
 
     @staticmethod
