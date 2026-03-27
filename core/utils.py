@@ -78,15 +78,29 @@ def preset_date_bounds(preset_key: str):
 
 
 def get_result_value(insights_data, action_type="lead"):
-    """Safely extract numeric value from insights.results list by action_type."""
+    """Safely extract numeric value from insights results or actions by action_type.
+
+    Checks `results` first (populated when the campaign objective matches),
+    then falls back to `actions` (always contains all conversion events).
+    """
     if not insights_data or not isinstance(insights_data, list) or len(insights_data) == 0:
         return 0
     insight = insights_data[0]
-    results = insight.get("results") or []
-    for res in results:
+
+    # Check results first (objective-based)
+    for res in (insight.get("results") or []):
         if res.get("action_type") == action_type:
             try:
                 return int(res.get("value", "0"))
             except (ValueError, TypeError):
-                return 0
+                pass
+
+    # Fallback to actions array (always present)
+    for action in (insight.get("actions") or []):
+        if action.get("action_type") == action_type:
+            try:
+                return int(action.get("value", "0"))
+            except (ValueError, TypeError):
+                pass
+
     return 0

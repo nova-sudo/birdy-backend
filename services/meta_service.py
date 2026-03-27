@@ -115,7 +115,7 @@ async def fetch_meta_data_for_group(
                     response = await client.get(
                         f"https://graph.facebook.com/v23.0/{meta_ad_account_id}/campaigns",
                         params={
-                            "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,status,creative{title,body,image_url},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
+                            "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,creative{title,body,image_url},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
                             "access_token": token["access_token"],
                         },
                     )
@@ -568,7 +568,7 @@ async def _fetch_meta_campaigns_for_preset(
         "adsets{name,status,"
         f"insights.date_preset({date_preset})"
         "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr}},"
-        "ads{name,status,creative{title,body,image_url},"
+        "ads{name,adset_id,status,creative{title,body,image_url},"
         f"insights.date_preset({date_preset})"
         "{actions,results,reach,spend,impressions,cpm,inline_link_clicks,cpc,clicks}}"
     )
@@ -844,7 +844,7 @@ async def fetch_meta_all_presets_for_group(
                     meta_ad_account_id, access_token, preset
                 )
                 if result.get("_rate_limited"):
-                    wait = 10 * (2 ** attempt)
+                    wait = 30 * (2 ** attempt)
                     logger.warning(
                         f"  Rate limited on preset '{preset}', "
                         f"waiting {wait}s (attempt {attempt + 1}/3)"
@@ -873,8 +873,8 @@ async def fetch_meta_all_presets_for_group(
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))
 
-        # 1 second between every preset call to stay well under rate limits
-        await asyncio.sleep(1.0)
+        # 3 seconds between every preset call to stay under Meta rate limits
+        await asyncio.sleep(3.0)
 
     # -- get ad account meta info --
     facebook_ad_accounts_data = await get_facebook_data(user_id, "global", "adaccounts", mongo_client)

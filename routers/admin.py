@@ -144,20 +144,26 @@ async def backfill_lead_counts(current_user: str = Depends(get_current_user)):
         return {"backfilled": len(results), "results": results}
 
 
-@router.post("/api/admin/backfill-ad-adset-ids")
-async def backfill_ad_adset_ids(current_user: str = Depends(get_current_user)):
+@router.post("/api/admin/refresh-meta")
+async def refresh_meta_data(current_user: str = Depends(get_current_user)):
     """
-    One-time backfill: re-fetches all Meta preset cache for every client group
-    belonging to the current user, so that every ad object gets adset_id populated.
-    Runs fetch_meta_all_presets_for_group per group -- same function used by the
-    normal refresh, but now with the adset_id fix in place.
+    Force re-fetch all Meta data for every client group.
+    Clears the 5-minute account_data cache first, then re-fetches from Meta API
+    with the latest fields (adset_id on ads, actions in insights).
     """
-    # Import here to avoid circular imports -- this function lives in main.py
-    from main import fetch_meta_all_presets_for_group
+    from services.meta_service import fetch_meta_data_for_group, fetch_meta_all_presets_for_group
 
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
+        users_collection = db["users"]
         client_groups_collection = db["client_groups"]
+
+        # Clear the in-DB account_data cache so fetch_meta_data_for_group hits Meta fresh
+        await users_collection.update_one(
+            {"user_id": current_user},
+            {"$unset": {f"integrations.facebook.accounts": ""}}
+        )
+        logger.info(f"Cleared Meta account_data cache for user [{current_user}]")
 
         groups = await client_groups_collection.find(
             {
@@ -173,37 +179,47 @@ async def backfill_ad_adset_ids(current_user: str = Depends(get_current_user)):
         if not token or not token.get("access_token"):
             raise HTTPException(status_code=401, detail="No valid Facebook token found.")
 
+        # Get ad accounts list for the fetch function
+        import httpx
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"https://graph.facebook.com/v23.0/me/adaccounts",
+                params={"fields": "id,name,currency,created_time", "access_token": token["access_token"]},
+            )
+            facebook_ad_accounts = resp.json().get("data", []) if resp.status_code == 200 else []
+
         results = []
         for group in groups:
-            group_id          = group["id"]
-            group_name        = group.get("name", "Unknown")
+            group_name = group.get("name", "Unknown")
             meta_ad_account_id = group["meta_ad_account_id"]
-            ad_account_currency = group.get("ad_account_currency")
 
             try:
-                await fetch_meta_all_presets_for_group(
-                    group_id,
-                    meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    ad_account_currency
+                # Re-fetch the base account_data (campaigns/adsets/ads with new fields)
+                result = await fetch_meta_data_for_group(
+                    meta_ad_account_id, current_user, mongo_client, facebook_ad_accounts
                 )
+
+                # Also refresh all preset caches
+                ad_account_currency = group.get("ad_account_currency")
+                await fetch_meta_all_presets_for_group(
+                    group["id"], meta_ad_account_id, current_user, mongo_client, ad_account_currency
+                )
+
                 results.append({"group": group_name, "status": "ok"})
-                logger.info(f"Backfilled adset_ids for group '{group_name}'")
+                logger.info(f"Refreshed Meta data for group '{group_name}'")
             except Exception as e:
                 results.append({"group": group_name, "status": "error", "detail": str(e)})
-                logger.error(f"Backfill failed for group '{group_name}': {e}")
+                logger.error(f"Refresh failed for group '{group_name}': {e}")
 
-            # Respect rate limits between groups
-            await asyncio.sleep(5)
+            await asyncio.sleep(2)
 
-        ok_count  = sum(1 for r in results if r["status"] == "ok")
+        ok_count = sum(1 for r in results if r["status"] == "ok")
         err_count = sum(1 for r in results if r["status"] == "error")
 
         return {
-            "status":    "complete",
-            "total":     len(groups),
+            "status": "complete",
+            "total": len(groups),
             "succeeded": ok_count,
-            "failed":    err_count,
-            "details":   results
+            "failed": err_count,
+            "details": results,
         }
