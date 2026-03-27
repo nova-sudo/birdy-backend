@@ -132,7 +132,7 @@ async def refresh_meta_data_for_all_users():
                     access_token = facebook_token["access_token"]
 
                     # Process each group's Meta account
-                    for group in groups:
+                    for group_index, group in enumerate(groups):
                         if not group.get("meta_ad_account_id"):
                             continue
 
@@ -272,6 +272,11 @@ async def refresh_meta_data_for_all_users():
                                 exc_info=True
                             )
                             failure_count += 1
+
+                        # Cooldown between groups to avoid rate limits on shared ad accounts
+                        if group_index < len(groups) - 1:
+                            logger.info("⏳ Cooling down 30s before next group...")
+                            await asyncio.sleep(30)
 
                     # ============================================
                     # 🔥 DELAY BETWEEN USERS

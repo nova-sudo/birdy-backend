@@ -598,8 +598,11 @@ async def _fetch_meta_campaigns_for_preset(
 
                 if resp.status_code != 200:
                     body = resp.text[:300]
-                    is_rate_limit = resp.status_code == 429 or (
-                        resp.status_code == 400 and '"code":17' in body
+                    is_rate_limit = (
+                        resp.status_code == 429
+                        or (resp.status_code == 400 and '"code":17' in body)
+                        or (resp.status_code == 403 and '"code":4' in body)
+                        or "Application request limit reached" in body
                     )
                     logger.warning(
                         f"Meta API {resp.status_code} for preset={date_preset} "
@@ -873,8 +876,8 @@ async def fetch_meta_all_presets_for_group(
                 if attempt < 2:
                     await asyncio.sleep(5 * (attempt + 1))
 
-        # 3 seconds between every preset call to stay under Meta rate limits
-        await asyncio.sleep(3.0)
+        # 5 seconds between every preset call to stay under Meta rate limits
+        await asyncio.sleep(5.0)
 
     # -- get ad account meta info --
     facebook_ad_accounts_data = await get_facebook_data(user_id, "global", "adaccounts", mongo_client)
