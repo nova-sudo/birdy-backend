@@ -1465,9 +1465,32 @@ async def get_ghl_contacts_paginated_v2(
                 if date_filter:
                     query["contact_data.dateAdded"] = date_filter
 
-            # Get total count
+            # Get total count + aggregate opportunity stats across ALL matching contacts
             total_contacts = await contacts_collection.count_documents(query)
             logger.info(f"Total contacts found: {total_contacts} for user [{current_user}]")
+
+            # Aggregate opportunity stats (runs on the full query, not paginated)
+            stats_pipeline = [
+                {"$match": query},
+                {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
+                {"$group": {
+                    "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
+                    "count": {"$sum": 1},
+                    "total_value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
+                }},
+            ]
+            stats_cursor = contacts_collection.aggregate(stats_pipeline)
+            stats_docs = await stats_cursor.to_list(length=20)
+
+            opportunity_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0}
+            total_value = 0
+            for doc in stats_docs:
+                status = doc["_id"]
+                if status in opportunity_stats:
+                    opportunity_stats[status] = doc["count"]
+                total_value += doc.get("total_value", 0)
+
+            total_opportunities = sum(opportunity_stats.values())
 
             if total_contacts == 0:
                 return {
@@ -1479,6 +1502,15 @@ async def get_ghl_contacts_paginated_v2(
                         "per_page": limit,
                         "has_next": False,
                         "has_prev": False,
+                        "stats": {
+                            "total_opportunities": 0,
+                            "won": 0,
+                            "lost": 0,
+                            "open": 0,
+                            "abandoned": 0,
+                            "conversion_rate": 0,
+                            "total_value": 0,
+                        },
                     },
                     "message": "No contacts found",
                 }
@@ -1650,6 +1682,15 @@ async def get_ghl_contacts_paginated_v2(
                     "start_date": start_date,
                     "end_date": end_date,
                     "display_currency": user_currency,
+                    "stats": {
+                        "total_opportunities": total_opportunities,
+                        "won": opportunity_stats["won"],
+                        "lost": opportunity_stats["lost"],
+                        "open": opportunity_stats["open"],
+                        "abandoned": opportunity_stats["abandoned"],
+                        "conversion_rate": round((opportunity_stats["won"] / total_opportunities) * 100, 1) if total_opportunities > 0 else 0,
+                        "total_value": round(total_value, 2),
+                    },
                 },
                 "message": f"Retrieved {len(contacts)} contacts (newest first)"
                            + (f" from {start_date} to {end_date}" if (start_date or end_date) else ""),
