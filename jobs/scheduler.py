@@ -21,13 +21,13 @@ def start_background_jobs():
     from jobs.alert_jobs import evaluate_all_alerts
 
     # Token refresh: runs every 12 hours at :00 minutes
-    # scheduler.add_job(
-    #     refresh_tokens_for_all_users,
-    #     CronTrigger( minute='32'),
-    #     id='token_refresh',
-    #     replace_existing=True,
-    #     max_instances=1
-    # )
+    scheduler.add_job(
+        refresh_tokens_for_all_users,
+        CronTrigger( minute='55'),
+        id='token_refresh',
+        replace_existing=True,
+        max_instances=1
+    )
 
     scheduler.add_job(
         evaluate_all_alerts,

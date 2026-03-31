@@ -13,7 +13,7 @@ from datetime import date as _date, datetime, timedelta
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE
@@ -1709,3 +1709,147 @@ async def get_ghl_contacts_paginated_v2(
                 status_code=500,
                 detail=f"Failed to fetch contacts: {str(e)}",
             )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/client-groups/{group_id}/refresh/{integration}
+# ---------------------------------------------------------------------------
+
+@router.post("/api/client-groups/{group_id}/refresh/{integration}")
+async def refresh_integration_data(
+    group_id: str,
+    integration: str,
+    background_tasks: BackgroundTasks,
+    current_user: str = Depends(get_current_user),
+):
+    """Kick off a full invalidate + refresh for a single integration on a group."""
+    if integration not in ("meta", "ghl"):
+        raise HTTPException(status_code=400, detail="integration must be 'meta' or 'ghl'")
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        group = await db.client_groups.find_one({"id": group_id, "user_id": current_user})
+        if not group:
+            raise HTTPException(status_code=404, detail="Client group not found")
+
+        status_field = f"{integration}_refresh_status"
+        await db.client_groups.update_one(
+            {"id": group_id},
+            {"$set": {status_field: "running"}},
+        )
+
+    background_tasks.add_task(_run_refresh, group_id, integration, current_user, group)
+    return {"status": "started", "integration": integration}
+
+
+async def _run_refresh(group_id: str, integration: str, user_id: str, group: dict):
+    """Background task: full invalidate + refresh for one integration."""
+    status_field = f"{integration}_refresh_status"
+    refresh_field = f"last_{integration}_refresh"
+
+    try:
+        async with get_mongo_client() as mongo_client:
+            db = mongo_client[DB_NAME]
+
+            if integration == "meta":
+                ad_account_id = group.get("meta_ad_account_id")
+                currency = group.get("ad_account_currency")
+                if not ad_account_id:
+                    logger.warning(f"No Meta ad account for group {group_id}")
+                    await db.client_groups.update_one(
+                        {"id": group_id}, {"$set": {status_field: "error"}}
+                    )
+                    return
+
+                # 1. Clear cached facebook data
+                await db.client_groups.update_one(
+                    {"id": group_id}, {"$set": {"facebook_cache": {}}}
+                )
+
+                # 2. Re-fetch all presets
+                await fetch_meta_all_presets_for_group(
+                    group_id=group_id,
+                    meta_ad_account_id=ad_account_id,
+                    user_id=user_id,
+                    mongo_client=mongo_client,
+                    ad_account_currency=currency,
+                )
+
+                # 3. Re-fetch all leads
+                await fetch_and_cache_facebook_leads_FIXED(
+                    ad_account_currency=currency,
+                    group_id=group_id,
+                    meta_ad_account_id=ad_account_id,
+                    user_id=user_id,
+                    mongo_client=mongo_client,
+                    is_initial_load=True,
+                )
+
+                # 4. Recalculate lead counts per preset
+                await update_preset_lead_counts(
+                    group_id=group_id,
+                    user_id=user_id,
+                    mongo_client=mongo_client,
+                )
+
+            elif integration == "ghl":
+                location_id = group.get("ghl_location_id")
+                if not location_id:
+                    logger.warning(f"No GHL location for group {group_id}")
+                    await db.client_groups.update_one(
+                        {"id": group_id}, {"$set": {status_field: "error"}}
+                    )
+                    return
+
+                await fetch_and_cache_ghl_data_optimized(
+                    group_id=group_id,
+                    ghl_location_id=location_id,
+                    user_id=user_id,
+                    mongo_client=mongo_client,
+                    is_initial_load=True,
+                )
+
+            # Mark complete
+            await db.client_groups.update_one(
+                {"id": group_id},
+                {"$set": {
+                    status_field: "complete",
+                    refresh_field: datetime.utcnow(),
+                }},
+            )
+            logger.info(f"Refresh complete: {integration} for group {group_id}")
+
+    except Exception as e:
+        logger.error(f"Refresh failed: {integration} for group {group_id}: {e}", exc_info=True)
+        try:
+            async with get_mongo_client() as mc:
+                await mc[DB_NAME].client_groups.update_one(
+                    {"id": group_id}, {"$set": {status_field: "error"}}
+                )
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# GET /api/client-groups/{group_id}/refresh-status
+# ---------------------------------------------------------------------------
+
+@router.get("/api/client-groups/{group_id}/refresh-status")
+async def get_refresh_status(
+    group_id: str,
+    current_user: str = Depends(get_current_user),
+):
+    """Poll the refresh status for a group's integrations."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        group = await db.client_groups.find_one(
+            {"id": group_id, "user_id": current_user},
+            {"meta_refresh_status": 1, "ghl_refresh_status": 1, "_id": 0},
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Client group not found")
+
+        return {
+            "meta_refresh_status": group.get("meta_refresh_status", "idle"),
+            "ghl_refresh_status": group.get("ghl_refresh_status", "idle"),
+        }
