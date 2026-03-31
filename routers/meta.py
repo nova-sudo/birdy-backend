@@ -685,3 +685,96 @@ async def get_facebook_leads_filtered(
         except Exception as e:
             logger.error(f"Error fetching filtered leads: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
+# POST /api/facebook/update-status
+# ---------------------------------------------------------------------------
+
+from pydantic import BaseModel
+
+class StatusUpdateRequest(BaseModel):
+    object_id: str
+    object_type: str  # "campaign", "adset", "ad"
+    status: str       # "ACTIVE", "PAUSED"
+
+@router.post("/api/facebook/update-status")
+async def update_facebook_object_status(
+    body: StatusUpdateRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Toggle a campaign, ad set, or ad between ACTIVE and PAUSED via Meta Graph API."""
+    if body.object_type not in ("campaign", "adset", "ad"):
+        raise HTTPException(status_code=400, detail="object_type must be 'campaign', 'adset', or 'ad'")
+    if body.status not in ("ACTIVE", "PAUSED"):
+        raise HTTPException(status_code=400, detail="status must be 'ACTIVE' or 'PAUSED'")
+
+    async with get_mongo_client() as mongo_client:
+        token_data = await get_facebook_token(current_user, mongo_client)
+        if not token_data or not token_data.get("access_token"):
+            raise HTTPException(status_code=401, detail="No valid Facebook token found")
+
+        access_token = token_data["access_token"]
+
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.post(
+                    f"https://graph.facebook.com/v23.0/{body.object_id}",
+                    data={
+                        "status": body.status,
+                        "access_token": access_token,
+                    },
+                )
+
+                if resp.status_code != 200:
+                    error_data = resp.json()
+                    error_msg = error_data.get("error", {}).get("message", "Unknown error")
+                    logger.error(f"Meta status update failed: {error_msg}")
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=f"Meta API error: {error_msg}",
+                    )
+
+                logger.info(
+                    f"Updated {body.object_type} {body.object_id} to {body.status} "
+                    f"for user {current_user}"
+                )
+
+                # Update cached status in MongoDB so it persists across reloads
+                db = mongo_client[DB_NAME]
+                new_status_lower = body.status.capitalize()  # "Active" or "Paused" — matches Meta's format
+                collection_key = {
+                    "campaign": "campaigns",
+                    "adset": "adsets",
+                    "ad": "ads",
+                }[body.object_type]
+
+                # Update each preset bucket individually (MongoDB can't do
+                # positional array filters across multiple array paths at once)
+                from core.constants import META_CACHE_PRESETS
+                paths = [f"facebook_cache.{p}.{collection_key}" for p in META_CACHE_PRESETS]
+                paths.append(f"facebook_cache.{collection_key}")  # backward-compat top-level
+
+                for path in paths:
+                    try:
+                        await db.client_groups.update_many(
+                            {"user_id": current_user, f"{path}.id": body.object_id},
+                            {"$set": {f"{path}.$.status": new_status_lower}},
+                        )
+                    except Exception:
+                        pass  # path may not exist for all groups/presets
+
+                logger.info(f"Updated cached status for {body.object_type} {body.object_id} in DB")
+
+                return {
+                    "success": True,
+                    "object_id": body.object_id,
+                    "object_type": body.object_type,
+                    "new_status": body.status,
+                }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating Meta status: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to update status: {str(e)}")
