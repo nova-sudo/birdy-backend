@@ -15,60 +15,50 @@ def start_background_jobs():
         logger.info("Scheduler already running, skipping initialization")
         return
 
+    from jobs.ghl_jobs import refresh_tokens_for_all_users, refresh_ghl_data_for_all_users
     from jobs.meta_jobs import refresh_meta_data_for_all_users
-    from jobs.ghl_jobs import refresh_ghl_data_for_all_users, refresh_tokens_for_all_users
-    from jobs.hp_jobs import refresh_hp_data_for_all_users
     from jobs.alert_jobs import evaluate_all_alerts
 
-    # Token refresh: runs every 12 hours at :00 minutes
+    # GHL token refresh: every 45 minutes (tokens expire in 1 hour)
     scheduler.add_job(
         refresh_tokens_for_all_users,
-        CronTrigger( minute='55'),
+        CronTrigger(minute='*/45'),
         id='token_refresh',
         replace_existing=True,
-        max_instances=1
+        max_instances=1,
     )
 
-    scheduler.add_job(
-        evaluate_all_alerts,
-        CronTrigger(minute="30"),
-        id="alert_evaluation",
-        replace_existing=True,
-        max_instances=1
-    )
-
-    # GHL data refresh: runs hourly at :05 (waits for token refresh to complete)
-    scheduler.add_job(
-        refresh_ghl_data_for_all_users,
-        CronTrigger(minute='00'),
-        id='ghl_refresh',
-        replace_existing=True,
-        max_instances=2
-
-    )
-    #
-    # # Meta data refresh: runs hourly at :25 (staggered)
+    # Meta data refresh: hourly at :10 (frequent presets every run, slow presets once daily)
     scheduler.add_job(
         refresh_meta_data_for_all_users,
         CronTrigger(minute='10'),
         id='meta_refresh',
         replace_existing=True,
-        max_instances=1
+        max_instances=1,
     )
 
-    # # HP data refresh: runs hourly at :45 (staggered)
-    # scheduler.add_job(
-    #     refresh_hp_data_for_all_users,
-    #     CronTrigger(minute='10'),
-    #     id='hp_refresh',
-    #     replace_existing=True,
-    #     max_instances=1
-    # )
+    # GHL contacts refresh: hourly at :30
+    scheduler.add_job(
+        refresh_ghl_data_for_all_users,
+        CronTrigger(minute='30'),
+        id='ghl_refresh',
+        replace_existing=True,
+        max_instances=1,
+    )
+
+    # Alert evaluation: hourly at :45
+    scheduler.add_job(
+        evaluate_all_alerts,
+        CronTrigger(minute='45'),
+        id='alert_evaluation',
+        replace_existing=True,
+        max_instances=1,
+    )
 
     scheduler.start()
-    logger.info("🚀 Background refresh jobs started with cron scheduling")
+    logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45)")
 
-
+ 
 def stop_background_jobs():
     """Gracefully stop all background jobs"""
     if scheduler.running:
