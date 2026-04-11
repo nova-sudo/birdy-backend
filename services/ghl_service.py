@@ -93,6 +93,7 @@ async def refresh_ghl_data_for_user(user_id: str):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         client_groups_collection = db["client_groups"]
+        contacts_collection = db["ghl_contacts"]
 
         groups = await client_groups_collection.find(
             {"user_id": user_id, "ghl_location_id": {"$exists": True, "$ne": None}}
@@ -124,12 +125,38 @@ async def refresh_ghl_data_for_user(user_id: str):
 
                 location_data = subaccount_tokens.get(location_id, {})
 
+                # Quick opportunity revenue aggregation
+                opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                             "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
+                try:
+                    opp_pipeline = [
+                        {"$match": {"user_id": user_id, "location_id": location_id}},
+                        {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
+                        {"$group": {
+                            "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
+                            "count": {"$sum": 1},
+                            "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
+                        }},
+                    ]
+                    opp_docs = await contacts_collection.aggregate(opp_pipeline).to_list(20)
+                    for doc in opp_docs:
+                        status = doc["_id"]
+                        opp_stats["total_opportunities"] += doc["count"]
+                        opp_stats["total_revenue"] += doc.get("value", 0)
+                        if status in opp_stats:
+                            opp_stats[status] = doc["count"]
+                        if status == "won":
+                            opp_stats["won_revenue"] = doc.get("value", 0)
+                except Exception:
+                    pass
+
                 cache_data = {
                     "location_id": location_id,
                     "name": location_data.get("name", "Unknown Location"),
                     "address": location_data.get("address"),
                     "metrics": {
-                        "total_contacts": contact_count
+                        "total_contacts": contact_count,
+                        "opportunity_stats": opp_stats,
                     }
                 }
 
@@ -522,6 +549,31 @@ async def fetch_and_cache_ghl_data_optimized(
         # Convert tag counter to sorted dict
         tag_metrics = dict(tag_counter.most_common())
 
+        # Aggregate opportunity revenue stats
+        opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                     "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
+        try:
+            opp_pipeline = [
+                {"$match": {"user_id": user_id, "location_id": ghl_location_id}},
+                {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
+                {"$group": {
+                    "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
+                    "count": {"$sum": 1},
+                    "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
+                }},
+            ]
+            opp_docs = await contacts_collection.aggregate(opp_pipeline).to_list(20)
+            for doc in opp_docs:
+                status = doc["_id"]
+                opp_stats["total_opportunities"] += doc["count"]
+                opp_stats["total_revenue"] += doc.get("value", 0)
+                if status in opp_stats:
+                    opp_stats[status] = doc["count"]
+                if status == "won":
+                    opp_stats["won_revenue"] = doc.get("value", 0)
+        except Exception as e:
+            logger.warning(f"Failed to aggregate opportunity stats for {ghl_location_id}: {e}")
+
         # Update cache
         cache_data = {
             "location_id": ghl_location_id,
@@ -529,7 +581,8 @@ async def fetch_and_cache_ghl_data_optimized(
             "address": location_address,
             "metrics": {
                 "total_contacts": total_contacts_in_db,
-                "tag_breakdown": tag_metrics
+                "tag_breakdown": tag_metrics,
+                "opportunity_stats": opp_stats,
             }
         }
 

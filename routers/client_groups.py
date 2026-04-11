@@ -152,33 +152,95 @@ async def get_client_groups(
             ghl_windowed: dict = {}
             if not is_all_time:
                 contacts_col = db["ghl_contacts"]
+                # Two-stage aggregation: count contacts, then unwind tags in Mongo
+                ghl_date_match = {
+                    "user_id": current_user,
+                    "contact_data.dateAdded": {
+                        "$gte": f"{ghl_start}T00:00:00.000Z",
+                        "$lte": f"{ghl_end}T23:59:59.999Z",
+                    },
+                }
                 pipeline = [
-                    {"$match": {
-                        "user_id": current_user,
-                        "contact_data.dateAdded": {
-                            "$gte": f"{ghl_start}T00:00:00.000Z",
-                            "$lte": f"{ghl_end}T23:59:59.999Z",
-                        },
-                    }},
-                    {"$group": {
-                        "_id": "$client_group_id",
-                        "new_contacts": {"$sum": 1},
-                        "all_tags": {"$push": "$contact_data.tags"},
+                    {"$match": ghl_date_match},
+                    {"$facet": {
+                        "counts": [
+                            {"$group": {
+                                "_id": "$client_group_id",
+                                "new_contacts": {"$sum": 1},
+                            }},
+                        ],
+                        "tags": [
+                            {"$unwind": {"path": "$contact_data.tags", "preserveNullAndEmptyArrays": False}},
+                            {"$group": {
+                                "_id": {"group": "$client_group_id", "tag": "$contact_data.tags"},
+                                "count": {"$sum": 1},
+                            }},
+                            {"$sort": {"count": -1}},
+                            {"$group": {
+                                "_id": "$_id.group",
+                                "tags": {"$push": {"tag": "$_id.tag", "count": "$count"}},
+                            }},
+                        ],
+                        "opportunities": [
+                            {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
+                            {"$group": {
+                                "_id": {"group": "$client_group_id", "status": {"$ifNull": ["$contact_data.opportunities.status", "open"]}},
+                                "count": {"$sum": 1},
+                                "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
+                            }},
+                        ],
                     }},
                 ]
-                for row in await contacts_col.aggregate(pipeline).to_list(None):
-                    tag_counter: Counter = Counter()
-                    for tag_list in row.get("all_tags", []):
-                        if isinstance(tag_list, list):
-                            for t in tag_list:
-                                if t:
-                                    tag_counter[t] += 1
-                    ghl_windowed[row["_id"]] = {
-                        "new_contacts": row["new_contacts"],
-                        "tag_breakdown": dict(tag_counter.most_common()),
-                    }
+                facet_result = await contacts_col.aggregate(pipeline).to_list(1)
+                if facet_result:
+                    facet = facet_result[0]
+                    # Build counts map
+                    for row in facet.get("counts", []):
+                        ghl_windowed[row["_id"]] = {
+                            "new_contacts": row["new_contacts"],
+                            "tag_breakdown": {},
+                        }
+                    # Merge tags
+                    for row in facet.get("tags", []):
+                        group_id = row["_id"]
+                        if group_id not in ghl_windowed:
+                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}, "opportunity_stats": {}}
+                        ghl_windowed[group_id]["tag_breakdown"] = {
+                            t["tag"]: t["count"] for t in row.get("tags", [])
+                        }
+                    # Merge opportunity stats
+                    for row in facet.get("opportunities", []):
+                        group_id = row["_id"]["group"]
+                        status = row["_id"]["status"]
+                        if group_id not in ghl_windowed:
+                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}, "opportunity_stats": {}}
+                        if "opportunity_stats" not in ghl_windowed[group_id]:
+                            ghl_windowed[group_id]["opportunity_stats"] = {
+                                "won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                                "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0,
+                            }
+                        opp = ghl_windowed[group_id]["opportunity_stats"]
+                        opp["total_opportunities"] += row["count"]
+                        opp["total_revenue"] += row.get("value", 0)
+                        if status in ("won", "lost", "open", "abandoned"):
+                            opp[status] += row["count"]
+                        if status == "won":
+                            opp["won_revenue"] += row.get("value", 0)
 
             # -- Fetch groups from DB --
+            # Only project the specific preset bucket requested, not all 13
+            fb_projection = {
+                f"facebook_cache.{resolved_preset}": 1,
+                "facebook_cache.ad_account_id": 1,
+                "facebook_cache.name": 1,
+                "facebook_cache.currency": 1,
+                "facebook_cache.original_currency": 1,
+                "facebook_cache.total_leads": 1,
+                "facebook_cache.metrics": 1,
+                "facebook_cache.campaigns": 1,
+                "facebook_cache.adsets": 1,
+                "facebook_cache.ads": 1,
+            }
             client_groups = await client_groups_collection.find(
                 {"user_id": current_user},
                 {
@@ -187,10 +249,11 @@ async def get_client_groups(
                     "ad_account_currency": 1, "notes": 1,
                     "created_at": 1, "updated_at": 1,
                     "gohighlevel_cache": 1,
-                    "facebook_cache": 1,
+                    **fb_projection,
                     "hotprospector_cache": 1,
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
                     "status": 1,
+                    "meta_token_error": 1,
                 },
             ).to_list(None)
 
@@ -217,13 +280,16 @@ async def get_client_groups(
                     group_data["gohighlevel"] = ghl_cache
                 else:
                     windowed = ghl_windowed.get(gid, {})
+                    cached_metrics = ghl_cache.get("metrics") or {}
+                    windowed_opp = windowed.get("opportunity_stats", cached_metrics.get("opportunity_stats", {}))
                     group_data["gohighlevel"] = {
                         **ghl_cache,
                         "metrics": {
-                            **(ghl_cache.get("metrics") or {}),
+                            **cached_metrics,
                             "total_contacts": windowed.get("new_contacts", 0),
                             "tag_breakdown": windowed.get("tag_breakdown", {}),
-                            "lifetime_total_contacts": (ghl_cache.get("metrics") or {}).get("total_contacts", 0),
+                            "opportunity_stats": windowed_opp,
+                            "lifetime_total_contacts": cached_metrics.get("total_contacts", 0),
                         },
                     }
 
@@ -424,60 +490,21 @@ async def create_client_group_optimized(
                     is_initial_load=True,
                 )
 
-            # Fetch Meta data -- ALL presets in one pass
+            # Fetch Meta data via resilient refresh manager
             if request.meta_ad_account_id:
                 if not request.ad_account_currency:
                     raise HTTPException(
                         status_code=400,
                         detail="ad_account_currency is required when meta_ad_account_id is provided",
                     )
-                await fetch_meta_all_presets_for_group(
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    request.ad_account_currency,
-                )
-                # Fetch ALL Meta leads into database
-                await fetch_and_cache_facebook_leads_FIXED(
-                    request.ad_account_currency,
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    is_initial_load=True,
-                )
-                await update_preset_lead_counts(group_id, current_user, mongo_client)
-                # Cool down 60s before the per-day granular calls
-                logger.info("Cooling down 60s before granular insight fetch...")
-                await asyncio.sleep(60)
-                await fetch_and_cache_campaign_insights(
-                    request.ad_account_currency,
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    is_initial_load=True,
-                )
-                logger.info("Cooling down 60s before granular insight fetch...")
-                await asyncio.sleep(60)
-                await fetch_and_cache_adset_insights(
-                    request.ad_account_currency,
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                    is_initial_load=True,
-                )
-                logger.info("Cooling down 60s before granular insight fetch...")
-                await asyncio.sleep(60)
-                await fetch_and_cache_ad_insights(
-                    request.ad_account_currency,
-                    group_id,
-                    request.meta_ad_account_id,
-                    current_user,
-                    mongo_client,
-                )
+                from services.meta_refresh_manager import start_refresh
+
+                group_for_refresh = {
+                    "meta_ad_account_id": request.meta_ad_account_id,
+                    "ad_account_currency": request.ad_account_currency,
+                    "name": request.name,
+                }
+                await start_refresh(group_id, current_user, group_for_refresh, mongo_client)
 
             # STEP 4: Mark as complete
             await client_groups_collection.update_one(
@@ -1752,8 +1779,9 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
             db = mongo_client[DB_NAME]
 
             if integration == "meta":
+                from services.meta_refresh_manager import start_refresh
+
                 ad_account_id = group.get("meta_ad_account_id")
-                currency = group.get("ad_account_currency")
                 if not ad_account_id:
                     logger.warning(f"No Meta ad account for group {group_id}")
                     await db.client_groups.update_one(
@@ -1761,36 +1789,9 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
                     )
                     return
 
-                # 1. Clear cached facebook data
-                await db.client_groups.update_one(
-                    {"id": group_id}, {"$set": {"facebook_cache": {}}}
-                )
-
-                # 2. Re-fetch all presets
-                await fetch_meta_all_presets_for_group(
-                    group_id=group_id,
-                    meta_ad_account_id=ad_account_id,
-                    user_id=user_id,
-                    mongo_client=mongo_client,
-                    ad_account_currency=currency,
-                )
-
-                # 3. Re-fetch all leads
-                await fetch_and_cache_facebook_leads_FIXED(
-                    ad_account_currency=currency,
-                    group_id=group_id,
-                    meta_ad_account_id=ad_account_id,
-                    user_id=user_id,
-                    mongo_client=mongo_client,
-                    is_initial_load=True,
-                )
-
-                # 4. Recalculate lead counts per preset
-                await update_preset_lead_counts(
-                    group_id=group_id,
-                    user_id=user_id,
-                    mongo_client=mongo_client,
-                )
+                # Delegate to the resilient refresh manager
+                await start_refresh(group_id, user_id, group, mongo_client)
+                return  # manager handles status updates
 
             elif integration == "ghl":
                 location_id = group.get("ghl_location_id")
@@ -1821,10 +1822,15 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
 
     except Exception as e:
         logger.error(f"Refresh failed: {integration} for group {group_id}: {e}", exc_info=True)
+        error_msg = str(e)[:300]
         try:
             async with get_mongo_client() as mc:
                 await mc[DB_NAME].client_groups.update_one(
-                    {"id": group_id}, {"$set": {status_field: "error"}}
+                    {"id": group_id},
+                    {"$set": {
+                        status_field: "error",
+                        f"{integration}_refresh_error": error_msg,
+                    }},
                 )
         except Exception:
             pass
@@ -1844,12 +1850,51 @@ async def get_refresh_status(
         db = mongo_client[DB_NAME]
         group = await db.client_groups.find_one(
             {"id": group_id, "user_id": current_user},
-            {"meta_refresh_status": 1, "ghl_refresh_status": 1, "_id": 0},
+            {
+                "meta_refresh_status": 1, "ghl_refresh_status": 1,
+                "meta_refresh_error": 1, "ghl_refresh_error": 1,
+                "meta_token_error": 1, "_id": 0,
+            },
         )
         if not group:
             raise HTTPException(status_code=404, detail="Client group not found")
 
+        # Get granular Meta refresh progress from job tracker
+        from services.meta_refresh_manager import get_refresh_progress
+        meta_progress = await get_refresh_progress(group_id, mongo_client)
+
         return {
             "meta_refresh_status": group.get("meta_refresh_status", "idle"),
             "ghl_refresh_status": group.get("ghl_refresh_status", "idle"),
+            "meta_refresh_error": group.get("meta_refresh_error"),
+            "ghl_refresh_error": group.get("ghl_refresh_error"),
+            "meta_token_error": group.get("meta_token_error", False),
+            "meta_refresh_progress": meta_progress,
         }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/client-groups/refresh-all          — start the cycle
+# DELETE /api/client-groups/refresh-all        — stop it
+# GET  /api/client-groups/refresh-all/status   — poll progress
+# ---------------------------------------------------------------------------
+
+@router.post("/api/client-groups/refresh-all")
+async def start_refresh_all(current_user: str = Depends(get_current_user)):
+    """Start a staggered refresh cycle: one group every 15 min."""
+    from jobs.refresh_all_job import start_cycle
+    return start_cycle()
+
+
+@router.delete("/api/client-groups/refresh-all")
+async def stop_refresh_all(current_user: str = Depends(get_current_user)):
+    """Cancel a running refresh cycle."""
+    from jobs.refresh_all_job import stop_cycle
+    return stop_cycle()
+
+
+@router.get("/api/client-groups/refresh-all/status")
+async def refresh_all_status(current_user: str = Depends(get_current_user)):
+    """Get progress of the current refresh cycle."""
+    from jobs.refresh_all_job import get_cycle_status
+    return get_cycle_status()
