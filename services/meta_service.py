@@ -218,6 +218,7 @@ async def fetch_meta_data_for_group(
                 adset_impressions = 0
                 adset_clicks = 0
                 adset_reach = 0
+                adset_results = 0
 
                 if adset_insights:
                     insight = adset_insights[0]
@@ -226,6 +227,7 @@ async def fetch_meta_data_for_group(
                         adset_impressions = int(insight.get("impressions", 0) or 0)
                         adset_clicks = int(insight.get("clicks", 0) or 0)
                         adset_reach = int(insight.get("reach", 0) or 0)
+                        adset_results = get_result_value(adset_insights, "lead")
                     except (ValueError, TypeError):
                         pass
 
@@ -238,6 +240,7 @@ async def fetch_meta_data_for_group(
                     "impressions": adset_impressions,
                     "clicks": adset_clicks,
                     "reach": adset_reach,
+                    "results": adset_results,
                     "cpm": round((adset_spend / adset_impressions * 1000), 2) if adset_impressions > 0 else 0,
                     "cpc": round((adset_spend / adset_clicks), 2) if adset_clicks > 0 else 0,
                     "ctr": round((adset_clicks / adset_impressions * 100), 2) if adset_impressions > 0 else 0,
@@ -259,7 +262,7 @@ async def fetch_meta_data_for_group(
                         ad_impressions = int(insight.get("impressions", 0) or 0)
                         ad_clicks = int(insight.get("clicks", 0) or 0)
                         ad_reach = int(insight.get("reach", 0) or 0)
-                        ad_results = int(insight.get("results", 0) or 0)
+                        ad_results = get_result_value(ad_insights, "lead")
                     except (ValueError, TypeError):
                         pass
 
@@ -598,6 +601,25 @@ async def _fetch_meta_campaigns_for_preset(
 
                 if resp.status_code != 200:
                     body = resp.text[:300]
+
+                    # Token or permission error — no point retrying or continuing
+                    is_auth_error = (
+                        # Code 190: invalid/expired token
+                        (resp.status_code == 400
+                         and ('"code":190' in body or "not a confirmed user" in body
+                              or "not allowed" in body))
+                        # Code 200: missing ads_read/ads_management permission
+                        or (resp.status_code == 403
+                            and ('"code":200' in body or "ads_management" in body
+                                 or "ads_read" in body))
+                    )
+                    if is_auth_error:
+                        logger.error(
+                            f"Meta API auth/permission error for preset={date_preset} "
+                            f"account={ad_account_id}: {body}"
+                        )
+                        raise Exception(f"Facebook auth/permission error for account {ad_account_id}: {body[:200]}")
+
                     is_rate_limit = (
                         resp.status_code == 429
                         or (resp.status_code == 400 and '"code":17' in body)
@@ -664,7 +686,7 @@ async def _fetch_meta_campaigns_for_preset(
 
                     for adset in campaign.get("adsets", {}).get("data", []):
                         a_ins = adset.get("insights", {}).get("data", [])
-                        a_spend = a_imp = a_clicks = a_reach = 0
+                        a_spend = a_imp = a_clicks = a_reach = a_results = 0
                         if a_ins:
                             ins = a_ins[0]
                             try:
@@ -672,6 +694,7 @@ async def _fetch_meta_campaigns_for_preset(
                                 a_imp = int(ins.get("impressions", 0) or 0)
                                 a_clicks = int(ins.get("clicks", 0) or 0)
                                 a_reach = int(ins.get("reach", 0) or 0)
+                                a_results = get_result_value(a_ins, "lead")
                             except (ValueError, TypeError):
                                 pass
                         adsets_list.append({
@@ -683,6 +706,7 @@ async def _fetch_meta_campaigns_for_preset(
                             "impressions": a_imp,
                             "clicks": a_clicks,
                             "reach": a_reach,
+                            "results": a_results,
                             "cpm": round(a_spend / a_imp * 1000, 2) if a_imp > 0 else 0,
                             "cpc": round(a_spend / a_clicks, 2) if a_clicks > 0 else 0,
                             "ctr": round(a_clicks / a_imp * 100, 2) if a_imp > 0 else 0,
@@ -698,7 +722,7 @@ async def _fetch_meta_campaigns_for_preset(
                                 ad_imp = int(ins.get("impressions", 0) or 0)
                                 ad_clicks = int(ins.get("clicks", 0) or 0)
                                 ad_reach = int(ins.get("reach", 0) or 0)
-                                ad_results = int(ins.get("results", 0) or 0)
+                                ad_results = get_result_value(ad_ins, "lead")
                             except (ValueError, TypeError):
                                 pass
                         creative = ad.get("creative", {})
@@ -957,7 +981,7 @@ async def fetch_meta_all_presets_for_group(
         "facebook_cache.original_currency": ad_account_currency,
         "facebook_cache.total_leads": total_leads_count,
         "last_meta_refresh": datetime.utcnow(),
-        "last_meta_refresh_mode": "full_presets",
+        "last_meta_refresh_mode": "full_presets" if len(preset_data) >= 10 else "frequent_only",
     }
 
     for preset_key, data in preset_data.items():
