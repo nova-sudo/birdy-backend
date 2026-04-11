@@ -72,10 +72,12 @@ async def create_alert(request: CreateAlertRequest, current_user: str = Depends(
             "user_id": current_user,
             "name": request.name,
             "description": request.description or "",
+            "type": request.type or "warning",
             "condition": request.condition.model_dump(),
             "target_group_ids": request.target_group_ids or [],
             "target_group_names": group_names,
             "notification_channels": request.notification_channels or ["in_app"],
+            "frequency": request.frequency or "daily",
             "status": "active",   # active | paused | triggered
             "last_triggered_at": None,
             "last_evaluated_at": None,
@@ -87,6 +89,25 @@ async def create_alert(request: CreateAlertRequest, current_user: str = Depends(
 
         await db["alerts"].insert_one(alert_doc)
         logger.info(f"Created alert {alert_id} for user {current_user}")
+
+        # Auto-evaluate immediately so the user sees a value right away
+        try:
+            eval_result = await evaluate_alert(alert_doc, mongo_client)
+            update = {
+                "last_evaluated_at": datetime.utcnow(),
+                "last_eval_result":  eval_result,
+                "current_value":     eval_result.get("current_value", 0.0),
+                "progress_pct":      eval_result.get("progress_pct", 0.0),
+                "updated_at":        datetime.utcnow(),
+            }
+            if eval_result.get("triggered"):
+                update["status"] = "triggered"
+                update["last_triggered_at"] = datetime.utcnow()
+            await db["alerts"].update_one({"id": alert_id}, {"$set": update})
+            alert_doc.update(update)
+            logger.info(f"Auto-evaluated alert {alert_id}: {eval_result.get('message', '')}")
+        except Exception as e:
+            logger.warning(f"Auto-evaluation failed for {alert_id}: {e}")
 
         return {"success": True, "alert": mongo_to_dict(alert_doc), "message": "Alert created successfully"}
 
@@ -125,6 +146,10 @@ async def update_alert(
                 update_fields["target_group_names"] = []
         if request.notification_channels is not None:
             update_fields["notification_channels"] = request.notification_channels
+        if request.type is not None:
+            update_fields["type"] = request.type
+        if request.frequency is not None:
+            update_fields["frequency"] = request.frequency
         if request.status is not None:
             update_fields["status"] = request.status
 
