@@ -26,7 +26,7 @@ from integrations.facebook_utils.facebook_adsets import create_adset_insights_in
 from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics
 from billing import router as billing_router
 
 logging.basicConfig(level=logging.INFO)
@@ -79,3 +79,5 @@ app.include_router(settings.router)
 app.include_router(alerts.router)
 app.include_router(admin.router)
 app.include_router(billing_router)
+app.include_router(chat.router)
+app.include_router(metrics.router)
