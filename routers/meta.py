@@ -31,12 +31,50 @@ from integrations.facebook_utils.facebook_optimized import (
 from integrations.facebook_utils.facebook_leads import (
     fetch_and_cache_facebook_leads_FIXED,
 )
-from integrations.gohighlevel import get_agency_token, get_subaccount_tokens
+from integrations.gohighlevel import (
+    ghl_integration, get_agency_token, get_subaccount_tokens, save_agency_token,
+)
 from services.meta_service import get_facebook_data, save_facebook_data
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+# ---------------------------------------------------------------------------
+# GET /api/facebook/debug-token — check granted permissions
+# ---------------------------------------------------------------------------
+
+@router.get("/api/facebook/debug-token")
+async def debug_facebook_token(current_user: str = Depends(get_current_user)):
+    """Check what permissions the current Meta token actually has."""
+    async with get_mongo_client() as mongo_client:
+        token_doc = await get_facebook_token(current_user, mongo_client)
+        if not token_doc or not token_doc.get("access_token"):
+            raise HTTPException(status_code=400, detail="No Meta token found")
+
+        access_token = token_doc["access_token"]
+
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            # Check token permissions
+            resp = await client.get(
+                "https://graph.facebook.com/v23.0/me/permissions",
+                params={"access_token": access_token},
+            )
+            permissions = resp.json() if resp.status_code == 200 else {"error": resp.text}
+
+            # Check which pages the token can access
+            pages_resp = await client.get(
+                "https://graph.facebook.com/v23.0/me/accounts",
+                params={"access_token": access_token, "fields": "id,name,access_token"},
+            )
+            pages = pages_resp.json() if pages_resp.status_code == 200 else {"error": pages_resp.text}
+
+        return {
+            "permissions": permissions,
+            "pages": pages,
+            "token_expires_at": token_doc.get("expires_at"),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +161,54 @@ async def api_status(current_user: str = Depends(get_current_user)):
             agency_token = await get_agency_token(current_user, mongo_client)
             subaccount_tokens = await get_subaccount_tokens(current_user, mongo_client)
             facebook_token = await get_facebook_token(current_user, mongo_client)
+
+            # ── Auto-refresh expired GHL agency token ──────────────
+            if agency_token:
+                expires_at = agency_token.get("expires_at")
+                is_expired = expires_at and datetime.now() >= expires_at
+                if is_expired and agency_token.get("refresh_token"):
+                    try:
+                        success, result = await ghl_integration.refresh_agency_token(
+                            agency_token["refresh_token"]
+                        )
+                        if success:
+                            await save_agency_token(current_user, result, mongo_client)
+                            agency_token = await get_agency_token(current_user, mongo_client)
+                            logger.info(f"Auto-refreshed GHL agency token for {current_user}")
+
+                            # Also regenerate location tokens
+                            company_id = result.get("companyId") or agency_token.get("company_id")
+                            fresh_access = result.get("access_token")
+                            if company_id and fresh_access:
+                                for loc_id in (subaccount_tokens or {}):
+                                    try:
+                                        ok, loc_tokens = await ghl_integration.generate_location_token(
+                                            company_id, loc_id, fresh_access
+                                        )
+                                        if ok:
+                                            from integrations.gohighlevel import (
+                                                save_subaccount_token,
+                                                fetch_location_details,
+                                                get_contact_count_from_ghl,
+                                            )
+                                            details = await fetch_location_details(
+                                                loc_id, loc_tokens.get("access_token")
+                                            )
+                                            count = await get_contact_count_from_ghl(
+                                                loc_id, loc_tokens.get("access_token")
+                                            )
+                                            await save_subaccount_token(
+                                                current_user, loc_id, loc_tokens,
+                                                mongo_client, details, contact_count=count,
+                                            )
+                                    except Exception as e:
+                                        logger.warning(f"Auto-refresh location {loc_id} failed: {e}")
+                                subaccount_tokens = await get_subaccount_tokens(current_user, mongo_client)
+                        else:
+                            logger.warning(f"GHL agency token refresh failed for {current_user}")
+                    except Exception as e:
+                        logger.error(f"GHL auto-refresh error for {current_user}: {e}")
+
             status = {
                 "connected": bool(agency_token or facebook_token),
                 "gohighlevel": {

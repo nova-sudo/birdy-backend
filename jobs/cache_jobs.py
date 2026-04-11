@@ -24,15 +24,19 @@ async def populate_cache_for_existing_groups():
             db = mongo_client[DB_NAME]
             client_groups_collection = db["client_groups"]
 
-            # Find all groups that don't have cache OR have empty cache
+            # Find groups that don't have cache, excluding groups with active refreshes
             groups_needing_cache = await client_groups_collection.find({
-                "$or": [
-                    {"gohighlevel_cache": {"$exists": False}},
-                    {"facebook_cache": {"$exists": False}},
-                    {"hotprospector_cache": {"$exists": False}},
-                    {"gohighlevel_cache": {}},
-                    {"facebook_cache": {}},
-                    {"hotprospector_cache": {}}
+                "$and": [
+                    {"$or": [
+                        {"gohighlevel_cache": {"$exists": False}},
+                        {"facebook_cache": {"$exists": False}},
+                        {"hotprospector_cache": {"$exists": False}},
+                        {"gohighlevel_cache": {}},
+                        {"facebook_cache": {}},
+                        {"hotprospector_cache": {}}
+                    ]},
+                    # Skip groups currently being refreshed by the manager
+                    {"meta_refresh_status": {"$nin": ["running"]}},
                 ]
             }).to_list(None)
 

@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E \"^@router\\\\.\\(get|post|put|delete|patch\\)\" /c/Users/ASUS/Desktop/Birdy/birdy-backend/routers/*.py)",
+      "Bash(grep -r \"firstName\\\\|lastName\\\\|customFields\" /c/Users/ASUS/Desktop/Birdy/birdy-backend/services/*.py /c/Users/ASUS/Desktop/Birdy/birdy-backend/integrations/*.py -B 2 -A 2)",
+      "Bash(xargs grep:*)",
+      "Bash(npm install:*)",
+      "Bash(curl -w \"\\\\nTotal time: %{time_total}s\\\\nConnect: %{time_connect}s\\\\nTTFB: %{time_starttransfer}s\\\\n\" -o /dev/null -s http://localhost:8000/api/status)",
+      "Bash(curl -w \"\\\\nTotal: %{time_total}s | Connect: %{time_connect}s | TTFB: %{time_starttransfer}s\\\\n\" -o /dev/null -s http://localhost:3007/api/status)",
+      "Bash(timeout 20 python -c \":*)",
+      "Bash(python -c \"from dotenv import load_dotenv; load_dotenv\\(\\); import os; uri=os.getenv\\(''MONGODB_URI'',''''\\); host=uri.split\\(''@''\\)[-1].split\\(''/''\\)[0] if ''@'' in uri else ''not found''; print\\(host\\)\")",
+      "Bash(curl -w \"\\\\nTotal: %{time_total}s | TTFB: %{time_starttransfer}s\\\\n\" -o /dev/null -s http://localhost:3007/api/status)",
+      "Bash(for i:*)",
+      "Bash(do curl:*)",
+      "Bash(done)",
+      "Bash(wmic process:*)",
+      "Bash(grep -E \"\\\\.\\(py\\)$\")",
+      "Bash(python -c \"from jobs.refresh_all_job import refresh_all_groups; print\\(''Import OK''\\)\")",
+      "Bash(python -c \"from jobs.scheduler import start_background_jobs; print\\(''Scheduler import OK''\\)\")",
+      "Bash(python -c \"from jobs.refresh_all_job import start_cycle, stop_cycle, get_cycle_status; print\\(''OK''\\)\")",
+      "Bash(python -c \"from routers.chat import router; print\\(''Chat router OK''\\)\")",
+      "Bash(python -c \":*)",
+      "Bash(find C:UsersASUSDesktopBytesbytes-dashboard -name tailwind.config.* -o -name globals.css -o -name layout.tsx -o -name layout.jsx)",
+      "Bash(grep -r Outfit C:UsersASUSDesktopBytesbytes-dashboardappsdashboardsrc --include=*.tsx --include=*.ts --include=*.jsx --include=*.js)",
+      "Bash(find C:UsersASUSDesktopBytesbytes-dashboardpackagesshared -type f -name *.tsx -o -name *.css)",
+      "Bash(find C:UsersASUSDesktopBytesbytes-dashboard -maxdepth 3 -name tailwind* -type f)",
+      "Bash(python -c \"from routers.auth import router; print\\(''auth OK''\\)\")",
+      "Bash(python -c \"from jobs.scheduler import start_background_jobs; print\\(''scheduler OK''\\)\")",
+      "Bash(python -c \"from routers.meta import router; print\\(''meta.py OK''\\)\")",
+      "Bash(python -c \"from ai.config import AI_PROVIDER; print\\(f''AI_PROVIDER = {AI_PROVIDER!r}''\\)\")",
+      "Bash(python -c \"from ai.config import AI_PROVIDER; print\\(''AI_PROVIDER ='', repr\\(AI_PROVIDER\\)\\)\")",
+      "Bash(python -c \"from dotenv import load_dotenv; load_dotenv\\(\\); import os; print\\(''AI_PROVIDER ='', repr\\(os.getenv\\(''AI_PROVIDER''\\)\\)\\)\")",
+      "Bash(echo $AI_PROVIDER)",
+      "Bash(cmd.exe /c \"echo %AI_PROVIDER%\")",
+      "Bash(python -c \"import os; print\\(os.environ.get\\(''AI_PROVIDER'', ''NOT SET''\\)\\)\")",
+      "Bash(find C:UsersASUSDesktopBirdybirdy-backend -name refresh_all_job.py -o -name *refresh*job*)",
+      "Bash(grep -r \"refresh_all_job\\\\|start_cycle\\\\|_run_cycle\" C:UsersASUSDesktopBirdybirdy-backendrouters --include=*.py)",
+      "Bash(grep -r \"refresh_all_job\\\\|start_cycle\" C:UsersASUSDesktopBirdybirdy-backend --include=*.py)",
+      "Bash(1 timeout:*)"
+    ]
+  }
+}

@@ -1,0 +1,434 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Birdy AI — Backend Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: 'Outfit', 'Inter', system-ui, sans-serif; background: #f8f7fc; color: #17122c; }
+  h1 { text-align: center; padding: 32px 0 8px; font-size: 2rem; }
+  h2 { text-align: center; padding: 0 0 24px; font-size: 1rem; color: #6e6b7b; font-weight: 400; }
+  .diagram-section { padding: 20px 40px 60px; }
+  .diagram-section h3 { font-size: 1.25rem; margin-bottom: 16px; padding-left: 8px; border-left: 4px solid #7C4DFF; }
+  .mermaid { background: white; border-radius: 16px; padding: 32px; border: 1px solid #e6e1ef; margin-bottom: 40px; overflow-x: auto; }
+  .legend { display: flex; gap: 24px; justify-content: center; flex-wrap: wrap; padding: 16px; }
+  .legend-item { display: flex; align-items: center; gap: 8px; font-size: 0.85rem; }
+  .legend-dot { width: 14px; height: 14px; border-radius: 4px; }
+</style>
+</head>
+<body>
+
+<h1>Birdy AI — Backend Architecture</h1>
+<h2>Complete system diagram with emphasis on the AI pipeline</h2>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:#7C4DFF"></div> AI Core</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#0ea5e9"></div> LLM Providers</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#f59e0b"></div> Tools</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#10b981"></div> Data Sources</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#ef4444"></div> External APIs</div>
+  <div class="legend-item"><div class="legend-dot" style="background:#8b5cf6"></div> Background Jobs</div>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 1: Full System Overview
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>1. Full System Overview</h3>
+<pre class="mermaid">
+graph TB
+    subgraph FRONTEND["Frontend (Next.js — birdy-beta)"]
+        FE_HEADER["Header Search Bar"]
+        FE_MODAL["Chat Modal (BirdyChatModal)"]
+        FE_PAGE["Ask Birdy Page (conversations sidebar + chat)"]
+        FE_SETTINGS["Settings Page (refresh toggle)"]
+    end
+
+    subgraph BACKEND["Backend (FastAPI — birdy-backend)"]
+        subgraph API["API Layer"]
+            CHAT_EP["POST /api/chat"]
+            STATUS_EP["GET /api/status"]
+            REFRESH_EP["POST /api/client-groups/refresh-all"]
+            ALERTS_EP["GET|POST|PATCH /api/alerts"]
+        end
+
+        subgraph AI_CORE["AI Core"]
+            ORCHESTRATOR["Orchestrator\n(run_chat loop)"]
+            SESSION["Session Store\n(in-memory, 1hr TTL)"]
+            PROMPT["System Prompt\n(birdy.py)"]
+            REGISTRY["Tool Registry\n(14 tools)"]
+        end
+
+        subgraph PROVIDERS["LLM Providers"]
+            MISTRAL["Mistral\nmistral-medium-latest"]
+            ANTHROPIC["Anthropic\nclaude-sonnet-4"]
+            GROQ["Groq\ngpt-oss-120b"]
+            OPENROUTER["OpenRouter\nqwen3.6-plus"]
+        end
+
+        subgraph TOOLS["AI Tool Modules"]
+            META_CACHED["Meta Cached Tools\n4 tools"]
+            META_LIVE["Meta Live Tools\n2 tools"]
+            GHL_TOOLS["GHL Tools\n2 tools"]
+            GROUP_TOOLS["Group Tools\n1 tool"]
+            SUMMARY_TOOLS["Summary Tools\n1 tool"]
+            COMPARE_TOOLS["Compare Tools\n1 tool"]
+            ALERT_TOOLS["Alert Tools\n3 tools"]
+            DERIVED["Derived Metrics\n(enrich utility)"]
+        end
+
+        subgraph JOBS["Background Jobs"]
+            REFRESH_CYCLE["Refresh All Cycle\n(1 group / 15 min)"]
+            TOKEN_REFRESH["GHL Token Refresh\n(every 45 min)"]
+            CACHE_POP["Cache Populator\n(on startup)"]
+        end
+
+        subgraph DATA["Data Layer (MongoDB)"]
+            DB_GROUPS["client_groups\n(facebook_cache, gohighlevel_cache)"]
+            DB_LEADS["facebook_leads"]
+            DB_CONTACTS["ghl_contacts"]
+            DB_ALERTS["alerts"]
+            DB_USERS["users\n(integrations, tokens)"]
+            DB_INSIGHTS["facebook_*_insights\n(campaign/adset/ad)"]
+        end
+    end
+
+    subgraph EXTERNAL["External APIs"]
+        META_API["Meta Graph API\nv23.0"]
+        GHL_API["GoHighLevel API"]
+    end
+
+    %% Frontend → Backend
+    FE_HEADER -->|"user types query"| FE_MODAL
+    FE_PAGE -->|"POST /api/chat"| CHAT_EP
+    FE_MODAL -->|"POST /api/chat"| CHAT_EP
+    FE_SETTINGS -->|"POST refresh-all"| REFRESH_EP
+
+    %% Chat endpoint flow
+    CHAT_EP --> ORCHESTRATOR
+    ORCHESTRATOR <-->|"restore/save"| SESSION
+    ORCHESTRATOR -->|"get system prompt"| PROMPT
+    ORCHESTRATOR <-->|"select provider"| MISTRAL
+    ORCHESTRATOR <-->|"select provider"| ANTHROPIC
+    ORCHESTRATOR <-->|"select provider"| GROQ
+    ORCHESTRATOR <-->|"select provider"| OPENROUTER
+    ORCHESTRATOR <-->|"execute tools"| REGISTRY
+
+    %% Registry → Tools
+    REGISTRY --> META_CACHED
+    REGISTRY --> META_LIVE
+    REGISTRY --> GHL_TOOLS
+    REGISTRY --> GROUP_TOOLS
+    REGISTRY --> SUMMARY_TOOLS
+    REGISTRY --> COMPARE_TOOLS
+    REGISTRY --> ALERT_TOOLS
+
+    %% Tools → Data
+    META_CACHED -->|"read cache"| DB_GROUPS
+    META_CACHED -->|"fallback"| DB_INSIGHTS
+    META_CACHED -->|"read leads"| DB_LEADS
+    META_LIVE -->|"direct call"| META_API
+    GHL_TOOLS -->|"read"| DB_CONTACTS
+    GROUP_TOOLS -->|"read"| DB_GROUPS
+    SUMMARY_TOOLS -->|"read cache"| DB_GROUPS
+    COMPARE_TOOLS -->|"read cache"| DB_GROUPS
+    ALERT_TOOLS -->|"read/write"| DB_ALERTS
+
+    %% Derived metrics
+    DERIVED -.->|"enriches"| META_CACHED
+    DERIVED -.->|"enriches"| SUMMARY_TOOLS
+    DERIVED -.->|"enriches"| COMPARE_TOOLS
+    DERIVED -.->|"enriches"| META_LIVE
+
+    %% Background jobs
+    REFRESH_CYCLE -->|"fetch presets"| META_API
+    REFRESH_CYCLE -->|"fetch contacts"| GHL_API
+    REFRESH_CYCLE -->|"update cache"| DB_GROUPS
+    REFRESH_CYCLE -->|"upsert"| DB_LEADS
+    REFRESH_CYCLE -->|"upsert"| DB_CONTACTS
+    TOKEN_REFRESH -->|"refresh tokens"| GHL_API
+    TOKEN_REFRESH -->|"save tokens"| DB_USERS
+    CACHE_POP -->|"populate"| DB_GROUPS
+
+    %% Status auto-refresh
+    STATUS_EP -->|"auto-refresh if expired"| GHL_API
+    STATUS_EP -->|"read/update"| DB_USERS
+
+    %% Styling
+    style AI_CORE fill:#f3f0ff,stroke:#7C4DFF,stroke-width:2px
+    style PROVIDERS fill:#e0f2fe,stroke:#0ea5e9,stroke-width:2px
+    style TOOLS fill:#fef3c7,stroke:#f59e0b,stroke-width:2px
+    style DATA fill:#d1fae5,stroke:#10b981,stroke-width:2px
+    style EXTERNAL fill:#fee2e2,stroke:#ef4444,stroke-width:2px
+    style JOBS fill:#ede9fe,stroke:#8b5cf6,stroke-width:2px
+    style FRONTEND fill:#faf5ff,stroke:#a78bfa,stroke-width:2px
+</pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 2: AI Chat Pipeline (detailed)
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>2. AI Chat Pipeline — Detailed Flow</h3>
+<pre class="mermaid">
+sequenceDiagram
+    participant U as User (Frontend)
+    participant R as POST /api/chat
+    participant S as Session Store
+    participant O as Orchestrator
+    participant P as LLM Provider
+    participant T as Tool Registry
+    participant DB as MongoDB
+    participant M as Meta API
+
+    U->>R: { message, session_id }
+    R->>S: get_or_create(session_id, user_id)
+    S-->>R: (session_id, history[])
+
+    R->>O: run_chat(provider, registry, db, user_id, msg, session_id)
+
+    Note over O: Append system prompt + user message to history
+
+    loop Max 6 iterations (5 with tools + 1 final)
+        O->>P: chat_completion(messages, tool_schemas, temp=0.3)
+        P-->>O: ProviderResponse { content, tool_calls[] }
+
+        alt No tool calls
+            O->>S: save_messages(session_id, history)
+            O-->>R: { reply, tools_used, session_id }
+            R-->>U: ChatResponse JSON
+        else Has tool calls
+            loop For each tool_call
+                O->>T: execute(tool_name, db=db, user_id=user_id, **args)
+
+                alt Cached tool (meta_tools, ghl_tools, etc.)
+                    T->>DB: Query facebook_cache / ghl_contacts / alerts
+                    DB-->>T: Document(s)
+                    Note over T: enrich() adds CPL, conversion_rate, frequency
+                else Live Meta tool
+                    T->>DB: Get access_token from users collection
+                    T->>M: GET /v23.0/{account}/campaigns?time_range=...
+                    M-->>T: Campaign + adset + ad data
+                    Note over T: enrich() adds derived metrics
+                else Alert write tool
+                    T->>DB: Insert/update alerts collection
+                    DB-->>T: Success
+                end
+
+                T-->>O: JSON string (truncated to 8000 chars)
+                Note over O: Append tool result to history
+            end
+        end
+    end
+</pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 3: Tool Registry & All 14 Tools
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>3. Tool Registry — All 14 Tools</h3>
+<pre class="mermaid">
+graph LR
+    REG["Tool Registry<br/>(registry.py)"]
+
+    subgraph CACHED["Cached Insights (meta_tools.py)"]
+        T1["get_campaign_insights"]
+        T2["get_adset_insights"]
+        T3["get_ad_insights"]
+        T4["get_facebook_leads"]
+    end
+
+    subgraph LIVE["Live Meta API (meta_live_tools.py)"]
+        T5["get_meta_insights_live"]
+        T6["get_meta_leads_live"]
+    end
+
+    subgraph GHL["GHL CRM (ghl_tools.py)"]
+        T7["get_ghl_contacts"]
+        T8["get_ghl_opportunity_stats"]
+    end
+
+    subgraph DISC["Discovery (group_tools.py)"]
+        T9["get_client_groups"]
+    end
+
+    subgraph DASH["Dashboard (summary_tools.py + compare_tools.py)"]
+        T10["get_account_summary"]
+        T11["compare_periods"]
+    end
+
+    subgraph ALERT["Alerts (alert_tools.py)"]
+        T12["get_alerts"]
+        T13["create_alert"]
+        T14["update_alert"]
+    end
+
+    REG --> CACHED
+    REG --> LIVE
+    REG --> GHL
+    REG --> DISC
+    REG --> DASH
+    REG --> ALERT
+
+    %% Data sources
+    T1 & T2 & T3 -->|"facebook_cache"| FC[("client_groups<br/>collection")]
+    T4 -->|"query"| FL[("facebook_leads<br/>collection")]
+    T5 & T6 -->|"GET /v23.0"| MA(("Meta Graph<br/>API"))
+    T7 & T8 -->|"query"| GC[("ghl_contacts<br/>collection")]
+    T9 & T10 & T11 -->|"read cache"| FC
+    T12 & T13 & T14 -->|"read/write"| AL[("alerts<br/>collection")]
+
+    style CACHED fill:#fef3c7,stroke:#f59e0b
+    style LIVE fill:#fee2e2,stroke:#ef4444
+    style GHL fill:#dbeafe,stroke:#3b82f6
+    style DISC fill:#d1fae5,stroke:#10b981
+    style DASH fill:#f3e8ff,stroke:#a855f7
+    style ALERT fill:#fce7f3,stroke:#ec4899
+</pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 4: LLM Provider Selection
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>4. LLM Provider Selection</h3>
+<pre class="mermaid">
+graph TD
+    CONFIG["ai/config.py<br/>AI_PROVIDER env var"]
+
+    CONFIG -->|"mistral (default)"| MISTRAL["MistralProvider<br/>api.mistral.ai/v1<br/>mistral-medium-latest"]
+    CONFIG -->|"anthropic"| ANTHROPIC["AnthropicProvider<br/>Anthropic SDK<br/>claude-sonnet-4"]
+    CONFIG -->|"groq"| GROQ["GroqProvider<br/>Groq SDK<br/>gpt-oss-120b"]
+    CONFIG -->|"openrouter"| OPENROUTER["OpenRouterProvider<br/>openrouter.ai/api/v1<br/>qwen3.6-plus"]
+
+    MISTRAL & ANTHROPIC & GROQ & OPENROUTER --> BASE["BaseLLMProvider<br/>(abstract)"]
+
+    BASE -->|"Returns"| RESP["ProviderResponse<br/>{ content, tool_calls[], finish_reason }"]
+
+    style MISTRAL fill:#ff6b35,color:#fff
+    style ANTHROPIC fill:#d97706,color:#fff
+    style GROQ fill:#0ea5e9,color:#fff
+    style OPENROUTER fill:#8b5cf6,color:#fff
+    style BASE fill:#f3f4f6,stroke:#9ca3af
+</pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 5: Session & Memory Flow
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>5. Session Memory Flow</h3>
+<pre class="mermaid">
+graph TD
+    MSG1["Message 1: 'How is Client ABC doing?'"]
+    MSG2["Message 2: 'Compare that to last month'"]
+    MSG3["Message 3: 'Create an alert if spend drops 20%'"]
+
+    subgraph SESSION["Session Store (in-memory)"]
+        direction TB
+        SYS["[0] System Prompt"]
+        U1["[1] User: How is Client ABC doing?"]
+        A1T["[2] Assistant: tool_call get_client_groups"]
+        T1R["[3] Tool result: {groups: [...]}"]
+        A1T2["[4] Assistant: tool_call get_account_summary"]
+        T1R2["[5] Tool result: {overall: {...}}"]
+        A1["[6] Assistant: Here's the summary..."]
+        U2["[7] User: Compare that to last month"]
+        A2T["[8] Assistant: tool_call compare_periods"]
+        T2R["[9] Tool result: {changes: {...}}"]
+        A2["[10] Assistant: Here's the comparison..."]
+        U3["[11] User: Create an alert if spend drops 20%"]
+        A3T["[12] Assistant: tool_call create_alert"]
+        T3R["[13] Tool result: {success: true}"]
+        A3["[14] Assistant: Alert created!"]
+    end
+
+    MSG1 -->|"session_id: null"| SYS
+    MSG2 -->|"session_id: chat_abc123"| U2
+    MSG3 -->|"session_id: chat_abc123"| U3
+
+    NOTE1["LLM sees FULL history<br/>on every call — knows<br/>'that' = Client ABC"]
+
+    SESSION -.-> NOTE1
+
+    style SESSION fill:#f3f0ff,stroke:#7C4DFF,stroke-width:2px
+    style NOTE1 fill:#fef3c7,stroke:#f59e0b
+</pre>
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════
+     DIAGRAM 6: Data Refresh Pipeline
+     ═══════════════════════════════════════════════════════════ -->
+<div class="diagram-section">
+<h3>6. Data Refresh Pipeline</h3>
+<pre class="mermaid">
+graph TB
+    subgraph TRIGGERS["Refresh Triggers"]
+        BTN["Settings: Start Refresh Cycle"]
+        LOGIN["User Login (background)"]
+        SCHED["Scheduler (every 45 min tokens)"]
+        STARTUP["App Startup (cache populator)"]
+    end
+
+    subgraph REFRESH["Refresh All Cycle (1 group / 15 min)"]
+        direction TB
+        QUEUE["Build queue: all groups"]
+        PICK["Pick next group"]
+        META_R["Meta Refresh<br/>fetch_meta_all_presets_for_group()<br/>+ incremental leads<br/>+ update lead counts"]
+        GHL_R["GHL Refresh<br/>fetch_and_cache_ghl_data_optimized()<br/>(incremental contacts)"]
+        WAIT["Wait 15 minutes"]
+    end
+
+    subgraph TOKEN["Token Refresh"]
+        AGENCY["Refresh agency token<br/>(refresh_token → new access_token)"]
+        LOCATION["Regenerate location tokens<br/>(agency token → location tokens)"]
+    end
+
+    subgraph CACHE["Updated Cache (on client_groups)"]
+        FB_CACHE["facebook_cache<br/>13 presets x {campaigns, adsets, ads, metrics}"]
+        GHL_CACHE["gohighlevel_cache<br/>{total_contacts, tag_breakdown}"]
+    end
+
+    BTN --> QUEUE
+    QUEUE --> PICK
+    PICK --> META_R
+    PICK --> GHL_R
+    META_R --> FB_CACHE
+    GHL_R --> GHL_CACHE
+    META_R & GHL_R --> WAIT
+    WAIT -->|"next group"| PICK
+
+    LOGIN --> AGENCY
+    SCHED --> AGENCY
+    AGENCY --> LOCATION
+
+    STARTUP -->|"populate empty caches"| FB_CACHE & GHL_CACHE
+
+    style TRIGGERS fill:#ede9fe,stroke:#8b5cf6,stroke-width:2px
+    style REFRESH fill:#fef3c7,stroke:#f59e0b,stroke-width:2px
+    style TOKEN fill:#dbeafe,stroke:#3b82f6,stroke-width:2px
+    style CACHE fill:#d1fae5,stroke:#10b981,stroke-width:2px
+</pre>
+</div>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: 'default',
+    flowchart: { curve: 'basis', htmlLabels: true, padding: 15 },
+    sequence: { actorMargin: 40, messageFontSize: 13 },
+    themeVariables: {
+      primaryColor: '#f3f0ff',
+      primaryBorderColor: '#7C4DFF',
+      primaryTextColor: '#17122c',
+      lineColor: '#9ca3af',
+      fontSize: '14px',
+    }
+  });
+</script>
+
+</body>
+</html>

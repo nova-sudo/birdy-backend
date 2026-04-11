@@ -1,7 +1,7 @@
 import logging
 import bcrypt
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
 
 from core.config import (
     JWT_EXPIRY_MINUTES,
@@ -67,8 +67,62 @@ async def register_user(request: RegisterRequest, response: Response):
             raise HTTPException(status_code=500, detail=f"Failed to register user: {str(e)}")
 
 
+async def _refresh_ghl_tokens_on_login(user_id: str):
+    """Refresh GHL agency + location tokens in the background after login."""
+    try:
+        from integrations.gohighlevel import (
+            ghl_integration, get_agency_token, save_agency_token,
+            get_subaccount_tokens, save_subaccount_token,
+            fetch_location_details, get_contact_count_from_ghl,
+        )
+        async with get_mongo_client() as mongo_client:
+            agency_token = await get_agency_token(user_id, mongo_client)
+            if not agency_token or not agency_token.get("refresh_token"):
+                return
+
+            # Refresh agency token
+            success, result = await ghl_integration.refresh_agency_token(
+                agency_token["refresh_token"]
+            )
+            if not success:
+                logger.warning(f"GHL agency token refresh failed for {user_id}: {result.get('error')}")
+                return
+
+            await save_agency_token(user_id, result, mongo_client)
+            logger.info(f"GHL agency token refreshed on login for {user_id}")
+
+            # Regenerate location tokens with the fresh agency token
+            company_id = result.get("companyId") or agency_token.get("company_id")
+            agency_access = result.get("access_token")
+            if not company_id or not agency_access:
+                return
+
+            subaccounts = await get_subaccount_tokens(user_id, mongo_client)
+            for location_id in (subaccounts or {}):
+                try:
+                    ok, loc_tokens = await ghl_integration.generate_location_token(
+                        company_id, location_id, agency_access
+                    )
+                    if ok:
+                        details = await fetch_location_details(
+                            location_id, loc_tokens.get("access_token")
+                        )
+                        count = await get_contact_count_from_ghl(
+                            location_id, loc_tokens.get("access_token")
+                        )
+                        await save_subaccount_token(
+                            user_id, location_id, loc_tokens, mongo_client,
+                            details, contact_count=count
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to refresh location {location_id}: {e}")
+
+    except Exception as e:
+        logger.error(f"GHL token refresh on login failed for {user_id}: {e}", exc_info=True)
+
+
 @router.post("/api/login")
-async def login_user(request: LoginRequest, response: Response):
+async def login_user(request: LoginRequest, response: Response, background_tasks: BackgroundTasks):
     async with get_mongo_client() as mongo_client:
         try:
             logger.debug(f"Starting login for user {request.email}, rememberMe: {request.rememberMe}")
@@ -103,6 +157,11 @@ async def login_user(request: LoginRequest, response: Response):
 
             set_cookie(response, "auth_token", access_token, access_token_max_age)
             set_cookie(response, "refresh_token", refresh_token, refresh_token_max_age)
+
+            # Refresh GHL tokens in background (non-blocking)
+            ghl_data = user_doc.get("integrations", {}).get("gohighlevel", {})
+            if ghl_data.get("agency", {}).get("refresh_token"):
+                background_tasks.add_task(_refresh_ghl_tokens_on_login, request.email)
 
             # Read default_currency from the user doc
             default_currency = user_doc.get("default_currency")
