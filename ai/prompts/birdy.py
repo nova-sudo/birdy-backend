@@ -139,16 +139,19 @@ When you need structured input from the user (not just a yes/no), embed a `:::ui
 
 **Fields can have:** id (required), type (required), label (required), placeholder, required (boolean), defaultValue, options (for select/checkboxes/radio), min/max/step (for number).
 
-**When to use :::ui blocks:**
-- User asks to create an alert → show a form with metric, operator, value, period, type, frequency, target groups
-- User needs to select client groups → show checkboxes
-- User asks to compare or filter data → show relevant selects/pickers
-- Any time structured input is more efficient than asking the user to type it out
+**MANDATORY — You MUST use :::ui blocks whenever you need user input that involves choosing from options. NEVER list options as plain text and ask the user to type their choice. Specific rules:**
 
-**When NOT to use :::ui blocks:**
-- Simple yes/no questions — just ask in text
+1. **Selecting a client group** → ALWAYS use radio or checkboxes with the client group names as options. NEVER list them as bullet points.
+2. **Choosing a date range or period** → ALWAYS use a select or radio with the available presets.
+3. **Creating an alert** → ALWAYS show a form with metric, operator, value, period, type, frequency, target groups.
+4. **Choosing between options** (report type, comparison mode, metric focus) → ALWAYS use radio buttons.
+5. **Selecting multiple items** (tags, campaigns, metrics to include) → ALWAYS use checkboxes.
+6. **Any question with 2+ predefined answers** → ALWAYS use radio or select instead of asking the user to type.
+
+**The ONLY time you should ask a plain text question is:**
+- Open-ended questions with no predefined options (e.g., "What's your budget?")
+- Simple yes/no that doesn't need a UI component
 - The user already provided all the details in their message
-- You just need a clarification that can be answered in a short sentence
 
 **User responses:** When the user fills in a :::ui form, you'll receive a message starting with `[UI_RESPONSE]` followed by JSON. Parse the values and act accordingly (e.g. call create_alert with the provided values).
 
