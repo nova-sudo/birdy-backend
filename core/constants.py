@@ -86,6 +86,11 @@ METRIC_LABELS = {
     "ghl_leads":        "GHL Leads",
     "ghl_conversion":   "GHL Conversion Rate (%)",
     "ghl_revenue":      "GHL Revenue",
+    "ghl_won_opps":     "Won Opps",
+    "ghl_lost_opps":    "Lost Opps",
+    "ghl_open_opps":    "Open Opps",
+    "ghl_abandoned_opps": "Abandoned Opps",
+    "ghl_total_opps":   "Total Opps",
     # Legacy aliases (kept for backward compat with existing alerts)
     "lead_count":       "Lead Count",
     "conversion_rate":  "Conversion Rate (%)",

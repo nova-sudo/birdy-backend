@@ -1739,6 +1739,381 @@ async def get_ghl_contacts_paginated_v2(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/campaigns/tag-rollup  — Tag counts per campaign/adset/ad
+# ---------------------------------------------------------------------------
+
+@router.get("/api/campaigns/tag-rollup")
+async def get_campaign_tag_rollup(
+    groups: str = Query(default=""),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Aggregate GHL contact tags by campaign/adset/ad attribution.
+    Returns tag counts grouped by campaignId, adset (utmMedium), and adId.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+            match_q = {"user_id": current_user}
+            if group_ids:
+                match_q["client_group_id"] = {"$in": group_ids}
+
+            pipeline = [
+                {"$match": match_q},
+                {"$unwind": {"path": "$contact_data.tags", "preserveNullAndEmptyArrays": False}},
+                {"$group": {
+                    "_id": {
+                        "campaign_id": {"$ifNull": ["$contact_data.attributionSource.campaignId", ""]},
+                        "adset": {"$ifNull": ["$contact_data.attributionSource.utmMedium", ""]},
+                        "ad_id": {"$ifNull": ["$contact_data.attributionSource.adId", ""]},
+                        "tag": "$contact_data.tags",
+                    },
+                    "count": {"$sum": 1},
+                }},
+            ]
+
+            docs = await db["ghl_contacts"].aggregate(pipeline).to_list(None)
+
+            by_campaign = {}
+            by_adset = {}
+            by_ad = {}
+
+            for doc in docs:
+                tag = doc["_id"]["tag"]
+                count = doc["count"]
+                cid = doc["_id"]["campaign_id"]
+                adset = doc["_id"]["adset"]
+                aid = doc["_id"]["ad_id"]
+
+                if cid:
+                    by_campaign.setdefault(cid, {})[tag] = by_campaign.get(cid, {}).get(tag, 0) + count
+                if adset:
+                    by_adset.setdefault(adset, {})[tag] = by_adset.get(adset, {}).get(tag, 0) + count
+                if aid:
+                    by_ad.setdefault(aid, {})[tag] = by_ad.get(aid, {}).get(tag, 0) + count
+
+            return {
+                "by_campaign": by_campaign,
+                "by_adset": by_adset,
+                "by_ad": by_ad,
+            }
+
+        except Exception as e:
+            logger.error(f"Error computing tag rollup: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# GET /api/leads/unified  — Cross-source lead matching
+# ---------------------------------------------------------------------------
+
+@router.get("/api/leads/unified")
+async def get_unified_leads(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=15, ge=1, le=500),
+    groups: str = Query(default=""),
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Unified leads endpoint: returns GHL contacts enriched with Meta and HP data.
+    Matches across sources using normalized email/phone match_keys.
+    """
+    import time as _time
+    async with get_mongo_client() as mongo_client:
+        try:
+            start_time = _time.time()
+            db = mongo_client[DB_NAME]
+            ghl_col = db["ghl_contacts"]
+            meta_col = db["facebook_leads"]
+            hp_col = db["hotprospector_leads"]
+
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+
+            # Build GHL query (same as ghl-paginated)
+            query = {"user_id": current_user}
+            if group_ids:
+                query["client_group_id"] = {"$in": group_ids}
+            if start_date or end_date:
+                date_filter = {}
+                if start_date:
+                    date_filter["$gte"] = f"{start_date}T00:00:00.000Z"
+                if end_date:
+                    date_filter["$lte"] = f"{end_date}T23:59:59.999Z"
+                query["contact_data.dateAdded"] = date_filter
+
+            # Paginate GHL contacts
+            total_contacts = await ghl_col.count_documents(query)
+            total_pages = max(1, -(-total_contacts // limit))
+            skip = (page - 1) * limit
+
+            contact_docs = await ghl_col.find(query).sort(
+                "contact_data.dateAdded", -1
+            ).skip(skip).limit(limit).to_list(limit)
+
+            # Collect all match_keys from this page
+            all_keys = set()
+            for doc in contact_docs:
+                for key in (doc.get("match_keys") or []):
+                    all_keys.add(key)
+
+            # Parallel lookup in Meta and HP collections
+            meta_matches = {}
+            hp_matches = {}
+
+            if all_keys:
+                keys_list = list(all_keys)
+                meta_q = {"user_id": current_user, "match_keys": {"$in": keys_list}}
+                hp_q = {"user_id": current_user, "match_keys": {"$in": keys_list}}
+
+                meta_docs, hp_docs = await asyncio.gather(
+                    meta_col.find(meta_q).to_list(None),
+                    hp_col.find(hp_q).to_list(None),
+                )
+
+                # Build ad→campaign/adset lookup from facebook_cache for resolving missing names
+                ad_to_meta = {}  # ad_id → {campaign_name, adset_name, campaign_id, adset_id}
+                # Load ALL user's groups (not just current page) since a Meta lead
+                # might come from a different group's ad account
+                if True:
+                    group_docs = await db["client_groups"].find(
+                        {"user_id": current_user},
+                        {"facebook_cache.maximum.ads": 1, "facebook_cache.maximum.campaigns": 1, "facebook_cache.maximum.adsets": 1,
+                         "facebook_cache.ads": 1, "facebook_cache.campaigns": 1, "facebook_cache.adsets": 1}
+                    ).to_list(None)
+                    for gdoc in group_docs:
+                        fb = gdoc.get("facebook_cache") or {}
+                        preset = fb.get("maximum") or fb
+                        # Build campaign_id → name map
+                        camp_map = {c["id"]: c.get("name", "") for c in (preset.get("campaigns") or [])}
+                        # Build adset_id → {name, campaign_id} map
+                        adset_map = {a["id"]: {"name": a.get("name", ""), "campaign_id": a.get("campaign_id", "")} for a in (preset.get("adsets") or [])}
+                        # Build ad_id AND ad_name → full resolution
+                        ad_name_to_meta = {}  # ad_name → resolution (fallback when ad_id is missing)
+                        for ad in (preset.get("ads") or []):
+                            cid = ad.get("campaign_id", "")
+                            asid = ad.get("adset_id", "")
+                            resolution = {
+                                "campaign_name": camp_map.get(cid, ""),
+                                "campaign_id": cid,
+                                "adset_name": adset_map.get(asid, {}).get("name", ""),
+                                "adset_id": asid,
+                                "ad_name": ad.get("name", ""),
+                            }
+                            aid = ad.get("id")
+                            if aid:
+                                ad_to_meta[aid] = resolution
+                            aname = ad.get("name")
+                            if aname:
+                                ad_name_to_meta[aname] = resolution
+
+                # Build lookup by match_key → enrichment data
+                for md in meta_docs:
+                    ld = md.get("lead_data", {})
+
+                    # Resolve missing campaign/adset from the cached ad hierarchy
+                    campaign_name = ld.get("campaign_name") or ""
+                    adset_name = ld.get("adset_name") or ""
+                    campaign_id = ld.get("campaign_id") or ""
+                    adset_id = ld.get("adset_id") or ""
+                    ad_id = ld.get("ad_id") or ""
+
+                    if not campaign_name or not adset_name:
+                        # Try resolving by ad_id first, then by ad_name as fallback
+                        resolved = None
+                        if ad_id and ad_id in ad_to_meta:
+                            resolved = ad_to_meta[ad_id]
+                        elif ld.get("ad_name") and ld["ad_name"] in ad_name_to_meta:
+                            resolved = ad_name_to_meta[ld["ad_name"]]
+                        if resolved:
+                            if not campaign_name:
+                                campaign_name = resolved.get("campaign_name", "")
+                                campaign_id = resolved.get("campaign_id", "") or campaign_id
+                            if not adset_name:
+                                adset_name = resolved.get("adset_name", "")
+                                adset_id = resolved.get("adset_id", "") or adset_id
+                            if not ad_id:
+                                ad_id = resolved.get("ad_id", "") if "ad_id" in resolved else ad_id
+
+                    enrichment = {
+                        "campaign_name": campaign_name,
+                        "campaign_id": campaign_id,
+                        "ad_name": ld.get("ad_name", ""),
+                        "ad_id": ad_id,
+                        "adset_name": adset_name,
+                        "adset_id": adset_id,
+                        "created_time": ld.get("created_time", ""),
+                        "form_id": ld.get("form_id", ""),
+                    }
+                    for key in (md.get("match_keys") or []):
+                        meta_matches[key] = enrichment
+
+                for hd in hp_docs:
+                    ld = hd.get("lead_data", {})
+                    enrichment = {
+                        "call_logs_count": ld.get("call_logs_count", 0),
+                        "last_call_date": "",
+                    }
+                    calls = ld.get("call_logs") or []
+                    if calls:
+                        enrichment["last_call_date"] = calls[0].get("call_time", "")
+                    for key in (hd.get("match_keys") or []):
+                        hp_matches[key] = enrichment
+
+            # Opportunity stats (same as ghl-paginated)
+            stats_pipeline = [
+                {"$match": query},
+                {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
+                {"$group": {
+                    "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
+                    "count": {"$sum": 1},
+                    "total_value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
+                }},
+            ]
+            stats_docs = await ghl_col.aggregate(stats_pipeline).to_list(20)
+            opportunity_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0}
+            total_value = 0.0
+            for doc in stats_docs:
+                status = doc["_id"]
+                if status in opportunity_stats:
+                    opportunity_stats[status] = doc["count"]
+                total_value += doc.get("total_value", 0)
+            total_opportunities = sum(opportunity_stats.values())
+
+            # Format contacts with enrichment
+            contacts = []
+            for doc in contact_docs:
+                contact = doc.get("contact_data", {})
+                doc_keys = doc.get("match_keys") or []
+
+                # Check source matches
+                has_meta = any(k in meta_matches for k in doc_keys)
+                has_hp = any(k in hp_matches for k in doc_keys)
+
+                # Get enrichment data (use first matching key)
+                meta_enrich = None
+                hp_enrich = None
+                for k in doc_keys:
+                    if k in meta_matches and not meta_enrich:
+                        meta_enrich = meta_matches[k]
+                    if k in hp_matches and not hp_enrich:
+                        hp_enrich = hp_matches[k]
+
+                # Fallback: if matched but still missing campaign/adset,
+                # use GHL contact's attributionSource which has campaign + utmMedium (adset)
+                if meta_enrich and (not meta_enrich.get("campaign_name") or not meta_enrich.get("adset_name")):
+                    attr = contact.get("attributionSource") or {}
+                    if not meta_enrich.get("campaign_name") and attr.get("campaign"):
+                        meta_enrich["campaign_name"] = attr["campaign"]
+                    if not meta_enrich.get("campaign_id") and attr.get("campaignId"):
+                        meta_enrich["campaign_id"] = attr["campaignId"]
+                    if not meta_enrich.get("adset_name") and attr.get("utmMedium"):
+                        meta_enrich["adset_name"] = attr["utmMedium"]
+                    if not meta_enrich.get("ad_name") and attr.get("utmContent"):
+                        meta_enrich["ad_name"] = attr["utmContent"]
+                    if not meta_enrich.get("ad_id") and attr.get("adId"):
+                        meta_enrich["ad_id"] = attr["adId"]
+
+                # Normalize email
+                email = contact.get("email")
+                if not email or (isinstance(email, str) and not email.strip()):
+                    email = f"no_email_ghl_{contact.get('id')}"
+                elif isinstance(email, str):
+                    email = email.strip().lower()
+
+                # Normalize name
+                contact_name = contact.get("contactName", "") or ""
+                if not contact_name:
+                    first = (contact.get("firstName") or "").strip()
+                    last = (contact.get("lastName") or "").strip()
+                    contact_name = f"{first} {last}".strip() or "Unknown"
+
+                formatted = {
+                    "contactId": contact.get("id"),
+                    "contactName": contact_name,
+                    "firstName": contact.get("firstName") or "",
+                    "lastName": contact.get("lastName") or "",
+                    "email": email,
+                    "phone": contact.get("phone") or "",
+                    "locationId": doc.get("location_id"),
+                    "groupName": doc.get("client_group_name", "Unknown Group"),
+                    "dateAdded": contact.get("dateAdded") or "",
+                    "dateUpdated": contact.get("dateUpdated") or "",
+                    "dateOfBirth": contact.get("dateOfBirth") or "",
+                    "tags": contact.get("tags") or [],
+                    "source": contact.get("source") or "",
+                    "type": contact.get("type") or "lead",
+                    "contactType": contact.get("contactType") or contact.get("type") or "lead",
+                    "address1": contact.get("address1") or "",
+                    "city": contact.get("city") or "",
+                    "state": contact.get("state") or "",
+                    "postalCode": contact.get("postalCode") or "",
+                    "country": contact.get("country") or "",
+                    "timezone": contact.get("timezone") or "",
+                    "companyName": contact.get("companyName") or "",
+                    "website": contact.get("website") or "",
+                    "businessId": contact.get("businessId") or "",
+                    "dnd": contact.get("dnd", False),
+                    "dndSettings": contact.get("dndSettings") or {},
+                    "customFields": contact.get("customFields") or [],
+                    "followers": contact.get("followers") or [],
+                    "assignedTo": contact.get("assignedTo") or "",
+                    "opportunities": contact.get("opportunities") or [],
+                    "attributionSource": contact.get("attributionSource") or {},
+                    "lastAttributionSource": contact.get("lastAttributionSource") or {},
+                    # Cross-source enrichment
+                    "sources": {
+                        "ghl": True,
+                        "meta": has_meta,
+                        "hp": has_hp,
+                    },
+                    "meta_enrichment": meta_enrich,
+                    "hp_enrichment": hp_enrich,
+                }
+                contacts.append(formatted)
+
+            elapsed = _time.time() - start_time
+
+            return {
+                "contacts": contacts,
+                "meta": {
+                    "total_contacts": total_contacts,
+                    "current_page": page,
+                    "total_pages": total_pages,
+                    "per_page": limit,
+                    "returned": len(contacts),
+                    "has_next": page < total_pages,
+                    "has_prev": page > 1,
+                    "sort_order": "newest_first",
+                    "date_filtered": bool(start_date or end_date),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "stats": {
+                        "total_opportunities": total_opportunities,
+                        "won": opportunity_stats["won"],
+                        "lost": opportunity_stats["lost"],
+                        "open": opportunity_stats["open"],
+                        "abandoned": opportunity_stats["abandoned"],
+                        "conversion_rate": round((opportunity_stats["won"] / total_opportunities) * 100, 1) if total_opportunities > 0 else 0,
+                        "total_value": round(total_value, 2),
+                    },
+                },
+                "message": f"Retrieved {len(contacts)} unified leads (newest first)",
+                "performance": {
+                    "response_time_ms": int(elapsed * 1000),
+                    "source": "unified",
+                },
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching unified leads: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to fetch unified leads: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
 # POST /api/client-groups/{group_id}/refresh/{integration}
 # ---------------------------------------------------------------------------
 

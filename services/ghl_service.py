@@ -8,6 +8,8 @@ import asyncio
 import logging
 from collections import Counter
 from datetime import datetime
+
+from utils.phone_normalize import compute_match_keys
 from typing import Dict, List, Tuple
 
 from core.database import DB_NAME
@@ -437,7 +439,8 @@ async def fetch_and_cache_ghl_data_optimized(
                                 "client_group_id": group_id,
                                 "client_group_name": client_group_name,
                                 "contact_id": contact.get("id"),
-                                "contact_data": contact,  # Save EVERYTHING
+                                "contact_data": contact,
+                                "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
                                 "created_at": datetime.now(),
                                 "updated_at": datetime.now()
                             })
@@ -466,7 +469,8 @@ async def fetch_and_cache_ghl_data_optimized(
                                 "client_group_id": group_id,
                                 "client_group_name": client_group_name,
                                 "contact_id": contact_id,
-                                "contact_data": contact,  # Save EVERYTHING
+                                "contact_data": contact,
+                                "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
                                 "updated_at": datetime.now()
                             }
 

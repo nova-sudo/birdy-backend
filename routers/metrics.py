@@ -46,33 +46,46 @@ async def get_available_metric_fields(current_user: str = Depends(get_current_us
 
         return {
             "base_metrics": [
-                {"id": "meta_spend", "label": "Meta Spend", "category": "Meta Ads"},
-                {"id": "meta_impressions", "label": "Impressions", "category": "Meta Ads"},
-                {"id": "meta_clicks", "label": "Clicks", "category": "Meta Ads"},
-                {"id": "meta_reach", "label": "Reach", "category": "Meta Ads"},
-                {"id": "meta_results", "label": "Results", "category": "Meta Ads"},
-                {"id": "meta_ctr", "label": "CTR", "category": "Meta Ads"},
-                {"id": "meta_cpc", "label": "CPC", "category": "Meta Ads"},
-                {"id": "meta_cpm", "label": "CPM", "category": "Meta Ads"},
-                {"id": "meta_leads", "label": "Meta Leads", "category": "Meta Ads"},
-                {"id": "ghl_contacts", "label": "GHL Contacts", "category": "GoHighLevel"},
-                {"id": "ghl_revenue", "label": "GHL Revenue", "category": "GoHighLevel"},
-                {"id": "conversion_rate", "label": "Conversion Rate", "category": "Calculated"},
-                {"id": "cost_per_lead", "label": "Cost Per Lead", "category": "Calculated"},
-                {"id": "engagement_rate", "label": "Engagement Rate", "category": "Calculated"},
-                # Campaign-level metrics (for Marketing Hub)
-                {"id": "spend", "label": "Spend", "category": "Campaigns"},
-                {"id": "impressions", "label": "Impressions", "category": "Campaigns"},
-                {"id": "clicks", "label": "Clicks", "category": "Campaigns"},
-                {"id": "reach", "label": "Reach", "category": "Campaigns"},
-                {"id": "results", "label": "Results", "category": "Campaigns"},
-                {"id": "leads", "label": "Leads", "category": "Campaigns"},
-                {"id": "ctr", "label": "CTR", "category": "Campaigns"},
-                {"id": "cpc", "label": "CPC", "category": "Campaigns"},
-                {"id": "cpm", "label": "CPM", "category": "Campaigns"},
-                {"id": "frequency", "label": "Frequency", "category": "Campaigns"},
+                # Group-level (Client Groups page)
+                {"id": "meta_spend", "label": "Meta Spend", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_impressions", "label": "Impressions", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_clicks", "label": "Clicks", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_reach", "label": "Reach", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_results", "label": "Results", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_ctr", "label": "CTR", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_cpc", "label": "CPC", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_cpm", "label": "CPM", "category": "Meta Ads", "level": "group"},
+                {"id": "meta_leads", "label": "Meta Leads", "category": "Meta Ads", "level": "group"},
+                {"id": "ghl_contacts", "label": "GHL Contacts", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_revenue", "label": "GHL Revenue", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_won_opps", "label": "Won Opps", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_lost_opps", "label": "Lost Opps", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_open_opps", "label": "Open Opps", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_abandoned_opps", "label": "Abandoned Opps", "category": "GoHighLevel", "level": "group"},
+                {"id": "ghl_total_opps", "label": "Total Opps", "category": "GoHighLevel", "level": "group"},
+                {"id": "conversion_rate", "label": "Conversion Rate", "category": "Calculated", "level": "group"},
+                {"id": "cost_per_lead", "label": "Cost Per Lead", "category": "Calculated", "level": "group"},
+                {"id": "engagement_rate", "label": "Engagement Rate", "category": "Calculated", "level": "group"},
+                # Campaign-level (Marketing Hub — Campaigns/AdSets/Ads)
+                {"id": "spend", "label": "Spend", "category": "Campaigns", "level": "campaign"},
+                {"id": "impressions", "label": "Impressions", "category": "Campaigns", "level": "campaign"},
+                {"id": "clicks", "label": "Clicks", "category": "Campaigns", "level": "campaign"},
+                {"id": "reach", "label": "Reach", "category": "Campaigns", "level": "campaign"},
+                {"id": "results", "label": "Results", "category": "Campaigns", "level": "campaign"},
+                {"id": "leads", "label": "Leads", "category": "Campaigns", "level": "campaign"},
+                {"id": "ctr", "label": "CTR", "category": "Campaigns", "level": "campaign"},
+                {"id": "cpc", "label": "CPC", "category": "Campaigns", "level": "campaign"},
+                {"id": "cpm", "label": "CPM", "category": "Campaigns", "level": "campaign"},
+                {"id": "frequency", "label": "Frequency", "category": "Campaigns", "level": "campaign"},
+                # Lead-level (Leads Hub / Marketing Hub Leads tab)
+                {"id": "opportunityValue", "label": "Opportunity Value", "category": "Lead Fields", "level": "lead"},
             ],
             "tags": sorted(tags),
+            "level_dashboards": {
+                "group": ["clients"],
+                "campaign": ["campaigns", "adsets", "ads"],
+                "lead": ["leads", "marketing_leads"],
+            },
         }
 
 
@@ -145,6 +158,8 @@ async def update_custom_metric(
                     m["format_type"] = request.format_type
                 if request.aggregation is not None:
                     m["aggregation"] = request.aggregation
+                if request.enabled is not None:
+                    m["enabled"] = request.enabled
                 m["updated_at"] = datetime.utcnow().isoformat()
                 found = True
                 break

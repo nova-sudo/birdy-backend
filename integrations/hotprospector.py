@@ -8,6 +8,8 @@ from motor.motor_asyncio import AsyncIOMotorClient
 from typing import List, Tuple, Optional, Dict
 import asyncio
 
+from utils.phone_normalize import compute_match_keys
+
 # Load environment variables
 load_dotenv()
 
@@ -408,7 +410,8 @@ async def save_hotprospector_leads_to_collection(
                 lead_doc = {
                     "user_id": user_id,
                     "ghl_location_id": ghl_location_id,
-                    "lead_data": lead,  # Now includes call_logs and call_logs_count!
+                    "lead_data": lead,
+                    "match_keys": compute_match_keys(lead.get("email"), lead.get("phone")),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now()
                 }

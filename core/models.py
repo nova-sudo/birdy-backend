@@ -88,6 +88,7 @@ class UpdateCustomMetricRequest(BaseModel):
     dashboards: Optional[List[str]] = None
     format_type: Optional[str] = None
     aggregation: Optional[str] = None
+    enabled: Optional[bool] = None
 
 
 # ── Birdy AI Chat ───────────────────────────────────────────────────────────

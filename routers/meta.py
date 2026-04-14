@@ -711,11 +711,12 @@ async def get_facebook_leads_filtered(
                     date_filter["$lte"] = end_date
                 query["lead_data.created_time"] = date_filter
 
-            # Fetch leads (sorted newest first)
+            # Fetch leads (sorted newest first) — include match_keys for GHL enrichment
             cursor = leads_collection.find(
                 query,
                 {
                     "lead_data": 1,
+                    "match_keys": 1,
                     "client_group_name": 1,
                     "ad_account_id": 1,
                     "client_group_id": 1,
@@ -724,11 +725,59 @@ async def get_facebook_leads_filtered(
 
             lead_docs = await cursor.to_list(length=limit)
 
-            # Format leads
+            # ── GHL enrichment: match Meta leads to GHL contacts ──
+            all_keys = set()
+            for doc in lead_docs:
+                for key in (doc.get("match_keys") or []):
+                    all_keys.add(key)
+
+            ghl_matches = {}
+            if all_keys:
+                ghl_col = db["ghl_contacts"]
+                ghl_docs = await ghl_col.find(
+                    {"user_id": current_user, "match_keys": {"$in": list(all_keys)}},
+                    {"match_keys": 1, "contact_data.tags": 1, "contact_data.opportunities": 1,
+                     "contact_data.firstName": 1, "contact_data.lastName": 1,
+                     "contact_data.dateAdded": 1, "contact_data.source": 1}
+                ).to_list(None)
+                for gd in ghl_docs:
+                    cd = gd.get("contact_data", {})
+                    opps = cd.get("opportunities") or []
+                    # Determine primary opportunity status
+                    opp_status = ""
+                    opp_value = 0
+                    if opps:
+                        # Pick the most relevant: won > open > lost > abandoned
+                        for priority in ["won", "open", "lost", "abandoned"]:
+                            match = next((o for o in opps if o.get("status") == priority), None)
+                            if match:
+                                opp_status = match.get("status", "")
+                                opp_value = match.get("monetaryValue", 0) or 0
+                                break
+                    enrichment = {
+                        "ghl_matched": True,
+                        "ghl_tags": cd.get("tags") or [],
+                        "ghl_opportunity_status": opp_status,
+                        "ghl_opportunity_value": opp_value,
+                        "ghl_date_added": cd.get("dateAdded", ""),
+                    }
+                    for key in (gd.get("match_keys") or []):
+                        ghl_matches[key] = enrichment
+
+            # Format leads with GHL enrichment
             leads = []
             for doc in lead_docs:
                 lead_data = doc.get("lead_data", {})
-                leads.append({
+                doc_keys = doc.get("match_keys") or []
+
+                # Find GHL enrichment
+                ghl_enrich = None
+                for k in doc_keys:
+                    if k in ghl_matches:
+                        ghl_enrich = ghl_matches[k]
+                        break
+
+                lead_entry = {
                     "lead_id": lead_data.get("id"),
                     "full_name": lead_data.get("full_name", ""),
                     "email": lead_data.get("email", ""),
@@ -744,7 +793,14 @@ async def get_facebook_leads_filtered(
                     "group_name": doc.get("client_group_name", "Unknown Group"),
                     "ad_account_id": doc.get("ad_account_id"),
                     "field_data": lead_data.get("field_data", {}),
-                })
+                    # GHL enrichment
+                    "ghl_matched": ghl_enrich is not None,
+                    "ghl_tags": ghl_enrich["ghl_tags"] if ghl_enrich else [],
+                    "ghl_opportunity_status": ghl_enrich["ghl_opportunity_status"] if ghl_enrich else "",
+                    "ghl_opportunity_value": ghl_enrich["ghl_opportunity_value"] if ghl_enrich else 0,
+                    "ghl_date_added": ghl_enrich["ghl_date_added"] if ghl_enrich else "",
+                }
+                leads.append(lead_entry)
 
             elapsed = time.time() - start_time
 

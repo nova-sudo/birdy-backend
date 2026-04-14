@@ -276,10 +276,14 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
         ghl_leads_q = {**ghl_base_q, "contact_data.dateAdded": ghl_date_filter}
         ghl_leads = float(await db["ghl_contacts"].count_documents(ghl_leads_q))
 
-        # GHL conversion rate: won ops / total ops across ALL contacts (not date-filtered)
+        # GHL opportunity stats across ALL contacts (not date-filtered)
         ghl_won = 0.0
+        ghl_lost = 0.0
+        ghl_open = 0.0
+        ghl_abandoned = 0.0
         ghl_total_ops = 0.0
-        if metric == "ghl_conversion":
+        opp_metrics = ("ghl_conversion", "ghl_won_opps", "ghl_lost_opps", "ghl_open_opps", "ghl_abandoned_opps", "ghl_total_opps")
+        if metric in opp_metrics:
             # Debug: count how many contacts match the base query
             base_count = await db["ghl_contacts"].count_documents(ghl_base_q)
             logger.info(f"ghl_conversion debug: ghl_base_q={ghl_base_q}, matched_contacts={base_count}")
@@ -298,7 +302,12 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
                 ghl_total_ops += doc["count"]
                 if doc["_id"] == "won":
                     ghl_won = doc["count"]
-            logger.info(f"ghl_conversion debug: won={ghl_won}, total={ghl_total_ops}")
+                elif doc["_id"] == "lost":
+                    ghl_lost = doc["count"]
+                elif doc["_id"] == "open":
+                    ghl_open = doc["count"]
+                elif doc["_id"] == "abandoned":
+                    ghl_abandoned = doc["count"]
 
         # GHL revenue: sum of won opportunity monetaryValue (all contacts, no date filter)
         ghl_revenue = 0.0
@@ -325,6 +334,16 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
             current_value = ghl_revenue
         elif metric == "ghl_conversion":
             current_value = (ghl_won / ghl_total_ops * 100) if ghl_total_ops else 0.0
+        elif metric == "ghl_won_opps":
+            current_value = ghl_won
+        elif metric == "ghl_lost_opps":
+            current_value = ghl_lost
+        elif metric == "ghl_open_opps":
+            current_value = ghl_open
+        elif metric == "ghl_abandoned_opps":
+            current_value = ghl_abandoned
+        elif metric == "ghl_total_opps":
+            current_value = ghl_total_ops
         elif metric == "meta_conversion" or metric == "conversion_rate":
             current_value = (meta_leads / total_clicks * 100) if total_clicks else 0.0
         elif metric == "spend":
@@ -372,6 +391,9 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
                     "meta_leads": meta_leads,
                     "ghl_contacts": ghl_leads, "ghl_leads": ghl_leads,
                     "ghl_revenue": ghl_revenue,
+                    "ghl_won_opps": ghl_won, "ghl_lost_opps": ghl_lost,
+                    "ghl_open_opps": ghl_open, "ghl_abandoned_opps": ghl_abandoned,
+                    "ghl_total_opps": ghl_total_ops,
                     "leads": ghl_leads,
                     "ctr": (total_clicks / total_impressions * 100) if total_impressions else 0,
                     "cpc": (total_spend / total_clicks) if total_clicks else 0,
@@ -462,7 +484,7 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
                 # Pure GHL lead count comparison
                 curr_val, prev_val = await _ghl_lead_counts()
 
-            elif metric in ("ghl_conversion", "ghl_revenue"):
+            elif metric in ("ghl_conversion", "ghl_revenue", "ghl_won_opps", "ghl_lost_opps", "ghl_open_opps", "ghl_abandoned_opps", "ghl_total_opps"):
                 # Can't time-window opportunities. Compare against last stored value.
                 curr_val = current_value
                 prev_val = float(alert.get("current_value", 0) or 0)
@@ -518,7 +540,7 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
 
             # For ghl_conversion, store the actual rate (not pct_change) so next
             # evaluation has a real baseline to compare against.
-            if metric in ("ghl_conversion", "ghl_revenue"):
+            if metric in ("ghl_conversion", "ghl_revenue", "ghl_won_opps", "ghl_lost_opps", "ghl_open_opps", "ghl_abandoned_opps", "ghl_total_opps"):
                 # current_value stays as the actual value so next eval has a baseline
                 pass
             else:

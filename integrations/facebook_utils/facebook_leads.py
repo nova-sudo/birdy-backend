@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import List, Tuple
 import httpx
 
+from utils.phone_normalize import compute_match_keys
+
 logger = logging.getLogger(__name__)
 
 from integrations.facebook_utils._api_helpers import api_get_with_backoff as _api_get_with_backoff
@@ -148,6 +150,7 @@ async def fetch_and_cache_facebook_leads_FIXED(
                     "client_group_name": client_group_name,
                     "lead_id": lead.get("lead_id"),
                     "lead_data": lead,
+                    "match_keys": compute_match_keys(lead.get("email"), lead.get("phone_number")),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now()
                 })
@@ -611,6 +614,7 @@ async def fetch_and_cache_facebook_leads_STAGED(
                     "client_group_name": client_group_name,
                     "lead_id": lead.get("lead_id"),
                     "lead_data": lead,
+                    "match_keys": compute_match_keys(lead.get("email"), lead.get("phone_number")),
                     "created_at": datetime.now(),
                     "updated_at": datetime.now()
                 })

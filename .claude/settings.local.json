@@ -36,7 +36,9 @@
       "Bash(find C:UsersASUSDesktopBirdybirdy-backend -name refresh_all_job.py -o -name *refresh*job*)",
       "Bash(grep -r \"refresh_all_job\\\\|start_cycle\\\\|_run_cycle\" C:UsersASUSDesktopBirdybirdy-backendrouters --include=*.py)",
       "Bash(grep -r \"refresh_all_job\\\\|start_cycle\" C:UsersASUSDesktopBirdybirdy-backend --include=*.py)",
-      "Bash(1 timeout:*)"
+      "Bash(1 timeout:*)",
+      "Bash(python -c \"from routers.settings import router; from jobs.alert_jobs import evaluate_all_alerts; from services.slack_service import send_test_message, send_alert_triggered; print\\('All imports OK'\\)\")",
+      "Bash(python -c ':*)"
     ]
   }
 }
