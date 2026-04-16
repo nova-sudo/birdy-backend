@@ -50,9 +50,10 @@ class FacebookIntegration:
         return f"{META_OAUTH_CONFIG['auth_url']}?{urllib.parse.urlencode(params)}"
 
     async def exchange_code_for_token(self, code):
-        """Exchange authorization code for access token using form data"""
+        """Exchange authorization code for access token, then upgrade to long-lived token."""
         async with httpx.AsyncClient(timeout=30.0) as client:
             try:
+                # Step 1: Exchange auth code for short-lived token
                 response = await client.post(
                     META_OAUTH_CONFIG["token_url"],
                     data={
@@ -70,9 +71,34 @@ class FacebookIntegration:
                     logger.error(f"Token exchange failed: {response.status_code} {response.text}")
                     return False, {"error": response.json().get("error", "Token exchange failed"), "status_code": response.status_code}
                 tokens = response.json()
+                short_lived_token = tokens.get("access_token")
+
+                # Step 2: Exchange short-lived token for long-lived token (~60 days)
+                try:
+                    ll_response = await client.get(
+                        META_OAUTH_CONFIG["token_url"],
+                        params={
+                            "grant_type": "fb_exchange_token",
+                            "client_id": self.client_id,
+                            "client_secret": self.client_secret,
+                            "fb_exchange_token": short_lived_token,
+                        },
+                    )
+                    if ll_response.status_code == 200:
+                        ll_data = ll_response.json()
+                        tokens["access_token"] = ll_data.get("access_token", short_lived_token)
+                        expires_in = ll_data.get("expires_in", 60 * 24 * 60 * 60)
+                        tokens["expires_in"] = expires_in
+                        tokens["token_type"] = "long_lived"
+                        logger.info("Successfully exchanged for long-lived Meta token (expires in %s s)", expires_in)
+                    else:
+                        logger.warning("Long-lived token exchange failed (%s), keeping short-lived token", ll_response.status_code)
+                except Exception as ll_err:
+                    logger.warning("Long-lived token exchange error, keeping short-lived token: %s", ll_err)
+
                 expires_in = tokens.get("expires_in", 60 * 24 * 60 * 60)  # Default: 60 days
                 tokens["expires_at"] = (datetime.now() + timedelta(seconds=expires_in)).isoformat()
-                logger.info(f"Token exchange response: {json.dumps(tokens, indent=2)}")
+                logger.info(f"Token exchange complete, expires_in={expires_in}s")
                 return True, tokens
             except httpx.RequestError as e:
                 logger.error(f"Network error during token exchange: {str(e)}")
