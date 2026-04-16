@@ -23,6 +23,61 @@ logger = logging.getLogger(__name__)
 
 
 # ------------------------------------------------------------------
+# cache_ghl_opp_stats_all_presets  — fetch & cache opp stats per preset
+# ------------------------------------------------------------------
+async def cache_ghl_opp_stats_all_presets(
+    group_id: str,
+    location_id: str,
+    access_token: str,
+    mongo_client,
+):
+    """
+    Fetch GHL opportunity stats for every date preset and write them
+    to client_groups.ghl_opp_cache.<preset_key>.
+    """
+    from core.constants import META_CACHE_PRESETS, ghl_date_bounds_mmddyyyy
+
+    db = mongo_client[DB_NAME]
+    groups_col = db["client_groups"]
+    opp_cache = {}
+
+    for preset in META_CACHE_PRESETS:
+        start, end = ghl_date_bounds_mmddyyyy(preset)
+        try:
+            ok, stats = await ghl_integration.fetch_opportunity_stats(
+                location_id, access_token, date_start=start, date_end=end,
+            )
+            if ok:
+                opp_cache[preset] = stats
+            else:
+                logger.warning("Opp stats failed for %s preset=%s", location_id, preset)
+        except Exception as e:
+            logger.warning("Opp stats error for %s preset=%s: %s", location_id, preset, e)
+        await asyncio.sleep(1)  # Rate limit between presets
+
+    opp_cache["updated_at"] = datetime.utcnow().isoformat()
+
+    # Write the full per-preset cache
+    await groups_col.update_one(
+        {"id": group_id},
+        {"$set": {"ghl_opp_cache": opp_cache}},
+    )
+
+    # Also write "maximum" stats into the legacy location for backward compat
+    max_stats = opp_cache.get("maximum", {})
+    if max_stats:
+        await groups_col.update_one(
+            {"id": group_id},
+            {"$set": {"gohighlevel_cache.metrics.opportunity_stats": max_stats}},
+        )
+
+    logger.info(
+        "Cached GHL opp stats for group %s: %d presets written",
+        group_id, len([k for k in opp_cache if k != "updated_at"]),
+    )
+
+
+# ------------------------------------------------------------------
 # fetch_ghl_contacts_for_group  (line ~2790)
 # ------------------------------------------------------------------
 async def fetch_ghl_contacts_for_group(
@@ -127,30 +182,23 @@ async def refresh_ghl_data_for_user(user_id: str):
 
                 location_data = subaccount_tokens.get(location_id, {})
 
-                # Quick opportunity revenue aggregation
+                # Fetch & cache opp stats for ALL date presets
+                access_token = location_data.get("access_token")
                 opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
                              "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
-                try:
-                    opp_pipeline = [
-                        {"$match": {"user_id": user_id, "location_id": location_id}},
-                        {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
-                        {"$group": {
-                            "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
-                            "count": {"$sum": 1},
-                            "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
-                        }},
-                    ]
-                    opp_docs = await contacts_collection.aggregate(opp_pipeline).to_list(20)
-                    for doc in opp_docs:
-                        status = doc["_id"]
-                        opp_stats["total_opportunities"] += doc["count"]
-                        opp_stats["total_revenue"] += doc.get("value", 0)
-                        if status in opp_stats:
-                            opp_stats[status] = doc["count"]
-                        if status == "won":
-                            opp_stats["won_revenue"] = doc.get("value", 0)
-                except Exception:
-                    pass
+                if access_token:
+                    try:
+                        await cache_ghl_opp_stats_all_presets(
+                            group["id"], location_id, access_token, mongo_client
+                        )
+                        # Read back "maximum" for the legacy cache
+                        g_doc = await client_groups_collection.find_one(
+                            {"id": group["id"]}, {"ghl_opp_cache.maximum": 1}
+                        )
+                        if g_doc:
+                            opp_stats = g_doc.get("ghl_opp_cache", {}).get("maximum", opp_stats)
+                    except Exception:
+                        pass
 
                 cache_data = {
                     "location_id": location_id,
@@ -553,30 +601,25 @@ async def fetch_and_cache_ghl_data_optimized(
         # Convert tag counter to sorted dict
         tag_metrics = dict(tag_counter.most_common())
 
-        # Aggregate opportunity revenue stats
+        # Fetch & cache opp stats for ALL date presets via GHL Opportunities API
+        try:
+            await cache_ghl_opp_stats_all_presets(
+                group_id, ghl_location_id, access_token, mongo_client
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache opp stats presets for {ghl_location_id}: {e}")
+
+        # Read back the "maximum" opp stats for the legacy cache field
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
                      "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
         try:
-            opp_pipeline = [
-                {"$match": {"user_id": user_id, "location_id": ghl_location_id}},
-                {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
-                {"$group": {
-                    "_id": {"$ifNull": ["$contact_data.opportunities.status", "open"]},
-                    "count": {"$sum": 1},
-                    "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
-                }},
-            ]
-            opp_docs = await contacts_collection.aggregate(opp_pipeline).to_list(20)
-            for doc in opp_docs:
-                status = doc["_id"]
-                opp_stats["total_opportunities"] += doc["count"]
-                opp_stats["total_revenue"] += doc.get("value", 0)
-                if status in opp_stats:
-                    opp_stats[status] = doc["count"]
-                if status == "won":
-                    opp_stats["won_revenue"] = doc.get("value", 0)
-        except Exception as e:
-            logger.warning(f"Failed to aggregate opportunity stats for {ghl_location_id}: {e}")
+            group_doc = await client_groups_collection.find_one(
+                {"id": group_id}, {"ghl_opp_cache.maximum": 1}
+            )
+            if group_doc:
+                opp_stats = group_doc.get("ghl_opp_cache", {}).get("maximum", opp_stats)
+        except Exception:
+            pass
 
         # Update cache
         cache_data = {

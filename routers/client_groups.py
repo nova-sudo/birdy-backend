@@ -16,7 +16,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 
 from core.database import DB_NAME
-from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE
+from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE, ghl_date_bounds
 from core.models import ClientGroupRequest
 from core.utils import mongo_to_dict, get_result_value
 from dependencies import get_current_user, get_mongo_client
@@ -107,45 +107,7 @@ async def get_client_groups(
             resolved_preset = PRESET_ALIAS.get(date_preset or "maximum", "maximum")
 
             # -- GHL: compute ISO date bounds for the window --
-            def _ghl_date_bounds(preset_key: str):
-                today = _date.today()
-                spec = GHL_PRESET_DATE_RANGE.get(preset_key)
-                if spec is None:
-                    return None, None
-                if isinstance(spec, tuple):
-                    start_days, end_days = spec
-                    return (
-                        (today - timedelta(days=start_days)).isoformat(),
-                        (today - timedelta(days=end_days)).isoformat(),
-                    )
-                if spec == "this_week_mon":
-                    s = today - timedelta(days=today.weekday())
-                    return s.isoformat(), today.isoformat()
-                if spec == "this_week_sun":
-                    s = today - timedelta(days=(today.weekday() + 1) % 7)
-                    return s.isoformat(), today.isoformat()
-                if spec == "this_month":
-                    return today.replace(day=1).isoformat(), today.isoformat()
-                if spec == "last_month":
-                    first_this = today.replace(day=1)
-                    last_prev = first_this - timedelta(days=1)
-                    return last_prev.replace(day=1).isoformat(), last_prev.isoformat()
-                if spec == "this_quarter":
-                    qm = ((today.month - 1) // 3) * 3 + 1
-                    return today.replace(month=qm, day=1).isoformat(), today.isoformat()
-                if spec == "last_quarter":
-                    qm = ((today.month - 1) // 3) * 3 + 1
-                    first_this_q = today.replace(month=qm, day=1)
-                    last_prev_q = first_this_q - timedelta(days=1)
-                    pqm = ((last_prev_q.month - 1) // 3) * 3 + 1
-                    return last_prev_q.replace(month=pqm, day=1).isoformat(), last_prev_q.isoformat()
-                if spec == "this_year":
-                    return today.replace(month=1, day=1).isoformat(), today.isoformat()
-                if spec == "last_year":
-                    return _date(today.year - 1, 1, 1).isoformat(), _date(today.year - 1, 12, 31).isoformat()
-                return None, None
-
-            ghl_start, ghl_end = _ghl_date_bounds(resolved_preset)
+            ghl_start, ghl_end = ghl_date_bounds(resolved_preset)
             is_all_time = ghl_start is None
 
             # -- GHL: aggregate new_contacts + windowed tag_breakdown --
@@ -181,14 +143,6 @@ async def get_client_groups(
                                 "tags": {"$push": {"tag": "$_id.tag", "count": "$count"}},
                             }},
                         ],
-                        "opportunities": [
-                            {"$unwind": {"path": "$contact_data.opportunities", "preserveNullAndEmptyArrays": False}},
-                            {"$group": {
-                                "_id": {"group": "$client_group_id", "status": {"$ifNull": ["$contact_data.opportunities.status", "open"]}},
-                                "count": {"$sum": 1},
-                                "value": {"$sum": {"$ifNull": [{"$toDouble": "$contact_data.opportunities.monetaryValue"}, 0]}},
-                            }},
-                        ],
                     }},
                 ]
                 facet_result = await contacts_col.aggregate(pipeline).to_list(1)
@@ -204,28 +158,12 @@ async def get_client_groups(
                     for row in facet.get("tags", []):
                         group_id = row["_id"]
                         if group_id not in ghl_windowed:
-                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}, "opportunity_stats": {}}
+                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}}
                         ghl_windowed[group_id]["tag_breakdown"] = {
                             t["tag"]: t["count"] for t in row.get("tags", [])
                         }
-                    # Merge opportunity stats
-                    for row in facet.get("opportunities", []):
-                        group_id = row["_id"]["group"]
-                        status = row["_id"]["status"]
-                        if group_id not in ghl_windowed:
-                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}, "opportunity_stats": {}}
-                        if "opportunity_stats" not in ghl_windowed[group_id]:
-                            ghl_windowed[group_id]["opportunity_stats"] = {
-                                "won": 0, "lost": 0, "open": 0, "abandoned": 0,
-                                "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0,
-                            }
-                        opp = ghl_windowed[group_id]["opportunity_stats"]
-                        opp["total_opportunities"] += row["count"]
-                        opp["total_revenue"] += row.get("value", 0)
-                        if status in ("won", "lost", "open", "abandoned"):
-                            opp[status] += row["count"]
-                        if status == "won":
-                            opp["won_revenue"] += row.get("value", 0)
+                    # NOTE: Opportunity stats are now read from ghl_opp_cache (per-preset),
+                    # no longer aggregated live from contact_data.opportunities
 
             # -- Fetch groups from DB --
             # Only project the specific preset bucket requested, not all 13
@@ -249,6 +187,8 @@ async def get_client_groups(
                     "ad_account_currency": 1, "notes": 1,
                     "created_at": 1, "updated_at": 1,
                     "gohighlevel_cache": 1,
+                    f"ghl_opp_cache.{resolved_preset}": 1,
+                    "ghl_opp_cache.maximum": 1,
                     **fb_projection,
                     "hotprospector_cache": 1,
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
@@ -274,21 +214,31 @@ async def get_client_groups(
                 group_data = mongo_to_dict(group)
                 gid = group_data.get("id") or ""
 
-                # -- GHL: merge lifetime cache + windowed counts --
+                # -- GHL: merge lifetime cache + windowed counts + preset opp stats --
                 ghl_cache = group.get("gohighlevel_cache") or {}
+                # Read opp stats from the per-preset cache (ghl_opp_cache)
+                ghl_opp_cache = group.get("ghl_opp_cache") or {}
+                preset_opp = ghl_opp_cache.get(resolved_preset) or ghl_opp_cache.get("maximum") or {}
+                # Fall back to legacy cached opp stats if no preset cache exists yet
+                if not preset_opp:
+                    preset_opp = (ghl_cache.get("metrics") or {}).get("opportunity_stats", {})
+
                 if is_all_time:
-                    group_data["gohighlevel"] = ghl_cache
+                    ghl_cache_copy = {**ghl_cache}
+                    if preset_opp:
+                        metrics = ghl_cache_copy.get("metrics") or {}
+                        ghl_cache_copy["metrics"] = {**metrics, "opportunity_stats": preset_opp}
+                    group_data["gohighlevel"] = ghl_cache_copy
                 else:
                     windowed = ghl_windowed.get(gid, {})
                     cached_metrics = ghl_cache.get("metrics") or {}
-                    windowed_opp = windowed.get("opportunity_stats", cached_metrics.get("opportunity_stats", {}))
                     group_data["gohighlevel"] = {
                         **ghl_cache,
                         "metrics": {
                             **cached_metrics,
                             "total_contacts": windowed.get("new_contacts", 0),
                             "tag_breakdown": windowed.get("tag_breakdown", {}),
-                            "opportunity_stats": windowed_opp,
+                            "opportunity_stats": preset_opp,
                             "lifetime_total_contacts": cached_metrics.get("total_contacts", 0),
                         },
                     }
@@ -318,6 +268,7 @@ async def get_client_groups(
                 group_data.pop("gohighlevel_cache", None)
                 group_data.pop("facebook_cache", None)
                 group_data.pop("hotprospector_cache", None)
+                group_data.pop("ghl_opp_cache", None)
 
                 result.append(group_data)
 

@@ -147,8 +147,12 @@ async def login_user(request: LoginRequest, response: Response, background_tasks
             logger.debug(f"Generating JWT tokens for {request.email}")
             access_token, refresh_token = await generate_tokens(request.email)
 
-            access_token_max_age = (JWT_EXPIRY_MINUTES * 60) if not request.rememberMe else (30 * 24 * 60 * 60)
-            refresh_token_max_age = (JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60) if not request.rememberMe else (90 * 24 * 60 * 60)
+            # Cookie max_age should always be long-lived — the JWT exp + refresh
+            # mechanism handles actual session expiry. Short cookie max_age was
+            # causing premature logouts because the browser deleted the cookie
+            # before the refresh flow could kick in.
+            access_token_max_age = 365 * 24 * 60 * 60   # 1 year
+            refresh_token_max_age = 365 * 24 * 60 * 60  # 1 year
 
             logger.debug(
                 f"Setting cookies: access_token_max_age={access_token_max_age}, "

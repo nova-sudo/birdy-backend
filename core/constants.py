@@ -68,6 +68,73 @@ GHL_PRESET_DATE_RANGE = {
     "last_year":           "last_year",
 }
 
+
+# ---------------------------------------------------------------------------
+# GHL date-bound helpers (shared by router + caching service)
+# ---------------------------------------------------------------------------
+from datetime import date as _date, timedelta
+
+
+def ghl_date_bounds(preset_key: str):
+    """
+    Convert a preset key to (start_iso, end_iso) date strings (yyyy-mm-dd).
+    Returns (None, None) for 'maximum' (all-time).
+    """
+    today = _date.today()
+    spec = GHL_PRESET_DATE_RANGE.get(preset_key)
+    if spec is None:
+        return None, None
+    if isinstance(spec, tuple):
+        start_days, end_days = spec
+        return (
+            (today - timedelta(days=start_days)).isoformat(),
+            (today - timedelta(days=end_days)).isoformat(),
+        )
+    if spec == "this_week_mon":
+        s = today - timedelta(days=today.weekday())
+        return s.isoformat(), today.isoformat()
+    if spec == "this_week_sun":
+        s = today - timedelta(days=(today.weekday() + 1) % 7)
+        return s.isoformat(), today.isoformat()
+    if spec == "this_month":
+        return today.replace(day=1).isoformat(), today.isoformat()
+    if spec == "last_month":
+        first_this = today.replace(day=1)
+        last_prev = first_this - timedelta(days=1)
+        first_prev = last_prev.replace(day=1)
+        return first_prev.isoformat(), last_prev.isoformat()
+    if spec == "this_quarter":
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        return today.replace(month=q_start_month, day=1).isoformat(), today.isoformat()
+    if spec == "last_quarter":
+        q_start_month = ((today.month - 1) // 3) * 3 + 1
+        q_start = today.replace(month=q_start_month, day=1)
+        last_q_end = q_start - timedelta(days=1)
+        last_q_start_month = ((last_q_end.month - 1) // 3) * 3 + 1
+        return last_q_end.replace(month=last_q_start_month, day=1).isoformat(), last_q_end.isoformat()
+    if spec == "this_year":
+        return today.replace(month=1, day=1).isoformat(), today.isoformat()
+    if spec == "last_year":
+        return today.replace(year=today.year - 1, month=1, day=1).isoformat(), today.replace(year=today.year - 1, month=12, day=31).isoformat()
+    return None, None
+
+
+def ghl_date_bounds_mmddyyyy(preset_key: str):
+    """
+    Same as ghl_date_bounds but returns dates in mm-dd-yyyy format
+    as required by the GHL Opportunities Search API.
+    Returns (None, None) for 'maximum'.
+    """
+    start_iso, end_iso = ghl_date_bounds(preset_key)
+    if start_iso is None:
+        return None, None
+    # Convert yyyy-mm-dd → mm-dd-yyyy
+    def _convert(iso_str):
+        parts = iso_str.split("-")
+        return f"{parts[1]}-{parts[2]}-{parts[0]}"
+    return _convert(start_iso), _convert(end_iso)
+
+
 METRIC_LABELS = {
     # Meta Ads
     "spend":            "Total Spend",
