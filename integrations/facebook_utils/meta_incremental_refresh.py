@@ -105,7 +105,7 @@ async def _fetch_account_insights_today(
     }
 
     all_insights = []
-    base_url = f"https://graph.facebook.com/v23.0/{ad_account_id}/insights"
+    base_url = f"https://graph.facebook.com/v25.0/{ad_account_id}/insights"
     params = {
         "level": level,
         "date_preset": "today",
@@ -471,7 +471,7 @@ async def fetch_todays_facebook_leads_incremental(
 
 async def _get_todays_active_ad_ids(ad_account_id: str, access_token: str) -> List[str]:
     all_ids = []
-    base_url = f"https://graph.facebook.com/v23.0/{ad_account_id}/ads"
+    base_url = f"https://graph.facebook.com/v25.0/{ad_account_id}/ads"
     params = {
         "fields": "id",
         "access_token": access_token,
@@ -514,7 +514,7 @@ async def _get_todays_leads_for_ad(
         async with httpx.AsyncClient(timeout=60.0) as client:
             data = await _api_get_with_retry(
                 client,
-                f"https://graph.facebook.com/v23.0/{ad_id}",
+                f"https://graph.facebook.com/v25.0/{ad_id}",
                 {"fields": "leads,name", "date_preset": "today", "access_token": access_token}
             )
             if not data:

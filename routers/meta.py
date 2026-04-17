@@ -58,14 +58,14 @@ async def debug_facebook_token(current_user: str = Depends(get_current_user)):
         async with httpx.AsyncClient(timeout=15.0) as client:
             # Check token permissions
             resp = await client.get(
-                "https://graph.facebook.com/v23.0/me/permissions",
+                "https://graph.facebook.com/v25.0/me/permissions",
                 params={"access_token": access_token},
             )
             permissions = resp.json() if resp.status_code == 200 else {"error": resp.text}
 
             # Check which pages the token can access
             pages_resp = await client.get(
-                "https://graph.facebook.com/v23.0/me/accounts",
+                "https://graph.facebook.com/v25.0/me/accounts",
                 params={"access_token": access_token, "fields": "id,name,access_token"},
             )
             pages = pages_resp.json() if pages_resp.status_code == 200 else {"error": pages_resp.text}
@@ -273,7 +273,7 @@ async def get_facebook_adaccounts(current_user: str = Depends(get_current_user))
 
             async with httpx.AsyncClient(timeout=300.0) as client:
                 response = await client.get(
-                    "https://graph.facebook.com/v23.0/me/adaccounts",
+                    "https://graph.facebook.com/v25.0/me/adaccounts",
                     params={
                         "fields": "name,currency,created_time,owner",
                         "access_token": token["access_token"],
@@ -861,7 +861,7 @@ async def update_facebook_object_status(
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 resp = await client.post(
-                    f"https://graph.facebook.com/v23.0/{body.object_id}",
+                    f"https://graph.facebook.com/v25.0/{body.object_id}",
                     data={
                         "status": body.status,
                         "access_token": access_token,

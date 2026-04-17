@@ -940,7 +940,7 @@ async def get_client_group_comprehensive(
                     if not account_data:
                         async with httpx.AsyncClient(timeout=300.0) as client:
                             response = await client.get(
-                                f"https://graph.facebook.com/v23.0/{meta_ad_account_id}/campaigns",
+                                f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                                 params={
                                     "fields": "name,status,insights.date_preset(maximum){actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,spend,results,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,insights.date_preset(maximum){actions,spend,results,impressions,cpm,clicks,cpc,ctr}}",
                                     "access_token": token["access_token"],

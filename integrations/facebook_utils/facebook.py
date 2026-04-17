@@ -15,13 +15,13 @@ logger = logging.getLogger(__name__)
 
 # Meta OAuth configuration
 META_OAUTH_CONFIG = {
-    "auth_url": "https://www.facebook.com/v18.0/dialog/oauth",
-    "token_url": "https://graph.facebook.com/v18.0/oauth/access_token",
+    "auth_url": "https://www.facebook.com/v25.0/dialog/oauth",
+    "token_url": "https://graph.facebook.com/v25.0/oauth/access_token",
     "scopes": [
-        "read_insights",
-        "pages_show_list",
         "ads_management",
         "ads_read",
+        "read_insights",
+        "pages_show_list",
         "business_management",
         "leads_retrieval",
         "pages_read_engagement",

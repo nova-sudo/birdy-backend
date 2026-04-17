@@ -42,7 +42,7 @@ class MetaDataFetcher:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(
-                    f"https://graph.facebook.com/v23.0/{account_id}/campaigns",
+                    f"https://graph.facebook.com/v25.0/{account_id}/campaigns",
                     params={
                         "fields": "name,insights{actions,spend,results,reach,impressions,clicks,cpc,ctr,cost_per_result},adsets{name,insights{actions,spend,results,impressions,clicks,cpc,ctr,cost_per_result}},ads{name,insights{actions,spend,results,impressions,clicks,cpc,ctr,cost_per_result}}",
                         "access_token": self.token["access_token"]
@@ -85,7 +85,7 @@ class MetaDataFetcher:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(
-                    f"https://graph.facebook.com/v23.0/{account_id}/campaigns",
+                    f"https://graph.facebook.com/v25.0/{account_id}/campaigns",
                     params={
                         "fields": "ads{leads{id,ad_name,field_data,,platform,created_time}}",
                         "access_token": self.token["access_token"]

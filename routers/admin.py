@@ -183,7 +183,7 @@ async def refresh_meta_data(current_user: str = Depends(get_current_user)):
         import httpx
         async with httpx.AsyncClient(timeout=30.0) as client:
             resp = await client.get(
-                f"https://graph.facebook.com/v23.0/me/adaccounts",
+                f"https://graph.facebook.com/v25.0/me/adaccounts",
                 params={"fields": "id,name,currency,created_time", "access_token": token["access_token"]},
             )
             facebook_ad_accounts = resp.json().get("data", []) if resp.status_code == 200 else []

@@ -113,7 +113,7 @@ async def fetch_meta_data_for_group(
             if token and token.get("access_token"):
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     response = await client.get(
-                        f"https://graph.facebook.com/v23.0/{meta_ad_account_id}/campaigns",
+                        f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                         params={
                             "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,creative{title,body,image_url},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
                             "access_token": token["access_token"],
@@ -143,7 +143,7 @@ async def fetch_meta_data_for_group(
             if token and token.get("access_token"):
                 async with httpx.AsyncClient(timeout=300.0) as client:
                     response = await client.get(
-                        f"https://graph.facebook.com/v23.0/{meta_ad_account_id}/campaigns",
+                        f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                         params={
                             "fields": "ads{leads.date_preset(maximum){id}}",
                             "access_token": token["access_token"],
@@ -587,7 +587,7 @@ async def _fetch_meta_campaigns_for_preset(
 
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
-            url = f"https://graph.facebook.com/v23.0/{ad_account_id}/campaigns"
+            url = f"https://graph.facebook.com/v25.0/{ad_account_id}/campaigns"
             params = {"fields": fields, "access_token": access_token, "limit": 100}
             next_url = None
             page = 0

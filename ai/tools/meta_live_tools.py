@@ -19,7 +19,7 @@ from integrations.facebook_utils.facebook import get_facebook_token
 
 logger = logging.getLogger(__name__)
 
-META_API = "https://graph.facebook.com/v23.0"
+META_API = "https://graph.facebook.com/v25.0"
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────

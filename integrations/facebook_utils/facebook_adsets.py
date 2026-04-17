@@ -28,7 +28,7 @@ class FacebookAdSetFetcher:
 
     def __init__(self, access_token: str):
         self.access_token = access_token
-        self.base_url = "https://graph.facebook.com/v23.0"
+        self.base_url = "https://graph.facebook.com/v25.0"
 
     async def stage1_get_all_adset_ids(
             self,

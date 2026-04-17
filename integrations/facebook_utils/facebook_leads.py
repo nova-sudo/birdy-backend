@@ -253,7 +253,7 @@ async def stage1_get_all_ad_ids(
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             # Initial request
-            url = f"https://graph.facebook.com/v23.0/{ad_account_id}/ads"
+            url = f"https://graph.facebook.com/v25.0/{ad_account_id}/ads"
             params = {
                 "fields": "id",
                 "access_token": access_token,
@@ -327,7 +327,7 @@ async def stage2_get_all_leads_for_ad(
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
             # Initial request - REMOVED campaign_name and adset_name
-            url = f"https://graph.facebook.com/v23.0/{ad_id}"
+            url = f"https://graph.facebook.com/v25.0/{ad_id}"
             params = {
                 # 🔥 UPDATED: Request all desired lead sub-fields via nested field expansion
                 "fields": "name,leads{created_time,id,ad_id,form_id,field_data,ad_name,adset_id,adset_name,campaign_id,campaign_name,is_organic,platform}",

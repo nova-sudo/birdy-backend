@@ -85,7 +85,7 @@ async def _validate_token(access_token: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                "https://graph.facebook.com/v23.0/me",
+                "https://graph.facebook.com/v25.0/me",
                 params={"access_token": access_token},
             )
             if resp.status_code == 200:
@@ -216,7 +216,7 @@ async def refresh_meta_data_for_all_users():
                             )
                             try:
                                 async with httpx.AsyncClient() as client:
-                                    url = f"https://graph.facebook.com/v18.0/{meta_ad_account_id}"
+                                    url = f"https://graph.facebook.com/v25.0/{meta_ad_account_id}"
                                     params = {"fields": "currency", "access_token": access_token}
                                     resp = await client.get(url, params=params)
                                     data = resp.json()

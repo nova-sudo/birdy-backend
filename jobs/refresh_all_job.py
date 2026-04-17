@@ -183,7 +183,7 @@ async def _validate_meta_token(access_token: str) -> bool:
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.get(
-                "https://graph.facebook.com/v23.0/me",
+                "https://graph.facebook.com/v25.0/me",
                 params={"access_token": access_token},
             )
             if resp.status_code == 200:
@@ -207,7 +207,7 @@ async def _refresh_group_meta(group, user_id, access_token, mongo_client, db):
         try:
             async with httpx.AsyncClient() as client:
                 resp = await client.get(
-                    f"https://graph.facebook.com/v23.0/{meta_ad_account_id}",
+                    f"https://graph.facebook.com/v25.0/{meta_ad_account_id}",
                     params={"fields": "currency", "access_token": access_token},
                 )
                 ad_account_currency = resp.json().get("currency")
