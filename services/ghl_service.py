@@ -55,25 +55,31 @@ async def cache_ghl_opp_stats_all_presets(
             logger.warning("Opp stats error for %s preset=%s: %s", location_id, preset, e)
         await asyncio.sleep(1)  # Rate limit between presets
 
-    opp_cache["updated_at"] = datetime.utcnow().isoformat()
+    # Only write presets that actually succeeded — never overwrite good data with empty
+    if not opp_cache:
+        logger.warning("All opp stats calls failed for group %s, skipping write", group_id)
+        return
 
-    # Write the full per-preset cache
+    # Write each successful preset individually (dot-notation) so failed ones keep old data
+    update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
+    update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
+
     await groups_col.update_one(
         {"id": group_id},
-        {"$set": {"ghl_opp_cache": opp_cache}},
+        {"$set": update_fields},
     )
 
     # Also write "maximum" stats into the legacy location for backward compat
-    max_stats = opp_cache.get("maximum", {})
-    if max_stats:
+    max_stats = opp_cache.get("maximum")
+    if max_stats and max_stats.get("total_opportunities", 0) > 0:
         await groups_col.update_one(
             {"id": group_id},
             {"$set": {"gohighlevel_cache.metrics.opportunity_stats": max_stats}},
         )
 
     logger.info(
-        "Cached GHL opp stats for group %s: %d presets written",
-        group_id, len([k for k in opp_cache if k != "updated_at"]),
+        "Cached GHL opp stats for group %s: %d/%d presets written",
+        group_id, len(opp_cache), len(META_CACHE_PRESETS),
     )
 
 
@@ -184,8 +190,15 @@ async def refresh_ghl_data_for_user(user_id: str):
 
                 # Fetch & cache opp stats for ALL date presets
                 access_token = location_data.get("access_token")
-                opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
-                             "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
+                # Start with existing opp stats so we never overwrite good data with zeros
+                existing_doc = await client_groups_collection.find_one(
+                    {"id": group["id"]},
+                    {"gohighlevel_cache.metrics.opportunity_stats": 1, "ghl_opp_cache.maximum": 1}
+                )
+                opp_stats = (existing_doc or {}).get("gohighlevel_cache", {}).get("metrics", {}).get("opportunity_stats", {
+                    "won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                    "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0,
+                })
                 if access_token:
                     try:
                         await cache_ghl_opp_stats_all_presets(
@@ -195,10 +208,10 @@ async def refresh_ghl_data_for_user(user_id: str):
                         g_doc = await client_groups_collection.find_one(
                             {"id": group["id"]}, {"ghl_opp_cache.maximum": 1}
                         )
-                        if g_doc:
-                            opp_stats = g_doc.get("ghl_opp_cache", {}).get("maximum", opp_stats)
+                        if g_doc and g_doc.get("ghl_opp_cache", {}).get("maximum", {}).get("total_opportunities", 0) > 0:
+                            opp_stats = g_doc["ghl_opp_cache"]["maximum"]
                     except Exception:
-                        pass
+                        pass  # Keep existing opp_stats
 
                 cache_data = {
                     "location_id": location_id,
@@ -609,15 +622,23 @@ async def fetch_and_cache_ghl_data_optimized(
         except Exception as e:
             logger.warning(f"Failed to cache opp stats presets for {ghl_location_id}: {e}")
 
-        # Read back the "maximum" opp stats for the legacy cache field
+        # Read back opp stats — prefer fresh "maximum" from ghl_opp_cache, fall back to existing
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
                      "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
         try:
             group_doc = await client_groups_collection.find_one(
-                {"id": group_id}, {"ghl_opp_cache.maximum": 1}
+                {"id": group_id},
+                {"ghl_opp_cache.maximum": 1, "gohighlevel_cache.metrics.opportunity_stats": 1}
             )
             if group_doc:
-                opp_stats = group_doc.get("ghl_opp_cache", {}).get("maximum", opp_stats)
+                fresh = group_doc.get("ghl_opp_cache", {}).get("maximum", {})
+                if fresh and fresh.get("total_opportunities", 0) > 0:
+                    opp_stats = fresh
+                else:
+                    # Keep whatever was there before — don't overwrite with zeros
+                    existing = group_doc.get("gohighlevel_cache", {}).get("metrics", {}).get("opportunity_stats", {})
+                    if existing and existing.get("total_opportunities", 0) > 0:
+                        opp_stats = existing
         except Exception:
             pass
 
