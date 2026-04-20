@@ -77,30 +77,73 @@ def preset_date_bounds(preset_key: str):
     return None, None
 
 
+# Meta reports lead-like conversions under many action_type keys depending on
+# the campaign objective. We prefer the exact requested type, then fall back
+# through the common lead-related variants, and finally use `results[0]` which
+# Meta populates with the campaign's primary result.
+_LEAD_ACTION_TYPES = (
+    "lead",
+    "onsite_conversion.lead_grouped",
+    "offsite_conversion.fb_pixel_lead",
+    "leadgen_grouped",
+    "leadgen_other",
+    "submit_application_total",
+    "onsite_web_lead",
+    "complete_registration",
+)
+
+
+def _int_or_zero(v):
+    try:
+        return int(float(v or 0))
+    except (ValueError, TypeError):
+        return 0
+
+
 def get_result_value(insights_data, action_type="lead"):
     """Safely extract numeric value from insights results or actions by action_type.
 
-    Checks `results` first (populated when the campaign objective matches),
-    then falls back to `actions` (always contains all conversion events).
+    Resolution order:
+      1. `results` with matching action_type
+      2. `actions` with matching action_type
+      3. If action_type is "lead" (default): `results`/`actions` with any
+         known lead-like action_type (pixel lead, onsite lead, application, etc.)
+      4. If action_type is "lead" (default) and `results` is present but none
+         of the above matched: use the first entry in `results` (Meta puts the
+         campaign-relevant outcome there regardless of its action_type).
     """
     if not insights_data or not isinstance(insights_data, list) or len(insights_data) == 0:
         return 0
     insight = insights_data[0]
 
-    # Check results first (objective-based)
-    for res in (insight.get("results") or []):
-        if res.get("action_type") == action_type:
-            try:
-                return int(res.get("value", "0"))
-            except (ValueError, TypeError):
-                pass
+    results_list = insight.get("results") or []
+    actions_list = insight.get("actions") or []
 
-    # Fallback to actions array (always present)
-    for action in (insight.get("actions") or []):
+    # 1. Exact match in results
+    for res in results_list:
+        if res.get("action_type") == action_type:
+            return _int_or_zero(res.get("value"))
+
+    # 2. Exact match in actions
+    for action in actions_list:
         if action.get("action_type") == action_type:
-            try:
-                return int(action.get("value", "0"))
-            except (ValueError, TypeError):
-                pass
+            return _int_or_zero(action.get("value"))
+
+    # 3 & 4: Only relaxed fallbacks when we were looking for "lead"
+    if action_type == "lead":
+        # Check all lead-like action types in priority order
+        for at in _LEAD_ACTION_TYPES[1:]:  # skip "lead" (already tried)
+            for res in results_list:
+                if res.get("action_type") == at:
+                    return _int_or_zero(res.get("value"))
+            for action in actions_list:
+                if action.get("action_type") == at:
+                    return _int_or_zero(action.get("value"))
+
+        # 4. Last resort — Meta populates results[0] with whatever the
+        # campaign's primary outcome is. If it's non-zero and no lead-like
+        # type matched, use it (this covers custom conversion events).
+        if results_list:
+            return _int_or_zero(results_list[0].get("value"))
 
     return 0
