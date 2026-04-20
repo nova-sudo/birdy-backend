@@ -21,6 +21,12 @@ async def run_chat(
     # Restore or create session
     session_id, history = session_store.get_or_create(session_id, user_id)
 
+    # Defensive clean-up of any malformed history left over from a previous
+    # request (e.g. dangling tool calls, orphaned assistant(tool_calls) that
+    # lost their tool responses to a trim). Prevents Mistral 400s like
+    # "Unexpected role 'tool' after role 'system'".
+    history[:] = session_store.sanitize_history(history)
+
     # Build messages: system prompt + history + new user message
     if not history:
         history.append({"role": "system", "content": get_system_prompt()})
