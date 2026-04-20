@@ -15,6 +15,8 @@ from ai.tools.summary_tools import register_summary_tools
 from ai.tools.compare_tools import register_compare_tools
 from ai.tools.alert_tools import register_alert_tools
 from ai.tools.meta_live_tools import register_meta_live_tools
+from ai.tools.custom_metrics_tools import register_custom_metrics_tools
+from ai.tools.unified_leads_tools import register_unified_leads_tools
 from ai.orchestrator import run_chat
 
 logger = logging.getLogger(__name__)
@@ -29,6 +31,8 @@ register_summary_tools()
 register_compare_tools()
 register_alert_tools()
 register_meta_live_tools()
+register_custom_metrics_tools()
+register_unified_leads_tools()
 
 
 def _get_provider():

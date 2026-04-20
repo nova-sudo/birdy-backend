@@ -18,7 +18,17 @@ def get_system_prompt() -> str:
 **Leads & Contacts:**
 - `get_facebook_leads` — Facebook leads with contact info and source ad/campaign.
 - `get_ghl_contacts` — GoHighLevel CRM contacts with tags, source, and opportunity data.
-- `get_ghl_opportunity_stats` — Aggregated opportunity stats (won/lost/open counts and values) per group.
+- `get_unified_leads` — Leads matched across GHL, Meta, and HotProspector using email/phone. Each lead shows which sources have a record of it, plus Meta campaign/ad and GHL opp status. Supports filters: source, matched_only, opportunity_status, has_tag, date range.
+- `get_unified_lead_stats` — Cross-source totals + overlap counts (GHL-only, GHL+Meta, GHL+HP, all three). Use for "what's my lead match rate" questions.
+
+**GHL Opportunities & Tags (API-cached, per-preset):**
+- `get_ghl_opportunity_stats` — Accurate opportunity counts (won/lost/open/abandoned), won revenue, and conversion rate per client group. Backed by the GHL Opportunities Search API and pre-cached for all 13 date presets. **Prefer this over ghl_contacts for any opp/revenue/conversion question.**
+- `get_ghl_tag_breakdown` — Tag → contact count per group + global ranking. Use for tag distribution / lead-qualification questions.
+- `get_tag_rollup_by_campaign` — Tag counts rolled up to Meta campaign/adset/ad level. Use for questions like "which campaign has the most hot leads".
+
+**Custom Metrics (user-defined formulas):**
+- `list_custom_metrics` — List the user's custom formula metrics (id, name, formula, format type, target dashboards). Call first to discover available custom metrics.
+- `compute_custom_metric` — Evaluate a custom metric across client groups for a date preset. Use when the user asks about a metric they defined by name (e.g., "what's my ROAS" if they created a ROAS metric).
 
 **Dashboard & Comparison:**
 - `get_account_summary` — High-level overview across all groups: total spend, leads, CPL, conversion rate, GHL contacts. Use for "how am I doing" or "give me a summary" questions.
@@ -63,8 +73,9 @@ The cached tools (get_campaign_insights, get_adset_insights, get_ad_insights, ge
 
 **Alert Metrics:**
 - Meta Ads: spend, impressions, clicks, reach, ctr, cpc, cpm, meta_leads, meta_conversion, cpl, cost_per_result, frequency
-- GHL: ghl_leads, ghl_conversion
+- GHL: ghl_leads, ghl_conversion, ghl_revenue, ghl_won_opps, ghl_lost_opps, ghl_open_opps, ghl_abandoned_opps, ghl_total_opps
 - GHL Tags: Use `tag:TAG_NAME` format (e.g. `tag:Hot Lead`, `tag:booked consult hp`)
+- Custom metrics: Use `custom:METRIC_ID` format
 - Legacy aliases still accepted: lead_count, conversion_rate
 
 **Alert Operators:** gt (>), lt (<), eq (=), neq (≠), pct_drop (% decrease), pct_rise (% increase).
