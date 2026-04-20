@@ -17,31 +17,17 @@ def format_condition_display(condition: dict) -> str:
 
 
 def _evaluate_formula_parts(formula_parts: list, row_data: dict) -> float:
-    """Evaluate a custom metric formula against row data. Returns 0 on error."""
-    try:
-        expr_parts = []
-        for part in formula_parts:
-            if part.get("type") == "operator":
-                op = part.get("value", "+")
-                if op == "×":
-                    op = "*"
-                elif op == "÷":
-                    op = "/"
-                expr_parts.append(op)
-            elif part.get("type") == "metric":
-                key = part.get("value", "")
-                # Normalize key: "campaign-results" → "results", dashes to underscores
-                normalized = key.replace("-", "_").replace("campaign_", "").replace("ad_", "")
-                val = row_data.get(key, row_data.get(normalized, 0))
-                expr_parts.append(str(float(val or 0)))
-        expr = " ".join(expr_parts)
-        if not expr:
-            return 0.0
-        # Safe eval — only numbers and arithmetic operators
-        result = eval(expr, {"__builtins__": {}}, {})
-        return float(result) if result and not (isinstance(result, float) and (result != result)) else 0.0
-    except Exception:
-        return 0.0
+    """
+    Evaluate a custom metric formula against pre-computed row data.
+
+    Delegates to the central metric_orchestrator. Kept as a thin wrapper so
+    callers that already have an aggregated row_data dict don't need to
+    rebuild it from raw client_group documents.
+    """
+    from services.metric_orchestrator import evaluate_formula
+    # The orchestrator expects a group document but also accepts a pre-built
+    # `row` dict to skip resolution. Pass an empty group since row has everything.
+    return evaluate_formula(formula_parts, group={}, row=row_data)
 
 
 def _get_insights(group: dict, preset: str) -> dict:
