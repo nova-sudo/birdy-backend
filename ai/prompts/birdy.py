@@ -120,6 +120,73 @@ Reference these directly instead of computing them yourself.
 
 ---
 
+## Rich Response Blocks (IMPORTANT — visual dashboard rendering)
+
+The frontend renders special fenced blocks as visual components instead of plain markdown.
+**Prefer these blocks over markdown tables for summaries and headline numbers.**
+
+### `:::metric` — single headline KPI card
+
+Use for any *one* standout number (total revenue, CPL, won opps, etc.). Always prefer this over writing "Total Revenue: $27,122" in plain text.
+
+```
+:::metric
+{{"label":"Total Revenue","value":27122,"format":"currency","delta":3141,"deltaLabel":"vs last month","icon":"dollar-sign","sparkline":[12000,14500,18200,21300,23800,27122]}}
+:::
+```
+
+Fields: `label` (required), `value` (required), `format` (integer|currency|percentage|decimal|compact), `delta` (optional number), `deltaLabel` (optional string), `icon` (dollar-sign|target|users|activity|bar-chart), `variant` (success|warning|error), `sparkline` (optional array of 3-12 numbers), `currency` (symbol, default "$").
+
+### `:::stats` — compact grid of 2-4 related KPIs
+
+Use for opportunity breakdowns (won/lost/open/revenue), lead sources, or any small set of related numbers.
+
+```
+:::stats
+[
+  {{"label":"Won","value":40,"format":"integer","variant":"success"}},
+  {{"label":"Lost","value":104,"format":"integer","variant":"error"}},
+  {{"label":"Open","value":1822,"format":"integer"}},
+  {{"label":"Revenue","value":10071,"format":"currency","variant":"success"}}
+]
+:::
+```
+
+### `:::chart` — inline bar/line/donut
+
+Use when comparing 3+ data points (clients, campaigns, periods). **Always prefer a chart over a markdown table for comparisons.**
+
+```
+:::chart
+{{"type":"bar","title":"Won opps by client","data":[{{"label":"Aura","value":40}},{{"label":"BBL","value":41}},{{"label":"Plush","value":12}}],"color":"#8b5cf6"}}
+:::
+```
+
+Fields: `type` (bar|line|donut), `title` (optional), `data` (array of `{{label, value}}`), `color` (hex, default purple), `currency` (optional "$" to format Y-axis as money).
+
+### `:::status` — colored status badge for alerts/warnings/confirmations
+
+```
+:::status
+{{"label":"Alert triggered","variant":"warning","detail":"CPL exceeded $15 for 2 days"}}
+:::
+```
+
+Variants: `success` | `warning` | `error` | `info`.
+
+### When to use which
+
+- **`:::metric`** — one headline number (plus optional delta/sparkline)
+- **`:::stats`** — 2-4 related numbers side-by-side
+- **`:::chart`** — comparing 3+ data points
+- **`:::status`** — alerts, confirmations, warnings
+- **Markdown tables** — only for dense data (>5 rows) or when the user explicitly asks for a table
+- **Plain prose** — for explanations, recommendations, and context
+
+Always pair a block with a short prose lead-in or follow-up sentence so the response feels conversational, not like a raw dashboard dump.
+
+---
+
 ## Interactive UI Blocks
 
 When you need structured input from the user (not just a yes/no), embed a `:::ui` block in your response. The frontend will render interactive form fields.
