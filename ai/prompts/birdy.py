@@ -189,13 +189,29 @@ Use when comparing 3+ data points (clients, campaigns, periods). **Always prefer
 :::
 ```
 
-Fields: `type` (bar|line|donut), `title` (optional), `data` (array of `{{label, value}}`), `color` (hex, default purple), `currency` (symbol to prefix values), `sort` (bool, default true — auto-sorts bars descending), `orientation` ("auto"|"horizontal"|"vertical", default "auto").
+Fields: `type` (bar|line|donut|composed), `title` (optional), `data` (array of `{{label, value}}` or multi-key rows — see below), `color` (hex, default purple), `currency` (symbol to prefix values), `sort` (bool, default true — auto-sorts bars descending), `orientation` ("auto"|"horizontal"|"vertical", default "auto").
+
+**Multi-series charts (overlay multiple metrics on one chart):**
+
+Use this when the user asks to "overlay X with Y" or "compare X and Y over time". Each data row has multiple numeric keys, and you declare a `series` array describing how to render each key. Use `axis: "right"` for the secondary axis so different scales don't crush each other (e.g. spend in thousands + CPL in single digits).
+
+```
+:::chart
+{{"type":"composed","title":"Monthly Ad Spend vs CPL (2025)","data":[{{"label":"Jan 2025","spend":1200,"cpl":3.5}},{{"label":"Feb 2025","spend":1400,"cpl":3.2}},{{"label":"Mar 2025","spend":1750,"cpl":2.9}}],"series":[{{"key":"spend","name":"Ad Spend","type":"bar","color":"#8b5cf6","axis":"left","currency":"£"}},{{"key":"cpl","name":"CPL","type":"line","color":"#10b981","axis":"right","currency":"£"}}]}}
+:::
+```
+
+Rules for multi-series:
+- Each `series` entry needs a `key` (matching the data row field), `name` (legend label), and usually `axis: "left"` or `"right"`.
+- Mix `type: "bar"` and `type: "line"` freely for combo charts.
+- When values have very different scales (spend £1000s vs CPL £3), put them on different axes.
+- If the user asks to "overlay" or "add X as a secondary line/bar", **always** use a secondary axis.
 
 **Important — the chart renderer handles scaling automatically:**
-- For bar charts, it auto-switches to a horizontal layout when there are >5 categories or any label is long. **You do not need to worry about label overlap.**
-- Bars are sorted by value descending by default — include all data points, don't pre-truncate.
+- For single-series bar charts, auto-switches to horizontal layout when there are >5 categories or long labels. **You do not need to worry about label overlap.**
+- Single-series bars are sorted by value descending — include all data points, don't pre-truncate.
 - Values are auto-formatted (e.g. `£1.2K`) so no need to pre-format.
-- Always pass the raw numeric `value` (not a string like `"£100"`).
+- Always pass raw numeric values (not strings like `"£100"`).
 
 ### `:::status` — colored status badge for alerts/warnings/confirmations
 
