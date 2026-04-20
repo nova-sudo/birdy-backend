@@ -1,9 +1,14 @@
 """
-Backfill script: fetches opportunity stats from the GHL Opportunities Search API
-for every client group × every date preset, and writes them into ghl_opp_cache.
+Backfill script — recomputes ghl_opp_cache for every client group.
 
-This replaces the old approach of aggregating from embedded
-contact_data.opportunities (which was often incomplete).
+For each group:
+  1. Pull every opportunity from the GHL API in one paginated sweep
+  2. Derive stats for all 13 date presets in-memory using
+     integrations.gohighlevel.compute_opp_stats (by lastStatusChangeAt /
+     createdAt rather than the GHL API's creation-date filter, which was
+     returning zeros for long-cycle pipelines).
+  3. Write every preset to ghl_opp_cache.<preset> and mirror "maximum" into
+     the legacy gohighlevel_cache.metrics.opportunity_stats for backward compat.
 
 Run with:  python -m scripts.backfill_opportunity_stats
 """
@@ -12,6 +17,7 @@ import asyncio
 import logging
 import os
 import sys
+from datetime import datetime
 
 # Add project root to path so imports work
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -21,8 +27,12 @@ load_dotenv()
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from core.database import DB_NAME
-from core.constants import META_CACHE_PRESETS, ghl_date_bounds_mmddyyyy
-from integrations.gohighlevel import ghl_integration, get_subaccount_tokens
+from core.constants import META_CACHE_PRESETS, ghl_date_bounds
+from integrations.gohighlevel import (
+    ghl_integration,
+    get_subaccount_tokens,
+    compute_opp_stats,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -38,31 +48,31 @@ async def backfill():
     users_col = db["users"]
     groups_col = db["client_groups"]
 
-    # Get all users that have GHL integration
     users = await users_col.find(
         {"integrations.gohighlevel": {"$exists": True}},
         {"user_id": 1},
     ).to_list(None)
 
-    logger.info(f"Found {len(users)} users with GHL integration")
-    logger.info(f"Will fetch {len(META_CACHE_PRESETS)} presets per group")
+    logger.info("Found %d users with GHL integration", len(users))
+    logger.info("Will derive %d presets per group from one opp fetch each", len(META_CACHE_PRESETS))
 
     total_updated = 0
     total_failed = 0
+    total_skipped = 0
 
     for user_doc in users:
         user_id = user_doc["user_id"]
-        logger.info(f"\n{'='*60}")
-        logger.info(f"Processing user: {user_id}")
+        logger.info("\n" + "=" * 60)
+        logger.info("Processing user: %s", user_id)
 
         try:
             subaccount_tokens = await get_subaccount_tokens(user_id, client)
         except Exception as e:
-            logger.error(f"  Failed to get subaccount tokens: {e}")
+            logger.error("  Failed to get subaccount tokens: %s", e)
             continue
 
         if not subaccount_tokens:
-            logger.warning(f"  No subaccount tokens found, skipping")
+            logger.warning("  No subaccount tokens found, skipping")
             continue
 
         groups = await groups_col.find(
@@ -70,69 +80,83 @@ async def backfill():
             {"id": 1, "name": 1, "ghl_location_id": 1},
         ).to_list(None)
 
-        logger.info(f"  Found {len(groups)} client groups with GHL locations")
+        logger.info("  Found %d client groups with GHL locations", len(groups))
 
         for group in groups:
             group_id = group["id"]
             group_name = group.get("name", "Unknown")
             location_id = group["ghl_location_id"]
 
-            location_data = subaccount_tokens.get(location_id, {})
-            access_token = location_data.get("access_token")
-
+            access_token = subaccount_tokens.get(location_id, {}).get("access_token")
             if not access_token:
-                logger.warning(f"  [{group_name}] No access token for location {location_id}, skipping")
+                logger.warning("  [%s] No access token, skipping", group_name)
                 total_failed += 1
                 continue
 
-            logger.info(f"  [{group_name}] Fetching opp stats for {len(META_CACHE_PRESETS)} presets...")
-            opp_cache = {}
-            preset_ok = 0
+            logger.info("  [%s] Fetching all opportunities…", group_name)
+            ok, opps = await ghl_integration.fetch_all_opportunities(location_id, access_token)
 
-            for preset in META_CACHE_PRESETS:
-                start, end = ghl_date_bounds_mmddyyyy(preset)
-                try:
-                    ok, stats = await ghl_integration.fetch_opportunity_stats(
-                        location_id, access_token, date_start=start, date_end=end
+            if not ok:
+                logger.warning("  [%s] API fetch failed — preserving existing cache", group_name)
+                total_failed += 1
+                await asyncio.sleep(1)
+                continue
+
+            # Safety: if fetch returned empty but cache has data, skip
+            if not opps:
+                existing = await groups_col.find_one(
+                    {"id": group_id}, {"ghl_opp_cache.maximum": 1}
+                )
+                existing_max = (existing or {}).get("ghl_opp_cache", {}).get("maximum", {}) or {}
+                if (existing_max.get("total_opportunities") or 0) > 0:
+                    logger.warning(
+                        "  [%s] API returned 0 opps but cache has %s — skipping to preserve",
+                        group_name, existing_max.get("total_opportunities"),
                     )
-                    if ok:
-                        opp_cache[preset] = stats
-                        preset_ok += 1
-                    else:
-                        logger.warning(f"    preset={preset} failed")
-                except Exception as e:
-                    logger.warning(f"    preset={preset} error: {e}")
-                await asyncio.sleep(1)  # Rate limit
+                    total_skipped += 1
+                    continue
+                logger.info("  [%s] No opportunities (legitimately empty location)", group_name)
 
-            from datetime import datetime
-            opp_cache["updated_at"] = datetime.utcnow().isoformat()
+            # Derive all preset stats in-memory
+            opp_cache = {
+                preset: compute_opp_stats(opps, *ghl_date_bounds(preset))
+                for preset in META_CACHE_PRESETS
+            }
 
-            # Write the full per-preset cache
+            # Write via dot-notation
+            update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
+            update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
+
             await groups_col.update_one(
                 {"id": group_id},
-                {"$set": {"ghl_opp_cache": opp_cache}},
+                {"$set": update_fields},
             )
 
-            # Also write "maximum" into legacy location
-            max_stats = opp_cache.get("maximum", {})
-            if max_stats:
+            # Mirror "maximum" into legacy location
+            max_stats = opp_cache.get("maximum") or {}
+            if (max_stats.get("total_opportunities") or 0) > 0:
                 await groups_col.update_one(
                     {"id": group_id},
                     {"$set": {"gohighlevel_cache.metrics.opportunity_stats": max_stats}},
                 )
 
-            logger.info(f"  [{group_name}] ✅ {preset_ok}/{len(META_CACHE_PRESETS)} presets cached")
-            if max_stats:
-                logger.info(f"    maximum: won={max_stats.get('won',0)} lost={max_stats.get('lost',0)} "
-                           f"open={max_stats.get('open',0)} abandoned={max_stats.get('abandoned',0)} "
-                           f"revenue=${max_stats.get('won_revenue',0):,.2f}")
+            l7 = opp_cache.get("last_7d") or {}
+            l30 = opp_cache.get("last_30d") or {}
+            logger.info(
+                "  [%s] %d opps | max won=%d total=%d rev=£%.0f | last_7d won=%d total=%d | last_30d won=%d total=%d",
+                group_name, len(opps),
+                max_stats.get("won", 0), max_stats.get("total_opportunities", 0), max_stats.get("won_revenue", 0),
+                l7.get("won", 0), l7.get("total_opportunities", 0),
+                l30.get("won", 0), l30.get("total_opportunities", 0),
+            )
             total_updated += 1
+            await asyncio.sleep(1)
 
-            # Delay between groups
-            await asyncio.sleep(2)
-
-    logger.info(f"\n{'='*60}")
-    logger.info(f"Backfill complete: {total_updated} groups updated, {total_failed} failed")
+    logger.info("\n" + "=" * 60)
+    logger.info(
+        "Backfill complete: %d updated, %d failed, %d skipped (data preserved)",
+        total_updated, total_failed, total_skipped,
+    )
 
     client.close()
 

@@ -216,28 +216,22 @@ async def get_client_groups(
 
                 # -- GHL: merge lifetime cache + windowed counts + preset opp stats --
                 ghl_cache = group.get("gohighlevel_cache") or {}
-                # Read opp stats. Opportunities are *pipeline state* (won/lost/open
-                # are cumulative), so we always show the lifetime snapshot regardless
-                # of the requested preset. The GHL `date` param filters by opp
-                # *creation date* only, which for windowed presets often returns
-                # zero for pipelines with no new opps in that window — not what the
-                # user expects on a dashboard. Only fall back to a windowed preset
-                # if the lifetime cache is missing.
                 ghl_opp_cache = group.get("ghl_opp_cache") or {}
-
-                def _has_data(d):
-                    return isinstance(d, dict) and (d.get("total_opportunities") or 0) > 0
-
-                max_stats = ghl_opp_cache.get("maximum")
                 legacy_stats = (ghl_cache.get("metrics") or {}).get("opportunity_stats") or {}
 
-                if _has_data(max_stats):
-                    preset_opp = max_stats
-                elif _has_data(legacy_stats):
-                    preset_opp = legacy_stats
+                # Pick the per-preset stats. A zero-activity preset is a legitimate
+                # result (means "no won/lost/open events in this window") and must
+                # be used as-is rather than falling back to lifetime. Only fall
+                # back if the preset is genuinely missing from the cache.
+                preset_stats = ghl_opp_cache.get(resolved_preset)
+                if isinstance(preset_stats, dict):
+                    preset_opp = preset_stats
+                elif isinstance(ghl_opp_cache.get("maximum"), dict):
+                    # Preset missing — use lifetime snapshot as backup
+                    preset_opp = ghl_opp_cache["maximum"]
                 else:
-                    # Last resort — try the requested preset, else empty
-                    preset_opp = ghl_opp_cache.get(resolved_preset) or {}
+                    # No per-preset cache at all — fall back to legacy (pre-migration) data
+                    preset_opp = legacy_stats
 
                 if is_all_time:
                     ghl_cache_copy = {**ghl_cache}

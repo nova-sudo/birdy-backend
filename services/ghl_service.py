@@ -32,35 +32,50 @@ async def cache_ghl_opp_stats_all_presets(
     mongo_client,
 ):
     """
-    Fetch GHL opportunity stats for every date preset and write them
-    to client_groups.ghl_opp_cache.<preset_key>.
+    Fetch every opportunity for the location ONCE, then derive stats for all 13
+    date presets in-memory from lastStatusChangeAt / createdAt. This is much
+    cheaper than 13 API calls and correctly reflects "activity in window"
+    semantics (old per-preset calls filtered by creation date only, which for
+    long-cycle pipelines returned near-zero for every windowed preset).
+
+    Failure handling:
+      - If the full opp fetch fails, we write NOTHING (preserves existing cache).
+      - If the opp list comes back empty and the existing "maximum" cache is
+        non-empty, we also skip writes (safety against intermittent API issues).
     """
-    from core.constants import META_CACHE_PRESETS, ghl_date_bounds_mmddyyyy
+    from core.constants import META_CACHE_PRESETS, ghl_date_bounds
+    from integrations.gohighlevel import compute_opp_stats
 
     db = mongo_client[DB_NAME]
     groups_col = db["client_groups"]
-    opp_cache = {}
 
-    for preset in META_CACHE_PRESETS:
-        start, end = ghl_date_bounds_mmddyyyy(preset)
-        try:
-            ok, stats = await ghl_integration.fetch_opportunity_stats(
-                location_id, access_token, date_start=start, date_end=end,
-            )
-            if ok:
-                opp_cache[preset] = stats
-            else:
-                logger.warning("Opp stats failed for %s preset=%s", location_id, preset)
-        except Exception as e:
-            logger.warning("Opp stats error for %s preset=%s: %s", location_id, preset, e)
-        await asyncio.sleep(1)  # Rate limit between presets
-
-    # Only write presets that actually succeeded — never overwrite good data with empty
-    if not opp_cache:
-        logger.warning("All opp stats calls failed for group %s, skipping write", group_id)
+    ok, opps = await ghl_integration.fetch_all_opportunities(location_id, access_token)
+    if not ok:
+        logger.warning("Opp fetch failed for %s — preserving existing cache", location_id)
         return
 
-    # Write each successful preset individually (dot-notation) so failed ones keep old data
+    # Safety: if fetch returned zero opps but we already had data, assume a
+    # transient/partial failure and skip rather than wipe good stats.
+    if not opps:
+        existing = await groups_col.find_one(
+            {"id": group_id}, {"ghl_opp_cache.maximum": 1}
+        )
+        existing_max = (existing or {}).get("ghl_opp_cache", {}).get("maximum", {}) or {}
+        if (existing_max.get("total_opportunities") or 0) > 0:
+            logger.warning(
+                "Opp fetch returned 0 opps for %s but cache has %s — skipping to preserve",
+                location_id, existing_max.get("total_opportunities"),
+            )
+            return
+
+    # Derive stats for every preset from the one opp list
+    opp_cache: dict = {}
+    for preset in META_CACHE_PRESETS:
+        start_iso, end_iso = ghl_date_bounds(preset)
+        opp_cache[preset] = compute_opp_stats(opps, start_iso, end_iso)
+
+    # Write all presets in one update via dot notation so failed presets (if any)
+    # wouldn't clobber the whole subdocument — belt-and-braces.
     update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
     update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
 
@@ -69,17 +84,17 @@ async def cache_ghl_opp_stats_all_presets(
         {"$set": update_fields},
     )
 
-    # Also write "maximum" stats into the legacy location for backward compat
-    max_stats = opp_cache.get("maximum")
-    if max_stats and max_stats.get("total_opportunities", 0) > 0:
+    # Also mirror "maximum" into the legacy location for backward compat
+    max_stats = opp_cache.get("maximum") or {}
+    if (max_stats.get("total_opportunities") or 0) > 0:
         await groups_col.update_one(
             {"id": group_id},
             {"$set": {"gohighlevel_cache.metrics.opportunity_stats": max_stats}},
         )
 
     logger.info(
-        "Cached GHL opp stats for group %s: %d/%d presets written",
-        group_id, len(opp_cache), len(META_CACHE_PRESETS),
+        "Cached GHL opp stats for group %s: %d opps, %d presets, maximum won=%d",
+        group_id, len(opps), len(META_CACHE_PRESETS), max_stats.get("won", 0),
     )
 
 

@@ -48,6 +48,87 @@ _pending_requests: Dict[str, asyncio.Future] = {}
 _cache_lock = asyncio.Lock()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Pure helpers for opportunity statistics.
+# The GHL `date` search param only filters by creation date, which is useless
+# for windowed dashboard stats (long sales cycles → zero "won this week").
+# Instead we paginate every opp once and derive windowed stats from
+# lastStatusChangeAt / createdAt.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _opp_monetary_value(opp: dict) -> float:
+    raw = opp.get("monetaryValue") or opp.get("value") or 0
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _in_window(iso_ts: str, start_iso: Optional[str], end_iso: Optional[str]) -> bool:
+    """Return True if iso_ts (yyyy-mm-dd[T...]) is between start and end (inclusive, yyyy-mm-dd)."""
+    if not iso_ts:
+        return False
+    day = iso_ts[:10]
+    if start_iso and day < start_iso:
+        return False
+    if end_iso and day > end_iso:
+        return False
+    return True
+
+
+def compute_opp_stats(
+    opps: List[Dict],
+    window_start: Optional[str] = None,
+    window_end: Optional[str] = None,
+) -> Dict:
+    """
+    Derive opp statistics from an opportunity list.
+
+    Lifetime mode (both dates None):
+      Counts every opp by its current status. This is the pipeline snapshot.
+
+    Windowed mode (dates given, yyyy-mm-dd):
+      won/lost/abandoned → opps whose lastStatusChangeAt falls in the window
+      open               → opps created in the window that are still open
+      total_opportunities = won + lost + abandoned + open
+      won_revenue = sum(monetaryValue) for opps counted as 'won' in the window
+    """
+    stats = {
+        "won": 0, "lost": 0, "open": 0, "abandoned": 0,
+        "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0,
+    }
+    lifetime = window_start is None and window_end is None
+
+    for opp in opps:
+        status = (opp.get("status") or "open").lower()
+        if status not in ("won", "lost", "open", "abandoned"):
+            continue
+        val = _opp_monetary_value(opp)
+
+        if lifetime:
+            stats[status] += 1
+            stats["total_opportunities"] += 1
+            if status == "won":
+                stats["won_revenue"] += val
+        else:
+            last_change = opp.get("lastStatusChangeAt") or ""
+            created = opp.get("createdAt") or ""
+            if status in ("won", "lost", "abandoned"):
+                if _in_window(last_change, window_start, window_end):
+                    stats[status] += 1
+                    stats["total_opportunities"] += 1
+                    if status == "won":
+                        stats["won_revenue"] += val
+            else:  # open
+                if _in_window(created, window_start, window_end):
+                    stats["open"] += 1
+                    stats["total_opportunities"] += 1
+
+    stats["won_revenue"] = round(stats["won_revenue"], 2)
+    stats["total_revenue"] = stats["won_revenue"]
+    return stats
+
+
 class GHLIntegration:
     def __init__(self, client_id, client_secret, redirect_uri):
         self.client_id = client_id
@@ -551,6 +632,68 @@ class GHLIntegration:
             logger.error(f"❌ Error fetching contacts: {str(e)}", exc_info=True)
             return False, {"error": str(e), "status_code": 500}
 
+    async def fetch_all_opportunities(
+            self,
+            location_id: str,
+            access_token: str,
+    ) -> Tuple[bool, List[Dict]]:
+        """
+        Paginate through every opportunity for a location (no date filter).
+
+        Returns (success, opps). On any pagination error, returns (False, partial_list)
+        so callers can decide whether to trust partial data. The downstream
+        `compute_opp_stats_all_presets` only writes if success is True.
+        """
+        url = "https://services.leadconnectorhq.com/opportunities/search"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        }
+
+        opps: list = []
+        page = 1
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                while page <= 500:  # generous safety cap
+                    params = {
+                        "location_id": location_id,
+                        "status": "all",
+                        "limit": 100,
+                        "page": page,
+                    }
+                    try:
+                        resp = await client.get(url, headers=headers, params=params)
+                    except Exception as e:
+                        logger.warning("GHL opp fetch network error page %s: %s", page, e)
+                        return False, opps
+
+                    if resp.status_code != 200:
+                        logger.warning(
+                            "GHL opp fetch returned %s on page %s: %s",
+                            resp.status_code, page, resp.text[:200],
+                        )
+                        return False, opps
+
+                    data = resp.json()
+                    chunk = data.get("opportunities", []) or []
+                    if not chunk:
+                        break
+                    opps.extend(chunk)
+
+                    meta = data.get("meta", {}) or {}
+                    total = meta.get("total", 0)
+                    if not meta.get("nextPage") and page * 100 >= total:
+                        break
+                    page += 1
+
+            logger.info("Fetched %d opportunities for location %s (%d pages)", len(opps), location_id, page)
+            return True, opps
+
+        except Exception as e:
+            logger.error("Failed to fetch opportunities for location %s: %s", location_id, e, exc_info=True)
+            return False, opps
+
     async def fetch_opportunity_stats(
             self,
             location_id: str,
@@ -559,100 +702,27 @@ class GHLIntegration:
             date_end: str = None,
     ) -> Tuple[bool, Dict]:
         """
-        Fetch opportunity statistics directly from the GHL Opportunities API.
+        Single-preset convenience wrapper. Paginates all opps once then filters.
 
-        Args:
-            location_id: GHL location ID
-            access_token: OAuth access token
-            date_start: Optional start date in mm-dd-yyyy format (GHL API format)
-            date_end: Optional end date in mm-dd-yyyy format (GHL API format)
+        For multi-preset refresh jobs, prefer `fetch_all_opportunities` + in-memory
+        computation (see services.metric_orchestrator or services.ghl_service).
 
-        Returns:
-            Tuple of (success, stats_dict) where stats_dict has keys:
-            won, lost, open, abandoned, total_opportunities, won_revenue, total_revenue
+        date_start/date_end are ISO yyyy-mm-dd; both None → lifetime stats.
         """
-        stats = {
-            "won": 0, "lost": 0, "open": 0, "abandoned": 0,
-            "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0,
-        }
-        base_url = "https://services.leadconnectorhq.com/opportunities/search"
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Version": "2021-07-28",
-            "Accept": "application/json",
-        }
+        ok, opps = await self.fetch_all_opportunities(location_id, access_token)
+        if not ok:
+            empty = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                     "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}
+            return False, empty
 
-        # Build base params (shared across all calls for this invocation)
-        base_params = {"location_id": location_id}
-        if date_start:
-            base_params["date"] = date_start
-        if date_end:
-            base_params["endDate"] = date_end
-
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                # 1. Get counts for each status via limit=1 calls
-                for status in ("won", "lost", "open", "abandoned"):
-                    try:
-                        params = {**base_params, "status": status, "limit": 1}
-                        resp = await client.get(base_url, headers=headers, params=params)
-                        if resp.status_code == 200:
-                            data = resp.json()
-                            count = data.get("meta", {}).get("total", 0)
-                            stats[status] = count
-                            stats["total_opportunities"] += count
-                        else:
-                            logger.warning(
-                                "GHL opportunities search (%s) returned %s: %s",
-                                status, resp.status_code, resp.text[:200],
-                            )
-                    except Exception as e:
-                        logger.warning("GHL opp stats call failed for status=%s: %s", status, e)
-
-                # 2. Paginate through ALL won opportunities to sum monetaryValue
-                won_revenue = 0.0
-                page = 1
-                while True:
-                    try:
-                        params = {**base_params, "status": "won", "limit": 100, "page": page}
-                        resp = await client.get(base_url, headers=headers, params=params)
-                        if resp.status_code != 200:
-                            break
-                        data = resp.json()
-                        opps = data.get("opportunities", [])
-                        if not opps:
-                            break
-                        for opp in opps:
-                            val = opp.get("monetaryValue") or 0
-                            try:
-                                val = float(val)
-                            except (TypeError, ValueError):
-                                val = 0.0
-                            won_revenue += val
-                        meta = data.get("meta", {})
-                        if not meta.get("nextPage") and page >= meta.get("total", 0) // 100 + 1:
-                            break
-                        page += 1
-                        if page > 200:  # Safety cap
-                            break
-                    except Exception as e:
-                        logger.warning("GHL opp revenue pagination error page %s: %s", page, e)
-                        break
-
-                stats["won_revenue"] = round(won_revenue, 2)
-                stats["total_revenue"] = round(won_revenue, 2)
-
-            date_label = f" [{date_start} to {date_end}]" if date_start else ""
-            logger.info(
-                "📊 GHL opp stats for location %s%s: won=%d lost=%d open=%d abandoned=%d revenue=%.2f",
-                location_id, date_label, stats["won"], stats["lost"], stats["open"],
-                stats["abandoned"], stats["won_revenue"],
-            )
-            return True, stats
-
-        except Exception as e:
-            logger.error("Failed to fetch opportunity stats for location %s: %s", location_id, e)
-            return False, stats
+        stats = compute_opp_stats(opps, date_start, date_end)
+        date_label = f" [{date_start} to {date_end}]" if date_start else ""
+        logger.info(
+            "📊 GHL opp stats for location %s%s: won=%d lost=%d open=%d abandoned=%d revenue=%.2f",
+            location_id, date_label, stats["won"], stats["lost"], stats["open"],
+            stats["abandoned"], stats["won_revenue"],
+        )
+        return True, stats
 
     async def fetch_all_contacts_search(
             self,
