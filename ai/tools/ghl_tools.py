@@ -1,3 +1,5 @@
+from calendar import monthrange
+
 from ai.tools.registry import registry
 from ai.config import MAX_RESULT_ITEMS
 from core.utils import mongo_to_dict
@@ -231,6 +233,132 @@ async def get_tag_rollup_by_campaign(db, user_id, group_ids=None, level="campaig
     return {"level": level, "results": results, "total": len(results)}
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Arbitrary-window opp stats (live from GHL API)
+# ─────────────────────────────────────────────────────────────────────────────
+
+async def _fetch_and_compute_window(db, user_id, group_id, start_date, end_date):
+    """
+    Pull every opportunity for a group's GHL location and compute stats for the
+    given window. Returns {stats, ok, error}. `start_date`/`end_date` are
+    yyyy-mm-dd ISO strings; both None = lifetime.
+    """
+    from integrations.gohighlevel import (
+        ghl_integration,
+        get_subaccount_tokens,
+        compute_opp_stats,
+    )
+
+    grp = await db["client_groups"].find_one(
+        {"user_id": user_id, "id": group_id},
+        {"id": 1, "name": 1, "ghl_location_id": 1},
+    )
+    if not grp:
+        return {"ok": False, "error": f"Group '{group_id}' not found"}
+    location_id = grp.get("ghl_location_id")
+    if not location_id:
+        return {"ok": False, "error": f"Group '{grp.get('name')}' has no GHL location linked"}
+
+    tokens = await get_subaccount_tokens(user_id, db.client)
+    access_token = (tokens or {}).get(location_id, {}).get("access_token")
+    if not access_token:
+        return {"ok": False, "error": f"No GHL access token for location {location_id}"}
+
+    ok, opps = await ghl_integration.fetch_all_opportunities(location_id, access_token)
+    if not ok:
+        return {"ok": False, "error": "GHL API fetch failed — the tool could not load opportunities"}
+
+    stats = compute_opp_stats(opps, start_date, end_date)
+    return {
+        "ok": True,
+        "group_id": grp["id"],
+        "group_name": grp.get("name"),
+        "total_opps_in_account": len(opps),
+        "window": {"start": start_date, "end": end_date} if start_date else {"start": None, "end": None, "label": "lifetime"},
+        "stats": stats,
+    }
+
+
+async def get_ghl_opp_stats_windowed(db, user_id, group_id, start_date=None, end_date=None):
+    """
+    Compute opp stats for an arbitrary date window — NOT restricted to the
+    13 cached presets. Use this when the user asks for a specific month,
+    quarter, or custom range that isn't in the standard preset list.
+    Example: 'March 2025', 'Q2 2024', 'Jan 15 to Feb 15 2025'.
+    """
+    if (start_date and not end_date) or (end_date and not start_date):
+        return {"error": "Provide both start_date and end_date, or neither for lifetime"}
+    result = await _fetch_and_compute_window(db, user_id, group_id, start_date, end_date)
+    return result
+
+
+async def get_ghl_opp_stats_monthly(db, user_id, group_id, year):
+    """
+    Return month-by-month opp stats for a given year. Fetches opps once
+    and derives 12 monthly stat objects in-memory (plus a yearly total).
+    Ideal for 'show me each month's revenue' charts.
+    """
+    from integrations.gohighlevel import (
+        ghl_integration,
+        get_subaccount_tokens,
+        compute_opp_stats,
+    )
+
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        return {"error": "`year` must be an integer like 2025"}
+
+    grp = await db["client_groups"].find_one(
+        {"user_id": user_id, "id": group_id},
+        {"id": 1, "name": 1, "ghl_location_id": 1},
+    )
+    if not grp:
+        return {"error": f"Group '{group_id}' not found"}
+    location_id = grp.get("ghl_location_id")
+    if not location_id:
+        return {"error": f"Group '{grp.get('name')}' has no GHL location linked"}
+
+    tokens = await get_subaccount_tokens(user_id, db.client)
+    access_token = (tokens or {}).get(location_id, {}).get("access_token")
+    if not access_token:
+        return {"error": f"No GHL access token for location {location_id}"}
+
+    ok, opps = await ghl_integration.fetch_all_opportunities(location_id, access_token)
+    if not ok:
+        return {"error": "GHL API fetch failed — the tool could not load opportunities"}
+
+    # Compute 12 monthly windows
+    months = []
+    MONTH_NAMES = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ]
+    for m in range(1, 13):
+        last_day = monthrange(year, m)[1]
+        start = f"{year:04d}-{m:02d}-01"
+        end = f"{year:04d}-{m:02d}-{last_day:02d}"
+        stats = compute_opp_stats(opps, start, end)
+        months.append({
+            "month": f"{MONTH_NAMES[m - 1]} {year}",
+            "start": start,
+            "end": end,
+            **stats,
+        })
+
+    # Yearly total (same data, window-free over the year)
+    yearly = compute_opp_stats(opps, f"{year:04d}-01-01", f"{year:04d}-12-31")
+
+    return {
+        "group_id": grp["id"],
+        "group_name": grp.get("name"),
+        "year": year,
+        "total_opps_in_account": len(opps),
+        "months": months,
+        "yearly_total": yearly,
+    }
+
+
 def register_ghl_tools():
     registry.register(
         name="get_ghl_contacts",
@@ -276,6 +404,52 @@ def register_ghl_tools():
             "required": [],
         },
         executor=get_ghl_opportunity_stats,
+    )
+
+    registry.register(
+        name="get_ghl_opp_stats_windowed",
+        description=(
+            "Compute GHL opportunity stats (won/lost/open/abandoned, won_revenue, "
+            "total_opportunities) for an ARBITRARY date window — not restricted to "
+            "the 13 cached presets. Use this whenever the user asks for a specific "
+            "month, quarter, or custom range that isn't in the preset list (e.g. "
+            "'March 2025', 'Q2 2024', 'Jan 15 to Feb 15 2025'). Works by fetching "
+            "all opps once via the GHL API and filtering by lastStatusChangeAt / "
+            "createdAt in-memory. Slower than cached presets (~3-10s) but accurate. "
+            "REQUIRES a single group_id. Omit both dates for lifetime stats."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The client group ID (from get_client_groups)."},
+                "start_date": {"type": "string", "description": "Window start in YYYY-MM-DD format."},
+                "end_date": {"type": "string", "description": "Window end in YYYY-MM-DD format."},
+            },
+            "required": ["group_id"],
+        },
+        executor=get_ghl_opp_stats_windowed,
+    )
+
+    registry.register(
+        name="get_ghl_opp_stats_monthly",
+        description=(
+            "Return month-by-month GHL opp stats for a given year. Fetches all opps "
+            "once and derives 12 monthly stat objects (won/lost/open/abandoned counts, "
+            "won_revenue, total_opportunities) plus a yearly total. Use this for "
+            "'monthly revenue in 2025' or 'show me each month's won opps for Aura in 2024' "
+            "style questions — it's the right tool for time-series charts spanning a year. "
+            "Stats are counted by lastStatusChangeAt for closed statuses and createdAt "
+            "for newly-open opps (so 'won in May' = opps closed won in May)."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "group_id": {"type": "string", "description": "The client group ID (from get_client_groups)."},
+                "year": {"type": "integer", "description": "The calendar year, e.g. 2025."},
+            },
+            "required": ["group_id", "year"],
+        },
+        executor=get_ghl_opp_stats_monthly,
     )
 
     registry.register(

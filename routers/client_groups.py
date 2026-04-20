@@ -194,6 +194,7 @@ async def get_client_groups(
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
                     "status": 1,
                     "meta_token_error": 1,
+                    "client_status": 1,
                 },
             ).to_list(None)
 
@@ -2297,3 +2298,42 @@ async def delete_client_group(
                 status_code=500,
                 detail=f"Failed to delete client group: {str(e)}",
             )
+
+# ---------------------------------------------------------------------------
+# PATCH /api/client-groups/{group_id}/client-status
+# ---------------------------------------------------------------------------
+
+@router.patch("/api/client-groups/{group_id}/client-status")
+async def update_client_status(
+    group_id: str,
+    request: Request,
+    current_user: str = Depends(get_current_user),
+):
+    """Update the client_status (Active / Inactive) for a client group"""
+    async with get_mongo_client() as mongo_client:
+        try:
+            body = await request.json()
+            client_status = body.get("client_status", "").strip()
+
+            if client_status not in ("Active", "Inactive"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="client_status must be 'Active' or 'Inactive'",
+                )
+
+            db = mongo_client[DB_NAME]
+            result = await db["client_groups"].update_one(
+                {"id": group_id, "user_id": current_user},
+                {"$set": {"client_status": client_status, "updated_at": datetime.now()}},
+            )
+
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="Client group not found")
+
+            return {"message": "Client status updated successfully", "client_status": client_status}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating client status: {str(e)}")
+            raise HTTPException(status_code=500, detail=f"Failed to update client status: {str(e)}")
