@@ -2234,3 +2234,65 @@ async def refresh_all_status(current_user: str = Depends(get_current_user)):
     """Get progress of the current refresh cycle."""
     from jobs.refresh_all_job import get_cycle_status
     return get_cycle_status()
+
+# ---------------------------------------------------------------------------
+# DELETE /api/client-groups/{group_id}
+# ---------------------------------------------------------------------------
+
+@router.delete("/api/client-groups/{group_id}")
+async def delete_client_group(
+    group_id: str,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Permanently delete a client group and all associated data:
+      1. GHL contacts (ghl_contacts collection)
+      2. The client group document itself
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            client_groups_collection = db["client_groups"]
+
+            # Verify ownership
+            group = await client_groups_collection.find_one(
+                {"id": group_id, "user_id": current_user},
+                {"id": 1, "name": 1},
+            )
+            if not group:
+                raise HTTPException(status_code=404, detail="Client group not found")
+
+            group_name = group.get("name", group_id)
+
+            # 1. Delete all GHL contacts for this group
+            contacts_result = await db["ghl_contacts"].delete_many(
+                {"user_id": current_user, "client_group_id": group_id}
+            )
+            logger.info(
+                f"Deleted {contacts_result.deleted_count} GHL contacts "
+                f"for group {group_id} ('{group_name}')"
+            )
+
+            # 2. Delete the client group itself
+            await client_groups_collection.delete_one(
+                {"id": group_id, "user_id": current_user}
+            )
+            logger.info(f"Deleted client group {group_id} ('{group_name}') for user {current_user}")
+
+            return {
+                "success": True,
+                "message": f"Client group '{group_name}' and all associated data have been deleted",
+                "deleted": {
+                    "group_id": group_id,
+                    "ghl_contacts_removed": contacts_result.deleted_count,
+                },
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting client group {group_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to delete client group: {str(e)}",
+            )
