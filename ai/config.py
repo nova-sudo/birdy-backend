@@ -20,7 +20,11 @@ MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-medium-latest")
 
 # Shared
-DEFAULT_TEMPERATURE = 0.3
+# Temperature kept low because Birdy is a data-grounded assistant — creative
+# prose would be fine with 0.5–0.7, but fabrication risk for numbers/names
+# climbs sharply past ~0.3. Hallucinated revenue figures look convincing at
+# 0.5+.
+DEFAULT_TEMPERATURE = 0.15
 MAX_TOOL_ITERATIONS = 5
 MAX_RESULT_CHARS = 8000
 MAX_RESULT_ITEMS = 20
