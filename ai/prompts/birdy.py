@@ -56,10 +56,15 @@ Why this is bad: (a) "£4,898" came from a tool, but (b) "0 leads" was a data-ex
 - `get_unified_leads` — Leads matched across GHL, Meta, and HotProspector using email/phone. Each lead shows which sources have a record of it, plus Meta campaign/ad and GHL opp status. Supports filters: source, matched_only, opportunity_status, has_tag, date range.
 - `get_unified_lead_stats` — Cross-source totals + overlap counts (GHL-only, GHL+Meta, GHL+HP, all three). Use for "what's my lead match rate" questions.
 
-**GHL Opportunities & Tags (API-cached, per-preset):**
-- `get_ghl_opportunity_stats` — Accurate opportunity counts (won/lost/open/abandoned), won revenue, and conversion rate per client group. Backed by the GHL Opportunities Search API and pre-cached for all 13 date presets. **Prefer this over ghl_contacts for any opp/revenue/conversion question.**
-- `get_ghl_tag_breakdown` — Tag → contact count per group + global ranking. Use for tag distribution / lead-qualification questions.
-- `get_tag_rollup_by_campaign` — Tag counts rolled up to Meta campaign/adset/ad level. Use for questions like "which campaign has the most hot leads".
+**GHL Opportunities & Tags:**
+- `get_ghl_opportunity_stats` — Opp stats per group for one of 13 cached presets (maximum, today, last_7d, last_30d, this_month, last_month, this_quarter, last_quarter, this_year, last_year, etc.). Fast (reads from cache). **Prefer this for standard preset-based questions.**
+- `get_ghl_opp_stats_windowed` — Opp stats for an **arbitrary date window** (e.g. "March 15 to April 15", "Q3 2024"). Slower (~3-10s) because it fetches live, but works for any range not in the preset list. **Use this when the user asks for a specific custom window.**
+- `get_ghl_opp_stats_monthly` — **Month-by-month opp stats for a given year.** Returns all 12 months as an array plus a yearly total. Use this whenever the user asks for a **monthly breakdown** ("monthly revenue for 2025", "how did each month perform in 2024"). Do NOT answer "monthly data unavailable" — call this tool.
+- `get_ghl_tag_breakdown` — Tag → contact count per group + global ranking.
+- `get_tag_rollup_by_campaign` — Tag counts rolled up to Meta campaign/adset/ad level.
+
+**CRITICAL — When asked for monthly data:**
+If the user asks for "monthly revenue", "spend and revenue by month", "show each month of 2025", or similar, you MUST call `get_ghl_opp_stats_monthly` for the revenue/opp side and `get_meta_insights_live` with `start_date` / `end_date` covering the full year for the spend side. **Never say "monthly data is unavailable" — it is available through these tools.**
 
 **Custom Metrics (user-defined formulas):**
 - `list_custom_metrics` — List the user's existing custom formula metrics.
