@@ -216,12 +216,28 @@ async def get_client_groups(
 
                 # -- GHL: merge lifetime cache + windowed counts + preset opp stats --
                 ghl_cache = group.get("gohighlevel_cache") or {}
-                # Read opp stats from the per-preset cache (ghl_opp_cache)
+                # Read opp stats. Opportunities are *pipeline state* (won/lost/open
+                # are cumulative), so we always show the lifetime snapshot regardless
+                # of the requested preset. The GHL `date` param filters by opp
+                # *creation date* only, which for windowed presets often returns
+                # zero for pipelines with no new opps in that window — not what the
+                # user expects on a dashboard. Only fall back to a windowed preset
+                # if the lifetime cache is missing.
                 ghl_opp_cache = group.get("ghl_opp_cache") or {}
-                preset_opp = ghl_opp_cache.get(resolved_preset) or ghl_opp_cache.get("maximum") or {}
-                # Fall back to legacy cached opp stats if no preset cache exists yet
-                if not preset_opp:
-                    preset_opp = (ghl_cache.get("metrics") or {}).get("opportunity_stats", {})
+
+                def _has_data(d):
+                    return isinstance(d, dict) and (d.get("total_opportunities") or 0) > 0
+
+                max_stats = ghl_opp_cache.get("maximum")
+                legacy_stats = (ghl_cache.get("metrics") or {}).get("opportunity_stats") or {}
+
+                if _has_data(max_stats):
+                    preset_opp = max_stats
+                elif _has_data(legacy_stats):
+                    preset_opp = legacy_stats
+                else:
+                    # Last resort — try the requested preset, else empty
+                    preset_opp = ghl_opp_cache.get(resolved_preset) or {}
 
                 if is_all_time:
                     ghl_cache_copy = {**ghl_cache}
