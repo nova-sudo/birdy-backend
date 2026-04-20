@@ -29,6 +29,7 @@ class ClientGroupRequest(BaseModel):
     hotprospector_group_id: str | None
     ad_account_currency: str | None
     notes: str | None = ""
+    client_status: str | None = "Active"
 
 
 class SaveViewRequest(BaseModel):

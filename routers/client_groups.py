@@ -436,6 +436,7 @@ async def create_client_group_optimized(
                 "last_ghl_refresh": None,
                 "last_meta_refresh": None,
                 "last_hp_refresh": None,
+                "client_status": "Active"
             }
 
             await client_groups_collection.insert_one(client_group)
