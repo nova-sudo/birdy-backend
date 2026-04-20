@@ -145,7 +145,9 @@ async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date
                             ad_i = int(ins.get("impressions", 0) or 0)
                             ad_c = int(ins.get("clicks", 0) or 0)
                             ad_r = int(ins.get("reach", 0) or 0)
-                            ad_res = int(ins.get("results", 0) or 0)
+                            # results is ALWAYS an array of {action_type, value} objects
+                            # — use get_result_value to extract the lead-like count
+                            ad_res = get_result_value(ad_ins, "lead")
                         ads_list.append({
                             "id": ad.get("id"), "name": ad.get("name"),
                             "campaign_id": campaign.get("id"),

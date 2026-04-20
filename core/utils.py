@@ -94,6 +94,26 @@ _LEAD_ACTION_TYPES = (
 
 
 def _int_or_zero(v):
+    # Meta sometimes nests values inside action-attribution breakdowns (e.g.
+    # `{"1d_click": "3", "7d_click": "5"}`) or wraps scalars in a list. Coerce
+    # those shapes defensively so we never crash on "int() argument must be …".
+    if v is None:
+        return 0
+    if isinstance(v, list):
+        # Use the first numeric-looking element
+        for item in v:
+            r = _int_or_zero(item)
+            if r:
+                return r
+        return 0
+    if isinstance(v, dict):
+        # Prefer a "value" field if present; else sum numeric leaves
+        if "value" in v:
+            return _int_or_zero(v["value"])
+        total = 0
+        for leaf in v.values():
+            total += _int_or_zero(leaf)
+        return total
     try:
         return int(float(v or 0))
     except (ValueError, TypeError):
