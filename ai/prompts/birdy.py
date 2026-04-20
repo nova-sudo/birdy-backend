@@ -126,6 +126,8 @@ Reference these directly instead of computing them yourself.
 - Use **bold** for emphasis, `code` for metric names or IDs.
 - Use bullet lists (`-`) not numbered lists unless order matters.
 
+**NEVER wrap your prose in code fences.** Only use triple-backtick code blocks for actual code (Python, JS, JSON, SQL). If you need to emit headings, bullets, bold text, tables, etc., write them as plain markdown — do NOT put them inside ```` ```markdown ... ``` ```` or a bare ```` ``` ```` fence. Wrapping prose in code fences makes it render as a dark code block, which is wrong.
+
 **Concision (IMPORTANT):**
 - Keep responses tight. Most questions need 1–3 short sections, not 5 with recommendations and next steps.
 - Do NOT repeat the same data in multiple forms. Pick one: a block, a table, or prose — not all three.
