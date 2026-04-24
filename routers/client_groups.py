@@ -8,6 +8,7 @@ import asyncio
 import logging
 import os
 import time
+import re
 from collections import Counter
 from datetime import date as _date, datetime, timedelta
 from typing import Optional
@@ -1790,6 +1791,7 @@ async def get_campaign_tag_rollup(
 # GET /api/leads/unified  — Cross-source lead matching
 # ---------------------------------------------------------------------------
 
+# AFTER
 @router.get("/api/leads/unified")
 async def get_unified_leads(
     page: int = Query(default=1, ge=1),
@@ -1797,6 +1799,13 @@ async def get_unified_leads(
     groups: str = Query(default=""),
     start_date: Optional[str] = Query(default=None),
     end_date: Optional[str] = Query(default=None),
+
+    source: Optional[str] = Query(default=None),
+    contact_type: Optional[str] = Query(default=None),
+    opportunity_status: Optional[str] = Query(default=None),
+    tags: Optional[str] = Query(default=None),
+    search: Optional[str] = Query(default=None),
+
     current_user: str = Depends(get_current_user),
 ):
     """
@@ -1825,6 +1834,36 @@ async def get_unified_leads(
                 if end_date:
                     date_filter["$lte"] = f"{end_date}T23:59:59.999Z"
                 query["contact_data.dateAdded"] = date_filter
+
+                # ── apply new server-side filters ──────────────────────────────
+                if source:
+                    query["contact_data.source"] = {"$regex": re.escape(source), "$options": "i"}
+
+                if contact_type:
+                    query["contact_data.contactType"] = contact_type
+
+                if opportunity_status:
+                    # Match contacts that have at least one opportunity with this status
+                    query["contact_data.opportunities"] = {
+                        "$elemMatch": {"status": opportunity_status}
+                    }
+
+                if tags:
+                    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+                    if tag_list:
+                        # Contact must have ALL requested tags
+                        query["contact_data.tags"] = {"$all": tag_list}
+
+                if search:
+                    s = search.strip()
+                    query["$or"] = [
+                        {"contact_data.contactName": {"$regex": s, "$options": "i"}},
+                        {"contact_data.firstName": {"$regex": s, "$options": "i"}},
+                        {"contact_data.lastName": {"$regex": s, "$options": "i"}},
+                        {"contact_data.email": {"$regex": s, "$options": "i"}},
+                        {"contact_data.phone": {"$regex": s, "$options": "i"}},
+                        {"contact_data.tags": {"$elemMatch": {"$regex": s, "$options": "i"}}},
+                    ]
 
             # Paginate GHL contacts
             total_contacts = await ghl_col.count_documents(query)
@@ -2359,3 +2398,79 @@ async def delete_client_group(
                 status_code=500,
                 detail=f"Failed to delete client group: {str(e)}",
             )
+
+@router.get("/api/leads/filter-options")
+async def get_leads_filter_options(
+    groups: str = Query(default=""),
+    start_date: str = Query(default=None),
+    end_date: str = Query(default=None),
+    current_user: str = Depends(get_current_user),
+):
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            ghl_col = db["ghl_contacts"]
+
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+
+            match_q = {"user_id": current_user}
+            if group_ids:
+                match_q["client_group_id"] = {"$in": group_ids}
+
+            # Normalize empty/null values to None
+            _EMPTY = {None, "", "null", "undefined", "None"}
+            if start_date in _EMPTY:
+                start_date = None
+            if end_date in _EMPTY:
+                end_date = None
+
+            # Parse dates — fallback to all-time range on missing or invalid input
+            try:
+                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(
+                    hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
+                ) if start_date else datetime(2000, 1, 1, tzinfo=timezone.utc)  # very old fallback
+
+                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
+                    hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
+                ) if end_date else datetime.now(timezone.utc)  # present fallback
+
+            except ValueError:
+                # Invalid format — use all-time range
+                start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
+                end_dt = datetime.now(timezone.utc)
+
+            match_q["contact_data.dateAdded"] = {"$gte": start_dt, "$lte": end_dt}
+
+            sources_pipeline = [
+                {"$match": match_q},
+                {"$match": {"contact_data.source": {"$exists": True, "$nin": [None, ""]}}},
+                {"$project": {
+                    "parts": {"$split": ["$contact_data.source", ","]}
+                }},
+                {"$unwind": "$parts"},
+                {"$project": {
+                    "source": {"$trim": {"input": "$parts"}}
+                }},
+                {"$match": {"source": {"$ne": ""}}},
+                {"$group": {"_id": "$source"}},
+                {"$sort": {"_id": 1}},
+            ]
+
+            types_raw, tags_raw, sources_docs = await asyncio.gather(
+                ghl_col.distinct("contact_data.contactType", match_q),
+                ghl_col.distinct("contact_data.tags", match_q),
+                ghl_col.aggregate(sources_pipeline).to_list(None),
+            )
+
+            def clean(lst):
+                return sorted({v.strip() for v in lst if v and isinstance(v, str) and v.strip()})
+
+            return {
+                "sources": sorted({doc["_id"] for doc in sources_docs if doc.get("_id")}),
+                "types":   clean(types_raw),
+                "tags":    clean(tags_raw),
+            }
+
+        except Exception as e:
+            logger.error(f"Error fetching filter options: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))

@@ -104,7 +104,14 @@ async def create_custom_metric(
             "id": metric_id,
             "name": request.name,
             "description": request.description or "",
-            "formula_parts": request.formula_parts,
+            "formula_parts": [
+                {
+                    "type": part.type,
+                    "value": part.value,
+                    "label": part.label or str(part.value),
+                }
+                for part in request.formula_parts
+            ],
             "formula_display": request.formula_display or "",
             "dashboards": request.dashboards or [],
             "format_type": request.format_type or "integer",
@@ -149,7 +156,14 @@ async def update_custom_metric(
                 if request.description is not None:
                     m["description"] = request.description
                 if request.formula_parts is not None:
-                    m["formula_parts"] = request.formula_parts
+                    m["formula_parts"] = [
+                        {
+                            "type": part.type,
+                            "value": part.value,
+                            "label": part.label or str(part.value),
+                        }
+                        for part in request.formula_parts
+                    ]
                 if request.formula_display is not None:
                     m["formula_display"] = request.formula_display
                 if request.dashboards is not None:
@@ -174,7 +188,6 @@ async def update_custom_metric(
 
         logger.info(f"Updated custom metric {metric_id} for user {current_user}")
         return {"success": True, "metric_id": metric_id}
-
 
 @router.delete("/api/custom-metrics/{metric_id}")
 async def delete_custom_metric(
