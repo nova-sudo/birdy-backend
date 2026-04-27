@@ -10,9 +10,8 @@ import os
 import time
 import re
 from collections import Counter
-from datetime import date as _date, datetime, timedelta
+from datetime import date as _date, datetime, timedelta, timezone
 from typing import Optional
-
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 
@@ -1824,9 +1823,11 @@ async def get_unified_leads(
             group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
 
             # Build GHL query (same as ghl-paginated)
-            query = {"user_id": current_user}
+            query: dict = {"user_id": current_user}
             if group_ids:
                 query["client_group_id"] = {"$in": group_ids}
+
+            # ── date filter (STRING comparison — dateAdded is ISO-8601) ────
             if start_date or end_date:
                 date_filter = {}
                 if start_date:
@@ -1835,35 +1836,33 @@ async def get_unified_leads(
                     date_filter["$lte"] = f"{end_date}T23:59:59.999Z"
                 query["contact_data.dateAdded"] = date_filter
 
-                # ── apply new server-side filters ──────────────────────────────
-                if source:
-                    query["contact_data.source"] = {"$regex": re.escape(source), "$options": "i"}
+            # ── server-side filters (OUTSIDE the date block) ────────────────
+            if source:
+                query["contact_data.source"] = {"$regex": re.escape(source), "$options": "i"}
 
-                if contact_type:
-                    query["contact_data.contactType"] = contact_type
+            if contact_type:
+                query["contact_data.contactType"] = contact_type
 
-                if opportunity_status:
-                    # Match contacts that have at least one opportunity with this status
-                    query["contact_data.opportunities"] = {
-                        "$elemMatch": {"status": opportunity_status}
-                    }
+            if opportunity_status:
+                query["contact_data.opportunities"] = {
+                    "$elemMatch": {"status": opportunity_status}
+                }
 
-                if tags:
-                    tag_list = [t.strip() for t in tags.split(",") if t.strip()]
-                    if tag_list:
-                        # Contact must have ALL requested tags
-                        query["contact_data.tags"] = {"$all": tag_list}
+            if tags:
+                tag_list = [t.strip() for t in tags.split(",") if t.strip()]
+                if tag_list:
+                    query["contact_data.tags"] = {"$all": tag_list}
 
-                if search:
-                    s = search.strip()
-                    query["$or"] = [
-                        {"contact_data.contactName": {"$regex": s, "$options": "i"}},
-                        {"contact_data.firstName": {"$regex": s, "$options": "i"}},
-                        {"contact_data.lastName": {"$regex": s, "$options": "i"}},
-                        {"contact_data.email": {"$regex": s, "$options": "i"}},
-                        {"contact_data.phone": {"$regex": s, "$options": "i"}},
-                        {"contact_data.tags": {"$elemMatch": {"$regex": s, "$options": "i"}}},
-                    ]
+            if search:
+                s = search.strip()
+                query["$or"] = [
+                    {"contact_data.contactName": {"$regex": s, "$options": "i"}},
+                    {"contact_data.firstName": {"$regex": s, "$options": "i"}},
+                    {"contact_data.lastName": {"$regex": s, "$options": "i"}},
+                    {"contact_data.email": {"$regex": s, "$options": "i"}},
+                    {"contact_data.phone": {"$regex": s, "$options": "i"}},
+                    {"contact_data.tags": {"$elemMatch": {"$regex": s, "$options": "i"}}},
+                ]
 
             # Paginate GHL contacts
             total_contacts = await ghl_col.count_documents(query)
@@ -2406,6 +2405,10 @@ async def get_leads_filter_options(
     end_date: str = Query(default=None),
     current_user: str = Depends(get_current_user),
 ):
+    """
+    Return distinct filter values for the leads table.
+    All three lookups (sources, types, tags) run in parallel.
+    """
     async with get_mongo_client() as mongo_client:
         try:
             db = mongo_client[DB_NAME]
@@ -2413,62 +2416,76 @@ async def get_leads_filter_options(
 
             group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
 
-            match_q = {"user_id": current_user}
+            # ── base match ──────────────────────────────────────────────────
+            match_q: dict = {"user_id": current_user}
             if group_ids:
                 match_q["client_group_id"] = {"$in": group_ids}
 
-            # Normalize empty/null values to None
+            # ── date filter (STRING comparison — dateAdded is ISO-8601) ────
             _EMPTY = {None, "", "null", "undefined", "None"}
-            if start_date in _EMPTY:
-                start_date = None
-            if end_date in _EMPTY:
-                end_date = None
+            if start_date not in _EMPTY:
+                try:
+                    normalized = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    match_q["contact_data.dateAdded"] = {"$gte": f"{normalized}T00:00:00.000Z"}
+                except ValueError:
+                    pass  # ignore bad format, fall back to no start bound
 
-            # Parse dates — fallback to all-time range on missing or invalid input
-            try:
-                start_dt = datetime.strptime(start_date, "%Y-%m-%d").replace(
-                    hour=0, minute=0, second=0, microsecond=0, tzinfo=timezone.utc
-                ) if start_date else datetime(2000, 1, 1, tzinfo=timezone.utc)  # very old fallback
+            if end_date not in _EMPTY:
+                try:
+                    normalized = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    existing = match_q.get("contact_data.dateAdded", {})
+                    existing["$lte"] = f"{normalized}T23:59:59.999Z"
+                    match_q["contact_data.dateAdded"] = existing
+                except ValueError:
+                    pass
 
-                end_dt = datetime.strptime(end_date, "%Y-%m-%d").replace(
-                    hour=23, minute=59, second=59, microsecond=999999, tzinfo=timezone.utc
-                ) if end_date else datetime.now(timezone.utc)  # present fallback
-
-            except ValueError:
-                # Invalid format — use all-time range
-                start_dt = datetime(2000, 1, 1, tzinfo=timezone.utc)
-                end_dt = datetime.now(timezone.utc)
-
-            match_q["contact_data.dateAdded"] = {"$gte": start_dt, "$lte": end_dt}
-
+            # ── sources pipeline ────────────────────────────────────────────
+            # GHL "source" can be a single string ("Facebook") or comma-separated
+            # ("Facebook, Google").  The pipeline normalises both cases.
             sources_pipeline = [
-                {"$match": match_q},
-                {"$match": {"contact_data.source": {"$exists": True, "$nin": [None, ""]}}},
+                {"$match": {
+                    **match_q,
+                    "contact_data.source": {"$type": "string"},   # skip null / missing
+                }},
+                # Trim whitespace first
+                {"$addFields": {
+                    "source_trimmed": {"$trim": {"input": "$contact_data.source"}}
+                }},
+                # Split on comma so "Facebook, Google" becomes two docs
                 {"$project": {
-                    "parts": {"$split": ["$contact_data.source", ","]}
+                    "parts": {"$split": ["$source_trimmed", ","]},
                 }},
                 {"$unwind": "$parts"},
                 {"$project": {
-                    "source": {"$trim": {"input": "$parts"}}
+                    "source": {"$trim": {"input": "$parts"}},
                 }},
                 {"$match": {"source": {"$ne": ""}}},
                 {"$group": {"_id": "$source"}},
                 {"$sort": {"_id": 1}},
             ]
 
+            # ── parallel fetch ──────────────────────────────────────────────
             types_raw, tags_raw, sources_docs = await asyncio.gather(
                 ghl_col.distinct("contact_data.contactType", match_q),
                 ghl_col.distinct("contact_data.tags", match_q),
                 ghl_col.aggregate(sources_pipeline).to_list(None),
             )
 
-            def clean(lst):
-                return sorted({v.strip() for v in lst if v and isinstance(v, str) and v.strip()})
+            def _clean(lst):
+                return sorted({
+                    v.strip()
+                    for v in lst
+                    if v and isinstance(v, str) and v.strip()
+                })
 
             return {
-                "sources": sorted({doc["_id"] for doc in sources_docs if doc.get("_id")}),
-                "types":   clean(types_raw),
-                "tags":    clean(tags_raw),
+                "sources": sorted({
+                    doc["_id"]
+                    for doc in sources_docs
+                    if doc.get("_id")
+                }),
+                "types": _clean(types_raw),
+                "tags": _clean(tags_raw),
             }
 
         except Exception as e:
