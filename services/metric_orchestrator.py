@@ -266,22 +266,36 @@ def evaluate_formula(
     group: dict,
     preset: str = "maximum",
     row: Optional[dict] = None,
+    custom_metrics: Optional[list] = None,
+    _evaluating: Optional[set] = None,
 ) -> float:
     """
     Evaluate a custom metric formula against a client group document.
 
-    formula_parts: list of {"type": "metric"|"operator", "value": <str>}
-    group:         the client_group document
-    preset:        date preset for the metric data
-    row:           optional pre-built row (from build_row) to avoid re-resolution
+    formula_parts:  list of {"type": "metric"|"operator", "value": <str>}
+    group:          the client_group document
+    preset:         date preset for the metric data
+    row:            optional pre-built row (from build_row) to avoid re-resolution
+    custom_metrics: optional list of the user's custom metric definitions
+                    (each must have "id" and "formula_parts"). Required if
+                    formula_parts contains references to other custom metrics
+                    (ids starting with "custom_"). Without it, those refs
+                    silently resolve to 0.
+    _evaluating:    internal — set of custom metric IDs currently in the
+                    evaluation stack, used to break cycles.
 
-    Returns 0.0 on empty formula, invalid expression, or division error.
+    Returns 0.0 on empty formula, invalid expression, division error, or cycle.
     """
     if not formula_parts:
         return 0.0
 
     if row is None:
         row = build_row(group, preset)
+
+    if _evaluating is None:
+        _evaluating = set()
+
+    custom_lookup = {m.get("id"): m for m in (custom_metrics or []) if m.get("id")}
 
     expression_parts = []
     for part in formula_parts:
@@ -294,6 +308,25 @@ def evaluate_formula(
             # Tag metrics resolved live (not in row)
             if pval.startswith("tag_"):
                 val = get_metric_value(pval, group, preset)
+            elif pval.startswith("custom_"):
+                # Custom metric reference — recurse into its formula
+                if pval in _evaluating:
+                    logger.warning("Custom metric cycle detected at %s — returning 0", pval)
+                    val = 0
+                else:
+                    cm = custom_lookup.get(pval)
+                    if not cm or not cm.get("formula_parts"):
+                        # Unknown reference (deleted, or list not provided) → 0
+                        val = 0
+                    else:
+                        val = evaluate_formula(
+                            cm["formula_parts"],
+                            group,
+                            preset,
+                            row=row,
+                            custom_metrics=custom_metrics,
+                            _evaluating=_evaluating | {pval},
+                        )
             else:
                 val = row.get(pval)
                 if val is None:
@@ -331,6 +364,7 @@ def evaluate_formula_aggregated(
     groups: list[dict],
     preset: str = "maximum",
     aggregation: str = "total",
+    custom_metrics: Optional[list] = None,
 ) -> float:
     """
     Evaluate a formula across multiple groups.
@@ -339,6 +373,8 @@ def evaluate_formula_aggregated(
       - "total": evaluate per-group then sum results (default)
       - "recompute": aggregate each base metric first, then evaluate formula once
                      (correct for ratios like CPL = spend/leads)
+    custom_metrics: pass-through to support custom-metric references inside the
+                    formula. See evaluate_formula() for details.
     """
     if not formula_parts or not groups:
         return 0.0
@@ -355,7 +391,12 @@ def evaluate_formula_aggregated(
                 agg_row[part["value"]] = sum(
                     get_metric_value(part["value"], g, preset) for g in groups
                 )
-        return evaluate_formula(formula_parts, {}, preset, row=agg_row)
+        return evaluate_formula(
+            formula_parts, {}, preset, row=agg_row, custom_metrics=custom_metrics
+        )
 
     # "total": per-group evaluation, sum the results
-    return sum(evaluate_formula(formula_parts, g, preset) for g in groups)
+    return sum(
+        evaluate_formula(formula_parts, g, preset, custom_metrics=custom_metrics)
+        for g in groups
+    )

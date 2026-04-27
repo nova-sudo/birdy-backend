@@ -174,10 +174,11 @@ async def compute_custom_metric(db, user_id, metric_id, preset="last_7d", group_
         },
     ).to_list(None)
 
-    # Evaluate per group via the orchestrator
+    # Evaluate per group via the orchestrator. Pass the full custom_metrics list
+    # so formulas can reference other custom metrics (e.g. ROAS uses CPA).
     per_group = []
     for g in groups:
-        value = evaluate_formula(formula_parts, g, resolved)
+        value = evaluate_formula(formula_parts, g, resolved, custom_metrics=metrics)
         per_group.append({
             "group_id": g.get("id"),
             "group_name": g.get("name"),
@@ -186,7 +187,9 @@ async def compute_custom_metric(db, user_id, metric_id, preset="last_7d", group_
 
     # Aggregate — "recompute" for ratio metrics, "total" for sums
     agg_mode = "recompute" if metric_aggregation == "average" or format_type == "percentage" else "total"
-    overall = evaluate_formula_aggregated(formula_parts, groups, resolved, aggregation=agg_mode)
+    overall = evaluate_formula_aggregated(
+        formula_parts, groups, resolved, aggregation=agg_mode, custom_metrics=metrics
+    )
     valid_count = len([g for g in per_group if g["value"] is not None])
 
     return {
