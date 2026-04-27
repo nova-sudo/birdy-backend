@@ -12,6 +12,48 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
+def _detect_cycle(
+    target_id: str,
+    target_formula_parts: list,
+    all_metrics: list,
+) -> str | None:
+    """
+    Walk the dependency graph rooted at `target_id` (with the proposed new
+    formula_parts) and return a human-readable error if a cycle is detected,
+    otherwise None.
+
+    `all_metrics` is the list of the user's existing custom metrics.
+    For an UPDATE, the caller should swap the target metric's formula_parts
+    with the new ones BEFORE calling this so the walk uses the proposed graph.
+
+    Cycle definition:
+      Metric A's formula references B, and following B's formula (and any
+      transitive references) eventually leads back to A.
+    """
+    by_id = {m.get("id"): (m.get("formula_parts") or []) for m in all_metrics if m.get("id")}
+    # Insert/override target with the proposed formula
+    by_id[target_id] = target_formula_parts or []
+
+    def walk(node_id: str, stack: list) -> str | None:
+        if node_id in stack:
+            cycle_path = " → ".join([*stack[stack.index(node_id):], node_id])
+            return f"Cycle detected: {cycle_path}"
+        next_stack = [*stack, node_id]
+        parts = by_id.get(node_id, [])
+        for p in parts:
+            if p.get("type") != "metric":
+                continue
+            ref = p.get("value", "")
+            if not ref or not ref.startswith("custom_"):
+                continue
+            err = walk(ref, next_stack)
+            if err:
+                return err
+        return None
+
+    return walk(target_id, [])
+
+
 @router.get("/api/custom-metrics")
 async def list_custom_metrics(current_user: str = Depends(get_current_user)):
     """Return all custom metrics for the current user."""
@@ -100,6 +142,16 @@ async def create_custom_metric(
 
         metric_id = f"custom_{current_user}_{int(datetime.utcnow().timestamp() * 1000)}"
 
+        # Cycle detection — fetch existing custom metrics and check the proposed
+        # formula won't create a circular dependency through other custom metrics.
+        existing = await db["users"].find_one(
+            {"user_id": current_user}, {"custom_metrics": 1}
+        )
+        all_metrics = (existing or {}).get("custom_metrics", []) or []
+        cycle_err = _detect_cycle(metric_id, request.formula_parts or [], all_metrics)
+        if cycle_err:
+            raise HTTPException(status_code=400, detail=cycle_err)
+
         metric_doc = {
             "id": metric_id,
             "name": request.name,
@@ -148,6 +200,13 @@ async def update_custom_metric(
             raise HTTPException(status_code=404, detail="User not found")
 
         metrics = user.get("custom_metrics", [])
+
+        # If formula_parts is changing, check for cycles using the PROPOSED graph
+        if request.formula_parts is not None:
+            cycle_err = _detect_cycle(metric_id, request.formula_parts, metrics)
+            if cycle_err:
+                raise HTTPException(status_code=400, detail=cycle_err)
+
         found = False
         for m in metrics:
             if m.get("id") == metric_id:
