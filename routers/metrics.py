@@ -142,16 +142,6 @@ async def create_custom_metric(
 
         metric_id = f"custom_{current_user}_{int(datetime.utcnow().timestamp() * 1000)}"
 
-        # Cycle detection — fetch existing custom metrics and check the proposed
-        # formula won't create a circular dependency through other custom metrics.
-        existing = await db["users"].find_one(
-            {"user_id": current_user}, {"custom_metrics": 1}
-        )
-        all_metrics = (existing or {}).get("custom_metrics", []) or []
-        cycle_err = _detect_cycle(metric_id, request.formula_parts or [], all_metrics)
-        if cycle_err:
-            raise HTTPException(status_code=400, detail=cycle_err)
-
         metric_doc = {
             "id": metric_id,
             "name": request.name,
@@ -200,13 +190,6 @@ async def update_custom_metric(
             raise HTTPException(status_code=404, detail="User not found")
 
         metrics = user.get("custom_metrics", [])
-
-        # If formula_parts is changing, check for cycles using the PROPOSED graph
-        if request.formula_parts is not None:
-            cycle_err = _detect_cycle(metric_id, request.formula_parts, metrics)
-            if cycle_err:
-                raise HTTPException(status_code=400, detail=cycle_err)
-
         found = False
         for m in metrics:
             if m.get("id") == metric_id:

@@ -8,10 +8,10 @@ import asyncio
 import logging
 import os
 import time
-import re
 from collections import Counter
-from datetime import date as _date, datetime, timedelta, timezone
+from datetime import date as _date, datetime, timedelta
 from typing import Optional
+
 import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request, Response
 
@@ -1395,16 +1395,29 @@ async def prefetch_marketing_data(
 
 @router.get("/api/contacts/ghl-paginated")
 async def get_ghl_contacts_paginated_v2(
-    page: int = Query(default=1, ge=1),
-    limit: int = Query(default=15, ge=1, le=500),
-    groups: str = Query(default=""),
-    start_date: Optional[str] = Query(default=None),
-    end_date: Optional[str] = Query(default=None),
-    current_user: str = Depends(get_current_user),
+        page: int = Query(default=1, ge=1),
+        limit: int = Query(default=15, ge=1, le=500),
+        groups: str = Query(default=""),
+        start_date: Optional[str] = Query(default=None),
+        end_date: Optional[str] = Query(default=None),
+        # ── filter params sent by FilterPanel / LeadsContent ──
+        source: Optional[str] = Query(default=None),  # comma-separated sources
+        tags: Optional[str] = Query(default=None),  # comma-separated tags
+        contact_type: Optional[str] = Query(default=None),  # single contactType
+        current_user: str = Depends(get_current_user),
 ):
     """
-    Fetch GHL contacts with currency conversion on opportunities.
+    Fetch GHL contacts with server-side filtering, pagination, and optional
+    currency conversion on opportunity values.
+
     Returns contacts in DESCENDING order (newest first).
+
+    Filter params
+    -------------
+    source       : comma-separated list — contact must match ANY of them
+                   (handles GHL's own comma-separated source strings)
+    tags         : comma-separated list — contact must have ALL of them
+    contact_type : exact match on contactType field
     """
     async with get_mongo_client() as mongo_client:
         try:
@@ -1414,7 +1427,7 @@ async def get_ghl_contacts_paginated_v2(
             contacts_collection = db["ghl_contacts"]
             users_collection = db["users"]
 
-            # Fetch user's default currency
+            # ── user default currency ────────────────────────────────────────
             user_doc = await users_collection.find_one(
                 {"user_id": current_user},
                 {"default_currency": 1},
@@ -1422,52 +1435,92 @@ async def get_ghl_contacts_paginated_v2(
             user_currency = user_doc.get("default_currency") if user_doc else None
             logger.info(f"User [{current_user}] default currency: {user_currency}")
 
-            # Parse group IDs
+            # ── group IDs ────────────────────────────────────────────────────
             group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
 
-            # Build query
-            query = {"user_id": current_user}
+            # ── base query ───────────────────────────────────────────────────
+            query: dict = {"user_id": current_user}
 
             if group_ids:
                 query["client_group_id"] = {"$in": group_ids}
 
-            if start_date or end_date:
-                date_filter = {}
+            # ── date filter ──────────────────────────────────────────────────
+            _EMPTY = {None, "", "null", "undefined", "None"}
 
-                if start_date:
-                    try:
-                        start_dt = datetime.fromisoformat(start_date.replace("Z", "+00:00"))
-                        start_dt = start_dt.replace(hour=0, minute=0, second=0, microsecond=0)
-                        date_filter["$gte"] = start_dt.isoformat()
-                    except ValueError:
-                        logger.warning(f"Invalid start_date format: {start_date}")
+            date_filter: dict = {}
+            if start_date not in _EMPTY:
+                try:
+                    norm = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    date_filter["$gte"] = f"{norm}T00:00:00.000Z"
+                except ValueError:
+                    logger.warning(f"Invalid start_date: {start_date!r} — ignored")
 
-                if end_date:
-                    try:
-                        end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
-                        end_dt = end_dt.replace(hour=23, minute=59, second=59, microsecond=999999)
-                        date_filter["$lte"] = end_dt.isoformat()
-                    except ValueError:
-                        logger.warning(f"Invalid end_date format: {end_date}")
+            if end_date not in _EMPTY:
+                try:
+                    norm = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    date_filter["$lte"] = f"{norm}T23:59:59.999Z"
+                except ValueError:
+                    logger.warning(f"Invalid end_date: {end_date!r} — ignored")
 
-                if date_filter:
-                    query["contact_data.dateAdded"] = date_filter
+            if date_filter:
+                query["contact_data.dateAdded"] = date_filter
 
-            # Get total count
+            # ── source filter ────────────────────────────────────────────────
+            # GHL stores source as a single string that can itself be
+            # comma-separated ("Facebook, Google").  We match if ANY of the
+            # selected sources appears in the field.
+            from urllib.parse import unquote
+
+            if source not in _EMPTY:
+                selected_sources = [unquote(s).strip() for s in source.split(",") if s.strip()]
+                if selected_sources:
+                    source_conditions = [
+                        {"contact_data.source": {"$regex": re.escape(s), "$options": "i"}}
+                        for s in selected_sources
+                    ]
+                    if len(source_conditions) == 1:
+                        query["contact_data.source"] = source_conditions[0]["contact_data.source"]
+                    else:
+                        existing_or = query.pop("$or", None)
+                        if existing_or:
+                            query["$and"] = [{"$or": existing_or}, {"$or": source_conditions}]
+                        else:
+                            query["$or"] = source_conditions
+
+            if tags not in _EMPTY:
+                selected_tags = [unquote(t).strip() for t in tags.split(",") if t.strip()]
+                if selected_tags:
+                    tag_conditions = [
+                        {"contact_data.tags": {"$elemMatch": {"$regex": f"^{re.escape(t)}$", "$options": "i"}}}
+                        for t in selected_tags
+                    ]
+                    if len(tag_conditions) == 1:
+                        query["contact_data.tags"] = tag_conditions[0]["contact_data.tags"]
+                    else:
+                        existing_or = query.pop("$or", None)
+                        if existing_or:
+                            query["$and"] = [{"$or": existing_or}, {"$or": tag_conditions}]
+                        else:
+                            query["$or"] = tag_conditions
+
+            # ── contact type filter ──────────────────────────────────────────
+            if contact_type not in _EMPTY:
+                query["contact_data.contactType"] = contact_type
+
+            # ── total count (filtered) ───────────────────────────────────────
             total_contacts = await contacts_collection.count_documents(query)
-            logger.info(f"Total contacts found: {total_contacts} for user [{current_user}]")
+            logger.info(
+                f"Contacts found: {total_contacts} "
+                f"[user={current_user}, groups={group_ids or 'all'}, "
+                f"source={source!r}, tags={tags!r}, type={contact_type!r}]"
+            )
 
-            # Opportunity stats — read from ghl_opp_cache (GHL Opportunities API source
-            # of truth) instead of aggregating embedded contact_data.opportunities, which
-            # is known to be incomplete (~25-45% under-count).
+            # ── opportunity stats from ghl_opp_cache ─────────────────────────
             opportunity_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0}
             total_value = 0.0
 
-            from core.constants import META_CACHE_PRESETS, ghl_date_bounds
-            # Try to map the request's date window to a known preset
             matching_preset = None
-            if start_date and end_date:
-                # Normalize to yyyy-mm-dd before comparing
+            if start_date not in _EMPTY and end_date not in _EMPTY:
                 try:
                     norm_start = start_date[:10]
                     norm_end = end_date[:10]
@@ -1478,19 +1531,25 @@ async def get_ghl_contacts_paginated_v2(
                             break
                 except Exception:
                     pass
-            elif not start_date and not end_date:
+            elif start_date in _EMPTY and end_date in _EMPTY:
                 matching_preset = "maximum"
 
-            group_query = {"user_id": current_user}
+            group_query: dict = {"user_id": current_user}
             if group_ids:
                 group_query["id"] = {"$in": group_ids}
 
-            groups_col = mongo_client[DB_NAME]["client_groups"]
             preset_to_use = matching_preset or "maximum"
+            groups_col = db["client_groups"]
             group_docs = await groups_col.find(
                 group_query,
-                {"id": 1, f"ghl_opp_cache.{preset_to_use}": 1, "ghl_opp_cache.maximum": 1, "_id": 0},
+                {
+                    "id": 1,
+                    f"ghl_opp_cache.{preset_to_use}": 1,
+                    "ghl_opp_cache.maximum": 1,
+                    "_id": 0,
+                },
             ).to_list(None)
+
             for g in group_docs:
                 cache = g.get("ghl_opp_cache") or {}
                 stats = cache.get(preset_to_use) or cache.get("maximum") or {}
@@ -1500,6 +1559,7 @@ async def get_ghl_contacts_paginated_v2(
 
             total_opportunities = sum(opportunity_stats.values())
 
+            # ── empty result short-circuit ───────────────────────────────────
             if total_contacts == 0:
                 return {
                     "contacts": [],
@@ -1523,11 +1583,10 @@ async def get_ghl_contacts_paginated_v2(
                     "message": "No contacts found",
                 }
 
-            # Calculate pagination
+            # ── pagination ───────────────────────────────────────────────────
             skip = (page - 1) * limit
             total_pages = (total_contacts + limit - 1) // limit
 
-            # Fetch contacts (sorted newest first)
             cursor = contacts_collection.find(
                 query,
                 {
@@ -1540,9 +1599,12 @@ async def get_ghl_contacts_paginated_v2(
             ).sort("contact_data.dateAdded", -1).skip(skip).limit(limit)
 
             contact_docs = await cursor.to_list(length=limit)
-            logger.info(f"Page {page}: fetched {len(contact_docs)} contacts | user_currency={user_currency}")
+            logger.info(
+                f"Page {page}: fetched {len(contact_docs)} contacts "
+                f"| user_currency={user_currency}"
+            )
 
-            # Helper: convert opportunity -- GBP is the default source currency
+            # ── currency conversion helper ────────────────────────────────────
             def convert_opportunity(opp: dict) -> dict:
                 if not user_currency or not opp:
                     return opp
@@ -1550,7 +1612,6 @@ async def get_ghl_contacts_paginated_v2(
                 opp = opp.copy()
                 monetary_fields = ["monetaryValue", "value", "amount"]
                 opp_id = opp.get("id", "unknown")
-
                 opp_currency = "GBP"
 
                 if opp_currency == user_currency:
@@ -1574,104 +1635,77 @@ async def get_ghl_contacts_paginated_v2(
                                 f"Opportunity [{opp_id}] {field}: "
                                 f"{opp_currency} {original} -> {user_currency} {converted}"
                             )
-                        except (ValueError, TypeError, Exception) as e:
-                            logger.error(f"Opportunity [{opp_id}] failed to convert {field}: {e}")
+                        except Exception as e:
+                            logger.error(
+                                f"Opportunity [{opp_id}] failed to convert {field}: {e}"
+                            )
 
                 opp["display_currency"] = user_currency
                 opp["original_currency"] = opp_currency
                 return opp
 
-            # Format contacts
+            # ── format contacts ───────────────────────────────────────────────
             contacts = []
             for doc in contact_docs:
                 contact = doc.get("contact_data", {})
 
-                # Normalize email
+                # Normalise email
                 email = contact.get("email")
                 if email is None or (isinstance(email, str) and not email.strip()):
                     email = f"no_email_ghl_{contact.get('id')}"
                 elif isinstance(email, str):
                     email = email.strip().lower()
 
-                # Normalize name
-                contact_name = contact.get("contactName", "") or ""
-                if isinstance(contact_name, str):
-                    contact_name = contact_name.strip()
-
+                # Normalise name
+                contact_name = (contact.get("contactName") or "").strip()
                 if not contact_name:
-                    first_name = (contact.get("firstName") or "").strip()
-                    last_name = (contact.get("lastName") or "").strip()
-                    contact_name = f"{first_name} {last_name}".strip() if first_name or last_name else "Unknown"
+                    first = (contact.get("firstName") or "").strip()
+                    last = (contact.get("lastName") or "").strip()
+                    contact_name = f"{first} {last}".strip() or "Unknown"
 
                 # Convert opportunities
-                raw_opportunities = contact.get("opportunities") or []
-                logger.info(
-                    f"Contact [{contact.get('id')}] '{contact_name}' "
-                    f"has {len(raw_opportunities)} opportunities"
-                )
-                converted_opportunities = [convert_opportunity(opp) for opp in raw_opportunities]
+                raw_opps = contact.get("opportunities") or []
+                converted_opps = [convert_opportunity(o) for o in raw_opps]
 
-                formatted_contact = {
-                    # Basic info
+                contacts.append({
                     "contactId": contact.get("id"),
                     "contactName": contact_name,
                     "firstName": contact.get("firstName") or "",
                     "lastName": contact.get("lastName") or "",
                     "email": email,
                     "phone": contact.get("phone") or "",
-
-                    # Location/group info
                     "locationId": doc.get("location_id"),
                     "groupName": doc.get("client_group_name", "Unknown Group"),
-
-                    # Dates
                     "dateAdded": contact.get("dateAdded") or "",
                     "dateUpdated": contact.get("dateUpdated") or "",
                     "dateOfBirth": contact.get("dateOfBirth") or "",
-
-                    # Contact details
                     "tags": contact.get("tags") or [],
                     "source": contact.get("source") or "",
                     "type": contact.get("type") or "lead",
                     "contactType": contact.get("contactType") or contact.get("type") or "lead",
-
-                    # Address
                     "address1": contact.get("address1") or "",
                     "city": contact.get("city") or "",
                     "state": contact.get("state") or "",
                     "postalCode": contact.get("postalCode") or "",
                     "country": contact.get("country") or "",
                     "timezone": contact.get("timezone") or "",
-
-                    # Business info
                     "companyName": contact.get("companyName") or "",
                     "website": contact.get("website") or "",
                     "businessId": contact.get("businessId") or "",
-
-                    # Additional fields
                     "dnd": contact.get("dnd", False),
                     "dndSettings": contact.get("dndSettings") or {},
                     "customFields": contact.get("customFields") or [],
                     "followers": contact.get("followers") or [],
                     "assignedTo": contact.get("assignedTo") or "",
-
-                    # Converted opportunities
-                    "opportunities": converted_opportunities,
-
-                    # Attribution
+                    "opportunities": converted_opps,
                     "attributionSource": contact.get("attributionSource") or {},
                     "lastAttributionSource": contact.get("lastAttributionSource") or {},
-
-                    # Currency metadata
                     "display_currency": user_currency,
-                }
-
-                contacts.append(formatted_contact)
+                })
 
             elapsed = time.time() - start_time
-
             logger.info(
-                f"Fetched page {page} (newest first): {len(contacts)} contacts "
+                f"ghl-paginated page {page} → {len(contacts)} contacts "
                 f"in {elapsed:.3f}s"
             )
 
@@ -1686,7 +1720,7 @@ async def get_ghl_contacts_paginated_v2(
                     "has_next": page < total_pages,
                     "has_prev": page > 1,
                     "sort_order": "newest_first",
-                    "date_filtered": bool(start_date or end_date),
+                    "date_filtered": bool(date_filter),
                     "start_date": start_date,
                     "end_date": end_date,
                     "display_currency": user_currency,
@@ -1696,12 +1730,24 @@ async def get_ghl_contacts_paginated_v2(
                         "lost": opportunity_stats["lost"],
                         "open": opportunity_stats["open"],
                         "abandoned": opportunity_stats["abandoned"],
-                        "conversion_rate": round((opportunity_stats["won"] / total_opportunities) * 100, 1) if total_opportunities > 0 else 0,
+                        "conversion_rate": (
+                            round(
+                                (opportunity_stats["won"] / total_opportunities) * 100, 1
+                            )
+                            if total_opportunities > 0
+                            else 0
+                        ),
                         "total_value": round(total_value, 2),
                     },
                 },
-                "message": f"Retrieved {len(contacts)} contacts (newest first)"
-                           + (f" from {start_date} to {end_date}" if (start_date or end_date) else ""),
+                "message": (
+                        f"Retrieved {len(contacts)} contacts (newest first)"
+                        + (
+                            f" from {start_date} to {end_date}"
+                            if date_filter
+                            else ""
+                        )
+                ),
                 "performance": {
                     "response_time_ms": int(elapsed * 1000),
                     "source": "mongodb",
@@ -1710,7 +1756,7 @@ async def get_ghl_contacts_paginated_v2(
 
         except Exception as e:
             logger.error(
-                f"Error fetching paginated contacts for user {current_user}: {str(e)}",
+                f"Error fetching paginated contacts for user {current_user}: {e}",
                 exc_info=True,
             )
             raise HTTPException(
@@ -1790,21 +1836,380 @@ async def get_campaign_tag_rollup(
 # GET /api/leads/unified  — Cross-source lead matching
 # ---------------------------------------------------------------------------
 
-    # AFTER
-    # BEFORE (broken — exact/single string match)
-    if source:
-        query["contact_data.source"] = {"$regex": re.escape(source), "$options": "i"}
+from urllib.parse import unquote
+from typing import List, Optional
 
-    # AFTER (fixed — splits comma-separated values, regex matches any of them)
-    if source:
-        selected_sources = [s.strip() for s in source.split(",") if s.strip()]
-        if selected_sources:
-            escaped = [re.escape(s) for s in selected_sources]
-            pattern = "(?:^|,\\s*)(" + "|".join(escaped) + ")(?:\\s*,|$)"
-            query["contact_data.source"] = {
-                "$regex": pattern,
-                "$options": "i"
+@router.get("/api/leads/unified")
+async def get_unified_leads(
+    page: int = Query(default=1, ge=1),
+    limit: int = Query(default=15, ge=1, le=500),
+    groups: str = Query(default=""),
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    source: List[str] = Query(default=[]),
+    tag: List[str] = Query(default=[]),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Unified leads endpoint: returns GHL contacts enriched with Meta and HP data.
+    Matches across sources using normalized email/phone match_keys.
+    """
+    import time as _time
+    async with get_mongo_client() as mongo_client:
+        try:
+            start_time = _time.time()
+            db = mongo_client[DB_NAME]
+            ghl_col = db["ghl_contacts"]
+            meta_col = db["facebook_leads"]
+            hp_col = db["hotprospector_leads"]
+
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+
+            # Build GHL query
+            query = {"user_id": current_user}
+            if group_ids:
+                query["client_group_id"] = {"$in": group_ids}
+            if start_date or end_date:
+                date_filter = {}
+                if start_date:
+                    date_filter["$gte"] = f"{start_date}T00:00:00.000Z"
+                if end_date:
+                    date_filter["$lte"] = f"{end_date}T23:59:59.999Z"
+                query["contact_data.dateAdded"] = date_filter
+
+            # ── source filter ────────────────────────────────────────────────
+            selected_sources = [unquote(s).strip() for s in source if s.strip()]
+            selected_tags = [unquote(t).strip() for t in tag if t.strip()]
+
+            logger.info(f"Selected sources: {selected_sources}")
+            logger.info(f"Selected tags: {selected_tags}")
+
+            source_conditions = [
+                {"contact_data.source": {"$regex": re.escape(s), "$options": "i"}}
+                for s in selected_sources
+            ]
+            tag_conditions = [
+                {"contact_data.tags": {"$elemMatch": {"$regex": f"^{re.escape(t)}$", "$options": "i"}}}
+                for t in selected_tags
+            ]
+
+            all_filter_conditions = source_conditions + tag_conditions
+
+            if all_filter_conditions:
+                # Wrap everything in $and so date filter and group filter are preserved
+                and_clauses = []
+
+                # Move existing top-level conditions into $and
+                base_query = {k: v for k, v in query.items() if k not in ("$and", "$or")}
+                query.clear()
+
+                for k, v in base_query.items():
+                    and_clauses.append({k: v})
+
+                # Add the source/tag OR block
+                and_clauses.append({"$or": all_filter_conditions})
+
+                query["$and"] = and_clauses
+
+            logger.info(f"Final MongoDB query: {query}")
+
+            # Paginate GHL contacts
+            total_contacts = await ghl_col.count_documents(query)
+            logger.info(f"Total contacts found: {total_contacts}")
+            total_pages = max(1, -(-total_contacts // limit))
+            skip = (page - 1) * limit
+
+            contact_docs = await ghl_col.find(query).sort(
+                "contact_data.dateAdded", -1
+            ).skip(skip).limit(limit).to_list(limit)
+
+            # Collect all match_keys from this page
+            all_keys = set()
+            for doc in contact_docs:
+                for key in (doc.get("match_keys") or []):
+                    all_keys.add(key)
+
+            # Parallel lookup in Meta and HP collections
+            meta_matches = {}
+            hp_matches = {}
+
+            if all_keys:
+                keys_list = list(all_keys)
+                meta_q = {"user_id": current_user, "match_keys": {"$in": keys_list}}
+                hp_q = {"user_id": current_user, "match_keys": {"$in": keys_list}}
+
+                meta_docs, hp_docs = await asyncio.gather(
+                    meta_col.find(meta_q).to_list(None),
+                    hp_col.find(hp_q).to_list(None),
+                )
+
+                # Build ad→campaign/adset lookup from facebook_cache
+                ad_to_meta = {}
+                ad_name_to_meta = {}
+                if True:
+                    group_docs = await db["client_groups"].find(
+                        {"user_id": current_user},
+                        {
+                            "facebook_cache.maximum.ads": 1,
+                            "facebook_cache.maximum.campaigns": 1,
+                            "facebook_cache.maximum.adsets": 1,
+                            "facebook_cache.ads": 1,
+                            "facebook_cache.campaigns": 1,
+                            "facebook_cache.adsets": 1,
+                        }
+                    ).to_list(None)
+                    for gdoc in group_docs:
+                        fb = gdoc.get("facebook_cache") or {}
+                        preset = fb.get("maximum") or fb
+                        camp_map = {
+                            c["id"]: c.get("name", "")
+                            for c in (preset.get("campaigns") or [])
+                        }
+                        adset_map = {
+                            a["id"]: {"name": a.get("name", ""), "campaign_id": a.get("campaign_id", "")}
+                            for a in (preset.get("adsets") or [])
+                        }
+                        for ad in (preset.get("ads") or []):
+                            cid = ad.get("campaign_id", "")
+                            asid = ad.get("adset_id", "")
+                            resolution = {
+                                "campaign_name": camp_map.get(cid, ""),
+                                "campaign_id": cid,
+                                "adset_name": adset_map.get(asid, {}).get("name", ""),
+                                "adset_id": asid,
+                                "ad_name": ad.get("name", ""),
+                            }
+                            aid = ad.get("id")
+                            if aid:
+                                ad_to_meta[aid] = resolution
+                            aname = ad.get("name")
+                            if aname:
+                                ad_name_to_meta[aname] = resolution
+
+                for md in meta_docs:
+                    ld = md.get("lead_data", {})
+                    campaign_name = ld.get("campaign_name") or ""
+                    adset_name = ld.get("adset_name") or ""
+                    campaign_id = ld.get("campaign_id") or ""
+                    adset_id = ld.get("adset_id") or ""
+                    ad_id = ld.get("ad_id") or ""
+
+                    if not campaign_name or not adset_name:
+                        resolved = None
+                        if ad_id and ad_id in ad_to_meta:
+                            resolved = ad_to_meta[ad_id]
+                        elif ld.get("ad_name") and ld["ad_name"] in ad_name_to_meta:
+                            resolved = ad_name_to_meta[ld["ad_name"]]
+                        if resolved:
+                            if not campaign_name:
+                                campaign_name = resolved.get("campaign_name", "")
+                                campaign_id = resolved.get("campaign_id", "") or campaign_id
+                            if not adset_name:
+                                adset_name = resolved.get("adset_name", "")
+                                adset_id = resolved.get("adset_id", "") or adset_id
+                            if not ad_id:
+                                ad_id = resolved.get("ad_id", "") if "ad_id" in resolved else ad_id
+
+                    enrichment = {
+                        "campaign_name": campaign_name,
+                        "campaign_id": campaign_id,
+                        "ad_name": ld.get("ad_name", ""),
+                        "ad_id": ad_id,
+                        "adset_name": adset_name,
+                        "adset_id": adset_id,
+                        "created_time": ld.get("created_time", ""),
+                        "form_id": ld.get("form_id", ""),
+                    }
+                    for key in (md.get("match_keys") or []):
+                        meta_matches[key] = enrichment
+
+                for hd in hp_docs:
+                    ld = hd.get("lead_data", {})
+                    enrichment = {
+                        "call_logs_count": ld.get("call_logs_count", 0),
+                        "last_call_date": "",
+                    }
+                    calls = ld.get("call_logs") or []
+                    if calls:
+                        enrichment["last_call_date"] = calls[0].get("call_time", "")
+                    for key in (hd.get("match_keys") or []):
+                        hp_matches[key] = enrichment
+
+            # Opportunity stats
+            opportunity_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0}
+            total_value = 0.0
+
+            from core.constants import META_CACHE_PRESETS, ghl_date_bounds
+            matching_preset = None
+            if start_date and end_date:
+                for p in META_CACHE_PRESETS:
+                    s, e = ghl_date_bounds(p)
+                    if s == start_date and e == end_date:
+                        matching_preset = p
+                        break
+            elif not start_date and not end_date:
+                matching_preset = "maximum"
+
+            group_query = {"user_id": current_user}
+            if group_ids:
+                group_query["id"] = {"$in": group_ids}
+
+            groups_col = db["client_groups"]
+            if matching_preset:
+                preset_field = f"ghl_opp_cache.{matching_preset}"
+                group_docs = await groups_col.find(
+                    group_query,
+                    {"id": 1, preset_field: 1, "ghl_opp_cache.maximum": 1, "_id": 0},
+                ).to_list(None)
+                for g in group_docs:
+                    stats = (g.get("ghl_opp_cache") or {}).get(matching_preset) or \
+                            (g.get("ghl_opp_cache") or {}).get("maximum") or {}
+                    for k in opportunity_stats:
+                        opportunity_stats[k] += int(stats.get(k, 0) or 0)
+                    total_value += float(stats.get("won_revenue", 0) or 0)
+            else:
+                logger.info(
+                    "Unified leads: date range %s..%s has no matching preset — returning lifetime opp stats",
+                    start_date, end_date,
+                )
+                group_docs = await groups_col.find(
+                    group_query,
+                    {"id": 1, "ghl_opp_cache.maximum": 1, "_id": 0},
+                ).to_list(None)
+                for g in group_docs:
+                    stats = (g.get("ghl_opp_cache") or {}).get("maximum") or {}
+                    for k in opportunity_stats:
+                        opportunity_stats[k] += int(stats.get(k, 0) or 0)
+                    total_value += float(stats.get("won_revenue", 0) or 0)
+
+            total_opportunities = sum(opportunity_stats.values())
+
+            # Format contacts with enrichment
+            contacts = []
+            for doc in contact_docs:
+                contact = doc.get("contact_data", {})
+                doc_keys = doc.get("match_keys") or []
+
+                has_meta = any(k in meta_matches for k in doc_keys)
+                has_hp = any(k in hp_matches for k in doc_keys)
+
+                meta_enrich = None
+                hp_enrich = None
+                for k in doc_keys:
+                    if k in meta_matches and not meta_enrich:
+                        meta_enrich = meta_matches[k]
+                    if k in hp_matches and not hp_enrich:
+                        hp_enrich = hp_matches[k]
+
+                if meta_enrich and (not meta_enrich.get("campaign_name") or not meta_enrich.get("adset_name")):
+                    attr = contact.get("attributionSource") or {}
+                    if not meta_enrich.get("campaign_name") and attr.get("campaign"):
+                        meta_enrich["campaign_name"] = attr["campaign"]
+                    if not meta_enrich.get("campaign_id") and attr.get("campaignId"):
+                        meta_enrich["campaign_id"] = attr["campaignId"]
+                    if not meta_enrich.get("adset_name") and attr.get("utmMedium"):
+                        meta_enrich["adset_name"] = attr["utmMedium"]
+                    if not meta_enrich.get("ad_name") and attr.get("utmContent"):
+                        meta_enrich["ad_name"] = attr["utmContent"]
+                    if not meta_enrich.get("ad_id") and attr.get("adId"):
+                        meta_enrich["ad_id"] = attr["adId"]
+
+                # Normalize email
+                email = contact.get("email")
+                if not email or (isinstance(email, str) and not email.strip()):
+                    email = f"no_email_ghl_{contact.get('id')}"
+                elif isinstance(email, str):
+                    email = email.strip().lower()
+
+                # Normalize name
+                contact_name = contact.get("contactName", "") or ""
+                if not contact_name:
+                    first = (contact.get("firstName") or "").strip()
+                    last = (contact.get("lastName") or "").strip()
+                    contact_name = f"{first} {last}".strip() or "Unknown"
+
+                formatted = {
+                    "contactId": contact.get("id"),
+                    "contactName": contact_name,
+                    "firstName": contact.get("firstName") or "",
+                    "lastName": contact.get("lastName") or "",
+                    "email": email,
+                    "phone": contact.get("phone") or "",
+                    "locationId": doc.get("location_id"),
+                    "groupName": doc.get("client_group_name", "Unknown Group"),
+                    "dateAdded": contact.get("dateAdded") or "",
+                    "dateUpdated": contact.get("dateUpdated") or "",
+                    "dateOfBirth": contact.get("dateOfBirth") or "",
+                    "tags": contact.get("tags") or [],
+                    "source": contact.get("source") or "",
+                    "type": contact.get("type") or "lead",
+                    "contactType": contact.get("contactType") or contact.get("type") or "lead",
+                    "address1": contact.get("address1") or "",
+                    "city": contact.get("city") or "",
+                    "state": contact.get("state") or "",
+                    "postalCode": contact.get("postalCode") or "",
+                    "country": contact.get("country") or "",
+                    "timezone": contact.get("timezone") or "",
+                    "companyName": contact.get("companyName") or "",
+                    "website": contact.get("website") or "",
+                    "businessId": contact.get("businessId") or "",
+                    "dnd": contact.get("dnd", False),
+                    "dndSettings": contact.get("dndSettings") or {},
+                    "customFields": contact.get("customFields") or [],
+                    "followers": contact.get("followers") or [],
+                    "assignedTo": contact.get("assignedTo") or "",
+                    "opportunities": contact.get("opportunities") or [],
+                    "attributionSource": contact.get("attributionSource") or {},
+                    "lastAttributionSource": contact.get("lastAttributionSource") or {},
+                    "sources": {
+                        "ghl": True,
+                        "meta": has_meta,
+                        "hp": has_hp,
+                    },
+                    "meta_enrichment": meta_enrich,
+                    "hp_enrichment": hp_enrich,
+                }
+                contacts.append(formatted)
+
+            elapsed = _time.time() - start_time
+
+            return {
+                "contacts": contacts,
+                "meta": {
+                    "total_contacts": total_contacts,
+                    "current_page": page,
+                    "total_pages": total_pages,
+                    "per_page": limit,
+                    "returned": len(contacts),
+                    "has_next": page < total_pages,
+                    "has_prev": page > 1,
+                    "sort_order": "newest_first",
+                    "date_filtered": bool(start_date or end_date),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "stats": {
+                        "total_opportunities": total_opportunities,
+                        "won": opportunity_stats["won"],
+                        "lost": opportunity_stats["lost"],
+                        "open": opportunity_stats["open"],
+                        "abandoned": opportunity_stats["abandoned"],
+                        "conversion_rate": round(
+                            (opportunity_stats["won"] / total_opportunities) * 100, 1
+                        ) if total_opportunities > 0 else 0,
+                        "total_value": round(total_value, 2),
+                    },
+                },
+                "message": f"Retrieved {len(contacts)} unified leads (newest first)",
+                "performance": {
+                    "response_time_ms": int(elapsed * 1000),
+                    "source": "unified",
+                },
             }
+
+        except Exception as e:
+            logger.error(f"Error fetching unified leads: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to fetch unified leads: {str(e)}")
+
 
 # ---------------------------------------------------------------------------
 # POST /api/client-groups/{group_id}/refresh/{integration}
@@ -2029,77 +2434,119 @@ async def delete_client_group(
                 detail=f"Failed to delete client group: {str(e)}",
             )
 
+
+# ---------------------------------------------------------------------------
+# GET /api/leads/filter-options
+# ---------------------------------------------------------------------------
+
 @router.get("/api/leads/filter-options")
 async def get_leads_filter_options(
-    groups: str = Query(default=""),
-    start_date: str = Query(default=None),
-    end_date: str = Query(default=None),
-    current_user: str = Depends(get_current_user),
+        groups: str = Query(default=""),
+        start_date: Optional[str] = Query(default=None),
+        end_date: Optional[str] = Query(default=None),
+        current_user: str = Depends(get_current_user),
 ):
     """
-    Return distinct filter values for the leads table.
-    All three lookups (sources, types, tags) run in parallel.
+    Return distinct filter values for the FilterPanel component.
+
+      sources  — atomic values split from GHL's comma-separated source strings
+      types    — distinct contactType values
+      tags     — distinct tag strings
+
+    All three DB lookups run in parallel.
+
+    Query params
+    ------------
+    groups     : comma-separated client_group_id values (omit = all groups)
+    start_date : YYYY-MM-DD  inclusive lower bound on dateAdded
+    end_date   : YYYY-MM-DD  inclusive upper bound on dateAdded
     """
     async with get_mongo_client() as mongo_client:
         try:
             db = mongo_client[DB_NAME]
             ghl_col = db["ghl_contacts"]
 
+            # ── group IDs ────────────────────────────────────────────────────
             group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
 
-            # ── base match ──────────────────────────────────────────────────
+            # ── base match ───────────────────────────────────────────────────
             match_q: dict = {"user_id": current_user}
             if group_ids:
                 match_q["client_group_id"] = {"$in": group_ids}
 
-            # ── date filter (STRING comparison — dateAdded is ISO-8601) ────
+            # ── date filter ──────────────────────────────────────────────────
             _EMPTY = {None, "", "null", "undefined", "None"}
+            date_filter: dict = {}
+
             if start_date not in _EMPTY:
                 try:
-                    normalized = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    match_q["contact_data.dateAdded"] = {"$gte": f"{normalized}T00:00:00.000Z"}
+                    norm = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    date_filter["$gte"] = f"{norm}T00:00:00.000Z"
                 except ValueError:
-                    pass  # ignore bad format, fall back to no start bound
+                    logger.warning(f"Invalid start_date: {start_date!r} — ignored")
 
             if end_date not in _EMPTY:
                 try:
-                    normalized = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    existing = match_q.get("contact_data.dateAdded", {})
-                    existing["$lte"] = f"{normalized}T23:59:59.999Z"
-                    match_q["contact_data.dateAdded"] = existing
+                    norm = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+                    date_filter["$lte"] = f"{norm}T23:59:59.999Z"
                 except ValueError:
-                    pass
+                    logger.warning(f"Invalid end_date: {end_date!r} — ignored")
 
-            # ── sources pipeline ────────────────────────────────────────────
-            # GHL "source" can be a single string ("Facebook") or comma-separated
-            # ("Facebook, Google").  The pipeline normalises both cases.
+            if date_filter:
+                match_q["contact_data.dateAdded"] = date_filter
+
+            # ── sources pipeline ─────────────────────────────────────────────
+            # Splits "Facebook, Google" → ["Facebook", "Google"] inside Mongo
+            # so the FilterPanel receives clean atomic values.
             sources_pipeline = [
                 {"$match": {
                     **match_q,
-                    "contact_data.source": {"$type": "string"},   # skip null / missing
+                    "contact_data.source": {
+                        "$exists": True,
+                        "$type": "string",
+                        "$ne": "",
+                    },
                 }},
-                # Trim whitespace first
                 {"$addFields": {
-                    "source_trimmed": {"$trim": {"input": "$contact_data.source"}}
+                    "_src_trimmed": {"$trim": {"input": "$contact_data.source"}},
                 }},
-                # Split on comma so "Facebook, Google" becomes two docs
                 {"$project": {
-                    "parts": {"$split": ["$source_trimmed", ","]},
+                    "_src_parts": {"$split": ["$_src_trimmed", ","]},
                 }},
-                {"$unwind": "$parts"},
+                {"$unwind": "$_src_parts"},
                 {"$project": {
-                    "source": {"$trim": {"input": "$parts"}},
+                    "_src": {"$trim": {"input": "$_src_parts"}},
                 }},
-                {"$match": {"source": {"$ne": ""}}},
-                {"$group": {"_id": "$source"}},
+                {"$match": {"_src": {"$ne": ""}}},
+                {"$group": {"_id": "$_src"}},
                 {"$sort": {"_id": 1}},
             ]
 
-            # ── parallel fetch ──────────────────────────────────────────────
-            types_raw, tags_raw, sources_docs = await asyncio.gather(
+            # ── tags pipeline ────────────────────────────────────────────────
+            tags_pipeline = [
+                {"$match": {
+                    **match_q,
+                    "contact_data.tags": {
+                        "$exists": True,
+                        "$not": {"$size": 0},
+                    },
+                }},
+                {"$unwind": "$contact_data.tags"},
+                {"$match": {
+                    "contact_data.tags": {"$type": "string", "$ne": ""},
+                }},
+                {"$group": {
+                    "_id": {"$trim": {"input": "$contact_data.tags"}},
+                }},
+                {"$match": {"_id": {"$ne": ""}}},
+                {"$sort": {"_id": 1}},
+            ]
+
+            # ── run all three in parallel ────────────────────────────────────
+            types_raw, sources_docs, tags_docs = await asyncio.gather(
                 ghl_col.distinct("contact_data.contactType", match_q),
-                ghl_col.distinct("contact_data.tags", match_q),
                 ghl_col.aggregate(sources_pipeline).to_list(None),
+                ghl_col.aggregate(tags_pipeline).to_list(None),
             )
 
             def _clean(lst):
@@ -2109,14 +2556,23 @@ async def get_leads_filter_options(
                     if v and isinstance(v, str) and v.strip()
                 })
 
+            sources = sorted({
+                doc["_id"] for doc in sources_docs if doc.get("_id")
+            })
+            tags = sorted({
+                doc["_id"] for doc in tags_docs if doc.get("_id")
+            })
+            types = _clean(types_raw)
+
+            logger.info(
+                f"filter-options [user={current_user}, groups={group_ids or 'all'}] "
+                f"→ {len(sources)} sources, {len(types)} types, {len(tags)} tags"
+            )
+
             return {
-                "sources": sorted({
-                    doc["_id"]
-                    for doc in sources_docs
-                    if doc.get("_id")
-                }),
-                "types": _clean(types_raw),
-                "tags": _clean(tags_raw),
+                "sources": sources,
+                "types": types,
+                "tags": tags,
             }
 
         except Exception as e:
