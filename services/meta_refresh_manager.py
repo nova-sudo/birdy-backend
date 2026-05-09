@@ -69,12 +69,14 @@ async def start_refresh(group_id: str, user_id: str, group: dict, mongo_client) 
 
     await db["meta_refresh_jobs"].insert_one(job_doc)
 
-    # Mark as refreshing — set a placeholder so cache_jobs doesn't re-trigger,
-    # but clear the preset data so fresh data gets written.
+    # Mark as refreshing without clobbering existing preset data — if the
+    # refresh fails partway, stale-but-valid data must remain in place.
+    # Per-preset writes use dot notation, so successful presets overwrite
+    # cleanly while failed ones keep their previous values.
     await db["client_groups"].update_one(
         {"id": group_id},
         {"$set": {
-            "facebook_cache": {"_refreshing": True},
+            "facebook_cache._refreshing": True,
             "meta_refresh_status": "running",
         }},
     )
