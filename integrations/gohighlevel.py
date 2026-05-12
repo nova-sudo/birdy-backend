@@ -249,136 +249,139 @@ class GHLIntegration:
 
     async def fetch_locations(self, company_id, access_token, retries=3, delay=2):
         """
-        Fetch ALL locations for a company. The GHL /locations endpoint caps
-        each response at 100 items internally regardless of the `limit` we
-        send — so we can't infer "last page" from `len(chunk) < limit`.
-        Instead we keep paginating with `skip` until either:
-          - the API returns an empty array (clean end), or
-          - the API returns IDs we've already seen (meaning skip is being
-            ignored — defensive against APIs that silently dropped the
-            parameter and would otherwise loop forever).
+        Fetch ALL sub-accounts for a company.
 
-        Returns (True, [normalized_location, ...]) on success. If a later
-        page fails after some succeed, returns what we have rather than
-        dropping the whole list.
+        GHL's `/locations?companyId=...` endpoint hard-caps at 100 items
+        and (in practice) silently ignores the `skip` parameter — calling
+        it with skip=100 returns the same first 100 IDs. So we can't
+        paginate it.
+
+        Instead we use `/oauth/installedLocations`, which DOES honour
+        `skip` + `limit` (up to 1000 per page). To make sure we cover
+        every sub-account regardless of whether our app is installed
+        on it, we fetch with `isInstalled=true` AND `isInstalled=false`
+        and merge the two lists (deduped by locationId).
+
+        Falls back to the legacy `/locations` endpoint if the alternative
+        endpoint refuses (e.g. 401/403), so existing callers keep working.
         """
-        page_size = 100   # GHL ignores higher values for this endpoint
-        skip = 0
-        all_locations: list = []
         seen_ids: set = set()
-        max_pages = 200   # safety cap (20,000 sub-accounts)
+        merged: list = []
 
         def _loc_id(loc):
             return loc.get("_id") or loc.get("id") or loc.get("locationId")
 
+        def _extend(chunk):
+            added = 0
+            for loc in chunk:
+                lid = _loc_id(loc)
+                if not lid or lid in seen_ids:
+                    continue
+                seen_ids.add(lid)
+                merged.append(loc)
+                added += 1
+            return added
+
         async with httpx.AsyncClient(timeout=OAUTH_CONFIG["request_timeout"]) as client:
-            page = 0
-            for page in range(max_pages):
-                last_error = None
-                last_status = None
-                chunk = None
+            installed_endpoint_ok = False
 
-                for attempt in range(retries):
-                    try:
-                        url = (
-                            f"{OAUTH_CONFIG['locations_url']}"
-                            f"?companyId={company_id}&limit={page_size}&skip={skip}"
-                        )
-                        logger.info(
-                            f"Locations fetch page={page + 1} skip={skip} "
-                            f"limit={page_size} attempt={attempt + 1}"
-                        )
+            for installed_flag in ("true", "false"):
+                page_size = 500
+                skip = 0
+                max_pages = 50  # 25,000-sub-account safety cap
 
-                        response = await client.get(
-                            url,
-                            headers={
-                                "Accept": "application/json",
-                                "Version": "2021-07-28",
-                                "Authorization": f"Bearer {access_token}",
-                            },
-                        )
-
-                        if response.status_code == 200:
-                            chunk = response.json().get("locations", []) or []
-                            break  # got the page, exit retry loop
-
-                        # First-page 404 → fall back to the alternative
-                        # endpoint (it doesn't paginate, returns all in one).
-                        if response.status_code == 404 and skip == 0:
-                            logger.warning("Primary endpoint returned 404, trying alternative...")
-                            alt_success, alt_result = await self._fetch_locations_alternative(
-                                company_id, access_token, client
-                            )
-                            if alt_success:
-                                return True, alt_result
-
-                        last_status = response.status_code
-                        try:
-                            last_error = response.json().get("error") or response.text[:200]
-                        except json.JSONDecodeError:
-                            last_error = response.text[:200] or f"HTTP {response.status_code}"
-                        logger.error(f"fetch_locations error: {last_error}")
-
-                        # Retry 5xx; give up on 4xx
-                        if attempt < retries - 1 and response.status_code >= 500:
-                            await asyncio.sleep(delay)
-                            continue
-                        break
-
-                    except httpx.RequestError as e:
-                        last_error = f"Network error: {str(e)}"
-                        logger.error(
-                            f"fetch_locations network error (attempt {attempt + 1}): {str(e)}"
-                        )
-                        if attempt < retries - 1:
-                            await asyncio.sleep(delay)
-                            continue
-                        break
-
-                if chunk is None:
-                    # Page totally failed. If we already have some locations,
-                    # return what we've got rather than dropping the whole list.
-                    if all_locations:
-                        logger.warning(
-                            f"fetch_locations: page {page + 1} failed after retries, "
-                            f"returning the {len(all_locations)} locations we have"
-                        )
-                        return True, self._normalize_locations(all_locations)
-                    return False, {
-                        "error": last_error or "Failed to fetch locations",
-                        "status_code": last_status or 500,
-                    }
-
-                # Empty chunk → clean end of pagination
-                if not chunk:
-                    break
-
-                # Detect "skip is being ignored" — if every item in this chunk
-                # is one we've already seen, the API is returning the same
-                # page over and over. Stop to avoid an infinite loop.
-                new_items = [loc for loc in chunk if _loc_id(loc) not in seen_ids]
-                if not new_items:
-                    logger.warning(
-                        f"fetch_locations: page {page + 1} returned only duplicate "
-                        f"IDs — assuming skip is unsupported, stopping with "
-                        f"{len(all_locations)} unique locations"
+                for page in range(max_pages):
+                    url = (
+                        f"https://services.leadconnectorhq.com/oauth/installedLocations"
+                        f"?companyId={company_id}&appId={APP_ID}"
+                        f"&isInstalled={installed_flag}&limit={page_size}&skip={skip}"
                     )
-                    break
+                    logger.info(
+                        f"installedLocations isInstalled={installed_flag} "
+                        f"page={page + 1} skip={skip} limit={page_size}"
+                    )
 
-                for loc in new_items:
-                    lid = _loc_id(loc)
-                    if lid:
-                        seen_ids.add(lid)
-                all_locations.extend(new_items)
+                    chunk = None
+                    for attempt in range(retries):
+                        try:
+                            response = await client.get(
+                                url,
+                                headers={
+                                    "Accept": "application/json",
+                                    "Version": "2021-07-28",
+                                    "Authorization": f"Bearer {access_token}",
+                                },
+                            )
+                            if response.status_code == 200:
+                                chunk = response.json().get("locations", []) or []
+                                installed_endpoint_ok = True
+                                break
+                            if response.status_code >= 500 and attempt < retries - 1:
+                                await asyncio.sleep(delay)
+                                continue
+                            logger.warning(
+                                f"installedLocations isInstalled={installed_flag} "
+                                f"returned {response.status_code}: {response.text[:200]}"
+                            )
+                            break
+                        except httpx.RequestError as e:
+                            logger.error(
+                                f"installedLocations network error "
+                                f"(attempt {attempt + 1}): {str(e)}"
+                            )
+                            if attempt < retries - 1:
+                                await asyncio.sleep(delay)
+                                continue
+                            break
 
-                # Advance skip cursor regardless of how many items we got.
-                # GHL ignores limit beyond 100 but does honour skip.
-                skip += page_size
+                    if chunk is None or not chunk:
+                        break
 
-            normalized = self._normalize_locations(all_locations)
-            logger.info(
-                f"✅ Fetched {len(normalized)} locations across {page + 1} page(s)"
-            )
+                    added = _extend(chunk)
+                    # Stop if the page didn't add anything new
+                    # (skip being ignored / sentinel response).
+                    if added == 0:
+                        logger.warning(
+                            f"installedLocations isInstalled={installed_flag} "
+                            f"page {page + 1} returned only duplicates — stopping"
+                        )
+                        break
+
+                    # Short page → end of list
+                    if len(chunk) < page_size:
+                        break
+
+                    skip += page_size
+
+            # If the installedLocations endpoint never returned 200 at all,
+            # fall back to the legacy /locations endpoint (capped at 100,
+            # but better than nothing).
+            if not installed_endpoint_ok:
+                logger.warning(
+                    "installedLocations unavailable — falling back to /locations"
+                )
+                try:
+                    response = await client.get(
+                        f"{OAUTH_CONFIG['locations_url']}"
+                        f"?companyId={company_id}&limit=100",
+                        headers={
+                            "Accept": "application/json",
+                            "Version": "2021-07-28",
+                            "Authorization": f"Bearer {access_token}",
+                        },
+                    )
+                    if response.status_code == 200:
+                        _extend(response.json().get("locations", []) or [])
+                    else:
+                        return False, {
+                            "error": response.text[:200] or "Failed to fetch locations",
+                            "status_code": response.status_code,
+                        }
+                except httpx.RequestError as e:
+                    return False, {"error": f"Network error: {str(e)}", "status_code": 500}
+
+            normalized = self._normalize_locations(merged)
+            logger.info(f"✅ Fetched {len(normalized)} unique locations total")
             return True, normalized
 
     async def _fetch_locations_alternative(self, company_id, access_token, client):
