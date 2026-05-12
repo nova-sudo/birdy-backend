@@ -249,20 +249,27 @@ class GHLIntegration:
 
     async def fetch_locations(self, company_id, access_token, retries=3, delay=2):
         """
-        Fetch ALL locations for a company. The previous version hardcoded
-        limit=100 and made a single request, silently capping agencies with
-        100+ sub-accounts at the first 100 results. Now paginates via
-        skip+limit until the API returns fewer than `page_size` items.
+        Fetch ALL locations for a company. The GHL /locations endpoint caps
+        each response at 100 items internally regardless of the `limit` we
+        send — so we can't infer "last page" from `len(chunk) < limit`.
+        Instead we keep paginating with `skip` until either:
+          - the API returns an empty array (clean end), or
+          - the API returns IDs we've already seen (meaning skip is being
+            ignored — defensive against APIs that silently dropped the
+            parameter and would otherwise loop forever).
 
-        Returns (True, [normalized_location, ...]) on success, or
-        (False, {"error": ..., "status_code": ...}) on total failure. If at
-        least one page succeeded before a later page errored, returns what
-        we already have rather than dropping the whole list.
+        Returns (True, [normalized_location, ...]) on success. If a later
+        page fails after some succeed, returns what we have rather than
+        dropping the whole list.
         """
-        page_size = 500   # GHL accepts up to 1000; 500 keeps page responses snappy
+        page_size = 100   # GHL ignores higher values for this endpoint
         skip = 0
         all_locations: list = []
-        max_pages = 100   # safety cap (50,000 sub-accounts)
+        seen_ids: set = set()
+        max_pages = 200   # safety cap (20,000 sub-accounts)
+
+        def _loc_id(loc):
+            return loc.get("_id") or loc.get("id") or loc.get("locationId")
 
         async with httpx.AsyncClient(timeout=OAUTH_CONFIG["request_timeout"]) as client:
             page = 0
@@ -342,16 +349,36 @@ class GHLIntegration:
                         "status_code": last_status or 500,
                     }
 
-                all_locations.extend(chunk)
-
-                # Last page if we got fewer than page_size items back
-                if len(chunk) < page_size:
+                # Empty chunk → clean end of pagination
+                if not chunk:
                     break
 
+                # Detect "skip is being ignored" — if every item in this chunk
+                # is one we've already seen, the API is returning the same
+                # page over and over. Stop to avoid an infinite loop.
+                new_items = [loc for loc in chunk if _loc_id(loc) not in seen_ids]
+                if not new_items:
+                    logger.warning(
+                        f"fetch_locations: page {page + 1} returned only duplicate "
+                        f"IDs — assuming skip is unsupported, stopping with "
+                        f"{len(all_locations)} unique locations"
+                    )
+                    break
+
+                for loc in new_items:
+                    lid = _loc_id(loc)
+                    if lid:
+                        seen_ids.add(lid)
+                all_locations.extend(new_items)
+
+                # Advance skip cursor regardless of how many items we got.
+                # GHL ignores limit beyond 100 but does honour skip.
                 skip += page_size
 
             normalized = self._normalize_locations(all_locations)
-            logger.info(f"✅ Fetched {len(normalized)} locations across {page + 1} page(s)")
+            logger.info(
+                f"✅ Fetched {len(normalized)} locations across {page + 1} page(s)"
+            )
             return True, normalized
 
     async def _fetch_locations_alternative(self, company_id, access_token, client):
