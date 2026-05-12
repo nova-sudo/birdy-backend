@@ -248,59 +248,111 @@ class GHLIntegration:
         return success, result
 
     async def fetch_locations(self, company_id, access_token, retries=3, delay=2):
-        """Fetch locations with better error handling"""
+        """
+        Fetch ALL locations for a company. The previous version hardcoded
+        limit=100 and made a single request, silently capping agencies with
+        100+ sub-accounts at the first 100 results. Now paginates via
+        skip+limit until the API returns fewer than `page_size` items.
+
+        Returns (True, [normalized_location, ...]) on success, or
+        (False, {"error": ..., "status_code": ...}) on total failure. If at
+        least one page succeeded before a later page errored, returns what
+        we already have rather than dropping the whole list.
+        """
+        page_size = 500   # GHL accepts up to 1000; 500 keeps page responses snappy
+        skip = 0
+        all_locations: list = []
+        max_pages = 100   # safety cap (50,000 sub-accounts)
+
         async with httpx.AsyncClient(timeout=OAUTH_CONFIG["request_timeout"]) as client:
-            for attempt in range(retries):
-                try:
-                    url = f"{OAUTH_CONFIG['locations_url']}?companyId={company_id}&limit=100"
-                    logger.info(f"Attempt {attempt + 1} to fetch locations for company_id: {company_id}")
+            page = 0
+            for page in range(max_pages):
+                last_error = None
+                last_status = None
+                chunk = None
 
-                    response = await client.get(
-                        url,
-                        headers={
-                            "Accept": "application/json",
-                            "Version": "2021-07-28",
-                            "Authorization": f"Bearer {access_token}"
-                        }
-                    )
-
-                    if response.status_code == 200:
-                        data = response.json()
-                        locations = data.get("locations", [])
-                        normalized_locations = self._normalize_locations(locations)
-                        logger.info(f"✅ Fetched {len(normalized_locations)} locations")
-                        return True, normalized_locations
-
-                    if response.status_code == 404:
-                        logger.warning("Primary endpoint returned 404, trying alternative...")
-                        alt_success, alt_result = await self._fetch_locations_alternative(
-                            company_id, access_token, client
-                        )
-                        if alt_success:
-                            return True, alt_result
-
-                    error_msg = f"Failed to fetch locations: {response.status_code}"
+                for attempt in range(retries):
                     try:
-                        error_msg = response.json().get("error", error_msg)
-                    except json.JSONDecodeError:
-                        pass
+                        url = (
+                            f"{OAUTH_CONFIG['locations_url']}"
+                            f"?companyId={company_id}&limit={page_size}&skip={skip}"
+                        )
+                        logger.info(
+                            f"Locations fetch page={page + 1} skip={skip} "
+                            f"limit={page_size} attempt={attempt + 1}"
+                        )
 
-                    logger.error(error_msg)
+                        response = await client.get(
+                            url,
+                            headers={
+                                "Accept": "application/json",
+                                "Version": "2021-07-28",
+                                "Authorization": f"Bearer {access_token}",
+                            },
+                        )
 
-                    if attempt < retries - 1 and response.status_code >= 500:
-                        await asyncio.sleep(delay)
-                        continue
+                        if response.status_code == 200:
+                            chunk = response.json().get("locations", []) or []
+                            break  # got the page, exit retry loop
 
-                    return False, {"error": error_msg, "status_code": response.status_code}
+                        # First-page 404 → fall back to the alternative
+                        # endpoint (it doesn't paginate, returns all in one).
+                        if response.status_code == 404 and skip == 0:
+                            logger.warning("Primary endpoint returned 404, trying alternative...")
+                            alt_success, alt_result = await self._fetch_locations_alternative(
+                                company_id, access_token, client
+                            )
+                            if alt_success:
+                                return True, alt_result
 
-                except httpx.RequestError as e:
-                    logger.error(f"Network error during fetch_locations (attempt {attempt + 1}): {str(e)}")
-                    if attempt < retries - 1:
-                        await asyncio.sleep(delay)
-                        continue
-                    return False, {"error": f"Network error: {str(e)}"}
+                        last_status = response.status_code
+                        try:
+                            last_error = response.json().get("error") or response.text[:200]
+                        except json.JSONDecodeError:
+                            last_error = response.text[:200] or f"HTTP {response.status_code}"
+                        logger.error(f"fetch_locations error: {last_error}")
 
-        return False, {"error": "Failed to fetch locations"}
+                        # Retry 5xx; give up on 4xx
+                        if attempt < retries - 1 and response.status_code >= 500:
+                            await asyncio.sleep(delay)
+                            continue
+                        break
+
+                    except httpx.RequestError as e:
+                        last_error = f"Network error: {str(e)}"
+                        logger.error(
+                            f"fetch_locations network error (attempt {attempt + 1}): {str(e)}"
+                        )
+                        if attempt < retries - 1:
+                            await asyncio.sleep(delay)
+                            continue
+                        break
+
+                if chunk is None:
+                    # Page totally failed. If we already have some locations,
+                    # return what we've got rather than dropping the whole list.
+                    if all_locations:
+                        logger.warning(
+                            f"fetch_locations: page {page + 1} failed after retries, "
+                            f"returning the {len(all_locations)} locations we have"
+                        )
+                        return True, self._normalize_locations(all_locations)
+                    return False, {
+                        "error": last_error or "Failed to fetch locations",
+                        "status_code": last_status or 500,
+                    }
+
+                all_locations.extend(chunk)
+
+                # Last page if we got fewer than page_size items back
+                if len(chunk) < page_size:
+                    break
+
+                skip += page_size
+
+            normalized = self._normalize_locations(all_locations)
+            logger.info(f"✅ Fetched {len(normalized)} locations across {page + 1} page(s)")
+            return True, normalized
 
     async def _fetch_locations_alternative(self, company_id, access_token, client):
         """Try alternative installedLocations endpoint"""
