@@ -251,22 +251,20 @@ class GHLIntegration:
         """
         Fetch ALL sub-accounts for a company.
 
-        GHL's `/locations?companyId=...` endpoint hard-caps at 100 items
-        and (in practice) silently ignores the `skip` parameter — calling
-        it with skip=100 returns the same first 100 IDs. So we can't
-        paginate it.
+        Strategy: try multiple GHL endpoints in order and keep whichever
+        gives us the most unique locations. Each endpoint has its own
+        quirks/caps so we don't rely on a single source of truth.
 
-        Instead we use `/oauth/installedLocations`, which DOES honour
-        `skip` + `limit` (up to 1000 per page). To make sure we cover
-        every sub-account regardless of whether our app is installed
-        on it, we fetch with `isInstalled=true` AND `isInstalled=false`
-        and merge the two lists (deduped by locationId).
-
-        Falls back to the legacy `/locations` endpoint if the alternative
-        endpoint refuses (e.g. 401/403), so existing callers keep working.
+        Endpoints tried (results merged & deduped by locationId):
+          1. /locations/search?companyId=... + skip pagination
+             (limit up to 1000; the proper agency-listing endpoint).
+          2. /oauth/installedLocations?isInstalled=true/false
+             (covers app-install marketplace listings; supports skip).
+          3. /locations?companyId=... (legacy, hard cap at 100 — fallback only).
         """
         seen_ids: set = set()
         merged: list = []
+        any_ok = False
 
         def _loc_id(loc):
             return loc.get("_id") or loc.get("id") or loc.get("locationId")
@@ -282,84 +280,83 @@ class GHLIntegration:
                 added += 1
             return added
 
-        async with httpx.AsyncClient(timeout=OAUTH_CONFIG["request_timeout"]) as client:
-            installed_endpoint_ok = False
+        async def _paginate(client, build_url, label, page_size, max_pages=50):
+            """Generic skip-pagination helper. Returns True if endpoint ok."""
+            nonlocal any_ok
+            skip = 0
+            ok = False
+            for page in range(max_pages):
+                url = build_url(skip, page_size)
+                logger.info(f"{label} page={page + 1} skip={skip} limit={page_size}")
 
-            for installed_flag in ("true", "false"):
-                page_size = 500
-                skip = 0
-                max_pages = 50  # 25,000-sub-account safety cap
-
-                for page in range(max_pages):
-                    url = (
-                        f"https://services.leadconnectorhq.com/oauth/installedLocations"
-                        f"?companyId={company_id}&appId={APP_ID}"
-                        f"&isInstalled={installed_flag}&limit={page_size}&skip={skip}"
-                    )
-                    logger.info(
-                        f"installedLocations isInstalled={installed_flag} "
-                        f"page={page + 1} skip={skip} limit={page_size}"
-                    )
-
-                    chunk = None
-                    for attempt in range(retries):
-                        try:
-                            response = await client.get(
-                                url,
-                                headers={
-                                    "Accept": "application/json",
-                                    "Version": "2021-07-28",
-                                    "Authorization": f"Bearer {access_token}",
-                                },
-                            )
-                            if response.status_code == 200:
-                                chunk = response.json().get("locations", []) or []
-                                installed_endpoint_ok = True
-                                break
-                            if response.status_code >= 500 and attempt < retries - 1:
-                                await asyncio.sleep(delay)
-                                continue
-                            logger.warning(
-                                f"installedLocations isInstalled={installed_flag} "
-                                f"returned {response.status_code}: {response.text[:200]}"
-                            )
+                chunk = None
+                for attempt in range(retries):
+                    try:
+                        response = await client.get(
+                            url,
+                            headers={
+                                "Accept": "application/json",
+                                "Version": "2021-07-28",
+                                "Authorization": f"Bearer {access_token}",
+                            },
+                        )
+                        if response.status_code == 200:
+                            chunk = response.json().get("locations", []) or []
+                            ok = True
+                            any_ok = True
                             break
-                        except httpx.RequestError as e:
-                            logger.error(
-                                f"installedLocations network error "
-                                f"(attempt {attempt + 1}): {str(e)}"
-                            )
-                            if attempt < retries - 1:
-                                await asyncio.sleep(delay)
-                                continue
-                            break
-
-                    if chunk is None or not chunk:
-                        break
-
-                    added = _extend(chunk)
-                    # Stop if the page didn't add anything new
-                    # (skip being ignored / sentinel response).
-                    if added == 0:
+                        if response.status_code >= 500 and attempt < retries - 1:
+                            await asyncio.sleep(delay)
+                            continue
                         logger.warning(
-                            f"installedLocations isInstalled={installed_flag} "
-                            f"page {page + 1} returned only duplicates — stopping"
+                            f"{label} returned {response.status_code}: "
+                            f"{response.text[:200]}"
                         )
                         break
-
-                    # Short page → end of list
-                    if len(chunk) < page_size:
+                    except httpx.RequestError as e:
+                        logger.error(f"{label} network error (attempt {attempt + 1}): {e}")
+                        if attempt < retries - 1:
+                            await asyncio.sleep(delay)
+                            continue
                         break
 
-                    skip += page_size
+                if chunk is None or not chunk:
+                    break
+                added = _extend(chunk)
+                if added == 0:
+                    logger.warning(f"{label} page {page + 1}: only duplicates — stopping")
+                    break
+                if len(chunk) < page_size:
+                    break
+                skip += page_size
+            return ok
 
-            # If the installedLocations endpoint never returned 200 at all,
-            # fall back to the legacy /locations endpoint (capped at 100,
-            # but better than nothing).
-            if not installed_endpoint_ok:
-                logger.warning(
-                    "installedLocations unavailable — falling back to /locations"
+        async with httpx.AsyncClient(timeout=OAUTH_CONFIG["request_timeout"]) as client:
+            # ── 1. /locations/search (proper agency listing, supports skip+limit) ──
+            def _search_url(skip, lim):
+                return (
+                    f"https://services.leadconnectorhq.com/locations/search"
+                    f"?companyId={company_id}&limit={lim}&skip={skip}"
                 )
+            await _paginate(client, _search_url, "locations/search", page_size=500)
+
+            # ── 2. /oauth/installedLocations for both install states ──
+            for installed_flag in ("true", "false"):
+                def _inst_url(skip, lim, flag=installed_flag):
+                    return (
+                        f"https://services.leadconnectorhq.com/oauth/installedLocations"
+                        f"?companyId={company_id}&appId={APP_ID}"
+                        f"&isInstalled={flag}&limit={lim}&skip={skip}"
+                    )
+                await _paginate(
+                    client, _inst_url,
+                    f"installedLocations[isInstalled={installed_flag}]",
+                    page_size=500,
+                )
+
+            # ── 3. legacy /locations as last resort (capped at 100) ──
+            if not any_ok:
+                logger.warning("All paginated endpoints failed — trying legacy /locations")
                 try:
                     response = await client.get(
                         f"{OAUTH_CONFIG['locations_url']}"
@@ -378,7 +375,7 @@ class GHLIntegration:
                             "status_code": response.status_code,
                         }
                 except httpx.RequestError as e:
-                    return False, {"error": f"Network error: {str(e)}", "status_code": 500}
+                    return False, {"error": f"Network error: {e}", "status_code": 500}
 
             normalized = self._normalize_locations(merged)
             logger.info(f"✅ Fetched {len(normalized)} unique locations total")
