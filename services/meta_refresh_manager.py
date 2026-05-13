@@ -3,9 +3,27 @@ services/meta_refresh_manager.py
 ---------------------------------
 Resilient Meta refresh orchestrator with granular per-preset tracking
 and automatic retry of failed steps.
+
+Two execution models share this module:
+
+  1. Inline (on-demand)  — start_refresh() creates a job and runs it to
+     completion in the same coroutine. Used by the on-demand refresh
+     endpoint and by group creation.
+
+  2. Tick-driven (cron)  — schedule_stale_groups() creates jobs for
+     stale groups, claim_next_jobs() atomically claims work, and
+     execute_refresh(max_seconds=...) advances each job within a
+     wall-clock budget. The Vercel /api/cron/meta-tick endpoint
+     drives this.
+
+Both share the same meta_refresh_jobs state machine and per-preset
+status tracking, so a partial job created inline can be resumed by a
+tick (and vice-versa).
 """
 
+import asyncio
 import logging
+import time
 from datetime import datetime, timedelta
 
 from core.constants import META_CACHE_PRESETS
@@ -25,16 +43,45 @@ logger = logging.getLogger(__name__)
 RETRY_DELAY_MINUTES = 10
 MAX_ATTEMPTS = 3
 
+# A job that has been in_progress for longer than this is considered stuck
+# (function crash, OOM, network drop) and may be reclaimed by the next tick.
+STALE_CLAIM_MINUTES = 10
+
+# Minimum remaining budget required to start the leads phase. Leads can be
+# slow, so if we're below this we skip and let the next tick handle it.
+LEADS_MIN_BUDGET_SECONDS = 60
+
 
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
-async def start_refresh(group_id: str, user_id: str, group: dict, mongo_client) -> str:
+async def create_refresh_job(
+    group_id: str,
+    user_id: str,
+    group: dict,
+    mongo_client,
+    presets: list[str] | None = None,
+    status: str = "pending",
+) -> str:
     """
-    Create a refresh job and start executing it.
+    Insert a meta_refresh_jobs document for the group. Does NOT execute
+    any fetches — the caller is responsible for either:
+      - calling execute_refresh() inline (start_refresh does this), or
+      - letting the cron tick claim and advance it.
+
+    Args:
+        presets: list of preset keys to refresh. Defaults to all presets.
+                 Pass META_ONGOING_PRESETS for the 5-hour cron, or
+                 META_STATIC_PRESETS for the monthly cron.
+        status:  initial job status. "pending" leaves it for the tick to
+                 claim; "in_progress" claims it immediately for inline use.
+
     Returns the job_id.
     """
+    if presets is None:
+        presets = META_CACHE_PRESETS
+
     db = mongo_client[DB_NAME]
     now = datetime.utcnow()
     job_id = f"refresh_{group_id}_{int(now.timestamp())}"
@@ -42,10 +89,11 @@ async def start_refresh(group_id: str, user_id: str, group: dict, mongo_client) 
     ad_account_id = group.get("meta_ad_account_id")
     currency = group.get("ad_account_currency")
 
-    # Build initial job document with all presets pending
-    presets_status = {}
-    for preset in META_CACHE_PRESETS:
-        presets_status[preset] = {"status": "pending", "attempt": 0, "error": None}
+    # Build initial job document with the requested presets pending
+    presets_status = {
+        preset: {"status": "pending", "attempt": 0, "error": None}
+        for preset in presets
+    }
 
     job_doc = {
         "job_id": job_id,
@@ -54,12 +102,14 @@ async def start_refresh(group_id: str, user_id: str, group: dict, mongo_client) 
         "ad_account_id": ad_account_id,
         "currency": currency,
         "group_name": group.get("name", ""),
-        "status": "in_progress",
+        "status": status,
         "created_at": now,
         "updated_at": now,
         "attempt": 1,
         "max_attempts": MAX_ATTEMPTS,
         "next_retry_at": None,
+        "_claimed_at": now if status == "in_progress" else None,
+        "preset_keys": presets,  # for observability
         "steps": {
             "presets": presets_status,
             "leads": {"status": "pending", "attempt": 0, "error": None},
@@ -81,19 +131,63 @@ async def start_refresh(group_id: str, user_id: str, group: dict, mongo_client) 
         }},
     )
 
-    logger.info(f"[{job_id}] Started Meta refresh for '{group.get('name', group_id)}'")
+    logger.info(
+        f"[{job_id}] Created Meta refresh job for '{group.get('name', group_id)}' "
+        f"({len(presets)} presets, status={status})"
+    )
+    return job_id
 
-    # Execute (this runs inline in the background task)
+
+async def start_refresh(
+    group_id: str,
+    user_id: str,
+    group: dict,
+    mongo_client,
+    presets: list[str] | None = None,
+) -> str:
+    """
+    Inline path: create a job and execute it to completion in the same
+    coroutine. Used by:
+      - on-demand POST /api/client-groups/{id}/refresh/meta
+      - group creation in routers/client_groups.py
+
+    For the cron-driven path, use create_refresh_job + the tick orchestrator.
+    """
+    job_id = await create_refresh_job(
+        group_id, user_id, group, mongo_client,
+        presets=presets, status="in_progress",
+    )
     await execute_refresh(job_id, mongo_client)
     return job_id
 
 
-async def execute_refresh(job_id: str, mongo_client):
+async def execute_refresh(
+    job_id: str,
+    mongo_client,
+    max_seconds: int | None = None,
+):
     """
     Execute or resume a refresh job. Only attempts steps that aren't already "success".
+
+    Args:
+        max_seconds: optional wall-clock budget. If provided, the function
+                     returns early once exceeded — successful presets so far
+                     are persisted, remaining work stays "pending", and the
+                     job is left in "partial" state for the next tick.
+                     When None (inline mode), runs to completion.
     """
     db = mongo_client[DB_NAME]
     jobs_col = db["meta_refresh_jobs"]
+
+    start_time = time.monotonic()
+
+    def remaining_budget() -> float:
+        if max_seconds is None:
+            return float("inf")
+        return max_seconds - (time.monotonic() - start_time)
+
+    def out_of_budget() -> bool:
+        return remaining_budget() <= 0
 
     job = await jobs_col.find_one({"job_id": job_id})
     if not job:
@@ -105,6 +199,24 @@ async def execute_refresh(job_id: str, mongo_client):
     ad_account_id = job["ad_account_id"]
     currency = job["currency"]
     steps = job["steps"]
+
+    async def yield_partial(reason: str):
+        """Save current progress as 'partial' and exit without finalizing."""
+        await jobs_col.update_one(
+            {"job_id": job_id},
+            {"$set": {
+                "status": "partial",
+                "_claimed_at": None,
+                "next_retry_at": datetime.utcnow(),
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        # Keep client_group in "running" so UI knows refresh is still ongoing
+        await db["client_groups"].update_one(
+            {"id": group_id},
+            {"$set": {"meta_refresh_status": "running"}},
+        )
+        logger.info(f"[{job_id}] Yielding partial ({reason}) — next tick will resume")
 
     # Validate token first
     token = await get_facebook_token(user_id, mongo_client)
@@ -119,6 +231,11 @@ async def execute_refresh(job_id: str, mongo_client):
     for preset_key, preset_state in steps["presets"].items():
         if preset_state["status"] == "success":
             continue  # already done
+
+        # Budget check before starting next preset
+        if out_of_budget():
+            await yield_partial(f"budget exhausted before '{preset_key}'")
+            return
 
         logger.info(f"[{job_id}] Fetching preset '{preset_key}' (attempt {preset_state['attempt'] + 1})")
 
@@ -172,7 +289,6 @@ async def execute_refresh(job_id: str, mongo_client):
             )
 
         # 5s cooldown between presets (Meta rate limit safety)
-        import asyncio
         await asyncio.sleep(5)
 
     if auth_failed:
@@ -185,6 +301,14 @@ async def execute_refresh(job_id: str, mongo_client):
     steps = job["steps"]
 
     if steps["leads"]["status"] != "success":
+        # Leads can be slow — skip if we don't have enough budget left
+        if remaining_budget() < LEADS_MIN_BUDGET_SECONDS:
+            await yield_partial(
+                f"insufficient budget for leads "
+                f"({remaining_budget():.0f}s < {LEADS_MIN_BUDGET_SECONDS}s)"
+            )
+            return
+
         logger.info(f"[{job_id}] Fetching leads...")
         await jobs_col.update_one(
             {"job_id": job_id},
@@ -233,6 +357,10 @@ async def execute_refresh(job_id: str, mongo_client):
     steps = job["steps"]
 
     if steps["lead_counts"]["status"] != "success":
+        if out_of_budget():
+            await yield_partial("budget exhausted before lead_counts")
+            return
+
         try:
             await update_preset_lead_counts(
                 group_id=group_id,
@@ -436,6 +564,7 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
         {"$set": {
             "status": final_status,
             "next_retry_at": next_retry,
+            "_claimed_at": None,  # release the claim so a tick can retry partial jobs
             "updated_at": datetime.utcnow(),
         }},
     )
@@ -455,4 +584,154 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
             error_parts.append(f"leads: {leads['error']}")
         update_fields["meta_refresh_error"] = "; ".join(error_parts)[:300]
 
-    await db["client_groups"].update_one({"id": group_id}, {"$set": update_fields})
+    # Build the update operation. On terminal states (complete/failed),
+    # also clear the _refreshing flag so the UI stops showing "refreshing".
+    # On "partial", leave the flag set — work is still in flight.
+    update_op = {"$set": update_fields}
+    if final_status != "partial":
+        update_op["$unset"] = {"facebook_cache._refreshing": ""}
+
+    await db["client_groups"].update_one({"id": group_id}, update_op)
+
+
+# ---------------------------------------------------------------------------
+# Tick-driven orchestration (used by routers/cron.py)
+# ---------------------------------------------------------------------------
+
+async def schedule_stale_groups(
+    mongo_client,
+    cutoff_hours: float,
+    presets: list[str],
+    limit: int = 100,
+) -> list[str]:
+    """
+    Find client groups whose Meta cache is older than `cutoff_hours` and
+    enqueue a refresh job for each (status="pending"). Idempotent — skips
+    groups that already have an open job.
+
+    Args:
+        cutoff_hours: how stale a group must be to schedule (e.g. 5 for the
+                      5-hour Meta cron).
+        presets:      preset keys to refresh. Pass META_ONGOING_PRESETS for
+                      the 5h cron, META_STATIC_PRESETS for the monthly one.
+        limit:        max number of groups to schedule per tick (caps the
+                      growth of meta_refresh_jobs per minute).
+
+    Returns the list of group_ids that were scheduled.
+    """
+    db = mongo_client[DB_NAME]
+    cutoff = datetime.utcnow() - timedelta(hours=cutoff_hours)
+
+    # Stage 1: candidate groups (stale or never refreshed)
+    candidates = await db["client_groups"].find(
+        {
+            "meta_ad_account_id": {"$exists": True, "$ne": None},
+            "$or": [
+                {"last_meta_refresh": {"$lt": cutoff}},
+                {"last_meta_refresh": {"$exists": False}},
+                {"last_meta_refresh": None},
+            ],
+        },
+        {
+            "id": 1, "user_id": 1, "name": 1,
+            "meta_ad_account_id": 1, "ad_account_currency": 1,
+        },
+    ).sort("last_meta_refresh", 1).limit(limit * 2).to_list(None)  # over-fetch in case some are filtered
+
+    if not candidates:
+        return []
+
+    # Stage 2: filter out groups that already have an open job
+    candidate_ids = [g["id"] for g in candidates]
+    open_jobs = await db["meta_refresh_jobs"].find(
+        {
+            "group_id": {"$in": candidate_ids},
+            "status": {"$in": ["pending", "in_progress", "partial"]},
+        },
+        {"group_id": 1},
+    ).to_list(None)
+    busy_ids = {j["group_id"] for j in open_jobs}
+
+    scheduled: list[str] = []
+    for group in candidates:
+        if len(scheduled) >= limit:
+            break
+        if group["id"] in busy_ids:
+            continue
+        try:
+            await create_refresh_job(
+                group_id=group["id"],
+                user_id=group["user_id"],
+                group=group,
+                mongo_client=mongo_client,
+                presets=presets,
+                status="pending",
+            )
+            scheduled.append(group["id"])
+        except Exception as e:
+            logger.error(f"Failed to schedule refresh for group {group['id']}: {e}")
+
+    if scheduled:
+        logger.info(
+            f"[scheduler] Enqueued {len(scheduled)} groups for refresh "
+            f"({len(presets)} presets, cutoff={cutoff_hours}h)"
+        )
+    return scheduled
+
+
+async def claim_next_jobs(
+    mongo_client,
+    n: int,
+    stale_claim_minutes: int = STALE_CLAIM_MINUTES,
+) -> list[dict]:
+    """
+    Atomically claim up to `n` refresh jobs for this tick to work on.
+
+    Picks jobs in this priority:
+      1. status="pending"            (never started)
+      2. status="partial"            (yielded due to budget/rate-limit)
+      3. status="in_progress" AND _claimed_at < now - stale_claim_minutes
+         (crash recovery — previous tick died)
+
+    Each claim sets status="in_progress" and refreshes _claimed_at so other
+    concurrent ticks won't grab the same job.
+
+    Returns the claimed job documents.
+    """
+    db = mongo_client[DB_NAME]
+    jobs_col = db["meta_refresh_jobs"]
+    now = datetime.utcnow()
+    stale_before = now - timedelta(minutes=stale_claim_minutes)
+
+    claimed: list[dict] = []
+    for _ in range(n):
+        # find_one_and_update is atomic — guarantees no two ticks claim the same row
+        job = await jobs_col.find_one_and_update(
+            {
+                "$or": [
+                    {"status": "pending"},
+                    {"status": "partial"},
+                    {
+                        "status": "in_progress",
+                        "$or": [
+                            {"_claimed_at": {"$lt": stale_before}},
+                            {"_claimed_at": None},
+                            {"_claimed_at": {"$exists": False}},
+                        ],
+                    },
+                ],
+                # Don't pick up jobs that have exhausted their retries
+                "$expr": {"$lt": ["$attempt", "$max_attempts"]},
+            },
+            {"$set": {"status": "in_progress", "_claimed_at": now, "updated_at": now}},
+            sort=[("next_retry_at", 1), ("created_at", 1)],
+            # default return_document=BEFORE is fine — execute_refresh re-fetches
+            # the job by job_id, so we only need the identifying fields here.
+        )
+        if not job:
+            break
+        claimed.append(job)
+
+    if claimed:
+        logger.info(f"[claim] Took {len(claimed)} job(s) for this tick")
+    return claimed

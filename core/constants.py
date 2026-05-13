@@ -1,4 +1,15 @@
-META_CACHE_PRESETS = [
+# ---------------------------------------------------------------------------
+# Meta preset taxonomy
+# ---------------------------------------------------------------------------
+#
+# ONGOING — windows that keep shifting; need to refresh on a cadence (every
+# 5h via Vercel cron, or the legacy hourly APScheduler on Azure).
+#
+# STATIC — windows that only change at period boundaries (1st of month,
+# new quarter, new year). Refreshed by the monthly cron on the 1st.
+# ---------------------------------------------------------------------------
+
+META_ONGOING_PRESETS = [
     "maximum",
     "today",
     "yesterday",
@@ -7,14 +18,20 @@ META_CACHE_PRESETS = [
     "last_14d",
     "last_30d",
     "this_month",
-    "last_month",
     "this_quarter",
-    "last_quarter",
     "this_year",
+]
+
+META_STATIC_PRESETS = [
+    "last_month",
+    "last_quarter",
     "last_year",
 ]
 
-# Tiered refresh: frequent presets refresh every hour, slow presets once daily
+META_CACHE_PRESETS = META_ONGOING_PRESETS + META_STATIC_PRESETS
+
+# Legacy tiered names — kept for backward compat with any callers that
+# imported them. New code should use ONGOING / STATIC.
 META_PRESETS_FREQUENT = [
     "today",
     "yesterday",

@@ -7,6 +7,7 @@ This file only wires them together.
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
@@ -26,7 +27,7 @@ from integrations.facebook_utils.facebook_adsets import create_adset_insights_in
 from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron
 from billing import router as billing_router
 
 logging.basicConfig(level=logging.INFO)
@@ -45,13 +46,22 @@ async def lifespan(app: FastAPI):
         await create_adset_insights_indexes(client)
         await create_ad_insights_indexes(client)
 
-    start_background_jobs()
+    # APScheduler is only suitable for long-lived processes (Azure App Service,
+    # bare VM, Docker, etc.). On Vercel's serverless runtime it's unreliable
+    # because containers are recycled — Vercel cron endpoints in routers/cron.py
+    # take over scheduling there.
+    if os.getenv("VERCEL"):
+        logger.info("Detected VERCEL runtime — skipping APScheduler (Vercel crons drive refreshes)")
+    else:
+        start_background_jobs()
+
     asyncio.create_task(populate_cache_for_existing_groups())
     logger.info("Server started")
 
     yield
 
-    stop_background_jobs()
+    if not os.getenv("VERCEL"):
+        stop_background_jobs()
     logger.info("Server stopped")
 
 
@@ -81,3 +91,4 @@ app.include_router(admin.router)
 app.include_router(billing_router)
 app.include_router(chat.router)
 app.include_router(metrics.router)
+app.include_router(cron.router)

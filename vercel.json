@@ -10,5 +10,27 @@
       "src": "/(.*)",
       "dest": "main.py"
     }
+  ],
+  "crons": [
+    {
+      "path": "/api/cron/meta-tick",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/ghl-tick",
+      "schedule": "* * * * *"
+    },
+    {
+      "path": "/api/cron/meta-static-tick",
+      "schedule": "0 1 1 * *"
+    },
+    {
+      "path": "/api/cron/ghl-tokens",
+      "schedule": "*/30 * * * *"
+    },
+    {
+      "path": "/api/cron/alerts",
+      "schedule": "15 * * * *"
+    }
   ]
 }
