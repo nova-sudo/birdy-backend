@@ -13,12 +13,12 @@ serverless function timeout, so anything that exceeds that must be split
 into resumable ticks (see meta_refresh_manager.execute_refresh's
 max_seconds parameter).
 
-Endpoints:
-    POST /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
-    POST /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence)
-    POST /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
-    POST /api/cron/ghl-tokens        — every 30 min (token rotation)
-    POST /api/cron/alerts            — hourly       (alert evaluation)
+Endpoints (Vercel crons invoke with GET):
+    GET /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
+    GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence)
+    GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
+    GET /api/cron/ghl-tokens        — every 30 min (token rotation)
+    GET /api/cron/alerts            — hourly       (alert evaluation)
 """
 
 import asyncio
@@ -83,7 +83,7 @@ def _verify_cron_auth(authorization: str | None):
 # Meta refresh — 5-hour cadence for ongoing presets
 # ---------------------------------------------------------------------------
 
-@router.post("/meta-tick")
+@router.get("/meta-tick")
 async def meta_tick(authorization: str | None = Header(default=None)):
     """
     Drives the resumable Meta refresh state machine. Runs every minute.
@@ -139,7 +139,7 @@ async def meta_tick(authorization: str | None = Header(default=None)):
     }
 
 
-@router.post("/meta-static-tick")
+@router.get("/meta-static-tick")
 async def meta_static_tick(authorization: str | None = Header(default=None)):
     """
     Refreshes the static Meta presets (Last Month, Last Quarter, Last Year).
@@ -199,7 +199,7 @@ async def meta_static_tick(authorization: str | None = Header(default=None)):
 # GHL data refresh — 1-hour cadence (matches the legacy APScheduler)
 # ---------------------------------------------------------------------------
 
-@router.post("/ghl-tick")
+@router.get("/ghl-tick")
 async def ghl_tick(authorization: str | None = Header(default=None)):
     """
     Refreshes GHL data for the stalest groups. Runs every minute.
@@ -330,7 +330,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
 # GHL token rotation — 30-minute cadence
 # ---------------------------------------------------------------------------
 
-@router.post("/ghl-tokens")
+@router.get("/ghl-tokens")
 async def ghl_tokens(authorization: str | None = Header(default=None)):
     """
     Regenerates GHL location tokens. Delegates to the existing job
@@ -355,7 +355,7 @@ async def ghl_tokens(authorization: str | None = Header(default=None)):
 # Alert evaluation — hourly
 # ---------------------------------------------------------------------------
 
-@router.post("/alerts")
+@router.get("/alerts")
 async def alerts(authorization: str | None = Header(default=None)):
     """
     Evaluates all active alerts. Delegates to the existing job function.
