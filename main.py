@@ -52,8 +52,7 @@ async def lifespan(app: FastAPI):
     # take over scheduling there.
     if os.getenv("VERCEL"):
         logger.info("Detected VERCEL runtime — skipping APScheduler (Vercel crons drive refreshes)")
-    else:
-        start_background_jobs()
+
 
     asyncio.create_task(populate_cache_for_existing_groups())
     logger.info("Server started")
