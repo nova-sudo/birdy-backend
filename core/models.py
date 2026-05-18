@@ -52,6 +52,11 @@ class CreateAlertRequest(BaseModel):
     target_group_ids: Optional[List[str]] = []
     notification_channels: Optional[List[str]] = ["in_app"]
     frequency: Optional[str] = "daily"     # "realtime" | "hourly" | "daily" | "weekly"
+    # "total"      → aggregate all selected clients into one value, evaluate once
+    # "per_client" → evaluate the condition independently for each client group;
+    #                the alert triggers (and fires a notification) for every client
+    #                that crosses the threshold individually
+    tracking_mode: Optional[str] = "total"
 
 
 class UpdateAlertRequest(BaseModel):
@@ -63,9 +68,16 @@ class UpdateAlertRequest(BaseModel):
     notification_channels: Optional[List[str]] = None
     frequency: Optional[str] = None
     status: Optional[str] = None
+    tracking_mode: Optional[str] = None
 
 
 class SnoozeAlertRequest(BaseModel):
+    hours: int = 24
+
+
+class SnoozeClientRequest(BaseModel):
+    """Snooze a single client within a per-client alert without pausing the whole alert."""
+    client_id: str
     hours: int = 24
 
 
