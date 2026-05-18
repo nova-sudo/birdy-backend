@@ -1834,6 +1834,141 @@ async def get_campaign_tag_rollup(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/campaigns/opp-rollup  — GHL opp counts per campaign/adset/ad
+# ---------------------------------------------------------------------------
+
+@router.get("/api/campaigns/opp-rollup")
+async def get_campaign_opp_rollup(
+    groups: str = Query(default=""),
+    start_date: Optional[str] = Query(default=None),
+    end_date: Optional[str] = Query(default=None),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Attribute GHL opportunity outcomes (won/lost/open/abandoned) down to the
+    campaign/ad set/ad that produced the lead.
+
+    For each Meta lead in the date range, look up its GHL contact via
+    match_keys and classify by the contact's primary opportunity status
+    (priority: won > open > lost > abandoned — same rule the leads tab uses).
+    Counts are then rolled up by campaign_id, adset_id, and ad_id.
+
+    Response shape mirrors /api/campaigns/tag-rollup so the frontend can
+    overlay per-row values onto the campaigns/adsets/ads tables.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            leads_collection = db["facebook_leads"]
+            ghl_col = db["ghl_contacts"]
+
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+
+            lead_query = {"user_id": current_user}
+            if group_ids:
+                lead_query["client_group_id"] = {"$in": group_ids}
+            if start_date or end_date:
+                date_filter = {}
+                if start_date:
+                    date_filter["$gte"] = start_date
+                if end_date:
+                    date_filter["$lte"] = end_date
+                lead_query["lead_data.created_time"] = date_filter
+
+            lead_docs = await leads_collection.find(
+                lead_query,
+                {
+                    "match_keys": 1,
+                    "lead_data.ad_id": 1,
+                    "lead_data.adset_id": 1,
+                    "lead_data.campaign_id": 1,
+                },
+            ).to_list(None)
+
+            # Build match_key → (primary_status, primary_value) map for GHL contacts
+            all_keys = set()
+            for doc in lead_docs:
+                for key in (doc.get("match_keys") or []):
+                    all_keys.add(key)
+
+            ghl_by_key: dict[str, tuple[str, float]] = {}
+            if all_keys:
+                ghl_docs = await ghl_col.find(
+                    {"user_id": current_user, "match_keys": {"$in": list(all_keys)}},
+                    {"match_keys": 1, "contact_data.opportunities": 1},
+                ).to_list(None)
+                for gd in ghl_docs:
+                    opps = (gd.get("contact_data") or {}).get("opportunities") or []
+                    status, value = "", 0.0
+                    if opps:
+                        for priority in ("won", "open", "lost", "abandoned"):
+                            match = next((o for o in opps if o.get("status") == priority), None)
+                            if match:
+                                status = priority
+                                try:
+                                    value = float(match.get("monetaryValue") or 0)
+                                except (TypeError, ValueError):
+                                    value = 0.0
+                                break
+                    for key in (gd.get("match_keys") or []):
+                        # First contact wins — mirrors the leads tab's primary-match rule
+                        if key not in ghl_by_key:
+                            ghl_by_key[key] = (status, value)
+
+            def _empty_bucket() -> dict:
+                return {
+                    "won": 0, "lost": 0, "open": 0, "abandoned": 0,
+                    "total": 0, "revenue": 0.0, "contacts": 0,
+                }
+
+            by_campaign: dict[str, dict] = {}
+            by_adset: dict[str, dict] = {}
+            by_ad: dict[str, dict] = {}
+
+            for doc in lead_docs:
+                lead_data = doc.get("lead_data") or {}
+                campaign_id = lead_data.get("campaign_id") or ""
+                adset_id = lead_data.get("adset_id") or ""
+                ad_id = lead_data.get("ad_id") or ""
+
+                # Find first matching GHL contact for this lead
+                ghl_match = None
+                for key in (doc.get("match_keys") or []):
+                    if key in ghl_by_key:
+                        ghl_match = ghl_by_key[key]
+                        break
+                if ghl_match is None:
+                    continue  # unmatched lead — contributes nothing to GHL columns
+
+                status, value = ghl_match
+
+                for bucket_map, key in (
+                    (by_campaign, campaign_id),
+                    (by_adset, adset_id),
+                    (by_ad, ad_id),
+                ):
+                    if not key:
+                        continue
+                    bucket = bucket_map.setdefault(key, _empty_bucket())
+                    bucket["contacts"] += 1
+                    if status:
+                        bucket["total"] += 1
+                        bucket[status] = bucket.get(status, 0) + 1
+                        if status == "won":
+                            bucket["revenue"] += value
+
+            return {
+                "by_campaign": by_campaign,
+                "by_adset": by_adset,
+                "by_ad": by_ad,
+            }
+
+        except Exception as e:
+            logger.error(f"Error computing opp rollup: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
 # GET /api/leads/unified
 # ---------------------------------------------------------------------------
 
