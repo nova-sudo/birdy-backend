@@ -38,7 +38,13 @@
       "Bash(grep -r \"refresh_all_job\\\\|start_cycle\" C:UsersASUSDesktopBirdybirdy-backend --include=*.py)",
       "Bash(1 timeout:*)",
       "Bash(python -c \"from routers.settings import router; from jobs.alert_jobs import evaluate_all_alerts; from services.slack_service import send_test_message, send_alert_triggered; print\\('All imports OK'\\)\")",
-      "Bash(python -c ':*)"
+      "Bash(python -c ':*)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('C:/Users/ASUS/Desktop/Birdy/birdy-backend/routers/client_groups.py'\\).read\\(\\)\\)\")",
+      "Read(//c/Users/ASUS/Desktop/Birdy/birdy-beta/**)",
+      "Bash(npx --no-install eslint --no-eslintrc --parser-options=ecmaVersion:latest,sourceType:module,ecmaFeatures:'{\"jsx\":true}' src/components/campaigns/MarketingContent.jsx)",
+      "Bash(node --check src/components/campaigns/MarketingContent.jsx)",
+      "Bash(npx next *)",
+      "Bash(git -C \"C:/Users/ASUS/Desktop/Birdy/birdy-beta\" log --oneline HEAD..origin/main -- src/components/campaigns/MarketingContent.jsx)"
     ]
   }
 }
