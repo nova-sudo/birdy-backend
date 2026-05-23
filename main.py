@@ -27,7 +27,7 @@ from integrations.facebook_utils.facebook_adsets import create_adset_insights_in
 from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron, webhooks
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron, webhooks, call_logs
 from services.call_logs_service import create_call_logs_indexes
 from billing import router as billing_router
 
@@ -94,3 +94,4 @@ app.include_router(chat.router)
 app.include_router(metrics.router)
 app.include_router(cron.router)
 app.include_router(webhooks.router)
+app.include_router(call_logs.router)

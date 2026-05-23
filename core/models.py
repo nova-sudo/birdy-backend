@@ -30,6 +30,11 @@ class ClientGroupRequest(BaseModel):
     ad_account_currency: str | None
     notes: str | None = ""
     client_status: str | None = "Active"
+    # Which provider feeds the Sales-Hub call log view for this client.
+    # "ghl" reads from the call_logs collection (populated by the GHL workflow
+    # webhook). "hotprospector" reserves the choice; HP data wiring comes once
+    # their endpoints are ready. Default mirrors the working path today.
+    call_log_provider: str | None = "ghl"
 
 
 class SaveViewRequest(BaseModel):

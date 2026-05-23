@@ -428,6 +428,7 @@ async def create_client_group_optimized(
                 "ad_account_currency": request.ad_account_currency,
                 "ghl_location_id": request.ghl_location_id,
                 "meta_ad_account_id": request.meta_ad_account_id,
+                "call_log_provider": request.call_log_provider or "ghl",
                 "notes": request.notes or "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
