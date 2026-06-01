@@ -18,6 +18,7 @@ from integrations.gohighlevel import (
     ghl_integration,
     get_subaccount_tokens,
 )
+from services.contact_classifier import classify_contact_type
 
 logger = logging.getLogger(__name__)
 
@@ -516,6 +517,10 @@ async def fetch_and_cache_ghl_data_optimized(
                                 "client_group_name": client_group_name,
                                 "contact_id": contact.get("id"),
                                 "contact_data": contact,
+                                # Top-level lead_type, computed from the contact's first-touch
+                                # attribution. Stored so Mongo aggregations / count queries
+                                # don't need to unwind contact_data. See contact_classifier.py.
+                                "lead_type": classify_contact_type(contact),
                                 "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
                                 "created_at": datetime.now(),
                                 "updated_at": datetime.now()
@@ -546,6 +551,10 @@ async def fetch_and_cache_ghl_data_optimized(
                                 "client_group_name": client_group_name,
                                 "contact_id": contact_id,
                                 "contact_data": contact,
+                                # Re-classified on every upsert so a GHL workflow that
+                                # later stamps `attributionSource` correctly updates an
+                                # existing contact from "contact" to "lead".
+                                "lead_type": classify_contact_type(contact),
                                 "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
                                 "updated_at": datetime.now()
                             }

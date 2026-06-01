@@ -69,6 +69,7 @@ from services.ghl_service import (
     get_ghl_contacts_sorted,
     get_tag_metrics_from_cache,
 )
+from services.contact_classifier import classify_contact_type
 
 logger = logging.getLogger(__name__)
 
@@ -1683,8 +1684,11 @@ async def get_ghl_contacts_paginated_v2(
                     "dateOfBirth": contact.get("dateOfBirth") or "",
                     "tags": contact.get("tags") or [],
                     "source": contact.get("source") or "",
-                    "type": contact.get("type") or "lead",
-                    "contactType": contact.get("contactType") or contact.get("type") or "lead",
+                    # `type` reflects Birdy's lead/contact classification, NOT GHL's
+                    # raw contact type. Rule: Facebook paid social == "lead", else
+                    # "contact". See services/contact_classifier.py.
+                    "type": classify_contact_type(contact),
+                    "contactType": classify_contact_type(contact),
                     "address1": contact.get("address1") or "",
                     "city": contact.get("city") or "",
                     "state": contact.get("state") or "",
@@ -2169,52 +2173,54 @@ async def get_unified_leads(
                     for key in (hd.get("match_keys") or []):
                         hp_matches[key] = enrichment
 
-            # Opportunity stats
+            # ── Stats (lead/contact counts + lead-filtered opportunity stats) ──
+            #
+            # `lead_count` / `contact_count`: total contacts under the current
+            # filter, bucketed by Birdy's lead/contact classification
+            # (services/contact_classifier.py). Powers the top row of cards
+            # added to the Leads page.
+            #
+            # `opportunity_stats`: opportunities for contacts where
+            # `lead_type == "lead"` ONLY — bottom row of cards is now lead-
+            # filtered per product decision (2026-06-01). The previous version
+            # used a pre-aggregated ghl_opp_cache that has no lead_type
+            # dimension, so we recompute from ghl_contacts here. Cost is
+            # bounded by the contact count under filter.
+            count_pipeline = [
+                {"$match": query},
+                {"$group": {"_id": "$lead_type", "count": {"$sum": 1}}},
+            ]
+            lead_count = 0
+            contact_count = 0
+            async for row in ghl_col.aggregate(count_pipeline):
+                bucket = row.get("_id")
+                cnt = int(row.get("count") or 0)
+                if bucket == "lead":
+                    lead_count += cnt
+                else:
+                    # Treat null / "contact" / any legacy value as "contact"
+                    contact_count += cnt
+
             opportunity_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0}
             total_value = 0.0
-
-            from core.constants import META_CACHE_PRESETS, ghl_date_bounds
-            matching_preset = None
-            if start_date and end_date:
-                for p in META_CACHE_PRESETS:
-                    s, e = ghl_date_bounds(p)
-                    if s == start_date and e == end_date:
-                        matching_preset = p
-                        break
-            elif not start_date and not end_date:
-                matching_preset = "maximum"
-
-            group_query = {"user_id": current_user}
-            if group_ids:
-                group_query["id"] = {"$in": group_ids}
-
-            groups_col = db["client_groups"]
-            if matching_preset:
-                preset_field = f"ghl_opp_cache.{matching_preset}"
-                group_docs = await groups_col.find(
-                    group_query,
-                    {"id": 1, preset_field: 1, "ghl_opp_cache.maximum": 1, "_id": 0},
-                ).to_list(None)
-                for g in group_docs:
-                    stats = (g.get("ghl_opp_cache") or {}).get(matching_preset) or \
-                            (g.get("ghl_opp_cache") or {}).get("maximum") or {}
-                    for k in opportunity_stats:
-                        opportunity_stats[k] += int(stats.get(k, 0) or 0)
-                    total_value += float(stats.get("won_revenue", 0) or 0)
-            else:
-                logger.info(
-                    "Unified leads: date range %s..%s has no matching preset — returning lifetime opp stats",
-                    start_date, end_date,
-                )
-                group_docs = await groups_col.find(
-                    group_query,
-                    {"id": 1, "ghl_opp_cache.maximum": 1, "_id": 0},
-                ).to_list(None)
-                for g in group_docs:
-                    stats = (g.get("ghl_opp_cache") or {}).get("maximum") or {}
-                    for k in opportunity_stats:
-                        opportunity_stats[k] += int(stats.get(k, 0) or 0)
-                    total_value += float(stats.get("won_revenue", 0) or 0)
+            opp_pipeline = [
+                {"$match": {**query, "lead_type": "lead"}},
+                {"$unwind": "$contact_data.opportunities"},
+                {"$group": {
+                    "_id": "$contact_data.opportunities.status",
+                    "count": {"$sum": 1},
+                    "value": {"$sum": {
+                        "$ifNull": ["$contact_data.opportunities.monetaryValue", 0]
+                    }},
+                }},
+            ]
+            async for row in ghl_col.aggregate(opp_pipeline):
+                status = (row.get("_id") or "").lower()
+                cnt = int(row.get("count") or 0)
+                if status in opportunity_stats:
+                    opportunity_stats[status] = cnt
+                if status == "won":
+                    total_value += float(row.get("value") or 0)
 
             total_opportunities = sum(opportunity_stats.values())
 
@@ -2276,8 +2282,11 @@ async def get_unified_leads(
                     "dateOfBirth": contact.get("dateOfBirth") or "",
                     "tags": contact.get("tags") or [],
                     "source": contact.get("source") or "",
-                    "type": contact.get("type") or "lead",
-                    "contactType": contact.get("contactType") or contact.get("type") or "lead",
+                    # `type` reflects Birdy's lead/contact classification, NOT GHL's
+                    # raw contact type. Rule: Facebook paid social == "lead", else
+                    # "contact". See services/contact_classifier.py.
+                    "type": classify_contact_type(contact),
+                    "contactType": classify_contact_type(contact),
                     "address1": contact.get("address1") or "",
                     "city": contact.get("city") or "",
                     "state": contact.get("state") or "",
@@ -2322,6 +2331,8 @@ async def get_unified_leads(
                     "start_date": start_date,
                     "end_date": end_date,
                     "stats": {
+                        "lead_count": lead_count,
+                        "contact_count": contact_count,
                         "total_opportunities": total_opportunities,
                         "won": opportunity_stats["won"],
                         "lost": opportunity_stats["lost"],
