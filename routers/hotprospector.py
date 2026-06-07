@@ -23,10 +23,15 @@ from integrations.hotprospector import (
     get_hotprospector_leads_from_collection,
     get_client_group_mapping,
 )
+from services.hp_service import fetch_and_cache_hp_call_center
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# Sales-Hub call-center cache freshness: serve straight from the hotprospector_leads
+# cache when the location's last_hp_refresh is younger than this; otherwise refetch.
+HP_CALL_CENTER_TTL = 6 * 3600  # 6 hours — matches the hp-tick cron cadence
 
 
 # ------------------------------------------------------------------
@@ -659,3 +664,111 @@ async def get_hotprospector_members(current_user: str = Depends(get_current_user
         except Exception as e:
             logger.error(f"Error fetching Hot Prospector members: {str(e)}")
             raise HTTPException(status_code=500, detail=f"Failed to fetch members: {str(e)}")
+
+
+# ------------------------------------------------------------------
+# GET /api/hotprospector/call-center
+# ------------------------------------------------------------------
+@router.get("/api/hotprospector/call-center")
+async def get_hp_call_center(
+        location_id: str = Query(..., description="GHL locationId of the selected client"),
+        skip: int = 0,
+        limit: int = 100,
+        refresh: bool = False,
+        current_user: str = Depends(get_current_user),
+):
+    """
+    Call-center dataset for a SINGLE client, scoped by its GHL locationId.
+
+    Cache-first: when the location's last_hp_refresh is within HP_CALL_CENTER_TTL
+    (6h) we serve leads (with nested call logs) straight from the hotprospector_leads
+    collection; otherwise we fetch fresh via fetch_and_cache_hp_call_center
+    (SearchByUserInput + bulk FetchUserCallLog) and then serve. ?refresh=true forces
+    a fresh fetch.
+
+    Response mirrors the Sales-Hub mock so the frontend mapping stays minimal:
+        { data: [<lead w/ nested call_logs>],
+          meta: { total, returned, skip, limit, total_calls, inbound_count,
+                  outbound_count, location_stats, last_refresh, cache_status } }
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            client_groups_collection = db["client_groups"]
+            leads_collection = db["hotprospector_leads"]
+
+            credentials = await get_hotprospector_credentials(current_user, mongo_client)
+            if not credentials:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Hot Prospector not connected. Add credentials in Settings → Integrations.",
+                )
+
+            cg_projection = {"name": 1, "last_hp_refresh": 1, "hotprospector_cache": 1}
+            group = await client_groups_collection.find_one(
+                {"user_id": current_user, "ghl_location_id": location_id},
+                projection=cg_projection,
+            )
+
+            last_refresh = group.get("last_hp_refresh") if group else None
+            is_fresh = bool(
+                last_refresh
+                and not refresh
+                and (datetime.utcnow() - last_refresh).total_seconds() < HP_CALL_CENTER_TTL
+            )
+
+            cache_status = "fresh"
+            if not is_fresh:
+                result = await fetch_and_cache_hp_call_center(
+                    current_user, location_id, mongo_client
+                )
+                cache_status = "refreshed" if result.get("success") else "error"
+                # Re-read so metrics + last_hp_refresh reflect the refresh just done.
+                group = await client_groups_collection.find_one(
+                    {"user_id": current_user, "ghl_location_id": location_id},
+                    projection=cg_projection,
+                )
+
+            # Paginated leads (with nested call_logs) straight from the cache collection.
+            # We bypass get_hotprospector_leads_from_collection here on purpose: its
+            # 5-minute staleness check would defeat the 6-hour cache window.
+            query = {"user_id": current_user, "ghl_location_id": location_id}
+            total_cached = await leads_collection.count_documents(query)
+            cursor = leads_collection.find(
+                query, projection={"lead_data": 1, "_id": 0}
+            ).skip(skip)
+            if limit and limit > 0:
+                cursor = cursor.limit(limit)
+            leads = [doc["lead_data"] async for doc in cursor]
+
+            hp_cache = (group or {}).get("hotprospector_cache") or {}
+            metrics = hp_cache.get("metrics") or {}
+            location_name = hp_cache.get("name") or (group or {}).get("name") or "Unknown Location"
+            last_refresh = (group or {}).get("last_hp_refresh")
+            total_leads = metrics.get("total_leads", total_cached)
+
+            return {
+                "data": leads,
+                "meta": {
+                    "total": total_leads,
+                    "returned": len(leads),
+                    "skip": skip,
+                    "limit": limit,
+                    "total_calls": metrics.get("total_calls", 0),
+                    "inbound_count": metrics.get("inbound_count", 0),
+                    "outbound_count": metrics.get("outbound_count", 0),
+                    "location_stats": {
+                        location_id: {"name": location_name, "count": total_leads}
+                    },
+                    "last_refresh": last_refresh.isoformat() if last_refresh else None,
+                    "cache_status": cache_status,
+                },
+            }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error in HP call-center for {location_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500, detail=f"Failed to load call center data: {str(e)}"
+            )

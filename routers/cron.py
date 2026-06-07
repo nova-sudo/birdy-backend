@@ -16,6 +16,7 @@ max_seconds parameter).
 Endpoints (Vercel crons invoke with GET):
     GET /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
     GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence)
+    GET /api/cron/hp-tick           — every 1 min  (HotProspector data, 6h cadence)
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
     GET /api/cron/alerts            — hourly       (alert evaluation)
@@ -59,6 +60,11 @@ GHL_CUTOFF_HOURS = 1
 # Stale-claim recovery — a group stuck in "running" for longer than this is
 # considered crashed and may be retried.
 GHL_STALE_CLAIM_MINUTES = 10
+
+# HotProspector refresh — 6-hour cadence (Sales-Hub call-center data).
+HP_GROUPS_PER_TICK = 5
+HP_CUTOFF_HOURS = 6
+HP_STALE_CLAIM_MINUTES = 10
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +310,137 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                             "ghl_refresh_error": err,
                         },
                         "$unset": {"_ghl_claimed_at": ""},
+                    },
+                )
+                return False
+
+        if claimed:
+            results = await asyncio.gather(
+                *[_refresh_one(g) for g in claimed],
+                return_exceptions=True,
+            )
+            ok_count = sum(1 for r in results if r is True)
+        else:
+            ok_count = 0
+
+    elapsed = time.monotonic() - tick_start
+    return {
+        "ok": True,
+        "claimed": len(claimed),
+        "succeeded": ok_count,
+        "elapsed_seconds": round(elapsed, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# HotProspector data refresh — 6-hour cadence (Sales-Hub call-center data)
+# ---------------------------------------------------------------------------
+
+@router.get("/hp-tick")
+async def hp_tick(authorization: str | None = Header(default=None)):
+    """
+    Refreshes HotProspector call-center data for the stalest HP-provider groups.
+    Runs every minute; the 6-hour cutoff governs how often a group is actually
+    refetched.
+
+    Same inline atomic-claim pattern as ghl-tick, on a separate status flag
+    (hp_refresh_status / _hp_claimed_at):
+
+      - Eligible: call_log_provider == "hotprospector", ghl_location_id set,
+                  last_hp_refresh older than cutoff (or never), and
+                  hp_refresh_status != "running" (or running but stuck >10 min)
+      - Claim:    $set hp_refresh_status="running", _hp_claimed_at=now
+      - Success:  hp_refresh_status="complete" (last_hp_refresh + metrics are
+                  written by fetch_and_cache_hp_call_center via update_many)
+      - Failure:  hp_refresh_status="error" — existing cache stays put
+
+    Groups that share a ghl_location_id are de-duped naturally: refreshing one
+    stamps last_hp_refresh on all of them (update_many), so the siblings fall out
+    of the stale filter without extra HotProspector calls.
+    """
+    _verify_cron_auth(authorization)
+
+    from services.hp_service import fetch_and_cache_hp_call_center
+
+    tick_start = time.monotonic()
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        client_groups = db["client_groups"]
+        now = datetime.utcnow()
+        cutoff = now - timedelta(hours=HP_CUTOFF_HOURS)
+        stale_lock_before = now - timedelta(minutes=HP_STALE_CLAIM_MINUTES)
+
+        # Atomically claim up to N stale HP-provider groups.
+        claimed: list[dict] = []
+        for _ in range(HP_GROUPS_PER_TICK):
+            doc = await client_groups.find_one_and_update(
+                {
+                    "call_log_provider": "hotprospector",
+                    "ghl_location_id": {"$exists": True, "$ne": None},
+                    "$or": [
+                        {"last_hp_refresh": {"$lt": cutoff}},
+                        {"last_hp_refresh": {"$exists": False}},
+                        {"last_hp_refresh": None},
+                    ],
+                    "$and": [
+                        {
+                            "$or": [
+                                {"hp_refresh_status": {"$ne": "running"}},
+                                {"_hp_claimed_at": {"$lt": stale_lock_before}},
+                                {"_hp_claimed_at": {"$exists": False}},
+                            ]
+                        }
+                    ],
+                },
+                {
+                    "$set": {
+                        "hp_refresh_status": "running",
+                        "_hp_claimed_at": now,
+                    }
+                },
+                sort=[("last_hp_refresh", 1)],  # oldest first
+                projection={
+                    "id": 1, "user_id": 1, "name": 1,
+                    "ghl_location_id": 1,
+                },
+            )
+            if not doc:
+                break
+            claimed.append(doc)
+
+        async def _refresh_one(group: dict):
+            group_id = group["id"]
+            user_id = group["user_id"]
+            name = group.get("name", group_id)
+            try:
+                result = await fetch_and_cache_hp_call_center(
+                    user_id, group["ghl_location_id"], mongo_client
+                )
+                if not result.get("success"):
+                    raise RuntimeError(result.get("error", "fetch_failed"))
+                await client_groups.update_one(
+                    {"id": group_id},
+                    {
+                        "$set": {"hp_refresh_status": "complete"},
+                        "$unset": {"_hp_claimed_at": ""},
+                    },
+                )
+                logger.info(
+                    f"[hp-tick] OK '{name}': {result['total_leads']} leads, "
+                    f"{result['total_calls']} calls"
+                )
+                return True
+            except Exception as e:
+                err = str(e)[:200]
+                logger.error(f"[hp-tick] FAIL '{name}': {err}")
+                await client_groups.update_one(
+                    {"id": group_id},
+                    {
+                        "$set": {
+                            "hp_refresh_status": "error",
+                            "hp_refresh_error": err,
+                        },
+                        "$unset": {"_hp_claimed_at": ""},
                     },
                 )
                 return False
