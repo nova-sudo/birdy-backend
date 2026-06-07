@@ -18,7 +18,9 @@ logger = logging.getLogger(__name__)
 
 # Hot Prospector API configuration
 HOTPROSPECTOR_CONFIG = {
-    "base_url": "https://hotprospector.com/glu/custom_api",
+    # Documented production host is app.hotprospector.com; overridable via env so
+    # the host can be flipped without a code change if the API moves.
+    "base_url": os.getenv("HOTPROSPECTOR_BASE_URL", "https://app.hotprospector.com/glu/custom_api"),
     "max_concurrent_requests": 10,
     "batch_size": 500,
     "request_timeout": 60.0,
@@ -207,8 +209,15 @@ class HotProspectorIntegration:
         if not success:
             return False, result
 
-        if isinstance(result, dict):
-            members = result.get("message", [])
+        # Response may be a dict or a single-element list wrapping the dict.
+        body = result[0] if isinstance(result, list) and result else result
+        if isinstance(body, dict):
+            # Per HP docs the members live under "data"; older shapes used "message".
+            members = body.get("data")
+            if members is None:
+                members = body.get("message", [])
+            if not isinstance(members, list):
+                members = []
             logger.info(f"Fetched {len(members)} team members from Hot Prospector")
             return True, members
 
@@ -244,6 +253,94 @@ class HotProspectorIntegration:
 
         return False, {"error": "No call logs found or unexpected response format"}
 
+    async def fetch_user_call_logs(
+            self,
+            ghl_location_id: str,
+            from_date: str = None,
+            to_date: str = None,
+            call_type: str = "",
+            page_size: int = 500,
+            max_records: int = 100000,
+    ):
+        """
+        Bulk-fetch ALL call logs for a GHL location via FetchUserCallLog.
+
+        One paginated endpoint (limit/offset) instead of one request per lead, so a
+        location with thousands of leads costs a handful of calls rather than thousands.
+
+        Args:
+            ghl_location_id: GHL locationId to scope the logs to.
+            from_date / to_date: optional Y-m-d filters (HP caps the range at 30 days).
+            call_type: "inbound", "outbound", or "" for both.
+            page_size: records per request (HP default is 100; we ask for more).
+            max_records: hard safety cap so a misbehaving has_more can't loop forever.
+
+        Returns:
+            (True, {"call_logs": [...raw...], "inbound_count", "outbound_count",
+                    "total_records"}) on success, else (False, {"error": ...}).
+        """
+        all_logs = []
+        offset = 0
+        inbound_count = 0
+        outbound_count = 0
+        total_records = 0
+
+        while True:
+            payload = {
+                "api_uId": self.api_uid,
+                "api_key": self.api_key,
+                "Method": "FetchUserCallLog",
+                "locationId": ghl_location_id,
+                "type": call_type or "",
+                "limit": page_size,
+                "offset": offset,
+                "sort_by": "call_time",
+                "sort_order": "DESC",
+            }
+            if from_date:
+                payload["from_date"] = from_date
+            if to_date:
+                payload["to_date"] = to_date
+
+            success, result = await self._make_request(payload, use_dedup=False)
+            if not success:
+                # If we already pulled some pages, return what we have so far.
+                if all_logs:
+                    break
+                return False, result
+
+            # Response may be a dict or a single-element list wrapping the dict.
+            body = result[0] if isinstance(result, list) and result else result
+            if not isinstance(body, dict) or body.get("response") != "true":
+                if all_logs:
+                    break
+                return False, {"error": "Unexpected FetchUserCallLog response format"}
+
+            page = body.get("Results", []) or []
+            all_logs.extend(page)
+
+            # Aggregate counts come back on every page; keep the latest non-empty values.
+            inbound_count = int(body.get("inbound_count") or inbound_count or 0)
+            outbound_count = int(body.get("outbound_count") or outbound_count or 0)
+            total_records = int(body.get("total_records") or total_records or 0)
+
+            has_more = bool(body.get("has_more"))
+            next_offset = body.get("next_offset")
+            if not has_more or not page or len(all_logs) >= max_records:
+                break
+            offset = int(next_offset) if next_offset is not None else offset + page_size
+
+        logger.info(
+            f"FetchUserCallLog: {len(all_logs)} call logs for location {ghl_location_id} "
+            f"(inbound={inbound_count}, outbound={outbound_count}, total={total_records})"
+        )
+        return True, {
+            "call_logs": all_logs,
+            "inbound_count": inbound_count,
+            "outbound_count": outbound_count,
+            "total_records": total_records or len(all_logs),
+        }
+
     def normalize_call_log(self, call_log: dict):
         """
         Normalize a call log object to a standard format.
@@ -268,6 +365,35 @@ class HotProspectorIntegration:
             "transfer": call_log.get("transfer") == "Yes",
             "call_status": call_log.get("call_status"),
             "speed_to_lead": int(call_log.get("speed_to_lead", 0))
+        }
+
+    def normalize_user_call_log(self, call_log: dict, location_name: str = None):
+        """
+        Normalize a FetchUserCallLog row to the same shape the Sales-Hub UI consumes
+        (see normalize_call_log).
+
+        FetchUserCallLog differs from FetchLeadCallLogs: the call DIRECTION lives in
+        `call_type` (the raw `call_status` is the outcome, e.g. "completed"), and there
+        is no per-row location name. The frontend reads `call_status` as the direction,
+        so we map it from `call_type` and stamp the GHL location name we already know.
+        """
+        return {
+            "lead_id": call_log.get("leadId"),
+            "lead_name": call_log.get("lead_Name"),
+            "location_name": location_name or "",
+            "from_number": call_log.get("from_number"),
+            "to_number": call_log.get("to_number"),
+            "recording_url": call_log.get("recording") or None,
+            "recording_id": call_log.get("recordingId"),
+            "group": call_log.get("group"),
+            "caller_name": call_log.get("caller_name"),
+            "call_time": call_log.get("call_time"),
+            "duration": int(call_log.get("duration") or 0),
+            "city": call_log.get("city", ""),
+            "state": call_log.get("state", ""),
+            "transfer": call_log.get("transfer") == "Yes",
+            "call_status": (call_log.get("call_type") or "").lower(),
+            "speed_to_lead": int(call_log.get("speed_to_lead") or 0),
         }
 
     def normalize_lead(self, lead: dict, ghl_location_id: str, ghl_location_name: str = None,

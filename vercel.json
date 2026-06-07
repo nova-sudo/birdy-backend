@@ -21,6 +21,10 @@
       "schedule": "* * * * *"
     },
     {
+      "path": "/api/cron/hp-tick",
+      "schedule": "* * * * *"
+    },
+    {
       "path": "/api/cron/meta-static-tick",
       "schedule": "0 1 1 * *"
     },
