@@ -194,6 +194,8 @@ async def get_client_groups(
                     "ghl_opp_cache.maximum": 1,
                     **fb_projection,
                     "hotprospector_cache": 1,
+                    f"hotprospector_call_cache.{resolved_preset}": 1,
+                    "hotprospector_call_cache.maximum": 1,
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
                     "status": 1,
                     "meta_token_error": 1,
@@ -257,8 +259,17 @@ async def get_client_groups(
                         },
                     }
 
-                # -- HP cache (unchanged) --
-                group_data["hotprospector"] = group.get("hotprospector_cache", {})
+                # -- HP cache + per-preset windowed call stats (Sales-Hub Overview) --
+                hp_cache = group.get("hotprospector_cache", {}) or {}
+                hp_call_cache = group.get("hotprospector_call_cache") or {}
+                hp_preset_stats = hp_call_cache.get(resolved_preset)
+                if not isinstance(hp_preset_stats, dict):
+                    hp_preset_stats = (
+                        hp_call_cache.get("maximum")
+                        if isinstance(hp_call_cache.get("maximum"), dict)
+                        else {}
+                    )
+                group_data["hotprospector"] = {**hp_cache, "call_stats": hp_preset_stats}
 
                 # -- Meta: read preset sub-document --
                 facebook_cache = group.get("facebook_cache") or {}

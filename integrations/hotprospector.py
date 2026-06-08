@@ -32,6 +32,23 @@ _pending_requests: Dict[str, asyncio.Future] = {}
 _cache_lock = asyncio.Lock()
 
 
+def _parse_hp_call_time(raw):
+    """
+    Parse HotProspector's display call_time (e.g. "Apr 15, 2026 6:34 pm") into an
+    ISO 8601 string so calls can be windowed by date preset. Returns None if it
+    can't be parsed. strptime's %p is case-insensitive, so lowercase am/pm works.
+    """
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    for fmt in ("%b %d, %Y %I:%M %p", "%b %d, %Y %I:%M:%S %p", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, fmt).isoformat()
+        except ValueError:
+            continue
+    return None
+
+
 class HotProspectorIntegration:
     def __init__(self, api_uid, api_key):
         self.api_uid = api_uid
@@ -388,6 +405,7 @@ class HotProspectorIntegration:
             "group": call_log.get("group"),
             "caller_name": call_log.get("caller_name"),
             "call_time": call_log.get("call_time"),
+            "call_time_iso": _parse_hp_call_time(call_log.get("call_time")),
             "duration": int(call_log.get("duration") or 0),
             "city": call_log.get("city", ""),
             "state": call_log.get("state", ""),

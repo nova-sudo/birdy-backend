@@ -16,7 +16,7 @@ max_seconds parameter).
 Endpoints (Vercel crons invoke with GET):
     GET /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
     GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence)
-    GET /api/cron/hp-tick           — every 1 min  (HotProspector data, 6h cadence)
+    GET /api/cron/hp-tick           — every 1 min  (HotProspector data, daily cadence)
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
     GET /api/cron/alerts            — hourly       (alert evaluation)
@@ -61,9 +61,10 @@ GHL_CUTOFF_HOURS = 1
 # considered crashed and may be retried.
 GHL_STALE_CLAIM_MINUTES = 10
 
-# HotProspector refresh — 6-hour cadence (Sales-Hub call-center data).
+# HotProspector refresh — daily cadence (Sales-Hub call-center data). Each refresh
+# pulls the full call-log history and re-derives per-preset stats, so daily is enough.
 HP_GROUPS_PER_TICK = 5
-HP_CUTOFF_HOURS = 6
+HP_CUTOFF_HOURS = 24
 HP_STALE_CLAIM_MINUTES = 10
 
 
@@ -340,8 +341,8 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
 async def hp_tick(authorization: str | None = Header(default=None)):
     """
     Refreshes HotProspector call-center data for the stalest HP-provider groups.
-    Runs every minute; the 6-hour cutoff governs how often a group is actually
-    refetched.
+    Runs every minute; the 24-hour cutoff governs how often a group is actually
+    refetched (full history re-pull + per-preset stat re-derivation).
 
     Same inline atomic-claim pattern as ghl-tick, on a separate status flag
     (hp_refresh_status / _hp_claimed_at):

@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 
 from core.database import DB_NAME
+from core.constants import META_CACHE_PRESETS, ghl_date_bounds
 from integrations.gohighlevel import get_subaccount_tokens
 from integrations.hotprospector import (
     HotProspectorIntegration,
@@ -18,6 +19,57 @@ from integrations.hotprospector import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _in_window(iso, start, end):
+    """True if an ISO timestamp's date falls within [start, end] (yyyy-mm-dd strings)."""
+    if not iso:
+        return False
+    d = iso[:10]
+    if start and d < start:
+        return False
+    if end and d > end:
+        return False
+    return True
+
+
+def _compute_call_stats_all_presets(leads, total_leads):
+    """
+    Bucket every call (across all leads) into each date preset by call_time_iso.
+    Returns {preset: {total_calls, inbound_count, outbound_count, transfers,
+    leads_with_calls, total_leads}}. "maximum" = all-time (no date filter).
+    Mirrors GHL's cache_ghl_opp_stats_all_presets: fetch once, derive every preset.
+    """
+    all_calls = [log for lead in leads for log in (lead.get("call_logs") or [])]
+    cache = {}
+    for preset in META_CACHE_PRESETS:
+        start, end = ghl_date_bounds(preset)  # (None, None) for "maximum"
+        total = inbound = outbound = transfers = 0
+        leads_with = set()
+        for log in all_calls:
+            in_win = True if (start is None and end is None) else _in_window(log.get("call_time_iso"), start, end)
+            if not in_win:
+                continue
+            total += 1
+            cs = log.get("call_status")
+            if cs == "inbound":
+                inbound += 1
+            elif cs == "outbound":
+                outbound += 1
+            if log.get("transfer"):
+                transfers += 1
+            lid = log.get("lead_id")
+            if lid is not None:
+                leads_with.add(str(lid))
+        cache[preset] = {
+            "total_calls": total,
+            "inbound_count": inbound,
+            "outbound_count": outbound,
+            "transfers": transfers,
+            "leads_with_calls": len(leads_with),
+            "total_leads": total_leads,
+        }
+    return cache
 
 
 async def fetch_hp_leads_for_group(
@@ -224,25 +276,34 @@ async def fetch_and_cache_hp_call_center(
             elif log.get("call_status") == "inbound":
                 inbound += 1
 
-    # 4. Persist leads (with nested call logs) to the cache collection.
+    # 4. Derive per-preset call stats (windowed by call_time) so the Sales-Hub
+    #    Overview can show date-filtered KPIs per client — mirrors GHL's
+    #    cache_ghl_opp_stats_all_presets (fetch once, bucket every preset).
+    call_cache = _compute_call_stats_all_presets(normalized_leads, len(normalized_leads))
+
+    # 5. Persist leads (with nested call logs) to the cache collection.
     await save_hotprospector_leads_to_collection(
         user_id, ghl_location_id, normalized_leads, mongo_client
     )
 
-    # 5. Refresh metrics + freshness on every client_group at this location.
+    # 6. Refresh metrics + per-preset call stats + freshness on every
+    #    client_group at this location (dot-notation so presets don't clobber).
+    set_fields = {
+        "hotprospector_cache.ghl_location_id": ghl_location_id,
+        "hotprospector_cache.name": location_name,
+        "hotprospector_cache.metrics.total_leads": len(normalized_leads),
+        "hotprospector_cache.metrics.total_calls": total_calls,
+        "hotprospector_cache.metrics.inbound_count": inbound,
+        "hotprospector_cache.metrics.outbound_count": outbound,
+        "last_hp_refresh": datetime.utcnow(),
+    }
+    for preset, stats in call_cache.items():
+        set_fields[f"hotprospector_call_cache.{preset}"] = stats
+    set_fields["hotprospector_call_cache.updated_at"] = datetime.utcnow().isoformat()
+
     await client_groups_collection.update_many(
         {"user_id": user_id, "ghl_location_id": ghl_location_id},
-        {
-            "$set": {
-                "hotprospector_cache.ghl_location_id": ghl_location_id,
-                "hotprospector_cache.name": location_name,
-                "hotprospector_cache.metrics.total_leads": len(normalized_leads),
-                "hotprospector_cache.metrics.total_calls": total_calls,
-                "hotprospector_cache.metrics.inbound_count": inbound,
-                "hotprospector_cache.metrics.outbound_count": outbound,
-                "last_hp_refresh": datetime.utcnow(),
-            }
-        },
+        {"$set": set_fields},
     )
 
     logger.info(
