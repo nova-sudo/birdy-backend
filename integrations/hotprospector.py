@@ -266,7 +266,11 @@ class HotProspectorIntegration:
 
         body = result[0] if isinstance(result, list) and result else result
         if isinstance(body, dict) and body.get("response") == "true":
-            return True, {"date": body.get("date"), "results": body.get("results", []) or []}
+            # Live API returns "Results" (capital R) even though the docs show "results".
+            results = body.get("Results")
+            if results is None:
+                results = body.get("results", [])
+            return True, {"date": body.get("date"), "results": results or []}
         return False, {"error": "Unexpected getMemberDashboardData response format"}
 
     async def fetch_lead_call_logs(self, lead_id: str):
