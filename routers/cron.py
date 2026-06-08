@@ -68,6 +68,10 @@ HP_GROUPS_PER_TICK = 3
 HP_CUTOFF_HOURS = 24
 HP_STALE_CLAIM_MINUTES = 10
 
+# HotProspector member-dashboard sync (account-level). The current-year backfill is
+# resumable across ticks — a year of per-day getMemberDashboardData calls won't fit one.
+HP_MEMBERS_PER_TICK = 3
+
 
 # ---------------------------------------------------------------------------
 # Auth
@@ -403,7 +407,7 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                 sort=[("last_hp_refresh", 1)],  # oldest first
                 projection={
                     "id": 1, "user_id": 1, "name": 1,
-                    "ghl_location_id": 1,
+                    "ghl_location_id": 1, "hp_backfill_status": 1,
                 },
             )
             if not doc:
@@ -414,27 +418,29 @@ async def hp_tick(authorization: str | None = Header(default=None)):
             group_id = group["id"]
             user_id = group["user_id"]
             name = group.get("name", group_id)
+            # First time → full historical backfill; afterwards → cheap incremental.
+            mode = "incremental" if group.get("hp_backfill_status") == "complete" else "backfill"
             try:
                 result = await fetch_and_cache_hp_call_center(
-                    user_id, group["ghl_location_id"], mongo_client
+                    user_id, group["ghl_location_id"], mongo_client, mode=mode
                 )
                 if not result.get("success"):
                     raise RuntimeError(result.get("error", "fetch_failed"))
+                set_fields = {"hp_refresh_status": "complete"}
+                if mode == "backfill":
+                    set_fields["hp_backfill_status"] = "complete"
                 await client_groups.update_one(
                     {"id": group_id},
-                    {
-                        "$set": {"hp_refresh_status": "complete"},
-                        "$unset": {"_hp_claimed_at": ""},
-                    },
+                    {"$set": set_fields, "$unset": {"_hp_claimed_at": ""}},
                 )
                 logger.info(
-                    f"[hp-tick] OK '{name}': {result['total_leads']} leads, "
+                    f"[hp-tick] OK '{name}' ({mode}): {result['total_leads']} leads, "
                     f"{result['total_calls']} calls"
                 )
                 return True
             except Exception as e:
                 err = str(e)[:200]
-                logger.error(f"[hp-tick] FAIL '{name}': {err}")
+                logger.error(f"[hp-tick] FAIL '{name}' ({mode}): {err}")
                 await client_groups.update_one(
                     {"id": group_id},
                     {
@@ -462,6 +468,92 @@ async def hp_tick(authorization: str | None = Header(default=None)):
         "claimed": len(claimed),
         "succeeded": ok_count,
         "elapsed_seconds": round(elapsed, 2),
+    }
+
+
+# ---------------------------------------------------------------------------
+# HotProspector member dashboards — daily (resumable current-year backfill)
+# ---------------------------------------------------------------------------
+
+@router.get("/hp-members-tick")
+async def hp_members_tick(authorization: str | None = Header(default=None)):
+    """
+    Account-level member-dashboard sync. Per claimed user:
+      - member_backfill not complete -> backfill the next chunk of current-year days
+        (resumable; getMemberDashboardData is per-day so a year won't fit one tick).
+      - complete but yesterday not yet stored -> finalize yesterday.
+    today/yesterday are always served live by the endpoint, so the store only needs
+    finalized past days.
+    """
+    _verify_cron_auth(authorization)
+
+    from integrations.hotprospector import HotProspectorIntegration
+    from services.hp_members import backfill_member_year, finalize_member_yesterday
+
+    tick_start = time.monotonic()
+    async with get_mongo_client() as mongo_client:
+        users = mongo_client[DB_NAME]["users"]
+        now = datetime.utcnow()
+        stale_lock_before = now - timedelta(minutes=HP_STALE_CLAIM_MINUTES)
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
+
+        claimed: list[dict] = []
+        for _ in range(HP_MEMBERS_PER_TICK):
+            doc = await users.find_one_and_update(
+                {
+                    "integrations.hotprospector.credentials.connected": True,
+                    "$or": [
+                        {"integrations.hotprospector.member_backfill.status": {"$ne": "complete"}},
+                        {"integrations.hotprospector.member_backfill.last_finalized_date": {"$ne": yesterday}},
+                    ],
+                    "$and": [{"$or": [
+                        {"integrations.hotprospector.member_backfill._claimed_at": {"$exists": False}},
+                        {"integrations.hotprospector.member_backfill._claimed_at": {"$lt": stale_lock_before}},
+                    ]}],
+                },
+                {"$set": {"integrations.hotprospector.member_backfill._claimed_at": now}},
+                projection={
+                    "user_id": 1,
+                    "integrations.hotprospector.credentials": 1,
+                    "integrations.hotprospector.member_backfill": 1,
+                },
+            )
+            if not doc:
+                break
+            claimed.append(doc)
+
+        async def _work(udoc):
+            user_id = udoc["user_id"]
+            hp = (udoc.get("integrations") or {}).get("hotprospector") or {}
+            creds = hp.get("credentials") or {}
+            mb = hp.get("member_backfill") or {}
+            integration = HotProspectorIntegration(creds.get("api_uid"), creds.get("api_key"))
+            try:
+                if mb.get("status") != "complete":
+                    await backfill_member_year(user_id, integration, mongo_client)
+                else:
+                    await finalize_member_yesterday(user_id, integration, mongo_client)
+                return True
+            except Exception as e:
+                logger.error(f"[hp-members-tick] FAIL user={user_id}: {str(e)[:200]}")
+                return False
+            finally:
+                await users.update_one(
+                    {"user_id": user_id},
+                    {"$unset": {"integrations.hotprospector.member_backfill._claimed_at": ""}},
+                )
+
+        if claimed:
+            results = await asyncio.gather(*[_work(u) for u in claimed], return_exceptions=True)
+            ok_count = sum(1 for r in results if r is True)
+        else:
+            ok_count = 0
+
+    return {
+        "ok": True,
+        "claimed": len(claimed),
+        "succeeded": ok_count,
+        "elapsed_seconds": round(time.monotonic() - tick_start, 2),
     }
 
 

@@ -8,7 +8,7 @@ import asyncio
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, date
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Query
 
@@ -24,6 +24,7 @@ from integrations.hotprospector import (
     get_client_group_mapping,
 )
 from services.hp_service import fetch_and_cache_hp_call_center, _in_window
+from services.hp_members import get_member_dashboard_range
 
 logger = logging.getLogger(__name__)
 
@@ -714,16 +715,24 @@ async def get_hp_call_center(
             if location_id:
                 group = await client_groups_collection.find_one(
                     {"user_id": current_user, "ghl_location_id": location_id},
-                    projection={"last_hp_refresh": 1},
+                    projection={"last_hp_refresh": 1, "hp_backfill_status": 1},
                 )
                 last_refresh = group.get("last_hp_refresh") if group else None
+                backfilled = (group or {}).get("hp_backfill_status") == "complete"
+                # Windows that include today/yesterday get a short TTL (near real-time);
+                # purely historical windows use the long TTL.
+                window_has_recent = (not end_date) or end_date >= date.today().isoformat()
+                ttl = 900 if window_has_recent else HP_CALL_CENTER_TTL  # 15 min vs 6h
                 is_fresh = bool(
                     last_refresh
                     and not refresh
-                    and (datetime.utcnow() - last_refresh).total_seconds() < HP_CALL_CENTER_TTL
+                    and (datetime.utcnow() - last_refresh).total_seconds() < ttl
                 )
                 if not is_fresh:
-                    await fetch_and_cache_hp_call_center(current_user, location_id, mongo_client)
+                    await fetch_and_cache_hp_call_center(
+                        current_user, location_id, mongo_client,
+                        mode="incremental" if backfilled else "backfill",
+                    )
 
             # Read (optionally location-scoped) leads from the cache collection.
             query = {"user_id": current_user}
@@ -779,13 +788,18 @@ async def get_hp_call_center(
 @router.get("/api/hotprospector/members/dashboard")
 async def get_hp_member_dashboard(
         date: str | None = None,
+        start_date: str | None = None,
+        end_date: str | None = None,
         current_user: str = Depends(get_current_user),
 ):
     """
-    Team list merged with per-agent dashboard metrics (getMemberDashboardData) for a
-    single day. `date` is Y-m-d (omit for today). Each row carries the member's
-    identity plus a `dashboard` object with that day's metrics (empty when the agent
-    had no activity, or the account has no dashboard data).
+    Team list merged with per-agent dashboard metrics (getMemberDashboardData),
+    aggregated over a date window.
+
+    Pass `start_date`+`end_date` (Y-m-d) for a range, or `date` for a single day
+    (omit all for today). Historical days are summed from the hotprospector_member_daily
+    store; TODAY and YESTERDAY in the window are fetched live. Each row carries the
+    member's identity plus an aggregated `dashboard` object (empty when no activity).
     """
     async with get_mongo_client() as mongo_client:
         try:
@@ -799,47 +813,48 @@ async def get_hp_member_dashboard(
                 credentials.get("api_uid"), credentials.get("api_key")
             )
 
+            # Resolve the window: explicit range, else single date, else today.
+            if not (start_date or end_date) and date:
+                start_date = end_date = date
+
+            rows = await get_member_dashboard_range(
+                current_user, start_date, end_date, integration, mongo_client
+            )
+
+            # Merge with the team list so inactive agents still appear.
             ok_m, members = await integration.get_member_users()
-            ok_d, dash = await integration.get_member_dashboard_data(date)
             members = members if (ok_m and isinstance(members, list)) else []
-            results = dash.get("results", []) if ok_d else []
-            dash_date = dash.get("date") if ok_d else date
+            by_email = {str(r.get("agentEmail") or "").lower(): r for r in rows if r.get("agentEmail")}
+            by_id = {str(r.get("agentId")): r for r in rows if r.get("agentId") is not None}
 
-            by_email, by_id = {}, {}
-            for a in results:
-                if a.get("agentEmail"):
-                    by_email[str(a["agentEmail"]).lower()] = a
-                if a.get("agentId") is not None:
-                    by_id[str(a["agentId"])] = a
-
-            rows, matched = [], set()
+            out, matched = [], set()
             for m in members:
-                a = by_email.get(str(m.get("email") or "").lower()) or by_id.get(str(m.get("memberId") or ""))
-                if a is not None:
-                    matched.add(id(a))
-                rows.append({**m, "dashboard": a or {}})
+                r = by_email.get(str(m.get("email") or "").lower()) or by_id.get(str(m.get("memberId") or ""))
+                if r is not None:
+                    matched.add(id(r))
+                out.append({**m, "dashboard": (r or {}).get("dashboard", {})})
 
-            # Agents present in the dashboard but not in the team list.
-            for a in results:
-                if id(a) in matched:
+            for r in rows:
+                if id(r) in matched:
                     continue
-                name = (a.get("agentName") or "").strip()
-                rows.append({
-                    "memberId": a.get("agentId"),
+                name = (r.get("agentName") or "").strip()
+                out.append({
+                    "memberId": r.get("agentId"),
                     "first_name": name.split(" ")[0] if name else "",
                     "last_name": " ".join(name.split(" ")[1:]) if " " in name else "",
-                    "email": a.get("agentEmail"),
+                    "email": r.get("agentEmail"),
                     "member_status": "Active",
-                    "dashboard": a,
+                    "dashboard": r.get("dashboard", {}),
                 })
 
             return {
-                "data": rows,
+                "data": out,
                 "meta": {
-                    "date": dash_date,
-                    "total": len(rows),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                    "total": len(out),
                     "team": len(members),
-                    "with_metrics": len(results),
+                    "with_metrics": len(rows),
                 },
             }
         except HTTPException:

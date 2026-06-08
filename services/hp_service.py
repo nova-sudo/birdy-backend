@@ -5,7 +5,7 @@ HotProspector helper / service functions extracted from main.py.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, date, timedelta
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, ghl_date_bounds
@@ -185,6 +185,38 @@ async def fetch_and_cache_hp_data(
         raise
 
 
+def _call_identity(c):
+    """Stable de-dup key for a normalized call log."""
+    rid = c.get("recording_id")
+    if rid:
+        return f"rid:{rid}"
+    return f"k:{c.get('call_time_iso')}|{c.get('from_number')}|{c.get('to_number')}|{c.get('lead_id')}"
+
+
+def _merge_calls(existing, recent):
+    """Union of two normalized-call lists, de-duped by call identity."""
+    seen, out = set(), []
+    for c in (existing or []) + (recent or []):
+        ident = _call_identity(c)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        out.append(c)
+    return out
+
+
+async def _load_stored_calls(user_id, ghl_location_id, mongo_client):
+    """All previously-stored (normalized) call logs for a location, flattened."""
+    col = mongo_client[DB_NAME]["hotprospector_leads"]
+    calls = []
+    async for doc in col.find(
+        {"user_id": user_id, "ghl_location_id": ghl_location_id},
+        {"lead_data.call_logs": 1},
+    ):
+        calls.extend((doc.get("lead_data") or {}).get("call_logs") or [])
+    return calls
+
+
 async def fetch_and_cache_hp_call_center(
         user_id: str,
         ghl_location_id: str,
@@ -192,6 +224,8 @@ async def fetch_and_cache_hp_call_center(
         integration: HotProspectorIntegration = None,
         location_name: str = None,
         client_group_name: str = None,
+        mode: str = "backfill",
+        recent_days: int = 3,
 ):
     """
     Fetch + cache the full call-center dataset for ONE GHL location: leads
@@ -250,15 +284,24 @@ async def fetch_and_cache_hp_call_center(
         for lead in hp_leads
     ]
 
-    # 2. Call logs for this location — fetched by locationId across history in
-    #    <=30-day windows. FetchUserCallLog returns only a small default window with
-    #    no dates, so we walk date windows to pull the full history.
-    calls_ok, raw_calls = await integration.fetch_call_logs_for_location(ghl_location_id)
-    if not calls_ok:
-        logger.warning(f"HP call-log fetch failed for {ghl_location_id}")
-    normalized_calls = [
-        integration.normalize_user_call_log(raw, location_name) for raw in raw_calls
-    ]
+    # 2. Call logs for this location (date-windowed; FetchUserCallLog needs dates).
+    #    - backfill: pull the full history once.
+    #    - incremental: keep the stored history and only re-pull the last few days,
+    #      merging by call identity — so the daily run stops re-fetching ~400 days.
+    if mode == "incremental":
+        existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
+        rec_ok, recent_raw = await integration.fetch_call_logs_for_location(
+            ghl_location_id, lookback_days=recent_days
+        )
+        if not rec_ok:
+            logger.warning(f"HP incremental call fetch failed for {ghl_location_id}")
+        recent_norm = [integration.normalize_user_call_log(raw, location_name) for raw in (recent_raw or [])]
+        normalized_calls = _merge_calls(existing, recent_norm)
+    else:
+        calls_ok, raw_calls = await integration.fetch_call_logs_for_location(ghl_location_id)
+        if not calls_ok:
+            logger.warning(f"HP call-log fetch failed for {ghl_location_id}")
+        normalized_calls = [integration.normalize_user_call_log(raw, location_name) for raw in (raw_calls or [])]
 
     # 3. Nest each call under its lead, matched by phone (then email, then leadId).
     #    Leads with no calls keep an empty list. Calls that match no lead are still

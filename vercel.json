@@ -25,6 +25,10 @@
       "schedule": "* * * * *"
     },
     {
+      "path": "/api/cron/hp-members-tick",
+      "schedule": "* * * * *"
+    },
+    {
       "path": "/api/cron/meta-static-tick",
       "schedule": "0 1 1 * *"
     },

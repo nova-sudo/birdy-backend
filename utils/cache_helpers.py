@@ -110,6 +110,8 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
             db["client_groups"].create_index([("user_id", 1), ("id", 1)], name="idx_cg_uid", background=True),
             db["webhooks"].create_index([("user_id", 1), ("event_type", 1), ("received_at", -1)], name="idx_wh_evt", background=True),
             db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1)], name="idx_hp_loc", background=True),
+            db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1), ("agentId", 1)], unique=True, name="idx_hpmd_uniq", background=True),
+            db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1)], name="idx_hpmd_date", background=True),
             db["alerts"].create_index([("user_id", 1), ("created_at", -1)], name="idx_al_created", background=True),
             db["alerts"].create_index([("user_id", 1), ("id", 1)], name="idx_al_id", background=True),
             db["alerts"].create_index([("user_id", 1), ("status", 1)], name="idx_al_status", background=True),
