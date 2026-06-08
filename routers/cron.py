@@ -62,8 +62,9 @@ GHL_CUTOFF_HOURS = 1
 GHL_STALE_CLAIM_MINUTES = 10
 
 # HotProspector refresh — daily cadence (Sales-Hub call-center data). Each refresh
-# pulls the full call-log history and re-derives per-preset stats, so daily is enough.
-HP_GROUPS_PER_TICK = 5
+# pulls the full call-log history (date-windowed) and re-derives per-preset stats, so
+# daily is enough. Fewer per tick than GHL because the windowed call fetch is heavier.
+HP_GROUPS_PER_TICK = 3
 HP_CUTOFF_HOURS = 24
 HP_STALE_CLAIM_MINUTES = 10
 

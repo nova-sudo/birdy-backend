@@ -1,6 +1,6 @@
 import httpx
 import json
-from datetime import datetime
+from datetime import datetime, date, timedelta
 import logging
 import os
 from dotenv import load_dotenv
@@ -360,6 +360,46 @@ class HotProspectorIntegration:
             "outbound_count": outbound_count,
             "total_records": total_records or len(all_logs),
         }
+
+    async def fetch_call_logs_for_location(
+            self,
+            ghl_location_id: str,
+            lookback_days: int = 400,
+            window_days: int = 30,
+    ):
+        """
+        Fetch ALL of a location's call logs over the past `lookback_days` by walking
+        <= `window_days` date windows.
+
+        FetchUserCallLog caps from_date/to_date at a 30-day range, AND with no dates
+        it returns only a small default (recent) window — so to get the real history
+        we must page through explicit date windows. locationId filtering works fine
+        once a date range is supplied.
+
+        Returns (ok, [raw call dicts]).
+        """
+        end = date.today()
+        start = end - timedelta(days=lookback_days)
+        all_calls = []
+        any_ok = False
+        cur = start
+        while cur <= end:
+            win_end = min(cur + timedelta(days=window_days - 1), end)
+            ok, payload = await self.fetch_user_call_logs(
+                ghl_location_id,
+                from_date=cur.isoformat(),
+                to_date=win_end.isoformat(),
+            )
+            if ok and isinstance(payload, dict):
+                any_ok = True
+                all_calls.extend(payload.get("call_logs", []) or [])
+            cur = win_end + timedelta(days=1)
+
+        logger.info(
+            f"Fetched {len(all_calls)} call logs for location {ghl_location_id} "
+            f"over last {lookback_days}d ({window_days}d windows)"
+        )
+        return any_ok, all_calls
 
     def normalize_call_log(self, call_log: dict):
         """

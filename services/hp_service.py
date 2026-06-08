@@ -34,32 +34,34 @@ def _in_window(iso, start, end):
     return True
 
 
-def _compute_call_stats_all_presets(leads, total_leads):
+def _compute_call_stats_all_presets(calls, total_leads):
     """
-    Bucket every call (across all leads) into each date preset by call_time_iso.
-    Returns {preset: {total_calls, inbound_count, outbound_count, transfers,
+    Bucket every call into each date preset by call_time_iso. Returns
+    {preset: {total_calls, inbound_count, outbound_count, transfers,
     leads_with_calls, total_leads}}. "maximum" = all-time (no date filter).
     Mirrors GHL's cache_ghl_opp_stats_all_presets: fetch once, derive every preset.
+
+    `calls` is the flat list of normalized calls for the location (matched or not);
+    `leads_with_calls` counts distinct leads a call was matched to (matched_lead_id).
     """
-    all_calls = [log for lead in leads for log in (lead.get("call_logs") or [])]
     cache = {}
     for preset in META_CACHE_PRESETS:
         start, end = ghl_date_bounds(preset)  # (None, None) for "maximum"
         total = inbound = outbound = transfers = 0
         leads_with = set()
-        for log in all_calls:
-            in_win = True if (start is None and end is None) else _in_window(log.get("call_time_iso"), start, end)
+        for c in calls:
+            in_win = True if (start is None and end is None) else _in_window(c.get("call_time_iso"), start, end)
             if not in_win:
                 continue
             total += 1
-            cs = log.get("call_status")
+            cs = c.get("call_status")
             if cs == "inbound":
                 inbound += 1
             elif cs == "outbound":
                 outbound += 1
-            if log.get("transfer"):
+            if c.get("transfer"):
                 transfers += 1
-            lid = log.get("lead_id")
+            lid = c.get("matched_lead_id")
             if lid is not None:
                 leads_with.add(str(lid))
         cache[preset] = {
@@ -248,18 +250,19 @@ async def fetch_and_cache_hp_call_center(
         for lead in hp_leads
     ]
 
-    # 2. Call logs — fetched ACCOUNT-WIDE (no locationId). HotProspector does not
-    #    reliably tag call logs with the GHL locationId, so we pull all of the
-    #    account's calls and assign each to this client by matching the call's phone
-    #    numbers (or leadId) to this location's leads. Phone/email is the reliable
-    #    join — the call's leadId scheme doesn't line up with SearchByUserInput's.
-    calls_ok, calls_payload = await integration.fetch_user_call_logs()
-    raw_calls = calls_payload.get("call_logs", []) if calls_ok else []
+    # 2. Call logs for this location — fetched by locationId across history in
+    #    <=30-day windows. FetchUserCallLog returns only a small default window with
+    #    no dates, so we walk date windows to pull the full history.
+    calls_ok, raw_calls = await integration.fetch_call_logs_for_location(ghl_location_id)
     if not calls_ok:
-        logger.warning(f"HP call-log fetch failed: {calls_payload}")
+        logger.warning(f"HP call-log fetch failed for {ghl_location_id}")
+    normalized_calls = [
+        integration.normalize_user_call_log(raw, location_name) for raw in raw_calls
+    ]
 
-    # 3. Index this location's leads by phone / email / leadId, then assign each
-    #    call to the matching lead. Leads with no calls keep an empty list.
+    # 3. Nest each call under its lead, matched by phone (then email, then leadId).
+    #    Leads with no calls keep an empty list. Calls that match no lead are still
+    #    counted in the stats below (they just aren't shown per-lead).
     lead_by_key = {}
     for lead in normalized_leads:
         lead["call_logs"] = []
@@ -274,37 +277,33 @@ async def fetch_and_cache_hp_call_center(
         if lid is not None:
             lead_by_key.setdefault(f"lead:{lid}", lead)
 
-    for raw in raw_calls:
+    for call in normalized_calls:
         match = None
-        # Phone match on either leg of the call (lead's number is one of them).
-        for num in (raw.get("from_number"), raw.get("to_number")):
+        # Phone match on either leg of the call (the lead's number is one of them).
+        for num in (call.get("from_number"), call.get("to_number")):
             np = normalize_phone(num)
             if np and f"phone:{np}" in lead_by_key:
                 match = lead_by_key[f"phone:{np}"]
                 break
         # leadId fallback when phone didn't resolve.
-        if match is None and raw.get("leadId") is not None:
-            match = lead_by_key.get(f"lead:{str(raw.get('leadId'))}")
-        if match is None:
-            continue  # belongs to another client's leads
-        match["call_logs"].append(integration.normalize_user_call_log(raw, location_name))
+        if match is None and call.get("lead_id") is not None:
+            match = lead_by_key.get(f"lead:{str(call.get('lead_id'))}")
+        if match is not None:
+            match["call_logs"].append(call)
+            call["matched_lead_id"] = match.get("id")
 
-    # 3b. Tally counts from the matched calls.
-    total_calls = inbound = outbound = 0
     for lead in normalized_leads:
-        logs = lead["call_logs"]
-        lead["call_logs_count"] = len(logs)
-        total_calls += len(logs)
-        for log in logs:
-            if log.get("call_status") == "outbound":
-                outbound += 1
-            elif log.get("call_status") == "inbound":
-                inbound += 1
+        lead["call_logs_count"] = len(lead["call_logs"])
 
-    # 4. Derive per-preset call stats (windowed by call_time) so the Sales-Hub
-    #    Overview can show date-filtered KPIs per client — mirrors GHL's
+    # 3b. All-time totals from ALL calls (matched or not).
+    total_calls = len(normalized_calls)
+    inbound = sum(1 for c in normalized_calls if c.get("call_status") == "inbound")
+    outbound = sum(1 for c in normalized_calls if c.get("call_status") == "outbound")
+
+    # 4. Derive per-preset call stats (windowed by call_time) from ALL calls so the
+    #    Sales-Hub Overview shows date-filtered KPIs per client — mirrors GHL's
     #    cache_ghl_opp_stats_all_presets (fetch once, bucket every preset).
-    call_cache = _compute_call_stats_all_presets(normalized_leads, len(normalized_leads))
+    call_cache = _compute_call_stats_all_presets(normalized_calls, len(normalized_leads))
 
     # 5. Persist leads (with nested call logs) to the cache collection.
     await save_hotprospector_leads_to_collection(
