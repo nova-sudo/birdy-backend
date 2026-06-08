@@ -1997,11 +1997,16 @@ async def get_unified_leads(
     end_date: Optional[str] = Query(default=None),
     source: List[str] = Query(default=[]),
     tag: List[str] = Query(default=[]),
+    opportunity_status: Optional[str] = Query(default=None),
     current_user: str = Depends(get_current_user),
 ):
     """
     Unified leads endpoint: returns GHL contacts enriched with Meta and HP data.
     Matches across sources using normalized email/phone match_keys.
+
+    `opportunity_status` (open|won|lost|abandoned) filters the leads list + its
+    pagination server-side to contacts that have an opportunity in that status; the
+    stats cards stay on the full unfiltered set.
     """
     import time as _time
     async with get_mongo_client() as mongo_client:
@@ -2061,14 +2066,24 @@ async def get_unified_leads(
 
             logger.info(f"Final MongoDB query: {query}")
 
+            # ── Opportunity-status tab filter (server-side) ──────────────────
+            # Filter the leads LIST (and its pagination) to contacts that have at
+            # least one opportunity in the selected status. The stats pipelines below
+            # keep using the unfiltered `query` so the cards show the full breakdown.
+            table_query = query
+            if opportunity_status and opportunity_status.strip().lower() != "all":
+                opp_cond = {"contact_data.opportunities": {"$elemMatch": {
+                    "status": {"$regex": f"^{re.escape(opportunity_status.strip())}$", "$options": "i"}
+                }}}
+                table_query = {"$and": [query, opp_cond]}
 
-            # Paginate GHL contacts
-            total_contacts = await ghl_col.count_documents(query)
+            # Paginate GHL contacts (filtered)
+            total_contacts = await ghl_col.count_documents(table_query)
             logger.info(f"Total contacts found: {total_contacts}")
             total_pages = max(1, -(-total_contacts // limit))
             skip = (page - 1) * limit
 
-            contact_docs = await ghl_col.find(query).sort(
+            contact_docs = await ghl_col.find(table_query).sort(
                 "contact_data.dateAdded", -1
             ).skip(skip).limit(limit).to_list(limit)
 
