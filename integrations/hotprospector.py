@@ -240,6 +240,35 @@ class HotProspectorIntegration:
 
         return False, {"error": "Unexpected response format"}
 
+    async def get_member_dashboard_data(self, date_str: str = None):
+        """
+        Per-agent dashboard metrics for a single day via getMemberDashboardData
+        (outbound/inbound counts, answered, answer rate, convos, appts, talk time, …).
+
+        Args:
+            date_str: 'Y-m-d' (omit for today; pass a past date for historical data).
+
+        Returns:
+            (True, {"date": <str>, "results": [<agent metrics dict>]}) on success,
+            else (False, {"error": ...}).
+        """
+        payload = {
+            "api_uId": self.api_uid,
+            "api_key": self.api_key,
+            "Method": "getMemberDashboardData",
+        }
+        if date_str:
+            payload["date"] = date_str
+
+        success, result = await self._make_request(payload, use_dedup=False)
+        if not success:
+            return False, result
+
+        body = result[0] if isinstance(result, list) and result else result
+        if isinstance(body, dict) and body.get("response") == "true":
+            return True, {"date": body.get("date"), "results": body.get("results", []) or []}
+        return False, {"error": "Unexpected getMemberDashboardData response format"}
+
     async def fetch_lead_call_logs(self, lead_id: str):
         """
         Fetch call logs for a specific lead.

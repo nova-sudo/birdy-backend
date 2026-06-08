@@ -771,3 +771,79 @@ async def get_hp_call_center(
             raise HTTPException(
                 status_code=500, detail=f"Failed to load call center data: {str(e)}"
             )
+
+
+# ------------------------------------------------------------------
+# GET /api/hotprospector/members/dashboard
+# ------------------------------------------------------------------
+@router.get("/api/hotprospector/members/dashboard")
+async def get_hp_member_dashboard(
+        date: str | None = None,
+        current_user: str = Depends(get_current_user),
+):
+    """
+    Team list merged with per-agent dashboard metrics (getMemberDashboardData) for a
+    single day. `date` is Y-m-d (omit for today). Each row carries the member's
+    identity plus a `dashboard` object with that day's metrics (empty when the agent
+    had no activity, or the account has no dashboard data).
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            credentials = await get_hotprospector_credentials(current_user, mongo_client)
+            if not credentials:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Hot Prospector not connected. Add credentials in Settings → Integrations.",
+                )
+            integration = HotProspectorIntegration(
+                credentials.get("api_uid"), credentials.get("api_key")
+            )
+
+            ok_m, members = await integration.get_member_users()
+            ok_d, dash = await integration.get_member_dashboard_data(date)
+            members = members if (ok_m and isinstance(members, list)) else []
+            results = dash.get("results", []) if ok_d else []
+            dash_date = dash.get("date") if ok_d else date
+
+            by_email, by_id = {}, {}
+            for a in results:
+                if a.get("agentEmail"):
+                    by_email[str(a["agentEmail"]).lower()] = a
+                if a.get("agentId") is not None:
+                    by_id[str(a["agentId"])] = a
+
+            rows, matched = [], set()
+            for m in members:
+                a = by_email.get(str(m.get("email") or "").lower()) or by_id.get(str(m.get("memberId") or ""))
+                if a is not None:
+                    matched.add(id(a))
+                rows.append({**m, "dashboard": a or {}})
+
+            # Agents present in the dashboard but not in the team list.
+            for a in results:
+                if id(a) in matched:
+                    continue
+                name = (a.get("agentName") or "").strip()
+                rows.append({
+                    "memberId": a.get("agentId"),
+                    "first_name": name.split(" ")[0] if name else "",
+                    "last_name": " ".join(name.split(" ")[1:]) if " " in name else "",
+                    "email": a.get("agentEmail"),
+                    "member_status": "Active",
+                    "dashboard": a,
+                })
+
+            return {
+                "data": rows,
+                "meta": {
+                    "date": dash_date,
+                    "total": len(rows),
+                    "team": len(members),
+                    "with_metrics": len(results),
+                },
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching HP member dashboard: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to load member dashboard: {str(e)}")
