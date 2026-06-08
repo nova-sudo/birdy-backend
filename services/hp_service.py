@@ -9,6 +9,7 @@ from datetime import datetime
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, ghl_date_bounds
+from utils.phone_normalize import normalize_phone, normalize_email
 from integrations.gohighlevel import get_subaccount_tokens
 from integrations.hotprospector import (
     HotProspectorIntegration,
@@ -247,27 +248,51 @@ async def fetch_and_cache_hp_call_center(
         for lead in hp_leads
     ]
 
-    # 2. All call logs for this location (bulk, paginated FetchUserCallLog).
-    calls_ok, calls_payload = await integration.fetch_user_call_logs(ghl_location_id)
-    logs_by_lead = {}
-    if calls_ok:
-        for raw in calls_payload.get("call_logs", []):
-            lead_id = raw.get("leadId")
-            if lead_id is None:
-                continue
-            logs_by_lead.setdefault(str(lead_id), []).append(
-                integration.normalize_user_call_log(raw, location_name)
-            )
-    else:
-        # Leads still cache fine; calls just stay empty this round.
-        logger.warning(f"HP call-log fetch failed for {ghl_location_id}: {calls_payload}")
+    # 2. Call logs — fetched ACCOUNT-WIDE (no locationId). HotProspector does not
+    #    reliably tag call logs with the GHL locationId, so we pull all of the
+    #    account's calls and assign each to this client by matching the call's phone
+    #    numbers (or leadId) to this location's leads. Phone/email is the reliable
+    #    join — the call's leadId scheme doesn't line up with SearchByUserInput's.
+    calls_ok, calls_payload = await integration.fetch_user_call_logs()
+    raw_calls = calls_payload.get("call_logs", []) if calls_ok else []
+    if not calls_ok:
+        logger.warning(f"HP call-log fetch failed: {calls_payload}")
 
-    # 3. Match logs onto leads (leads with none keep an empty list).
+    # 3. Index this location's leads by phone / email / leadId, then assign each
+    #    call to the matching lead. Leads with no calls keep an empty list.
+    lead_by_key = {}
+    for lead in normalized_leads:
+        lead["call_logs"] = []
+        for raw_phone in (lead.get("phone"), lead.get("mobile")):
+            np = normalize_phone(raw_phone)
+            if np:
+                lead_by_key.setdefault(f"phone:{np}", lead)
+        ne = normalize_email(lead.get("email"))
+        if ne:
+            lead_by_key.setdefault(f"email:{ne}", lead)
+        lid = lead.get("id")
+        if lid is not None:
+            lead_by_key.setdefault(f"lead:{lid}", lead)
+
+    for raw in raw_calls:
+        match = None
+        # Phone match on either leg of the call (lead's number is one of them).
+        for num in (raw.get("from_number"), raw.get("to_number")):
+            np = normalize_phone(num)
+            if np and f"phone:{np}" in lead_by_key:
+                match = lead_by_key[f"phone:{np}"]
+                break
+        # leadId fallback when phone didn't resolve.
+        if match is None and raw.get("leadId") is not None:
+            match = lead_by_key.get(f"lead:{str(raw.get('leadId'))}")
+        if match is None:
+            continue  # belongs to another client's leads
+        match["call_logs"].append(integration.normalize_user_call_log(raw, location_name))
+
+    # 3b. Tally counts from the matched calls.
     total_calls = inbound = outbound = 0
     for lead in normalized_leads:
-        lead_id = lead.get("id")
-        logs = logs_by_lead.get(str(lead_id), []) if lead_id is not None else []
-        lead["call_logs"] = logs
+        logs = lead["call_logs"]
         lead["call_logs_count"] = len(logs)
         total_calls += len(logs)
         for log in logs:

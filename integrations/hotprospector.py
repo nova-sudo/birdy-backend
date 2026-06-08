@@ -272,7 +272,7 @@ class HotProspectorIntegration:
 
     async def fetch_user_call_logs(
             self,
-            ghl_location_id: str,
+            ghl_location_id: str = None,
             from_date: str = None,
             to_date: str = None,
             call_type: str = "",
@@ -307,13 +307,16 @@ class HotProspectorIntegration:
                 "api_uId": self.api_uid,
                 "api_key": self.api_key,
                 "Method": "FetchUserCallLog",
-                "locationId": ghl_location_id,
                 "type": call_type or "",
                 "limit": page_size,
                 "offset": offset,
                 "sort_by": "call_time",
                 "sort_order": "DESC",
             }
+            # HP does not reliably tag call logs with the GHL locationId, so callers
+            # usually omit it and match calls to leads by phone/email instead.
+            if ghl_location_id:
+                payload["locationId"] = ghl_location_id
             if from_date:
                 payload["from_date"] = from_date
             if to_date:
