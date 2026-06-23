@@ -64,6 +64,22 @@ def _ghl_metrics(group: dict, preset: str) -> dict:
     return (group.get("gohighlevel_cache") or {}).get("metrics") or {}
 
 
+def _hp_call_stats(group: dict, preset: str) -> dict:
+    """
+    Read HotProspector (call-center) per-preset call stats.
+    Order: hotprospector_call_cache[preset] → hotprospector_call_cache.maximum
+           → hotprospector_cache.metrics (lifetime summary).
+    """
+    call_cache = group.get("hotprospector_call_cache") or {}
+    preset_stats = call_cache.get(preset)
+    if preset_stats and isinstance(preset_stats, dict):
+        return preset_stats
+    max_stats = call_cache.get("maximum")
+    if max_stats and isinstance(max_stats, dict):
+        return max_stats
+    return (group.get("hotprospector_cache") or {}).get("metrics") or {}
+
+
 def _ghl_tag_count(group: dict, preset: str, tag_name: str) -> float:
     """Read a single tag count from tag_breakdown. Case-insensitive match."""
     tag_breakdown = _ghl_metrics(group, preset).get("tag_breakdown") or {}
@@ -130,6 +146,18 @@ METRIC_REGISTRY: dict[str, dict] = {
     "ghl_leads":      {"source": "ghl", "path": "total_contacts", "aggregation": "sum", "format": "integer"},
     "total_tags":     {"source": "ghl", "path": "tag_breakdown",  "aggregation": "sum", "format": "integer", "transform": "count_keys"},
 
+    # ── HotProspector / Call Center (per-preset call cache, Client Groups page) ──
+    "hp_leads":            {"source": "hp_call", "path": "total_leads",      "aggregation": "sum", "format": "integer"},
+    "hp_total_calls":      {"source": "hp_call", "path": "total_calls",      "aggregation": "sum", "format": "integer"},
+    "hp_inbound":          {"source": "hp_call", "path": "inbound_count",    "aggregation": "sum", "format": "integer"},
+    "hp_outbound":         {"source": "hp_call", "path": "outbound_count",   "aggregation": "sum", "format": "integer"},
+    "hp_transfers":        {"source": "hp_call", "path": "transfers",        "aggregation": "sum", "format": "integer"},
+    "hp_leads_with_calls": {"source": "hp_call", "path": "leads_with_calls", "aggregation": "sum", "format": "integer"},
+    "hp_answered_calls":   {"source": "hp_call", "path": "answered_calls",   "aggregation": "sum", "format": "integer"},
+    "hp_talk_time":        {"source": "hp_call", "path": "total_talk_min",   "aggregation": "sum", "format": "decimal"},
+    "hp_connect_rate":     {"aggregation": "recompute", "components": ("hp_leads_with_calls", "hp_leads"),       "scale": 100, "format": "percentage"},
+    "hp_answer_rate":      {"aggregation": "recompute", "components": ("hp_answered_calls", "hp_total_calls"),   "scale": 100, "format": "percentage"},
+
     # ── Hybrid/derived (Client Groups dashboard) ──
     "conversion_rate": {"aggregation": "recompute", "components": ("ghl_contacts", "meta_leads"), "scale": 100, "format": "percentage"},
     "cost_per_lead":   {"aggregation": "recompute", "components": ("meta_spend", "ghl_contacts"), "format": "currency"},
@@ -141,6 +169,7 @@ _SOURCE_READERS: dict[str, Callable[[dict, str], dict]] = {
     "meta": _meta_insights,
     "ghl_opp": _ghl_opp_stats,
     "ghl": _ghl_metrics,
+    "hp_call": _hp_call_stats,
 }
 
 

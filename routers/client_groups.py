@@ -440,6 +440,7 @@ async def create_client_group_optimized(
                 "ad_account_currency": request.ad_account_currency,
                 "ghl_location_id": request.ghl_location_id,
                 "meta_ad_account_id": request.meta_ad_account_id,
+                "hotprospector_group_id": request.hotprospector_group_id,
                 "call_log_provider": request.call_log_provider or "ghl",
                 "notes": request.notes or "",
                 "created_at": datetime.now(),
@@ -449,6 +450,10 @@ async def create_client_group_optimized(
                 "gohighlevel_cache": {},
                 "facebook_cache": {},
                 "hotprospector_cache": {},
+                # Per-preset call-center stats (Sales-Hub Overview / Client Hub
+                # call columns). Seeded empty; the hp-tick cron backfills it on the
+                # next run because last_hp_refresh is None (mirrors meta/ghl caches).
+                "hotprospector_call_cache": {},
                 "last_ghl_refresh": None,
                 "last_meta_refresh": None,
                 "last_hp_refresh": None,

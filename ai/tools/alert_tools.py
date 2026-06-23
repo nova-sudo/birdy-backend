@@ -245,6 +245,9 @@ def register_alert_tools():
             "The alert is auto-evaluated immediately after creation. "
             "Meta metrics (spend, impressions, clicks, reach, ctr, cpc, cpm, meta_leads, meta_conversion, cpl, cost_per_result, frequency) "
             "track Facebook/Meta Ads data. GHL metrics (ghl_leads, ghl_conversion) track GoHighLevel data. "
+            "Call Center metrics track HotProspector data: per-client (hp_total_calls, hp_inbound, hp_outbound, hp_transfers, "
+            "hp_leads_with_calls, hp_answered_calls, hp_talk_time, hp_connect_rate, hp_answer_rate) and account-wide per-agent "
+            "(hp_agent_outbound, hp_agent_inbound, hp_agent_answered, hp_agent_convos, hp_agent_appts, hp_agent_talk_min, hp_agent_answer_rate). "
             "For GHL tags, use 'tag:TAG_NAME' as the metric (e.g., 'tag:Hot Lead', 'tag:booked consult hp'). "
             f"Valid operators: {_VALID_OPERATORS}."
         ),

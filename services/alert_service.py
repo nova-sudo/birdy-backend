@@ -121,6 +121,7 @@ async def _evaluate_scope(
     ghl_date_filter,
     user_id,
     db,
+    mongo_client,
     alert,
     period_label,
 ):
@@ -142,6 +143,22 @@ async def _evaluate_scope(
                _get_insights(g, meta_preset).get("total_leads", 0) or 0))
         for g in client_groups
     )
+
+    # ── Call Center (HotProspector) — per-preset call stats summed across scope ─
+    cc = {
+        "total_calls": 0.0, "inbound_count": 0.0, "outbound_count": 0.0,
+        "transfers": 0.0, "leads_with_calls": 0.0, "total_leads": 0.0,
+        "answered_calls": 0.0, "total_talk_min": 0.0,
+    }
+    for g in client_groups:
+        call_cache = g.get("hotprospector_call_cache") or {}
+        stats = call_cache.get(meta_preset)
+        if not isinstance(stats, dict):
+            stats = call_cache.get("maximum") if isinstance(call_cache.get("maximum"), dict) else {}
+        if not stats:
+            stats = (g.get("hotprospector_cache") or {}).get("metrics") or {}
+        for k in cc:
+            cc[k] += float(stats.get(k, 0) or 0)
 
     # ── GHL — scoped to this scope's group IDs only ───────────────────────────
     now = datetime.utcnow()
@@ -221,6 +238,28 @@ async def _evaluate_scope(
         current_value = (total_spend / total_results) if total_results else 0.0
     elif metric == "frequency":
         current_value = (total_impressions / total_reach) if total_reach else 0.0
+    # ── Call Center (HotProspector) per-client metrics ────────────────────────
+    elif metric == "hp_leads":            current_value = cc["total_leads"]
+    elif metric == "hp_total_calls":      current_value = cc["total_calls"]
+    elif metric == "hp_inbound":          current_value = cc["inbound_count"]
+    elif metric == "hp_outbound":         current_value = cc["outbound_count"]
+    elif metric == "hp_transfers":        current_value = cc["transfers"]
+    elif metric == "hp_leads_with_calls": current_value = cc["leads_with_calls"]
+    elif metric == "hp_answered_calls":   current_value = cc["answered_calls"]
+    elif metric == "hp_talk_time":        current_value = cc["total_talk_min"]
+    elif metric == "hp_connect_rate":
+        current_value = (cc["leads_with_calls"] / cc["total_leads"] * 100) if cc["total_leads"] else 0.0
+    elif metric == "hp_answer_rate":
+        current_value = (cc["answered_calls"] / cc["total_calls"] * 100) if cc["total_calls"] else 0.0
+    # ── Call Center (HotProspector) per-agent, account-wide metrics ────────────
+    elif metric.startswith("hp_agent_"):
+        from services.hp_members import aggregate_account_member_metrics
+        from core.constants import ghl_date_bounds
+        cc_start, cc_end = ghl_date_bounds(meta_preset)
+        # aggregate_account_member_metrics indexes mongo_client[DB_NAME] itself, so
+        # it needs the raw AsyncIOMotorClient — NOT the already-resolved `db` handle.
+        agent_totals = await aggregate_account_member_metrics(user_id, cc_start, cc_end, mongo_client)
+        current_value = float(agent_totals.get(metric, 0) or 0)
     elif metric.startswith("tag:"):
         tag_name = metric[4:]
         current_value = float(await db["ghl_contacts"].count_documents(
@@ -245,6 +284,14 @@ async def _evaluate_scope(
                 "ghl_open_opps": ghl_open, "ghl_abandoned_opps": ghl_abandoned,
                 "ghl_total_opps": ghl_total_ops,
                 "leads": ghl_leads,
+                "hp_leads": cc["total_leads"],
+                "hp_total_calls": cc["total_calls"],
+                "hp_inbound": cc["inbound_count"],
+                "hp_outbound": cc["outbound_count"],
+                "hp_transfers": cc["transfers"],
+                "hp_leads_with_calls": cc["leads_with_calls"],
+                "hp_answered_calls": cc["answered_calls"],
+                "hp_talk_time": cc["total_talk_min"],
                 "ctr": (total_clicks / total_impressions * 100) if total_impressions else 0,
                 "cpc": (total_spend / total_clicks) if total_clicks else 0,
                 "cpm": (total_spend / total_impressions * 1000) if total_impressions else 0,
@@ -301,6 +348,13 @@ async def _evaluate_scope(
             prev_val = float(alert.get("current_value", 0) or 0)
             if prev_val == 0.0 and alert.get("last_evaluated_at") is None:
                 prev_val = curr_val
+        elif metric.startswith("hp_"):
+            # Call-center metrics have no windowed-subtraction source; compare
+            # against the previously stored value (same approach as GHL opps).
+            curr_val = current_value
+            prev_val = float(alert.get("current_value", 0) or 0)
+            if prev_val == 0.0 and alert.get("last_evaluated_at") is None:
+                prev_val = curr_val
         elif metric == "meta_leads":
             curr_val = current_value
             prev_val = _prev_ad_metric("meta_leads")
@@ -336,7 +390,8 @@ async def _evaluate_scope(
 
         pct_change = ((curr_val - prev_val) / prev_val * 100) if prev_val > 0 else 0.0
         if metric not in ("ghl_conversion", "ghl_revenue", "ghl_won_opps", "ghl_lost_opps",
-                          "ghl_open_opps", "ghl_abandoned_opps", "ghl_total_opps"):
+                          "ghl_open_opps", "ghl_abandoned_opps", "ghl_total_opps") \
+                and not metric.startswith("hp_"):
             current_value = pct_change
 
         if operator == "pct_drop":
@@ -431,6 +486,10 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
         "id": 1, "name": 1,
         f"facebook_cache.{meta_preset}.metrics.insights": 1,
         "facebook_cache.metrics.insights": 1,
+        # Call Center (HotProspector) per-preset call stats + lifetime summary
+        f"hotprospector_call_cache.{meta_preset}": 1,
+        "hotprospector_call_cache.maximum": 1,
+        "hotprospector_cache.metrics": 1,
     }
     if pct_config.get("mode") == "subtract":
         projection[f"facebook_cache.{pct_config['wider']}.metrics.insights"] = 1
@@ -476,6 +535,7 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
         ghl_date_filter=ghl_date_filter,
         user_id=user_id,
         db=db,
+        mongo_client=mongo_client,
         alert=alert,
         period_label=period_label,
     )

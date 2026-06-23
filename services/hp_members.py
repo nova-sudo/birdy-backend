@@ -206,3 +206,41 @@ async def get_member_dashboard_range(user_id, start_date, end_date, integration,
                     _accumulate(_bucket(aid, a.get("agentName"), a.get("agentEmail"))["sums"], a)
 
     return [_format(aid, info["name"], info["email"], info["sums"]) for aid, info in agg.items()]
+
+
+# ── Account-wide aggregation (for metrics / alerts) ──────────────────────────
+
+async def aggregate_account_member_metrics(user_id, start_date, end_date, mongo_client):
+    """
+    Sum every agent's member-dashboard metrics into ONE account-wide snapshot
+    over [start_date, end_date] (inclusive, 'YYYY-MM-DD'; None = open bound).
+
+    Store-only (does NOT live-fetch HotProspector) so it is safe to call from the
+    alert evaluation cron. Returns a flat dict keyed by the public hp_agent_* metric
+    ids used in the metric registry / alert engine.
+    """
+    today = date.today()
+    start = start_date or date(today.year, 1, 1).isoformat()
+    end = end_date or today.isoformat()
+
+    sums = {f: 0.0 for f in _SUM_FIELDS}
+    cur = mongo_client[DB_NAME]["hotprospector_member_daily"].find(
+        {"user_id": user_id, "date": {"$gte": start, "$lte": end}},
+        {"metrics": 1},
+    )
+    async for doc in cur:
+        _accumulate(sums, doc.get("metrics") or {})
+
+    dialed = sums["outboundCall"] + sums["inboundCall"]
+    answered = sums["answered_calls"]
+    return {
+        "hp_agent_outbound": sums["outboundCall"],
+        "hp_agent_inbound": sums["inboundCall"],
+        "hp_agent_dialed": dialed,
+        "hp_agent_answered": answered,
+        "hp_agent_convos": sums["convos"],
+        "hp_agent_appts": sums["Appts"],
+        "hp_agent_talk_min": sums["talkMin"],
+        "hp_agent_sms": sums["SMS"],
+        "hp_agent_answer_rate": (answered / dialed * 100) if dialed else 0.0,
+    }

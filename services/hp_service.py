@@ -34,20 +34,37 @@ def _in_window(iso, start, end):
     return True
 
 
+def _dur_seconds(c):
+    """Parse a normalized call's duration (may be int/float/stringy) to seconds (float)."""
+    v = c.get("duration")
+    if v is None:
+        return 0.0
+    if isinstance(v, (int, float)):
+        return float(v)
+    try:
+        return float(str(v).strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
 def _compute_call_stats_all_presets(calls, total_leads):
     """
     Bucket every call into each date preset by call_time_iso. Returns
     {preset: {total_calls, inbound_count, outbound_count, transfers,
-    leads_with_calls, total_leads}}. "maximum" = all-time (no date filter).
+    leads_with_calls, total_leads, answered_calls, total_talk_min}}.
+    "maximum" = all-time (no date filter).
     Mirrors GHL's cache_ghl_opp_stats_all_presets: fetch once, derive every preset.
 
     `calls` is the flat list of normalized calls for the location (matched or not);
-    `leads_with_calls` counts distinct leads a call was matched to (matched_lead_id).
+    `leads_with_calls` counts distinct leads a call was matched to (matched_lead_id);
+    `answered_calls` counts calls that connected (duration > 0); `total_talk_min`
+    is the summed talk time in minutes.
     """
     cache = {}
     for preset in META_CACHE_PRESETS:
         start, end = ghl_date_bounds(preset)  # (None, None) for "maximum"
-        total = inbound = outbound = transfers = 0
+        total = inbound = outbound = transfers = answered = 0
+        talk_seconds = 0.0
         leads_with = set()
         for c in calls:
             in_win = True if (start is None and end is None) else _in_window(c.get("call_time_iso"), start, end)
@@ -61,6 +78,10 @@ def _compute_call_stats_all_presets(calls, total_leads):
                 outbound += 1
             if c.get("transfer"):
                 transfers += 1
+            dur = _dur_seconds(c)
+            if dur > 0:
+                answered += 1
+                talk_seconds += dur
             lid = c.get("matched_lead_id")
             if lid is not None:
                 leads_with.add(str(lid))
@@ -71,6 +92,8 @@ def _compute_call_stats_all_presets(calls, total_leads):
             "transfers": transfers,
             "leads_with_calls": len(leads_with),
             "total_leads": total_leads,
+            "answered_calls": answered,
+            "total_talk_min": round(talk_seconds / 60, 1),
         }
     return cache
 
@@ -342,6 +365,8 @@ async def fetch_and_cache_hp_call_center(
     total_calls = len(normalized_calls)
     inbound = sum(1 for c in normalized_calls if c.get("call_status") == "inbound")
     outbound = sum(1 for c in normalized_calls if c.get("call_status") == "outbound")
+    answered = sum(1 for c in normalized_calls if _dur_seconds(c) > 0)
+    talk_min = round(sum(_dur_seconds(c) for c in normalized_calls) / 60, 1)
 
     # 4. Derive per-preset call stats (windowed by call_time) from ALL calls so the
     #    Sales-Hub Overview shows date-filtered KPIs per client — mirrors GHL's
@@ -362,6 +387,8 @@ async def fetch_and_cache_hp_call_center(
         "hotprospector_cache.metrics.total_calls": total_calls,
         "hotprospector_cache.metrics.inbound_count": inbound,
         "hotprospector_cache.metrics.outbound_count": outbound,
+        "hotprospector_cache.metrics.answered_calls": answered,
+        "hotprospector_cache.metrics.total_talk_min": talk_min,
         "last_hp_refresh": datetime.utcnow(),
     }
     for preset, stats in call_cache.items():

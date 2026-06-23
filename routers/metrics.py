@@ -108,6 +108,27 @@ async def get_available_metric_fields(current_user: str = Depends(get_current_us
                 {"id": "conversion_rate", "label": "Conversion Rate", "category": "Calculated", "level": "group"},
                 {"id": "cost_per_lead", "label": "Cost Per Lead", "category": "Calculated", "level": "group"},
                 {"id": "engagement_rate", "label": "Engagement Rate", "category": "Calculated", "level": "group"},
+                # Call Center (HotProspector) — per-client, date-windowed
+                {"id": "hp_leads", "label": "Call Center Leads", "category": "Call Center", "level": "group"},
+                {"id": "hp_total_calls", "label": "Total Calls", "category": "Call Center", "level": "group"},
+                {"id": "hp_inbound", "label": "Inbound Calls", "category": "Call Center", "level": "group"},
+                {"id": "hp_outbound", "label": "Outbound Calls", "category": "Call Center", "level": "group"},
+                {"id": "hp_transfers", "label": "Call Transfers", "category": "Call Center", "level": "group"},
+                {"id": "hp_leads_with_calls", "label": "Leads Called", "category": "Call Center", "level": "group"},
+                {"id": "hp_answered_calls", "label": "Answered Calls", "category": "Call Center", "level": "group"},
+                {"id": "hp_talk_time", "label": "Talk Time (min)", "category": "Call Center", "level": "group"},
+                {"id": "hp_connect_rate", "label": "Connect Rate", "category": "Call Center", "level": "group"},
+                {"id": "hp_answer_rate", "label": "Answer Rate", "category": "Call Center", "level": "group"},
+                # Call Center (HotProspector) — per-agent, account-wide
+                {"id": "hp_agent_outbound", "label": "Agent Outbound Calls", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_inbound", "label": "Agent Inbound Calls", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_dialed", "label": "Agent Total Dials", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_answered", "label": "Agent Answered Calls", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_convos", "label": "Conversations", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_appts", "label": "Appointments Set", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_talk_min", "label": "Agent Talk Time (min)", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_sms", "label": "SMS Sent", "category": "Call Center Agents", "level": "account"},
+                {"id": "hp_agent_answer_rate", "label": "Agent Answer Rate", "category": "Call Center Agents", "level": "account"},
                 # Campaign-level (Marketing Hub — Campaigns/AdSets/Ads)
                 {"id": "spend", "label": "Spend", "category": "Campaigns", "level": "campaign"},
                 {"id": "impressions", "label": "Impressions", "category": "Campaigns", "level": "campaign"},
@@ -127,6 +148,7 @@ async def get_available_metric_fields(current_user: str = Depends(get_current_us
                 "group": ["clients"],
                 "campaign": ["campaigns", "adsets", "ads"],
                 "lead": ["leads", "marketing_leads"],
+                "account": ["sales_hub"],
             },
         }
 
