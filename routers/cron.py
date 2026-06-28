@@ -61,11 +61,13 @@ GHL_CUTOFF_HOURS = 1
 # considered crashed and may be retried.
 GHL_STALE_CLAIM_MINUTES = 10
 
-# HotProspector refresh — daily cadence (Sales-Hub call-center data). Each refresh
-# pulls the full call-log history (date-windowed) and re-derives per-preset stats, so
-# daily is enough. Fewer per tick than GHL because the windowed call fetch is heavier.
-HP_GROUPS_PER_TICK = 3
-HP_CUTOFF_HOURS = 24
+# HotProspector refresh — Sales-Hub call-center data. The FIRST sync per group is a
+# full history backfill; every refresh after that is the cheap incremental mode (only
+# re-pulls the last few days of calls), so a sub-daily cadence is fine. Default 12h,
+# env-tunable so the cadence can change without a redeploy. Fewer per tick than GHL
+# because the windowed call fetch is heavier.
+HP_GROUPS_PER_TICK = int(os.getenv("HP_GROUPS_PER_TICK", "3"))
+HP_CUTOFF_HOURS = int(os.getenv("HP_CUTOFF_HOURS", "12"))
 HP_STALE_CLAIM_MINUTES = 10
 
 # HotProspector member-dashboard sync (account-level). The current-year backfill is
