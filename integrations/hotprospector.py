@@ -1,6 +1,7 @@
 import httpx
 import json
 import time
+import re
 from datetime import datetime, date, timedelta
 import logging
 import os
@@ -51,6 +52,69 @@ _token_cache: Dict[str, dict] = {}          # api_uid -> {access_token, refresh_
 _token_locks: Dict[str, asyncio.Lock] = {}
 _token_locks_guard = asyncio.Lock()
 
+# ── Rate limiting ────────────────────────────────────────────────────────────
+# HotProspector enforces a PER-ENDPOINT rate limit (e.g. SearchByUserInput returns
+# 429 "Rate limit exceeded ... Try again in 60 seconds" after a short burst). Two
+# defenses, both env-overridable:
+#   1. Proactive: a minimum interval between calls to the SAME Method, so we rarely
+#      hit the limit. Only the known-tight methods are throttled; the rest rely on (2).
+#   2. Reactive: on a 429, honor the server's retry delay (Retry-After header or the
+#      "try again in N seconds" message) and retry, bounded.
+_RATE_MIN_INTERVAL = {
+    # Small by default: the per-minute cron only fires a few SearchByUserInput calls,
+    # so a short gap avoids tight bursts without adding much to the (serverless,
+    # timeout-bounded) tick. The one-shot backfill raises this via env to ~13s so it
+    # proactively stays under the limit instead of relying on 429 backoff.
+    "SearchByUserInput": float(os.getenv("HP_SEARCH_MIN_INTERVAL", "3")),
+}
+_RATE_DEFAULT_MIN_INTERVAL = float(os.getenv("HP_DEFAULT_MIN_INTERVAL", "0"))
+_rate_state: Dict[str, dict] = {}           # method -> {"lock": asyncio.Lock, "last": monotonic ts}
+_rate_state_guard = asyncio.Lock()
+
+# Reactive 429 backoff — kept SHORT by default so a single hp-tick can't blow the
+# serverless function timeout (vercel.json sets no maxDuration). Long-running jobs
+# (the backfill script) raise these via env. _HP_MAX_TOTAL_BACKOFF bounds the
+# CUMULATIVE 429 sleep one integration instance (≈ one group's sync, which can walk
+# ~14 call-log windows) may incur, so a cluster of 429s can't run for minutes.
+_HP_MAX_429_RETRIES = int(os.getenv("HP_MAX_429_RETRIES", "1"))
+_HP_MAX_429_WAIT = float(os.getenv("HP_MAX_429_WAIT", "30"))
+_HP_MAX_TOTAL_BACKOFF = float(os.getenv("HP_MAX_TOTAL_BACKOFF", "45"))
+
+
+async def _throttle_method(method: str):
+    """Proactively space out same-Method requests to respect per-endpoint limits."""
+    interval = _RATE_MIN_INTERVAL.get(method, _RATE_DEFAULT_MIN_INTERVAL)
+    if interval <= 0:
+        return
+    async with _rate_state_guard:
+        st = _rate_state.get(method)
+        if st is None:
+            st = {"lock": asyncio.Lock(), "last": 0.0}
+            _rate_state[method] = st
+    # Serialize calls to this Method and ensure >= interval seconds between them.
+    async with st["lock"]:
+        wait = st["last"] + interval - time.monotonic()
+        if wait > 0:
+            await asyncio.sleep(wait)
+        st["last"] = time.monotonic()
+
+
+def _retry_after_seconds(response) -> Optional[float]:
+    """Seconds to wait after a 429 — from the Retry-After header or the message text."""
+    ra = response.headers.get("Retry-After") or response.headers.get("retry-after")
+    if ra:
+        try:
+            return float(ra)
+        except (TypeError, ValueError):
+            pass
+    try:
+        body = response.json()
+        msg = body.get("message", "") if isinstance(body, dict) else ""
+    except Exception:
+        msg = response.text or ""
+    m = re.search(r"(\d+)\s*second", msg or "")
+    return float(m.group(1)) if m else None
+
 
 def _parse_hp_call_time(raw):
     """
@@ -75,6 +139,9 @@ class HotProspectorIntegration:
         self.api_key = api_key
         self.base_url = HOTPROSPECTOR_CONFIG["base_url"]
         self._semaphore = asyncio.Semaphore(HOTPROSPECTOR_CONFIG["max_concurrent_requests"])
+        # Cumulative 429-backoff seconds spent by THIS instance (one group's sync),
+        # capped at _HP_MAX_TOTAL_BACKOFF so a burst of rate limits can't run for minutes.
+        self._backoff_used = 0.0
 
     # ── v2 Bearer-token management ───────────────────────────────────────────
     async def _token_lock(self) -> asyncio.Lock:
@@ -185,12 +252,13 @@ class HotProspectorIntegration:
 
         status = response.status_code
         if status != 200:
-            # Surface 401 so the caller can refresh the token and retry once.
+            # Surface 401 so the caller can refresh the token and retry; surface the
+            # retry delay on 429 so the caller can back off the right amount.
+            err = {"error": f"API request failed with status {status}", "status_code": status}
+            if status == 429:
+                err["retry_after"] = _retry_after_seconds(response)
             logger.error(f"Hot Prospector API error: {status} {response.text[:300]}")
-            return False, {
-                "error": f"API request failed with status {status}",
-                "status_code": status,
-            }, status
+            return False, err, status
 
         try:
             data = response.json()
@@ -211,35 +279,62 @@ class HotProspectorIntegration:
         return True, data, status
 
     async def _execute(self, payload: dict):
-        """Run one logical request, handling v2 Bearer auth (with 401 retry) or v1."""
+        """One request: proactive throttle, then v2 Bearer auth (401 refresh) + 429 backoff."""
+        # Proactively space out same-Method calls to stay under the per-endpoint limit.
+        await _throttle_method(payload.get("Method", ""))
+        is_v1 = HOTPROSPECTOR_CONFIG.get("api_version") == "v1"
+
         async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
-            if HOTPROSPECTOR_CONFIG.get("api_version") == "v1":
+            if is_v1:
                 # Legacy: credentials travel in the body, no Authorization header.
-                ok, data, _ = await self._post_and_parse(
-                    client, HOTPROSPECTOR_CONFIG["legacy_base_url"], payload,
-                    {"Content-Type": "application/json"},
-                )
-                return ok, data
-
-            # v2: credentials live in the Bearer header, not the body.
-            body = {k: v for k, v in payload.items() if k not in ("api_uId", "api_key")}
-            token = await self._get_access_token()
-            if not token:
-                return False, {"error": "HotProspector authentication failed", "status_code": 401}
-
-            url = HOTPROSPECTOR_CONFIG["base_url"]
-            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
-            ok, data, status = await self._post_and_parse(client, url, body, headers)
-
-            if status == 401:
-                # Token expired/invalid mid-flight — force a new one and retry once.
-                token = await self._get_access_token(force=True)
+                url = HOTPROSPECTOR_CONFIG["legacy_base_url"]
+                body = payload
+                headers = {"Content-Type": "application/json"}
+            else:
+                # v2: credentials live in the Bearer header, not the body.
+                url = HOTPROSPECTOR_CONFIG["base_url"]
+                body = {k: v for k, v in payload.items() if k not in ("api_uId", "api_key")}
+                token = await self._get_access_token()
                 if not token:
                     return False, {"error": "HotProspector authentication failed", "status_code": 401}
-                headers["Authorization"] = f"Bearer {token}"
+                headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+
+            did_refresh = False
+            rate_retries = 0
+            while True:
                 ok, data, status = await self._post_and_parse(client, url, body, headers)
 
-            return ok, data
+                # Token expired/invalid mid-flight — force a new one and retry once.
+                if status == 401 and not is_v1 and not did_refresh:
+                    did_refresh = True
+                    token = await self._get_access_token(force=True)
+                    if not token:
+                        return False, {"error": "HotProspector authentication failed", "status_code": 401}
+                    headers["Authorization"] = f"Bearer {token}"
+                    continue
+
+                # Rate limited — back off the server-specified delay and retry, bounded
+                # both per-call (retries) and per-instance (cumulative backoff budget).
+                if status == 429 and rate_retries < _HP_MAX_429_RETRIES:
+                    delay = data.get("retry_after") if isinstance(data, dict) else None
+                    delay = min(float(delay) if delay else 60.0, _HP_MAX_429_WAIT)
+                    if self._backoff_used + delay > _HP_MAX_TOTAL_BACKOFF:
+                        logger.warning(
+                            f"HP 429 on '{payload.get('Method')}' but backoff budget "
+                            f"exhausted ({self._backoff_used:.0f}s used) — giving up to "
+                            f"protect the function timeout"
+                        )
+                        return ok, data
+                    rate_retries += 1
+                    self._backoff_used += delay
+                    logger.warning(
+                        f"HP rate limited on '{payload.get('Method')}'; backing off "
+                        f"{delay:.0f}s (retry {rate_retries}/{_HP_MAX_429_RETRIES})"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+
+                return ok, data
 
     async def _make_request(self, payload: dict, use_dedup: bool = True):
         """Make a request to the HotProspector API (v2 Bearer auth) with deduplication."""
@@ -274,15 +369,20 @@ class HotProspectorIntegration:
             self,
             ghl_location_id: str,
             search_field: str = "",
-            search_text: str = ""
+            search_text: str = "",
+            limit: int = 100,
+            offset: int = 0,
     ):
         """
-        Search leads using GHL locationId.
+        Search leads scoped to a GHL locationId.
 
-        Args:
-            ghl_location_id: The GHL locationId (e.g., "QAxWdczFbNx9t9Dg3Lz5")
-            search_field: Field to search (e.g., "email") - leave empty for all leads
-            search_text: Text to search for - leave empty for all leads
+        SearchByUserInput paginates: it serves one page (default 50, capped at
+        max_limit=100) and reports the TRUE total under `total_count`. Callers must
+        read total_count — NOT len(Results) — for an accurate lead count, otherwise
+        every location with >page_size leads looks like exactly one page.
+
+        Returns (True, {"leads": [...], "total_count": int, "total_pages": int}) on
+        success, else (False, {"error": ...}).
         """
         payload = {
             "api_uId": self.api_uid,
@@ -290,6 +390,8 @@ class HotProspectorIntegration:
             "locationId": ghl_location_id,
             "searchField": search_field,
             "searchText": search_text,
+            "limit": limit,
+            "offset": offset,
             "Method": "SearchByUserInput"
         }
 
@@ -297,34 +399,50 @@ class HotProspectorIntegration:
         if not success:
             return False, result
 
-        # Extract leads from response
-        if isinstance(result, list) and len(result) > 0:
-            if result[0].get("response") == "true":
-                leads = result[0].get("Results", [])
-                logger.info(f"Fetched {len(leads)} leads from GHL location {ghl_location_id}")
-                return True, leads
+        body = result[0] if isinstance(result, list) and result else result
+        if isinstance(body, dict) and body.get("response") == "true":
+            leads = body.get("Results", []) or []
+            total = int(body.get("total_count") or len(leads))
+            logger.info(
+                f"Fetched {len(leads)} of {total} leads from GHL location "
+                f"{ghl_location_id} (offset={offset})"
+            )
+            return True, {
+                "leads": leads,
+                "total_count": total,
+                "total_pages": int(body.get("total_pages") or 1),
+            }
 
         return False, {"error": "Unexpected response format or no results"}
 
-    async def fetch_all_leads_from_ghl_location(self, ghl_location_id: str):
+    async def fetch_all_leads_from_ghl_location(self, ghl_location_id: str, with_meta: bool = False):
         """
-        OPTIMIZED: Fetch all leads from a GHL location with single API call.
-        Uses empty search to retrieve all leads at once.
+        Fetch one page (up to max_limit=100) of leads for a GHL location, plus the
+        TRUE lead total reported by HotProspector.
 
-        This replaces the old character-by-character batching approach.
+        We deliberately do NOT page through every lead: the count comes from
+        `total_count`, per-lead call attribution comes from each call's own leadId
+        (so it isn't bounded by this page), and SearchByUserInput is tightly
+        rate-limited — paging hundreds of leads for every client would exhaust it.
+
+        Returns:
+            with_meta=False (default): (True, [lead, ...])  — backward compatible
+            with_meta=True:            (True, {"leads": [...], "total_count": int})
         """
-        logger.info(f"Fetching all leads for GHL location {ghl_location_id}")
+        logger.info(f"Fetching leads for GHL location {ghl_location_id}")
 
-        # Fetch all leads with empty search parameters
-        success, leads = await self.search_leads_by_ghl_location(
+        success, data = await self.search_leads_by_ghl_location(
             ghl_location_id=ghl_location_id,
             search_field="",  # Empty = all fields
-            search_text=""  # Empty = all leads
+            search_text=""    # Empty = all leads
         )
 
         if not success:
-            logger.error(f"Failed to fetch leads for location {ghl_location_id}: {leads}")
-            return False, leads
+            logger.error(f"Failed to fetch leads for location {ghl_location_id}: {data}")
+            return False, data
+
+        leads = data.get("leads", []) if isinstance(data, dict) else []
+        total_count = int(data.get("total_count", len(leads))) if isinstance(data, dict) else len(leads)
 
         # Deduplicate by LeadId (just in case)
         unique_leads = {}
@@ -335,18 +453,24 @@ class HotProspectorIntegration:
 
         deduplicated_leads = list(unique_leads.values())
 
-        logger.info(f"✅ Fetched {len(deduplicated_leads)} unique leads from GHL location {ghl_location_id}")
+        logger.info(
+            f"✅ Fetched {len(deduplicated_leads)} leads "
+            f"(HotProspector reports {total_count} total) for GHL location {ghl_location_id}"
+        )
+        if with_meta:
+            return True, {"leads": deduplicated_leads, "total_count": total_count}
         return True, deduplicated_leads
 
     async def _fetch_leads_for_char(self, ghl_location_id: str, char: str) -> Tuple[bool, List]:
         """Helper method to fetch leads for a single character"""
         try:
-            success, leads = await self.search_leads_by_ghl_location(
+            success, data = await self.search_leads_by_ghl_location(
                 ghl_location_id=ghl_location_id,
                 search_field="email",
                 search_text=char
             )
-            return success, leads if success else []
+            leads = data.get("leads", []) if success and isinstance(data, dict) else []
+            return success, leads
         except Exception as e:
             logger.error(f"Error fetching leads for char '{char}': {e}")
             return False, []

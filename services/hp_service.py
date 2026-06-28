@@ -82,8 +82,11 @@ def _compute_call_stats_all_presets(calls, total_leads):
             if dur > 0:
                 answered += 1
                 talk_seconds += dur
-            lid = c.get("matched_lead_id")
-            if lid is not None:
+            # Count distinct contacted leads from each call's own HotProspector
+            # leadId (phone-matched id as a fallback) so it isn't capped by the
+            # paginated lead page.
+            lid = c.get("lead_id") or c.get("matched_lead_id")
+            if lid is not None and str(lid).strip():
                 leads_with.add(str(lid))
         cache[preset] = {
             "total_calls": total,
@@ -296,11 +299,18 @@ async def fetch_and_cache_hp_call_center(
         mapping = await get_client_group_mapping(user_id, mongo_client)
         client_group_name = mapping.get(ghl_location_id)
 
-    # 1. Leads for this location (single SearchByUserInput call).
-    success, hp_leads = await integration.fetch_all_leads_from_ghl_location(ghl_location_id)
+    # 1. Leads for this location (single SearchByUserInput call). HotProspector
+    #    paginates leads (max 100/page) but reports the true total under total_count,
+    #    so the lead COUNT comes from there rather than len(the single page).
+    success, leads_info = await integration.fetch_all_leads_from_ghl_location(
+        ghl_location_id, with_meta=True
+    )
     if not success:
-        logger.warning(f"HP leads fetch failed for {ghl_location_id}: {hp_leads}")
-        return _fail(hp_leads.get("error") if isinstance(hp_leads, dict) else "fetch_failed")
+        logger.warning(f"HP leads fetch failed for {ghl_location_id}: {leads_info}")
+        return _fail(leads_info.get("error") if isinstance(leads_info, dict) else "fetch_failed")
+
+    hp_leads = leads_info["leads"]
+    total_lead_count = leads_info["total_count"]
 
     normalized_leads = [
         integration.normalize_lead(lead, ghl_location_id, location_name, client_group_name)
@@ -371,7 +381,7 @@ async def fetch_and_cache_hp_call_center(
     # 4. Derive per-preset call stats (windowed by call_time) from ALL calls so the
     #    Sales-Hub Overview shows date-filtered KPIs per client — mirrors GHL's
     #    cache_ghl_opp_stats_all_presets (fetch once, bucket every preset).
-    call_cache = _compute_call_stats_all_presets(normalized_calls, len(normalized_leads))
+    call_cache = _compute_call_stats_all_presets(normalized_calls, total_lead_count)
 
     # 5. Persist leads (with nested call logs) to the cache collection.
     await save_hotprospector_leads_to_collection(
@@ -383,7 +393,7 @@ async def fetch_and_cache_hp_call_center(
     set_fields = {
         "hotprospector_cache.ghl_location_id": ghl_location_id,
         "hotprospector_cache.name": location_name,
-        "hotprospector_cache.metrics.total_leads": len(normalized_leads),
+        "hotprospector_cache.metrics.total_leads": total_lead_count,
         "hotprospector_cache.metrics.total_calls": total_calls,
         "hotprospector_cache.metrics.inbound_count": inbound,
         "hotprospector_cache.metrics.outbound_count": outbound,
@@ -402,11 +412,12 @@ async def fetch_and_cache_hp_call_center(
 
     logger.info(
         f"HP call-center cached for {ghl_location_id}: "
-        f"{len(normalized_leads)} leads, {total_calls} calls (in={inbound}, out={outbound})"
+        f"{total_lead_count} leads ({len(normalized_leads)} on page), "
+        f"{total_calls} calls (in={inbound}, out={outbound})"
     )
     return {
         "ghl_location_id": ghl_location_id,
-        "total_leads": len(normalized_leads),
+        "total_leads": total_lead_count,
         "total_calls": total_calls,
         "inbound": inbound,
         "outbound": outbound,

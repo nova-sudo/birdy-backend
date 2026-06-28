@@ -27,6 +27,16 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from dotenv import load_dotenv
 load_dotenv()
 
+# This is a long-running one-shot job (not the timeout-bounded cron), so opt into
+# GENTLE proactive spacing — wide enough to stay under HotProspector's SearchByUserInput
+# limit so we rarely hit a 429 — plus a PATIENT, generous backoff budget for the rare
+# one. setdefault so an explicit .env value still wins. Must be set BEFORE importing the
+# integration, which reads these at import time.
+os.environ.setdefault("HP_SEARCH_MIN_INTERVAL", "13")   # ~4-5 searches/min, under the limit
+os.environ.setdefault("HP_MAX_429_WAIT", "65")          # honor the full "try again in 60s"
+os.environ.setdefault("HP_MAX_429_RETRIES", "3")
+os.environ.setdefault("HP_MAX_TOTAL_BACKOFF", "600")    # allow long cumulative waits
+
 from motor.motor_asyncio import AsyncIOMotorClient
 from core.database import DB_NAME
 from services.hp_service import fetch_and_cache_hp_call_center
