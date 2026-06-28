@@ -1,5 +1,6 @@
 import httpx
 import json
+import time
 from datetime import datetime, date, timedelta
 import logging
 import os
@@ -17,10 +18,22 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # Hot Prospector API configuration
+#
+# HooksCall "Custom API v2" (CustomApiV2): operations now run against
+# service.hookscall.com and authenticate with a Bearer access token exchanged
+# from api_uId/api_key (6h access token + long-lived refresh token) instead of
+# carrying the credentials in every request body. The operation contract itself
+# is unchanged — same Method-in-body routing and {"response":"true","Results":[...]}
+# envelope — so only the transport here changes; every method/normalizer is intact.
+#
+# Everything is env-overridable, and HOTPROSPECTOR_API_VERSION=v1 reverts to the
+# legacy app.hotprospector.com path (creds in body, no token) without a deploy.
 HOTPROSPECTOR_CONFIG = {
-    # Documented production host is app.hotprospector.com; overridable via env so
-    # the host can be flipped without a code change if the API moves.
-    "base_url": os.getenv("HOTPROSPECTOR_BASE_URL", "https://app.hotprospector.com/glu/custom_api"),
+    "api_version": os.getenv("HOTPROSPECTOR_API_VERSION", "v2"),
+    "base_url": os.getenv("HOTPROSPECTOR_BASE_URL", "https://service.hookscall.com/glu/api/v2/request"),
+    "auth_token_url": os.getenv("HOTPROSPECTOR_AUTH_URL", "https://service.hookscall.com/glu/api/v2/auth/token"),
+    "auth_refresh_url": os.getenv("HOTPROSPECTOR_REFRESH_URL", "https://service.hookscall.com/glu/api/v2/auth/refresh"),
+    "legacy_base_url": os.getenv("HOTPROSPECTOR_LEGACY_URL", "https://app.hotprospector.com/glu/custom_api"),
     "max_concurrent_requests": 10,
     "batch_size": 500,
     "request_timeout": 60.0,
@@ -30,6 +43,13 @@ HOTPROSPECTOR_CONFIG = {
 # In-memory cache for pending requests
 _pending_requests: Dict[str, asyncio.Future] = {}
 _cache_lock = asyncio.Lock()
+
+# Bearer-token cache (v2), keyed by api_uId. A serverless cold start re-auths at
+# most once per account; within a warm invocation the 6h token is reused across
+# every call. Per-uid locks collapse a burst of concurrent calls into one exchange.
+_token_cache: Dict[str, dict] = {}          # api_uid -> {access_token, refresh_token, expires_at}
+_token_locks: Dict[str, asyncio.Lock] = {}
+_token_locks_guard = asyncio.Lock()
 
 
 def _parse_hp_call_time(raw):
@@ -56,82 +76,199 @@ class HotProspectorIntegration:
         self.base_url = HOTPROSPECTOR_CONFIG["base_url"]
         self._semaphore = asyncio.Semaphore(HOTPROSPECTOR_CONFIG["max_concurrent_requests"])
 
+    # ── v2 Bearer-token management ───────────────────────────────────────────
+    async def _token_lock(self) -> asyncio.Lock:
+        """Per-api_uId lock so concurrent calls don't each hit /auth/token."""
+        async with _token_locks_guard:
+            lock = _token_locks.get(self.api_uid)
+            if lock is None:
+                lock = asyncio.Lock()
+                _token_locks[self.api_uid] = lock
+            return lock
+
+    def _store_token_response(self, response) -> Optional[str]:
+        """Parse an /auth/token or /auth/refresh response and cache the token."""
+        if response.status_code != 200:
+            logger.warning(f"HP auth failed: {response.status_code} {response.text[:200]}")
+            return None
+        try:
+            body = response.json()
+        except Exception:
+            logger.warning("HP auth returned non-JSON body")
+            return None
+        if not isinstance(body, dict):
+            logger.warning(f"HP auth unexpected response: {str(body)[:200]}")
+            return None
+        # Tolerate either {"success":..,"data":{access_token..}} or a flat body,
+        # and don't hinge on the exact success-flag type (bool True / "true").
+        data = body.get("data") if isinstance(body.get("data"), dict) else body
+        access = data.get("access_token")
+        if not access:
+            logger.warning(f"HP auth: no access_token in response: {str(body)[:200]}")
+            return None
+        expires_in = int(data.get("expires_in") or 21600)
+        prev = _token_cache.get(self.api_uid) or {}
+        _token_cache[self.api_uid] = {
+            "access_token": access,
+            # Keep the previous refresh token if the refresh response omits a new one.
+            "refresh_token": data.get("refresh_token") or prev.get("refresh_token"),
+            # 60s safety buffer so we never use a token that's about to expire.
+            "expires_at": time.time() + max(expires_in - 60, 60),
+        }
+        return access
+
+    async def _exchange_credentials(self, client: httpx.AsyncClient) -> Optional[str]:
+        """Exchange api_uId/api_key for a fresh access + refresh token."""
+        try:
+            resp = await client.post(
+                HOTPROSPECTOR_CONFIG["auth_token_url"],
+                json={"api_uId": self.api_uid, "api_key": self.api_key},
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as e:
+            logger.error(f"HP auth token network error: {e}")
+            return None
+        return self._store_token_response(resp)
+
+    async def _refresh_access_token(self, client: httpx.AsyncClient, refresh_token: str) -> Optional[str]:
+        """Use a refresh token to obtain a new access token."""
+        try:
+            resp = await client.post(
+                HOTPROSPECTOR_CONFIG["auth_refresh_url"],
+                json={"refresh_token": refresh_token},
+                headers={"Content-Type": "application/json"},
+            )
+        except httpx.RequestError as e:
+            logger.error(f"HP auth refresh network error: {e}")
+            return None
+        return self._store_token_response(resp)
+
+    async def _get_access_token(self, force: bool = False) -> Optional[str]:
+        """
+        Return a valid v2 access token. Serves the cached token until it nears
+        expiry; otherwise refreshes (preferred) or re-exchanges credentials.
+        `force=True` always fetches a new token (used after a 401).
+        """
+        cached = _token_cache.get(self.api_uid)
+        if (not force and cached and cached.get("access_token")
+                and cached.get("expires_at", 0) > time.time()):
+            return cached["access_token"]
+
+        lock = await self._token_lock()
+        async with lock:
+            # Re-check inside the lock — another coroutine may have just refreshed.
+            cached = _token_cache.get(self.api_uid)
+            if (not force and cached and cached.get("access_token")
+                    and cached.get("expires_at", 0) > time.time()):
+                return cached["access_token"]
+
+            async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
+                refresh_token = (cached or {}).get("refresh_token")
+                token = None
+                if refresh_token:
+                    token = await self._refresh_access_token(client, refresh_token)
+                if not token:
+                    token = await self._exchange_credentials(client)
+                return token
+
+    # ── Transport ────────────────────────────────────────────────────────────
+    async def _post_and_parse(self, client, url, body, headers):
+        """
+        POST and parse the HotProspector envelope.
+        Returns (success: bool, data_or_error: Any, status_code: Optional[int]).
+        """
+        try:
+            response = await client.post(url, json=body, headers=headers)
+        except httpx.RequestError as e:
+            logger.error(f"Network error during Hot Prospector request: {str(e)}")
+            return False, {"error": f"Network error: {str(e)}"}, None
+
+        status = response.status_code
+        if status != 200:
+            # Surface 401 so the caller can refresh the token and retry once.
+            logger.error(f"Hot Prospector API error: {status} {response.text[:300]}")
+            return False, {
+                "error": f"API request failed with status {status}",
+                "status_code": status,
+            }, status
+
+        try:
+            data = response.json()
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {str(e)}")
+            return False, {"error": f"Invalid JSON response: {str(e)}"}, status
+
+        # API-level error envelope: operations use {"response":"false","message":...};
+        # auth-style payloads use {"success": false, "message": ...}.
+        if isinstance(data, list) and len(data) > 0:
+            first = data[0]
+            if isinstance(first, dict) and first.get("response") == "false":
+                return False, {"error": first.get("message", "Unknown API error"), "status_code": 400}, status
+        elif isinstance(data, dict):
+            if data.get("response") == "false" or data.get("success") is False:
+                return False, {"error": data.get("message", "Unknown API error"), "status_code": 400}, status
+
+        return True, data, status
+
+    async def _execute(self, payload: dict):
+        """Run one logical request, handling v2 Bearer auth (with 401 retry) or v1."""
+        async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
+            if HOTPROSPECTOR_CONFIG.get("api_version") == "v1":
+                # Legacy: credentials travel in the body, no Authorization header.
+                ok, data, _ = await self._post_and_parse(
+                    client, HOTPROSPECTOR_CONFIG["legacy_base_url"], payload,
+                    {"Content-Type": "application/json"},
+                )
+                return ok, data
+
+            # v2: credentials live in the Bearer header, not the body.
+            body = {k: v for k, v in payload.items() if k not in ("api_uId", "api_key")}
+            token = await self._get_access_token()
+            if not token:
+                return False, {"error": "HotProspector authentication failed", "status_code": 401}
+
+            url = HOTPROSPECTOR_CONFIG["base_url"]
+            headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+            ok, data, status = await self._post_and_parse(client, url, body, headers)
+
+            if status == 401:
+                # Token expired/invalid mid-flight — force a new one and retry once.
+                token = await self._get_access_token(force=True)
+                if not token:
+                    return False, {"error": "HotProspector authentication failed", "status_code": 401}
+                headers["Authorization"] = f"Bearer {token}"
+                ok, data, status = await self._post_and_parse(client, url, body, headers)
+
+            return ok, data
+
     async def _make_request(self, payload: dict, use_dedup: bool = True):
-        """Make a request to Hot Prospector API with deduplication"""
+        """Make a request to the HotProspector API (v2 Bearer auth) with deduplication."""
         cache_key = json.dumps(payload, sort_keys=True)
 
+        future = None
         if use_dedup:
             async with _cache_lock:
                 if cache_key in _pending_requests:
                     logger.info(f"Returning cached pending request for {payload.get('Method')}")
                     return await _pending_requests[cache_key]
-
                 future = asyncio.Future()
                 _pending_requests[cache_key] = future
 
+        result = (False, {"error": "request aborted"})
         try:
             async with self._semaphore:
-                async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
-                    try:
-                        response = await client.post(
-                            self.base_url,
-                            json=payload,
-                            headers={"Content-Type": "application/json"}
-                        )
-
-                        if response.status_code != 200:
-                            logger.error(f"Hot Prospector API error: {response.status_code} {response.text}")
-                            result = (False, {
-                                "error": f"API request failed with status {response.status_code}",
-                                "status_code": response.status_code
-                            })
-                            if use_dedup:
-                                future.set_result(result)
-                            return result
-
-                        data = response.json()
-
-                        # Check for API-level errors
-                        if isinstance(data, list) and len(data) > 0:
-                            if data[0].get("response") == "false":
-                                result = (False, {
-                                    "error": data[0].get("message", "Unknown API error"),
-                                    "status_code": 400
-                                })
-                                if use_dedup:
-                                    future.set_result(result)
-                                return result
-                        elif isinstance(data, dict):
-                            if data.get("response") == "false":
-                                result = (False, {
-                                    "error": data.get("message", "Unknown API error"),
-                                    "status_code": 400
-                                })
-                                if use_dedup:
-                                    future.set_result(result)
-                                return result
-
-                        result = (True, data)
-                        if use_dedup:
-                            future.set_result(result)
-                        return result
-
-                    except httpx.RequestError as e:
-                        logger.error(f"Network error during Hot Prospector request: {str(e)}")
-                        result = (False, {"error": f"Network error: {str(e)}"})
-                        if use_dedup:
-                            future.set_exception(e)
-                        return result
-                    except json.JSONDecodeError as e:
-                        logger.error(f"JSON decode error: {str(e)}")
-                        result = (False, {"error": f"Invalid JSON response: {str(e)}"})
-                        if use_dedup:
-                            future.set_exception(e)
-                        return result
+                result = await self._execute(payload)
+        except Exception as e:
+            logger.error(f"Hot Prospector request failed: {str(e)}")
+            result = (False, {"error": str(e)})
         finally:
             if use_dedup:
+                if future is not None and not future.done():
+                    future.set_result(result)
                 async with _cache_lock:
                     _pending_requests.pop(cache_key, None)
+
+        return result
 
     async def search_leads_by_ghl_location(
             self,
