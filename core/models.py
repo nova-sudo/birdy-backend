@@ -115,6 +115,8 @@ class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
     page: Optional[str] = None
+    client_group_id: Optional[str] = None
+    client_name: Optional[str] = None
 
 
 class ChatResponse(BaseModel):

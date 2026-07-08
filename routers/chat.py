@@ -69,6 +69,8 @@ async def chat(
                 session_id=request.session_id,
                 page=request.page,
                 mongo_client=mongo_client,
+                client_group_id=request.client_group_id,
+                client_name=request.client_name,
             )
             return ChatResponse(**result)
         except ValueError as e:

@@ -65,6 +65,20 @@ _PAGE_TOOLS = {
     "call_center": [
         "get_client_groups",
     ],
+    "client_detail": [
+        "get_client_groups",
+        "get_campaign_insights",
+        "get_adset_insights",
+        "get_ad_insights",
+        "get_ghl_opp_stats_windowed",
+        "get_ghl_opp_stats_monthly",
+        "get_ghl_tag_breakdown",
+        "get_unified_leads",
+        "get_unified_lead_stats",
+        "compare_periods",
+        "get_alerts",
+        "get_meta_insights_live",
+    ],
 }
 
 # ── Alerts page system prompt ─────────────────────────────────────────────────
@@ -265,6 +279,30 @@ _PAGE_SYSTEM_PROMPTS = {
 }
 
 
+def _build_client_detail_prompt(client_name: str, client_group_id: str) -> str:
+    return f"""You are Birdy AI, a marketing analyst assistant scoped exclusively to the client "{client_name}" (group ID: {client_group_id}).
+
+## Strict scope
+You ONLY answer questions about {client_name}. You have no knowledge of and must not discuss any other client.
+If the user asks about a different client, another account, or anything outside {client_name}'s data, reply:
+"I'm scoped to {client_name} on this page. Please go to that client's page or use the main Birdy chat to ask about other clients."
+
+## What you can do for {client_name}
+- Campaign performance: call get_campaign_insights, get_adset_insights, get_ad_insights — always pass group_ids=["{client_group_id}"]
+- GHL opportunities & pipeline: call get_ghl_opp_stats_windowed, get_ghl_opp_stats_monthly, get_ghl_tag_breakdown — always pass group_ids=["{client_group_id}"]
+- Leads: call get_unified_leads, get_unified_lead_stats — always pass group_ids=["{client_group_id}"]
+- Period comparison: call compare_periods — always pass group_ids=["{client_group_id}"]
+- Active alerts: call get_alerts and filter by this client
+- Live Meta data: call get_meta_insights_live — always pass group_ids=["{client_group_id}"]
+
+## Rules
+- ALWAYS pass group_ids=["{client_group_id}"] to every tool call. Never omit it. Never use a different group ID.
+- Be concise and data-focused. Lead with the key number or insight, then context.
+- If data is unavailable for a requested period, say so clearly.
+- Never invent numbers. Only report what the tools return.
+"""
+
+
 async def run_chat(
     provider: BaseLLMProvider,
     tool_registry: ToolRegistry,
@@ -274,6 +312,8 @@ async def run_chat(
     session_id: Optional[str] = None,
     page: Optional[str] = None,
     mongo_client=None,
+    client_group_id: Optional[str] = None,
+    client_name: Optional[str] = None,
 ) -> dict:
     # Restore or create session
     session_id, history = session_store.get_or_create(session_id, user_id)
@@ -283,7 +323,12 @@ async def run_chat(
 
     # Inject system prompt once per session
     if not history:
-        system_content = _PAGE_SYSTEM_PROMPTS.get(page, get_system_prompt()) if page else get_system_prompt()
+        if page == "client_detail" and client_group_id and client_name:
+            system_content = _build_client_detail_prompt(client_name, client_group_id)
+        elif page:
+            system_content = _PAGE_SYSTEM_PROMPTS.get(page, get_system_prompt())
+        else:
+            system_content = get_system_prompt()
         history.append({"role": "system", "content": system_content})
 
     history.append({"role": "user", "content": message})
