@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Any, Callable, Coroutine
+from typing import Any, Callable, Coroutine, Optional
 
 from ai.config import MAX_RESULT_CHARS
 
@@ -30,8 +30,10 @@ class ToolRegistry:
             "executor": executor,
         }
 
-    def get_schemas(self) -> list[dict]:
-        return [t["schema"] for t in self._tools.values()]
+    def get_schemas(self, allowed: Optional[list] = None) -> list[dict]:
+        if allowed is None:
+            return [t["schema"] for t in self._tools.values()]
+        return [t["schema"] for name, t in self._tools.items() if name in allowed]
 
     def get_tool_names(self) -> list[str]:
         return list(self._tools.keys())
