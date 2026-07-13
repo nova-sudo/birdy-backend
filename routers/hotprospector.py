@@ -667,6 +667,63 @@ async def get_hotprospector_members(current_user: str = Depends(get_current_user
             raise HTTPException(status_code=500, detail=f"Failed to fetch members: {str(e)}")
 
 
+async def _get_windowed_leads_with_calls(leads_collection, query, start_date, end_date, skip, limit):
+    """
+    Aggregation counterpart to the find()-based path above: recompute each
+    lead's windowed call_logs (same date-window semantics as _in_window —
+    lexicographic yyyy-mm-dd comparison on the call_time_iso date portion),
+    drop leads with zero windowed calls, then paginate + count the *filtered*
+    set via $facet so meta.total matches what has_calls actually returns.
+    """
+    conds = [{"$ne": ["$$log.call_time_iso", None]}]
+    if start_date:
+        conds.append({"$gte": [{"$substrCP": ["$$log.call_time_iso", 0, 10]}, start_date]})
+    if end_date:
+        conds.append({"$lte": [{"$substrCP": ["$$log.call_time_iso", 0, 10]}, end_date]})
+
+    pipeline = [
+        {"$match": query},
+        {
+            "$addFields": {
+                "_windowed_logs": {
+                    "$filter": {
+                        "input": {"$ifNull": ["$lead_data.call_logs", []]},
+                        "as": "log",
+                        "cond": {"$and": conds},
+                    }
+                }
+            }
+        },
+        {"$addFields": {"_call_logs_count": {"$size": "$_windowed_logs"}}},
+        {"$match": {"_call_logs_count": {"$gt": 0}}},
+        {"$sort": {"created_at": -1}},
+        {
+            "$facet": {
+                "data": [
+                    {"$skip": skip},
+                    *([{"$limit": limit}] if limit and limit > 0 else []),
+                    {"$project": {"_id": 0, "lead_data": 1, "_windowed_logs": 1, "_call_logs_count": 1}},
+                ],
+                "total": [{"$count": "count"}],
+            }
+        },
+    ]
+
+    result = await leads_collection.aggregate(pipeline).to_list(1)
+    facet = result[0] if result else {"data": [], "total": []}
+    total = facet["total"][0]["count"] if facet["total"] else 0
+
+    leads = [
+        {
+            **(doc.get("lead_data") or {}),
+            "call_logs": doc["_windowed_logs"],
+            "call_logs_count": doc["_call_logs_count"],
+        }
+        for doc in facet["data"]
+    ]
+    return total, leads
+
+
 # ------------------------------------------------------------------
 # GET /api/hotprospector/call-center
 # ------------------------------------------------------------------
@@ -677,6 +734,7 @@ async def get_hp_call_center(
         end_date: str | None = None,
         skip: int = 0,
         limit: int = 100,
+        has_calls: bool = False,
         refresh: bool = False,
         current_user: str = Depends(get_current_user),
 ):
@@ -693,7 +751,9 @@ async def get_hp_call_center(
 
     start_date/end_date (yyyy-mm-dd, optional) window each lead's call_logs by
     call_time so counts match the selected date preset. Leads with no calls in the
-    window are still returned (count 0).
+    window are still returned (count 0) — unless has_calls=true, which drops them
+    (i.e. "hide no-dialer-activity leads"), filtered at the query level against the
+    *entire* matching set, not just the returned page.
 
     Response: { data: [<lead w/ windowed call_logs>],
                 meta: { total, returned, skip, limit, location_id, start_date, end_date } }
@@ -739,26 +799,43 @@ async def get_hp_call_center(
             if location_id:
                 query["ghl_location_id"] = location_id
 
-            total = await leads_collection.count_documents(query)
-            cursor = (
-                leads_collection.find(query, projection={"lead_data": 1, "_id": 0})
-                .sort("created_at", -1)
-                .skip(skip)
-            )
-            if limit and limit > 0:
-                cursor = cursor.limit(limit)
-
             windowed = bool(start_date or end_date)
-            leads = []
-            async for doc in cursor:
-                lead = doc.get("lead_data") or {}
-                if windowed:
-                    logs = [
-                        l for l in (lead.get("call_logs") or [])
-                        if _in_window(l.get("call_time_iso"), start_date, end_date)
-                    ]
-                    lead = {**lead, "call_logs": logs, "call_logs_count": len(logs)}
-                leads.append(lead)
+
+            if has_calls and windowed:
+                # Windowed counts only exist after per-request filtering of each
+                # lead's call_logs, so "has calls in this window" can't be a plain
+                # field filter — it needs an aggregation that recomputes the
+                # windowed count and drops zero-count leads before paginating,
+                # otherwise a page could come back empty while later pages still
+                # have matches.
+                total, leads = await _get_windowed_leads_with_calls(
+                    leads_collection, query, start_date, end_date, skip, limit,
+                )
+            else:
+                if has_calls:
+                    # No window: the stored count already reflects full call
+                    # history, so a plain field filter is enough.
+                    query["lead_data.call_logs_count"] = {"$gt": 0}
+
+                total = await leads_collection.count_documents(query)
+                cursor = (
+                    leads_collection.find(query, projection={"lead_data": 1, "_id": 0})
+                    .sort("created_at", -1)
+                    .skip(skip)
+                )
+                if limit and limit > 0:
+                    cursor = cursor.limit(limit)
+
+                leads = []
+                async for doc in cursor:
+                    lead = doc.get("lead_data") or {}
+                    if windowed:
+                        logs = [
+                            l for l in (lead.get("call_logs") or [])
+                            if _in_window(l.get("call_time_iso"), start_date, end_date)
+                        ]
+                        lead = {**lead, "call_logs": logs, "call_logs_count": len(logs)}
+                    leads.append(lead)
 
             return {
                 "data": leads,
@@ -770,6 +847,7 @@ async def get_hp_call_center(
                     "location_id": location_id,
                     "start_date": start_date,
                     "end_date": end_date,
+                    "has_calls": has_calls,
                 },
             }
 
