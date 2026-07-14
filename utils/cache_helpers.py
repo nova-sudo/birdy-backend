@@ -100,27 +100,56 @@ async def save_cached_data(
 
 async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
     """Create indexes for better query performance.
-    All fired concurrently with background=True so cold starts are fast."""
-    try:
-        db = mongo_client[os.getenv("MONGODB_DB", "birdy")]
+    All fired concurrently with background=True so cold starts are fast.
 
-        await asyncio.gather(
-            db["users"].create_index("user_id", unique=True, name="idx_users_uid", background=True),
-            db["users"].create_index([("user_id", 1), ("integrations.facebook.accounts", 1)], name="idx_users_fb", background=True),
-            db["client_groups"].create_index([("user_id", 1), ("id", 1)], name="idx_cg_uid", background=True),
-            db["webhooks"].create_index([("user_id", 1), ("event_type", 1), ("received_at", -1)], name="idx_wh_evt", background=True),
-            db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1)], name="idx_hp_loc", background=True),
-            db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1), ("agentId", 1)], unique=True, name="idx_hpmd_uniq", background=True),
-            db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1)], name="idx_hpmd_date", background=True),
-            db["alerts"].create_index([("user_id", 1), ("created_at", -1)], name="idx_al_created", background=True),
-            db["alerts"].create_index([("user_id", 1), ("id", 1)], name="idx_al_id", background=True),
-            db["alerts"].create_index([("user_id", 1), ("status", 1)], name="idx_al_status", background=True),
-            db["alert_notifications"].create_index([("user_id", 1), ("triggered_at", -1)], name="idx_notif_trig", background=True),
-            db["alert_notifications"].create_index([("user_id", 1), ("read", 1)], name="idx_notif_read", background=True),
-            db["ghl_contacts"].create_index([("user_id", 1), ("client_group_id", 1), ("contact_data.dateAdded", -1)], name="idx_ghl_date", background=True),
-        )
+    Each create_index call is awaited individually (return_exceptions=True)
+    rather than one bare asyncio.gather(): a single conflict — e.g. an index
+    with the same keys but a different (often auto-generated) name already
+    existing — must not abort/mask the rest of the batch, and every outcome
+    is logged so a real failure is visible instead of silent.
+    """
+    db = mongo_client[os.getenv("MONGODB_DB", "birdy")]
 
+    index_calls = [
+        # Names below match indexes that already exist in production under Mongo's
+        # auto-generated default name (created before an explicit name= was added
+        # here) — using that same name makes this call a true no-op instead of an
+        # IndexOptionsConflict (same keys, different requested name).
+        ("users.user_id_1", db["users"].create_index("user_id", unique=True, name="user_id_1", background=True)),
+        ("users.user_id_1_integrations.facebook.accounts_1", db["users"].create_index([("user_id", 1), ("integrations.facebook.accounts", 1)], name="user_id_1_integrations.facebook.accounts_1", background=True)),
+        ("client_groups.user_id_1_id_1", db["client_groups"].create_index([("user_id", 1), ("id", 1)], name="user_id_1_id_1", background=True)),
+        ("webhooks.user_id_1_event_type_1_received_at_-1", db["webhooks"].create_index([("user_id", 1), ("event_type", 1), ("received_at", -1)], name="user_id_1_event_type_1_received_at_-1", background=True)),
+        ("hotprospector_leads.user_id_1_ghl_location_id_1", db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1)], name="user_id_1_ghl_location_id_1", background=True)),
+        ("hotprospector_member_daily.idx_hpmd_uniq", db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1), ("agentId", 1)], unique=True, name="idx_hpmd_uniq", background=True)),
+        ("hotprospector_member_daily.idx_hpmd_date", db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1)], name="idx_hpmd_date", background=True)),
+        ("alerts.idx_al_created", db["alerts"].create_index([("user_id", 1), ("created_at", -1)], name="idx_al_created", background=True)),
+        ("alerts.idx_al_id", db["alerts"].create_index([("user_id", 1), ("id", 1)], name="idx_al_id", background=True)),
+        ("alerts.idx_al_status", db["alerts"].create_index([("user_id", 1), ("status", 1)], name="idx_al_status", background=True)),
+        ("alert_notifications.idx_notif_trig", db["alert_notifications"].create_index([("user_id", 1), ("triggered_at", -1)], name="idx_notif_trig", background=True)),
+        ("alert_notifications.idx_notif_read", db["alert_notifications"].create_index([("user_id", 1), ("read", 1)], name="idx_notif_read", background=True)),
+        ("ghl_contacts.idx_ghl_date", db["ghl_contacts"].create_index([("user_id", 1), ("client_group_id", 1), ("contact_data.dateAdded", -1)], name="idx_ghl_date", background=True)),
+        # meta_refresh_jobs previously had NO indexes beyond the default _id_, so
+        # every read in services/meta_refresh_manager.py (job_id lookups, the
+        # per-group "latest job" query, the stale-claim atomic $or, and the
+        # stuck-retry scan) was a full collection scan — the direct cause of the
+        # "Query Targeting: Scanned Objects / Returned > 1000" Atlas alert
+        # (measured live: ~18,000 docs scanned per 1-doc job_id lookup, on a
+        # cron that runs every minute). These cover every query shape in that file.
+        ("meta_refresh_jobs.idx_mrj_job_id", db["meta_refresh_jobs"].create_index("job_id", name="idx_mrj_job_id", background=True)),
+        ("meta_refresh_jobs.idx_mrj_group_created", db["meta_refresh_jobs"].create_index([("group_id", 1), ("created_at", -1)], name="idx_mrj_group_created", background=True)),
+        ("meta_refresh_jobs.idx_mrj_group_status", db["meta_refresh_jobs"].create_index([("group_id", 1), ("status", 1)], name="idx_mrj_group_status", background=True)),
+        ("meta_refresh_jobs.idx_mrj_status_retry", db["meta_refresh_jobs"].create_index([("status", 1), ("next_retry_at", 1), ("created_at", 1)], name="idx_mrj_status_retry", background=True)),
+    ]
+
+    results = await asyncio.gather(*(coro for _, coro in index_calls), return_exceptions=True)
+
+    failed = []
+    for (label, _), result in zip(index_calls, results):
+        if isinstance(result, Exception):
+            failed.append(label)
+            logger.warning(f"Index ensure failed for {label}: {result}")
+
+    if failed:
+        logger.warning(f"Performance indexes ensured with {len(failed)} failure(s): {failed}")
+    else:
         logger.info("Performance indexes ensured")
-
-    except Exception as e:
-        logger.error(f"Error creating indexes: {str(e)}")
