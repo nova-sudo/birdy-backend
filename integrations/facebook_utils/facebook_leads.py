@@ -1,5 +1,6 @@
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 import os
 import logging
 from datetime import datetime
@@ -104,12 +105,21 @@ async def fetch_and_cache_facebook_leads_FIXED(
         client_group_name = client_group.get("name") if client_group else "Unknown Group"
 
         logger.info(
-            f"🔄 Starting staged leads fetch for '{client_group_name}' "
-            f"(account: {meta_ad_account_id})"
+            f"🔄 Starting {'INITIAL' if is_initial_load else 'INCREMENTAL'} leads fetch "
+            f"for '{client_group_name}' (account: {meta_ad_account_id})"
         )
 
-        # Clear existing if initial load
+        total_spend_on_leads = 0.0
+
         if is_initial_load:
+            # ─── INITIAL SYNC PATH ─────────────────────────────────────
+            # Behavior byte-identical to before this refactor: wipe the
+            # ad-account's cached leads, walk every ad's full lead
+            # history, insert_many the results. Only runs on a client
+            # group that has never successfully synced (see the
+            # leads_initial_sync_done flag set at the end of this
+            # function).
+
             delete_result = await facebook_leads_collection.delete_many({
                 "user_id": user_id,
                 "ad_account_id": meta_ad_account_id,
@@ -117,64 +127,142 @@ async def fetch_and_cache_facebook_leads_FIXED(
             })
             logger.info(f"🗑️ Deleted {delete_result.deleted_count} existing leads")
 
-        # Fetch all leads using staged approach
-        total_leads, all_leads = await fetch_all_facebook_leads_staged(
-            meta_ad_account_id,
-            token["access_token"],
-            user_id,
-            group_id,
-            client_group_name,
-            max_concurrent_ads=5
-        )
+            total_leads, all_leads = await fetch_all_facebook_leads_staged(
+                meta_ad_account_id,
+                token["access_token"],
+                user_id,
+                group_id,
+                client_group_name,
+                max_concurrent_ads=5
+            )
 
-        # ============================================
-        # Save to database AND calculate metrics
-        # ============================================
-        total_saved = 0
-        total_spend_on_leads = 0.0
+            total_saved = 0
+            if all_leads:
+                lead_docs = []
+                for lead in all_leads:
+                    try:
+                        total_spend_on_leads += float(lead.get("spend", 0) or 0)
+                    except (ValueError, TypeError):
+                        pass
 
-        if all_leads:
-            lead_docs = []
-            for lead in all_leads:
-                # Track spend if available in lead data
-                try:
-                    lead_spend = float(lead.get("spend", 0) or 0)
-                    total_spend_on_leads += lead_spend
-                except (ValueError, TypeError):
-                    pass
+                    lead_docs.append({
+                        "user_id": user_id,
+                        "ad_account_id": meta_ad_account_id,
+                        "client_group_id": group_id,
+                        "client_group_name": client_group_name,
+                        "lead_id": lead.get("lead_id"),
+                        "lead_data": lead,
+                        "match_keys": compute_match_keys(lead.get("email"), lead.get("phone_number")),
+                        "created_at": datetime.now(),
+                        "updated_at": datetime.now()
+                    })
 
-                lead_docs.append({
-                    "user_id": user_id,
-                    "ad_account_id": meta_ad_account_id,
-                    "client_group_id": group_id,
-                    "client_group_name": client_group_name,
-                    "lead_id": lead.get("lead_id"),
-                    "lead_data": lead,
-                    "match_keys": compute_match_keys(lead.get("email"), lead.get("phone_number")),
-                    "created_at": datetime.now(),
-                    "updated_at": datetime.now()
-                })
+                batch_size = 500
+                for i in range(0, len(lead_docs), batch_size):
+                    batch = lead_docs[i:i + batch_size]
+                    try:
+                        result = await facebook_leads_collection.insert_many(
+                            batch,
+                            ordered=False
+                        )
+                        total_saved += len(result.inserted_ids)
+                        logger.info(f"💾 Saved batch {i // batch_size + 1}: {len(batch)} leads")
+                    except Exception as e:
+                        logger.error(f"Error saving batch: {str(e)}")
 
-            # Insert in batches
-            batch_size = 500
-            for i in range(0, len(lead_docs), batch_size):
-                batch = lead_docs[i:i + batch_size]
+        else:
+            # ─── INCREMENTAL SYNC PATH ─────────────────────────────────
+            # For every subsequent refresh. Uses the watermark cursor
+            # (newest stored lead's lead_id / created_time) to stop as
+            # soon as we see an already-known lead, so a healthy cron
+            # cadence only hits Meta for the delta since last run.
+            #
+            # Writes are idempotent upserts keyed on
+            # (user_id, ad_account_id, lead_id) so back-to-back runs
+            # produce zero duplicates even if the watermark bounces.
+            #
+            # NOTE: no delete_many — the whole point is to preserve
+            # everything we already have and only add newly-seen leads.
+            from integrations.facebook_utils.meta_incremental_refresh import (
+                fetch_todays_facebook_leads_incremental,
+            )
 
-                try:
-                    result = await facebook_leads_collection.insert_many(
-                        batch,
-                        ordered=False
-                    )
-                    total_saved += len(result.inserted_ids)
+            _new_count, new_leads = await fetch_todays_facebook_leads_incremental(
+                ad_account_id=meta_ad_account_id,
+                access_token=token["access_token"],
+                user_id=user_id,
+                client_group_id=group_id,
+                client_group_name=client_group_name,
+                mongo_client=mongo_client,
+                max_concurrent_ads=5,
+            )
 
-                    logger.info(
-                        f"💾 Saved batch {i // batch_size + 1}: {len(batch)} leads"
-                    )
-                except Exception as e:
-                    logger.error(f"Error saving batch: {str(e)}")
+            if new_leads:
+                now = datetime.now()
+                ops: list[UpdateOne] = []
+                for lead in new_leads:
+                    lead_id = lead.get("lead_id")
+                    if not lead_id:
+                        continue
+                    try:
+                        total_spend_on_leads += float(lead.get("spend", 0) or 0)
+                    except (ValueError, TypeError):
+                        pass
+                    ops.append(UpdateOne(
+                        {
+                            "user_id": user_id,
+                            "ad_account_id": meta_ad_account_id,
+                            "lead_id": lead_id,
+                        },
+                        {
+                            "$set": {
+                                "user_id": user_id,
+                                "ad_account_id": meta_ad_account_id,
+                                "client_group_id": group_id,
+                                "client_group_name": client_group_name,
+                                "lead_id": lead_id,
+                                "lead_data": lead,
+                                "match_keys": compute_match_keys(
+                                    lead.get("email"), lead.get("phone_number")
+                                ),
+                                "updated_at": now,
+                            },
+                            "$setOnInsert": {"created_at": now},
+                        },
+                        upsert=True,
+                    ))
+
+                if ops:
+                    batch_size = 500
+                    for i in range(0, len(ops), batch_size):
+                        chunk = ops[i:i + batch_size]
+                        try:
+                            await facebook_leads_collection.bulk_write(chunk, ordered=False)
+                            logger.info(
+                                f"💾 Upserted incremental batch {i // batch_size + 1}: {len(chunk)} leads"
+                            )
+                        except Exception as e:
+                            logger.error(f"Error upserting incremental batch: {str(e)}")
+
+            # For incremental runs, `total_saved` MUST come from the DB
+            # (not the number of newly-inserted rows) so
+            # facebook_cache.total_leads still equals the real persisted
+            # count. Query it once at the end and reuse.
+            total_saved = 0  # placeholder — recomputed via count_documents below
+
+        # ─── Accurate persisted count ─────────────────────────────────
+        # Recompute from Mongo so cache.total_leads stays correct on
+        # both paths — the initial-load `total_saved` counts insert_ids
+        # but the incremental path only adds a delta.
+        total_saved = await facebook_leads_collection.count_documents({
+            "user_id": user_id,
+            "ad_account_id": meta_ad_account_id,
+            "client_group_id": group_id,
+        })
 
         logger.info(
-            f"✅ COMPLETE: Saved {total_saved} leads for "
+            f"✅ COMPLETE ({'initial' if is_initial_load else 'incremental'}): "
+            f"{total_saved} total leads persisted for "
             f"'{client_group_name}' (account: {meta_ad_account_id})"
         )
 
@@ -221,6 +309,13 @@ async def fetch_and_cache_facebook_leads_FIXED(
                         "currency": user_currency,
                         "original_currency": ad_account_currency
                     },
+                    # Flag we've completed at least one lead sync for this
+                    # client group. execute_refresh reads this to decide
+                    # between the (expensive, whole-history) initial path
+                    # and the (cheap, since-watermark) incremental path
+                    # on subsequent runs. Idempotent — setting it every
+                    # time is harmless.
+                    "leads_initial_sync_done": True,
                     "last_meta_refresh": datetime.utcnow()
                 }
             }

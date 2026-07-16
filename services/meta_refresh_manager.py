@@ -337,6 +337,24 @@ async def execute_refresh(
             }},
         )
 
+        # Fresh sync only on the very first refresh for this client group
+        # (or after a manual full-resync reset). Every subsequent refresh
+        # runs incrementally against the newest-lead watermark — see
+        # integrations/facebook_utils/facebook_leads.py::fetch_and_cache_facebook_leads_FIXED
+        # for the two code paths and integrations/facebook_utils/
+        # meta_incremental_refresh.py for the watermark logic. Without this
+        # flag lookup, execute_refresh used to hard-code is_initial_load=True
+        # and re-fetched every ad's full lead history every 5 hours.
+        group_doc = await db["client_groups"].find_one(
+            {"id": group_id},
+            {"leads_initial_sync_done": 1},
+        )
+        is_initial_load = not (group_doc or {}).get("leads_initial_sync_done")
+        logger.info(
+            f"[{job_id}] Leads mode: "
+            f"{'INITIAL (full history)' if is_initial_load else 'INCREMENTAL (since watermark)'}"
+        )
+
         try:
             await fetch_and_cache_facebook_leads_FIXED(
                 ad_account_currency=currency,
@@ -344,7 +362,7 @@ async def execute_refresh(
                 meta_ad_account_id=ad_account_id,
                 user_id=user_id,
                 mongo_client=mongo_client,
-                is_initial_load=True,
+                is_initial_load=is_initial_load,
             )
 
             await jobs_col.update_one(
