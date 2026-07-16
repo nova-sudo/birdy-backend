@@ -388,10 +388,34 @@ async def fetch_todays_facebook_leads_incremental(
         max_concurrent_ads: int = 5
 ) -> Tuple[int, List[dict]]:
     """
-    INCREMENTAL: Fetch only TODAY's leads, stopping at the last known lead.
-    NOTE: No ad_account_currency param - that was the bug causing the TypeError.
+    INCREMENTAL: Fetch every Facebook lead created since our last-known
+    watermark, stopping when the cursor sees an already-stored lead_id or
+    a lead older than the watermark's created_time.
+
+    Historical note: this function was previously misnamed and misbehaved
+    when the refresh missed a day boundary. Two bugs fixed here:
+
+      1. Ad set was scoped to "today's active ads" via a
+         `date_preset: "today"` filter on /{ad_account}/ads. Ads paused
+         today with unread leads from yesterday were skipped entirely
+         → those leads never made it into the cache.
+
+      2. Lead fetch was scoped to `date_preset: "today"` too. If a refresh
+         was skipped past a day boundary (server outage, missed cron
+         cycle, etc.), yesterday's leads never appeared in the "today"
+         window, so the watermark cursor never fired and we silently
+         lost yesterday's leads.
+
+    Fix: use the FULL ad list (via stage1_get_all_ad_ids — the same helper
+    the initial-sync path uses) and let the watermark decide when to stop
+    on each ad. `date_preset: "maximum"` explicitly gives us all leads
+    with no time filter; Meta returns them newest-first, so the watermark
+    stops us within a few pages of a healthy cron cadence.
     """
     try:
+        # Late import so the two files stay decoupled at module load time.
+        from integrations.facebook_utils.facebook_leads import stage1_get_all_ad_ids
+
         db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["facebook_leads"]
 
@@ -412,15 +436,19 @@ async def fetch_todays_facebook_leads_incremental(
             last_known_created_time = last_known_lead.get("lead_data", {}).get("created_time")
             logger.info(f"Last known lead: {last_known_lead_id} from {last_known_created_time}")
         else:
-            logger.info("No previous leads, fetching all today's leads")
+            logger.info("No previous leads — this ad account has never had a lead fetched. "
+                        "Fetching everything (watermark will not trigger).")
 
-        ad_ids = await _get_todays_active_ad_ids(ad_account_id, access_token)
+        # Full ad list — the previous implementation used a "today's active
+        # ads" filter which silently dropped ads paused today with unread
+        # leads from yesterday. See docstring.
+        ad_ids = await stage1_get_all_ad_ids(ad_account_id, access_token)
 
         if not ad_ids:
-            logger.info("No active ads found for today")
+            logger.info("No ads found on this account — nothing to fetch")
             return 0, []
 
-        logger.info(f"Found {len(ad_ids)} active ads for today")
+        logger.info(f"Found {len(ad_ids)} ads (all lifetime), scanning for new leads since watermark")
 
         all_new_leads = []
         should_continue = True
@@ -512,10 +540,16 @@ async def _get_todays_leads_for_ad(
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
+            # `date_preset: "maximum"` = no time filter — Meta returns
+            # every lead ever collected for this ad, newest-first. The
+            # watermark inside _collect_new_leads is what stops the
+            # walk; using "today" here (as this code used to) silently
+            # dropped leads created before midnight on any refresh that
+            # skipped past a day boundary.
             data = await _api_get_with_retry(
                 client,
                 f"https://graph.facebook.com/v25.0/{ad_id}",
-                {"fields": "leads,name", "date_preset": "today", "access_token": access_token}
+                {"fields": "leads,name", "date_preset": "maximum", "access_token": access_token}
             )
             if not data:
                 return [], False
