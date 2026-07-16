@@ -123,3 +123,10 @@ class ChatResponse(BaseModel):
     reply: str
     tools_used: List[str] = []
     session_id: str = ""
+
+
+# ── External MCP Access Tokens ────────────────────────────────────────────────
+
+class CreateMcpTokenRequest(BaseModel):
+    name: str                          # e.g. "Claude Desktop on my laptop"
+    expiry_days: Optional[int] = 365

@@ -1,0 +1,7 @@
+-r requirements.txt
+
+# Test-only dependencies — not needed at runtime, kept out of requirements.txt
+# so the Vercel production build doesn't carry the extra weight.
+pytest==9.1.1
+pytest-asyncio==1.4.0
+mongomock-motor==0.0.36
