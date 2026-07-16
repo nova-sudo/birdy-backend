@@ -4,8 +4,11 @@ services/hp_service.py
 HotProspector helper / service functions extracted from main.py.
 """
 
+import hashlib
 import logging
 from datetime import datetime, date, timedelta
+
+from pymongo import UpdateOne
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, ghl_date_bounds
@@ -243,6 +246,120 @@ async def _load_stored_calls(user_id, ghl_location_id, mongo_client):
     return calls
 
 
+def _hp_call_source_event_id(call: dict, user_id: str) -> str:
+    """
+    Stable idempotency key for an HP call. Prefer HP's recordingId; when it
+    isn't present (short abandoned calls, transfer legs, older records),
+    fall back to a deterministic hash of the call's identifying fields so
+    re-runs still dedupe on the (source, source_event_id) unique index.
+    """
+    rid = call.get("recording_id")
+    if rid:
+        return f"hp_{rid}"
+    parts = [
+        str(user_id or ""),
+        str(call.get("from_number") or ""),
+        str(call.get("to_number") or ""),
+        str(call.get("call_time_iso") or call.get("call_time") or ""),
+        str(call.get("duration") or ""),
+        str(call.get("lead_id") or ""),
+    ]
+    digest = hashlib.sha1("|".join(parts).encode("utf-8")).hexdigest()[:16]
+    return f"hp_h_{digest}"
+
+
+def _parse_iso_maybe(value):
+    """Best-effort ISO-8601 string → datetime; returns None on any failure."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+async def _persist_hp_calls_to_call_logs(
+    calls,
+    *,
+    user_id: str,
+    location_id: str,
+    mongo_client,
+):
+    """
+    Bulk-upsert each normalized HP call into the `call_logs` collection so
+    /api/call_logs can serve HP calls the same way it serves GHL webhook
+    calls. Dedup key: (source, source_event_id) — matches the existing
+    unique index created by services/call_logs_service.create_call_logs_indexes.
+
+    Field mapping — HP normalized call → call_logs schema:
+        source          → "hotprospector"
+        source_event_id → HP recordingId (or fallback hash — see above)
+        contact_id      → matched_lead_id (NULL for unmatched calls; they
+                          land under the "Unmatched" pseudo-lead in the UI)
+        contact_phone   → from_number or to_number, whichever we've got
+        direction       → call_status ("inbound" / "outbound")
+        duration_seconds→ duration (already seconds per HP API convention)
+        started_at      → parsed call_time_iso
+        recording_url   → recording_url
+        raw_payload     → full normalized call (keeps transfer, group,
+                          city, state, speed_to_lead, etc. for debug)
+
+    We $set on every upsert so a re-fetched call refreshes mutable fields
+    (transfer often flips post-call). created_at / received_at stay stable
+    via $setOnInsert.
+    """
+    if not calls:
+        return
+
+    col = mongo_client[DB_NAME]["call_logs"]
+    now = datetime.utcnow()
+    ops = []
+
+    for c in calls:
+        event_id = _hp_call_source_event_id(c, user_id)
+        matched = c.get("matched_lead_id")
+
+        doc = {
+            "source": "hotprospector",
+            "source_event_id": event_id,
+            "user_id": user_id,
+            "location_id": location_id,
+            "contact_id": str(matched) if matched is not None else None,
+            "contact_phone": c.get("from_number") or c.get("to_number") or None,
+            "contact_email": None,
+            "direction": (c.get("call_status") or None),
+            "status": None,
+            "duration_seconds": int(c.get("duration") or 0),
+            "started_at": _parse_iso_maybe(c.get("call_time_iso") or c.get("call_time")),
+            "ended_at": None,
+            "recording_url": c.get("recording_url") or None,
+            "raw_payload": c,
+            "updated_at": now,
+        }
+
+        ops.append(UpdateOne(
+            {"source": "hotprospector", "source_event_id": event_id},
+            {
+                "$set": doc,
+                "$setOnInsert": {
+                    "created_at": now,
+                    "received_at": now,
+                    "headers": {},
+                },
+            },
+            upsert=True,
+        ))
+
+    # Batch to keep individual bulk_write payloads bounded on large locations.
+    BATCH = 1000
+    for i in range(0, len(ops), BATCH):
+        await col.bulk_write(ops[i:i + BATCH], ordered=False)
+
+
 async def fetch_and_cache_hp_call_center(
         user_id: str,
         ghl_location_id: str,
@@ -370,6 +487,51 @@ async def fetch_and_cache_hp_call_center(
 
     for lead in normalized_leads:
         lead["call_logs_count"] = len(lead["call_logs"])
+
+    # 3c. Persist EVERY call (matched or not) as its own document in the
+    #     shared call_logs collection. Sales-Hub doesn't consume this yet
+    #     (it reads /api/hotprospector/call-center), but /api/call_logs now
+    #     serves HP rows for future unification with the GHL webhook feed.
+    await _persist_hp_calls_to_call_logs(
+        normalized_calls,
+        user_id=user_id,
+        location_id=ghl_location_id,
+        mongo_client=mongo_client,
+    )
+
+    # 3d. Synthetic "Unmatched calls" pseudo-lead. Every call that didn't
+    #     hit a real lead by phone / email / leadId gets bucketed under one
+    #     synthetic lead here, so the Sales-Hub "Leads" tab shows them and
+    #     the visible call durations reconcile with Overview's Talk Time
+    #     card (which sums ALL calls, matched or not). Only added when
+    #     there are actually unmatched calls — an all-matched location
+    #     stays clean.
+    unmatched_calls = [c for c in normalized_calls if not c.get("matched_lead_id")]
+    if unmatched_calls:
+        unmatched_lead_id = f"__unmatched_{ghl_location_id}__"
+        unmatched_lead = {
+            "id": unmatched_lead_id,
+            # first_name is what Sales-Hub's mapLead reads for the display
+            # name (fullName = f"{first_name} {last_name}".trim()), so we
+            # put the whole label there and leave last_name blank.
+            "first_name": "Unmatched calls",
+            "last_name": "",
+            "email": None,
+            "phone": None,
+            "mobile": None,
+            "company": None,
+            "city": None,
+            "state": None,
+            "country_code": None,
+            "tags": [],
+            "ghl_location_id": ghl_location_id,
+            "ghl_location_name": location_name,
+            "client_name": client_group_name,
+            "call_logs": unmatched_calls,
+            "call_logs_count": len(unmatched_calls),
+            "_is_unmatched_bucket": True,  # marker for future UI polish / filtering
+        }
+        normalized_leads.append(unmatched_lead)
 
     # 3b. All-time totals from ALL calls (matched or not).
     total_calls = len(normalized_calls)

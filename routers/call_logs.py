@@ -116,8 +116,15 @@ async def list_call_logs(
         provider = (source or group.get("call_log_provider") or "ghl").lower()
         location_id = group.get("ghl_location_id")
 
-        # HP provider short-circuit until their endpoints are ready.
-        if provider == "hotprospector":
+        # Only known providers are queried; unknown values fail loudly below
+        # so config bugs (e.g. a stray value in Mongo) don't silently 200.
+        if provider not in ("ghl", "hotprospector"):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Unknown call_log_provider for group {group_id}: {provider!r}",
+            )
+
+        if not location_id:
             return {
                 "data": [],
                 "meta": {
@@ -127,65 +134,46 @@ async def list_call_logs(
                     "limit": limit,
                     "provider": provider,
                     "group_id": group_id,
-                    "location_id": location_id,
+                    "location_id": None,
                 },
-                "message": "Hot Prospector integration is not yet available.",
+                "message": "This client group has no linked GHL location.",
             }
 
-        # GHL — query the call_logs collection.
-        if provider == "ghl":
-            if not location_id:
-                return {
-                    "data": [],
-                    "meta": {
-                        "total": 0,
-                        "returned": 0,
-                        "skip": skip,
-                        "limit": limit,
-                        "provider": provider,
-                        "group_id": group_id,
-                        "location_id": None,
-                    },
-                    "message": "This client group has no linked GHL location.",
-                }
+        # Both providers share the same call_logs schema — only the `source`
+        # tag differs. GHL rows come from the /webhooks/call_logs handler;
+        # HotProspector rows are stamped by the HP cron (see
+        # services/hp_service.py::_persist_hp_calls_to_call_logs).
+        coll = db["call_logs"]
+        filt = {
+            "user_id": current_user,
+            "source": provider,
+            "location_id": location_id,
+        }
 
-            coll = db["call_logs"]
-            filt = {
-                "user_id": current_user,
-                "source": "ghl",
-                "location_id": location_id,
-            }
-
-            total = await coll.count_documents(filt)
-            cursor = (
-                coll.find(filt)
-                .sort("started_at", -1)
-                .skip(skip)
-                .limit(limit)
-            )
-            rows = await cursor.to_list(length=limit)
-            data = [_serialize(r) for r in rows]
-
-            logger.info(
-                "list_call_logs: user=%s group=%s provider=ghl total=%d returned=%d",
-                current_user, group_id, total, len(data),
-            )
-
-            return {
-                "data": data,
-                "meta": {
-                    "total": total,
-                    "returned": len(data),
-                    "skip": skip,
-                    "limit": limit,
-                    "provider": provider,
-                    "group_id": group_id,
-                    "location_id": location_id,
-                },
-            }
-
-        # Unknown provider value — fail loudly so we notice config bugs.
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unknown call_log_provider for group {group_id}: {provider!r}",
+        total = await coll.count_documents(filt)
+        cursor = (
+            coll.find(filt)
+            .sort("started_at", -1)
+            .skip(skip)
+            .limit(limit)
         )
+        rows = await cursor.to_list(length=limit)
+        data = [_serialize(r) for r in rows]
+
+        logger.info(
+            "list_call_logs: user=%s group=%s provider=%s total=%d returned=%d",
+            current_user, group_id, provider, total, len(data),
+        )
+
+        return {
+            "data": data,
+            "meta": {
+                "total": total,
+                "returned": len(data),
+                "skip": skip,
+                "limit": limit,
+                "provider": provider,
+                "group_id": group_id,
+                "location_id": location_id,
+            },
+        }
