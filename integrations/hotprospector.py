@@ -1,5 +1,6 @@
 import httpx
 import json
+import random
 import time
 import re
 from datetime import datetime, date, timedelta
@@ -62,24 +63,44 @@ _token_locks_guard = asyncio.Lock()
 #   2. Reactive: on a 429, honor the server's retry delay (Retry-After header or the
 #      "try again in N seconds" message) and retry, bounded.
 _RATE_MIN_INTERVAL = {
-    # Small by default: the per-minute cron only fires a few SearchByUserInput calls,
-    # so a short gap avoids tight bursts without adding much to the (serverless,
-    # timeout-bounded) tick. The one-shot backfill raises this via env to ~13s so it
-    # proactively stays under the limit instead of relying on 429 backoff.
-    "SearchByUserInput": float(os.getenv("HP_SEARCH_MIN_INTERVAL", "3")),
+    # Proactive per-method spacing. HP's SearchByUserInput enforces roughly a
+    # 5-6 request/min ceiling — a 6s gap gives us ~10 req/min in the worst case,
+    # which is still tight but leaves the reactive 429 handler as the safety
+    # net for burst violations. The one-shot backfill raises this via env to
+    # ~13s so it proactively stays under the limit.
+    #
+    # Was 3s previously — that let a burst of paginated leads calls trip HP's
+    # limit on the very first request per tick, and with only 1 retry (below)
+    # the whole location's sync failed. Bumped to 6s along with the reactive
+    # settings so tick-level retries actually recover.
+    "SearchByUserInput": float(os.getenv("HP_SEARCH_MIN_INTERVAL", "6")),
 }
 _RATE_DEFAULT_MIN_INTERVAL = float(os.getenv("HP_DEFAULT_MIN_INTERVAL", "0"))
 _rate_state: Dict[str, dict] = {}           # method -> {"lock": asyncio.Lock, "last": monotonic ts}
 _rate_state_guard = asyncio.Lock()
 
-# Reactive 429 backoff — kept SHORT by default so a single hp-tick can't blow the
-# serverless function timeout (vercel.json sets no maxDuration). Long-running jobs
-# (the backfill script) raise these via env. _HP_MAX_TOTAL_BACKOFF bounds the
-# CUMULATIVE 429 sleep one integration instance (≈ one group's sync, which can walk
-# ~14 call-log windows) may incur, so a cluster of 429s can't run for minutes.
-_HP_MAX_429_RETRIES = int(os.getenv("HP_MAX_429_RETRIES", "1"))
-_HP_MAX_429_WAIT = float(os.getenv("HP_MAX_429_WAIT", "30"))
-_HP_MAX_TOTAL_BACKOFF = float(os.getenv("HP_MAX_TOTAL_BACKOFF", "45"))
+# Reactive 429 backoff.
+#
+# Previous defaults were RETRIES=1, WAIT=30, TOTAL=45 — chosen to keep a single
+# hp-tick under Vercel's function timeout. In practice that meant: HP responds
+# "Rate limit exceeded ... Try again in 60 seconds", we sleep 30s (capped from
+# 60), retry too early, get 429 again, give up. Every location whose first
+# SearchByUserInput hit the limit failed the whole tick, leaving groups stuck
+# in hp_refresh_status="error" with "Failed to fetch leads on first page".
+#
+# New defaults let us honor the server's 60s advice AT LEAST once:
+#   - WAIT=65: hold up to 65s per retry (server says 60s + 5s slack)
+#   - RETRIES=2: two 60s retries beat the 5-req/min ceiling in most bursts
+#   - TOTAL=180: 2 retries × 65s + normal fetch time, still under Vercel's
+#                default 300s function timeout even for the busiest group
+_HP_MAX_429_RETRIES = int(os.getenv("HP_MAX_429_RETRIES", "2"))
+_HP_MAX_429_WAIT = float(os.getenv("HP_MAX_429_WAIT", "65"))
+_HP_MAX_TOTAL_BACKOFF = float(os.getenv("HP_MAX_TOTAL_BACKOFF", "180"))
+
+# Jitter fraction added to every 429 sleep. HP_GROUPS_PER_TICK=3 workers hit
+# HP concurrently — without jitter they all wake at the same moment and
+# stampede HP's rate-limit window together on the next request.
+_HP_JITTER_FRACTION = float(os.getenv("HP_JITTER_FRACTION", "0.15"))
 
 
 async def _throttle_method(method: str):
@@ -316,9 +337,14 @@ class HotProspectorIntegration:
 
                 # Rate limited — back off the server-specified delay and retry, bounded
                 # both per-call (retries) and per-instance (cumulative backoff budget).
+                # Jitter (±_HP_JITTER_FRACTION) desynchronizes the HP_GROUPS_PER_TICK
+                # parallel workers so they don't stampede HP's rate window together
+                # on the retry.
                 if status == 429 and rate_retries < _HP_MAX_429_RETRIES:
                     delay = data.get("retry_after") if isinstance(data, dict) else None
                     delay = min(float(delay) if delay else 60.0, _HP_MAX_429_WAIT)
+                    jitter = delay * _HP_JITTER_FRACTION * (2 * random.random() - 1)
+                    delay = max(1.0, delay + jitter)
                     if self._backoff_used + delay > _HP_MAX_TOTAL_BACKOFF:
                         logger.warning(
                             f"HP 429 on '{payload.get('Method')}' but backoff budget "
@@ -330,7 +356,7 @@ class HotProspectorIntegration:
                     self._backoff_used += delay
                     logger.warning(
                         f"HP rate limited on '{payload.get('Method')}'; backing off "
-                        f"{delay:.0f}s (retry {rate_retries}/{_HP_MAX_429_RETRIES})"
+                        f"{delay:.1f}s (retry {rate_retries}/{_HP_MAX_429_RETRIES})"
                     )
                     await asyncio.sleep(delay)
                     continue
