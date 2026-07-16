@@ -55,10 +55,16 @@ graph TB
         end
 
         subgraph AI_CORE["AI Core"]
-            ORCHESTRATOR["Orchestrator\n(run_chat loop)"]
+            ORCHESTRATOR["Orchestrator\n(run_chat loop, dual-dispatch)"]
             SESSION["Session Store\n(in-memory, 1hr TTL)"]
             PROMPT["System Prompt\n(birdy.py)"]
-            REGISTRY["Tool Registry\n(14 tools)"]
+            MCP_CLIENT["MCP Client\n(ai/mcp_client.py)"]
+            REGISTRY["Tool Registry\n(fallback path only)"]
+        end
+
+        subgraph MCP_SERVER["MCP Server — /mcp (ai/mcp/server.py)"]
+            MCP_AUTH["JWTVerifier\n(same HS256 secret as auth_token cookie)"]
+            MCP_TOOLS["26 tools across 9 modules\n@mcp.tool functions"]
         end
 
         subgraph PROVIDERS["LLM Providers"]
@@ -68,15 +74,17 @@ graph TB
             OPENROUTER["OpenRouter\nqwen3.6-plus"]
         end
 
-        subgraph TOOLS["AI Tool Modules"]
+        subgraph TOOLS["Legacy Tool Modules (fallback only)"]
             META_CACHED["Meta Cached Tools\n4 tools"]
             META_LIVE["Meta Live Tools\n2 tools"]
-            GHL_TOOLS["GHL Tools\n2 tools"]
+            GHL_TOOLS["GHL Tools\n6 tools"]
             GROUP_TOOLS["Group Tools\n1 tool"]
             SUMMARY_TOOLS["Summary Tools\n1 tool"]
             COMPARE_TOOLS["Compare Tools\n1 tool"]
             ALERT_TOOLS["Alert Tools\n3 tools"]
-            DERIVED["Derived Metrics\n(enrich utility)"]
+            CUSTOM_METRICS["Custom Metrics Tools\n6 tools"]
+            UNIFIED_LEADS["Unified Leads Tools\n2 tools"]
+            DERIVED["Derived Metrics\n(enrich utility, shared by both paths)"]
         end
 
         subgraph JOBS["Background Jobs"]
@@ -114,9 +122,15 @@ graph TB
     ORCHESTRATOR <-->|"select provider"| ANTHROPIC
     ORCHESTRATOR <-->|"select provider"| GROQ
     ORCHESTRATOR <-->|"select provider"| OPENROUTER
-    ORCHESTRATOR <-->|"execute tools"| REGISTRY
+    ORCHESTRATOR -->|"tool call by name"| MCP_CLIENT
+    MCP_CLIENT -->|"Bearer token,\nASGI transport (no real socket)"| MCP_AUTH
+    MCP_AUTH --> MCP_TOOLS
+    ORCHESTRATOR -.->|"fallback if MCP call fails"| REGISTRY
 
-    %% Registry → Tools
+    %% External MCP clients can also reach the server directly
+    EXT_MCP["External MCP Client\n(Claude Desktop, Claude Code, ...)"] -->|"POST /mcp\nBearer token"| MCP_AUTH
+
+    %% Registry → legacy Tools (fallback path only)
     REGISTRY --> META_CACHED
     REGISTRY --> META_LIVE
     REGISTRY --> GHL_TOOLS
@@ -124,8 +138,18 @@ graph TB
     REGISTRY --> SUMMARY_TOOLS
     REGISTRY --> COMPARE_TOOLS
     REGISTRY --> ALERT_TOOLS
+    REGISTRY --> CUSTOM_METRICS
+    REGISTRY --> UNIFIED_LEADS
 
-    %% Tools → Data
+    %% MCP tools → Data (same underlying queries as the legacy tools they replaced)
+    MCP_TOOLS -->|"read cache"| DB_GROUPS
+    MCP_TOOLS -->|"read/write"| DB_ALERTS
+    MCP_TOOLS -->|"read"| DB_CONTACTS
+    MCP_TOOLS -->|"read leads"| DB_LEADS
+    MCP_TOOLS -->|"direct call"| META_API
+    MCP_TOOLS -->|"shared Motor client"| MONGO_SHARED["core/mongo_client.py\n(long-lived singleton)"]
+
+    %% Legacy tools → Data (unchanged, still wired for the fallback path)
     META_CACHED -->|"read cache"| DB_GROUPS
     META_CACHED -->|"fallback"| DB_INSIGHTS
     META_CACHED -->|"read leads"| DB_LEADS
@@ -136,7 +160,8 @@ graph TB
     COMPARE_TOOLS -->|"read cache"| DB_GROUPS
     ALERT_TOOLS -->|"read/write"| DB_ALERTS
 
-    %% Derived metrics
+    %% Derived metrics (shared by both the MCP tools and their legacy fallback twins)
+    DERIVED -.->|"enriches"| MCP_TOOLS
     DERIVED -.->|"enriches"| META_CACHED
     DERIVED -.->|"enriches"| SUMMARY_TOOLS
     DERIVED -.->|"enriches"| COMPARE_TOOLS
@@ -158,20 +183,27 @@ graph TB
 
     %% Styling
     style AI_CORE fill:#f3f0ff,stroke:#7C4DFF,stroke-width:2px
+    style MCP_SERVER fill:#ecfdf5,stroke:#10b981,stroke-width:3px
     style PROVIDERS fill:#e0f2fe,stroke:#0ea5e9,stroke-width:2px
-    style TOOLS fill:#fef3c7,stroke:#f59e0b,stroke-width:2px
+    style TOOLS fill:#fef3c7,stroke:#f59e0b,stroke-width:2px,stroke-dasharray: 4 3
     style DATA fill:#d1fae5,stroke:#10b981,stroke-width:2px
     style EXTERNAL fill:#fee2e2,stroke:#ef4444,stroke-width:2px
     style JOBS fill:#ede9fe,stroke:#8b5cf6,stroke-width:2px
     style FRONTEND fill:#faf5ff,stroke:#a78bfa,stroke-width:2px
+    style EXT_MCP fill:#fee2e2,stroke:#ef4444,stroke-width:2px
 </pre>
+<p style="text-align:center;color:#6e6b7b;font-size:0.85rem;max-width:700px;margin:0 auto 16px;">
+  The dashed-border "Legacy Tool Modules" box is a fallback path only — the orchestrator
+  routes every tool call through the MCP server first, and only falls back to these
+  registry-executed functions if the MCP connection itself fails.
+</p>
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════
      DIAGRAM 2: AI Chat Pipeline (detailed)
      ═══════════════════════════════════════════════════════════ -->
 <div class="diagram-section">
-<h3>2. AI Chat Pipeline — Detailed Flow</h3>
+<h3>2. AI Chat Pipeline — Detailed Flow (MCP dual-dispatch)</h3>
 <pre class="mermaid">
 sequenceDiagram
     participant U as User (Frontend)
@@ -179,7 +211,9 @@ sequenceDiagram
     participant S as Session Store
     participant O as Orchestrator
     participant P as LLM Provider
-    participant T as Tool Registry
+    participant MC as MCP Client
+    participant MS as MCP Server (/mcp)
+    participant T as Tool Registry (fallback)
     participant DB as MongoDB
     participant M as Meta API
 
@@ -190,6 +224,9 @@ sequenceDiagram
     R->>O: run_chat(provider, registry, db, user_id, msg, session_id)
 
     Note over O: Append system prompt + user message to history
+    O->>MC: mint short-lived internal JWT for user_id
+    MC->>MS: list_tools() (Bearer token, ASGI transport)
+    MS-->>MC: 26 tool schemas (JWTVerifier already ran)
 
     loop Max 6 iterations (5 with tools + 1 final)
         O->>P: chat_completion(messages, tool_schemas, temp=0.3)
@@ -201,23 +238,19 @@ sequenceDiagram
             R-->>U: ChatResponse JSON
         else Has tool calls
             loop For each tool_call
-                O->>T: execute(tool_name, db=db, user_id=user_id, **args)
-
-                alt Cached tool (meta_tools, ghl_tools, etc.)
-                    T->>DB: Query facebook_cache / ghl_contacts / alerts
+                alt Tool is MCP-migrated (all 26 tools)
+                    O->>MC: call_mcp_tool(name, args)
+                    MC->>MS: tools/call (same auth path as external MCP clients)
+                    MS->>DB: Query / write (facebook_cache, ghl_contacts, alerts, ...)
+                    DB-->>MS: Document(s)
+                    MS-->>MC: CallToolResult (structured content)
+                    MC-->>O: JSON string (truncated to 8000 chars, error-shaped on failure)
+                else MCP connection failed — fallback
+                    O->>T: execute(tool_name, db=db, user_id=user_id, **args)
+                    T->>DB: Same query, direct in-process call
                     DB-->>T: Document(s)
-                    Note over T: enrich() adds CPL, conversion_rate, frequency
-                else Live Meta tool
-                    T->>DB: Get access_token from users collection
-                    T->>M: GET /v23.0/{account}/campaigns?time_range=...
-                    M-->>T: Campaign + adset + ad data
-                    Note over T: enrich() adds derived metrics
-                else Alert write tool
-                    T->>DB: Insert/update alerts collection
-                    DB-->>T: Success
+                    T-->>O: JSON string (identical truncation/error contract)
                 end
-
-                T-->>O: JSON string (truncated to 8000 chars)
                 Note over O: Append tool result to history
             end
         end
@@ -226,60 +259,82 @@ sequenceDiagram
 </div>
 
 <!-- ═══════════════════════════════════════════════════════════
-     DIAGRAM 3: Tool Registry & All 14 Tools
+     DIAGRAM 3: MCP Server — All 26 Tools
      ═══════════════════════════════════════════════════════════ -->
 <div class="diagram-section">
-<h3>3. Tool Registry — All 14 Tools</h3>
+<h3>3. MCP Server (ai/mcp/server.py) — All 26 Tools</h3>
 <pre class="mermaid">
 graph LR
-    REG["Tool Registry<br/>(registry.py)"]
+    MCP["Shared FastMCP instance<br/>(ai/mcp/server.py)<br/>auth: JWTVerifier (HS256)<br/>mounted at /mcp"]
 
-    subgraph CACHED["Cached Insights (meta_tools.py)"]
+    subgraph CACHED["Cached Insights (meta_mcp.py)"]
         T1["get_campaign_insights"]
         T2["get_adset_insights"]
         T3["get_ad_insights"]
         T4["get_facebook_leads"]
     end
 
-    subgraph LIVE["Live Meta API (meta_live_tools.py)"]
+    subgraph LIVE["Live Meta API (meta_live_mcp.py)"]
         T5["get_meta_insights_live"]
         T6["get_meta_leads_live"]
     end
 
-    subgraph GHL["GHL CRM (ghl_tools.py)"]
+    subgraph GHL["GHL CRM (ghl_mcp.py)"]
         T7["get_ghl_contacts"]
         T8["get_ghl_opportunity_stats"]
+        T8b["get_ghl_opp_stats_windowed"]
+        T8c["get_ghl_opp_stats_monthly"]
+        T8d["get_ghl_tag_breakdown"]
+        T8e["get_tag_rollup_by_campaign"]
     end
 
-    subgraph DISC["Discovery (group_tools.py)"]
+    subgraph DISC["Discovery (group_mcp.py)"]
         T9["get_client_groups"]
     end
 
-    subgraph DASH["Dashboard (summary_tools.py + compare_tools.py)"]
+    subgraph DASH["Dashboard (summary_mcp.py + compare_mcp.py)"]
         T10["get_account_summary"]
         T11["compare_periods"]
     end
 
-    subgraph ALERT["Alerts (alert_tools.py)"]
+    subgraph ALERT["Alerts (alert_mcp.py)"]
         T12["get_alerts"]
         T13["create_alert"]
         T14["update_alert"]
     end
 
-    REG --> CACHED
-    REG --> LIVE
-    REG --> GHL
-    REG --> DISC
-    REG --> DASH
-    REG --> ALERT
+    subgraph CUSTOM["Custom Metrics (custom_metrics_mcp.py)"]
+        T15["list_custom_metrics"]
+        T16["compute_custom_metric"]
+        T17["list_available_metric_fields"]
+        T18["create_custom_metric"]
+        T19["update_custom_metric"]
+        T20["delete_custom_metric"]
+    end
 
-    %% Data sources
+    subgraph UNIFIED["Cross-Source Leads (unified_leads_mcp.py)"]
+        T21["get_unified_leads"]
+        T22["get_unified_lead_stats"]
+    end
+
+    MCP --> CACHED
+    MCP --> LIVE
+    MCP --> GHL
+    MCP --> DISC
+    MCP --> DASH
+    MCP --> ALERT
+    MCP --> CUSTOM
+    MCP --> UNIFIED
+
+    %% Data sources — all via core/mongo_client.py's shared Motor client
     T1 & T2 & T3 -->|"facebook_cache"| FC[("client_groups<br/>collection")]
     T4 -->|"query"| FL[("facebook_leads<br/>collection")]
     T5 & T6 -->|"GET /v23.0"| MA(("Meta Graph<br/>API"))
-    T7 & T8 -->|"query"| GC[("ghl_contacts<br/>collection")]
+    T7 & T8 & T8b & T8c & T8d & T8e -->|"query"| GC[("ghl_contacts<br/>collection")]
     T9 & T10 & T11 -->|"read cache"| FC
     T12 & T13 & T14 -->|"read/write"| AL[("alerts<br/>collection")]
+    T15 & T16 & T17 & T18 & T19 & T20 -->|"read/write"| US[("users.custom_metrics")]
+    T21 & T22 -->|"cross-reference"| FC & GC & FL
 
     style CACHED fill:#fef3c7,stroke:#f59e0b
     style LIVE fill:#fee2e2,stroke:#ef4444
@@ -287,6 +342,8 @@ graph LR
     style DISC fill:#d1fae5,stroke:#10b981
     style DASH fill:#f3e8ff,stroke:#a855f7
     style ALERT fill:#fce7f3,stroke:#ec4899
+    style CUSTOM fill:#e0e7ff,stroke:#6366f1
+    style UNIFIED fill:#ffe4e6,stroke:#fb7185
 </pre>
 </div>
 

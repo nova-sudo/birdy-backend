@@ -26,10 +26,13 @@ from integrations.facebook_utils.facebook_campaigns import create_campaign_insig
 from integrations.facebook_utils.facebook_adsets import create_adset_insights_indexes
 from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
+from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
 from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron, webhooks, call_logs
 from services.call_logs_service import create_call_logs_indexes
 from billing import router as billing_router
+
+from ai.mcp import mcp_app
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -48,6 +51,8 @@ async def lifespan(app: FastAPI):
         await create_ad_insights_indexes(client)
         await create_call_logs_indexes(client)
 
+    get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
+
     # APScheduler is only suitable for long-lived processes (Azure App Service,
     # bare VM, Docker, etc.). On Vercel's serverless runtime it's unreliable
     # because containers are recycled — Vercel cron endpoints in routers/cron.py
@@ -61,14 +66,28 @@ async def lifespan(app: FastAPI):
 
     yield
 
+    await close_shared_mongo_client()
     if not os.getenv("VERCEL"):
         stop_background_jobs()
     logger.info("Server stopped")
 
 
+@asynccontextmanager
+async def combined_lifespan(app: FastAPI):
+    """Runs both the app's own lifespan and the mounted FastMCP app's lifespan.
+
+    FastMCP's Streamable HTTP session manager only starts inside its own
+    lifespan context — mounting mcp_app without wiring this in raises
+    "Task group is not initialized" on the first request to /mcp.
+    """
+    async with lifespan(app):
+        async with mcp_app.lifespan(app):
+            yield
+
+
 # ── App ──────────────────────────────────────────────────────────────────────
 
-app = FastAPI(lifespan=lifespan)
+app = FastAPI(lifespan=combined_lifespan)
 
 # Middleware
 app.add_middleware(
@@ -95,3 +114,7 @@ app.include_router(metrics.router)
 app.include_router(cron.router)
 app.include_router(webhooks.router)
 app.include_router(call_logs.router)
+
+# MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
+# shared FastMCP instance in ai/mcp/server.py
+app.mount("/mcp", mcp_app)

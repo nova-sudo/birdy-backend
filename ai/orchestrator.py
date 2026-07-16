@@ -1,3 +1,4 @@
+import contextlib
 import json
 import logging
 from typing import Optional
@@ -6,6 +7,7 @@ from ai.config import MAX_TOOL_ITERATIONS, DEFAULT_TEMPERATURE
 from ai.providers.base import BaseLLMProvider
 from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
+from ai import mcp_client
 from ai import session_store
 
 logger = logging.getLogger(__name__)
@@ -335,74 +337,101 @@ async def run_chat(
 
     tools_used = []
     allowed = _PAGE_TOOLS.get(page) if page else None
-    tool_schemas = tool_registry.get_schemas(allowed=allowed)
-    logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
-    for iteration in range(MAX_TOOL_ITERATIONS + 1):
-        response = await provider.chat_completion(
-            messages=history,
-            tools=tool_schemas if iteration < MAX_TOOL_ITERATIONS else None,
-            temperature=DEFAULT_TEMPERATURE,
-        )
-
-        if not response.tool_calls:
-            reply = response.content or "I wasn't able to generate a response."
-            reply = reply.strip() or "I wasn't able to generate a response."
-            logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
-            history.append({"role": "assistant", "content": reply})
-            session_store.save_messages(session_id, history)
-            return {
-                "reply": reply,
-                "tools_used": tools_used,
-                "session_id": session_id,
-            }
-
-        # Mistral rejects null content — use empty string when model omits it
-        assistant_msg = {"role": "assistant", "content": response.content or ""}
-        assistant_msg["tool_calls"] = [
-            {
-                "id": tc.id,
-                "type": "function",
-                "function": {"name": tc.name, "arguments": tc.arguments},
-            }
-            for tc in response.tool_calls
-        ]
-        history.append(assistant_msg)
-
-        # Execute each tool call
-        for tc in response.tool_calls:
-            tools_used.append(tc.name)
+    async with contextlib.AsyncExitStack() as stack:
+        mcp = None
+        if mcp_client.needs_mcp(allowed):
             try:
-                args = json.loads(tc.arguments) if tc.arguments else {}
-                if not isinstance(args, dict):
-                    args = {}
-            except (json.JSONDecodeError, TypeError):
-                args = {}
+                mcp = await stack.enter_async_context(mcp_client.mcp_client_for(user_id))
+            except Exception as e:
+                # MCP mount/connection broken — degrade to the registry fallback
+                # below instead of failing the whole chat request.
+                logger.warning(f"MCP client connection failed, falling back to registry: {e}")
 
-            logger.info(f"Tool call: {tc.name} | Args: {args}")
+        registry_schemas = [
+            s for s in tool_registry.get_schemas(allowed=allowed)
+            if s["function"]["name"] not in mcp_client.MCP_TOOL_NAMES
+        ]
+        mcp_schemas = await mcp_client.get_mcp_schemas(mcp, allowed) if mcp else None
+        if mcp_schemas is None:
+            # MCP unreachable (or not needed) — fall back to the registry's own
+            # copies of the same tools so a live MCP outage degrades instead of
+            # losing the tools entirely.
+            mcp_schemas = [
+                s for s in tool_registry.get_schemas(allowed=allowed)
+                if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
+            ]
+        tool_schemas = registry_schemas + mcp_schemas
+        logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
-            result = await tool_registry.execute(
-                tc.name,
-                db=db,
-                user_id=user_id,
-                mongo_client=mongo_client,
-                **args,
+        for iteration in range(MAX_TOOL_ITERATIONS + 1):
+            response = await provider.chat_completion(
+                messages=history,
+                tools=tool_schemas if iteration < MAX_TOOL_ITERATIONS else None,
+                temperature=DEFAULT_TEMPERATURE,
             )
 
-            logger.info(f"Tool result ({tc.name}): {result[:500]}")
+            if not response.tool_calls:
+                reply = response.content or "I wasn't able to generate a response."
+                reply = reply.strip() or "I wasn't able to generate a response."
+                logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
+                history.append({"role": "assistant", "content": reply})
+                session_store.save_messages(session_id, history)
+                return {
+                    "reply": reply,
+                    "tools_used": tools_used,
+                    "session_id": session_id,
+                }
 
-            history.append({
-                "role": "tool",
-                "tool_call_id": tc.id,
-                "content": result,
-            })
+            # Mistral rejects null content — use empty string when model omits it
+            assistant_msg = {"role": "assistant", "content": response.content or ""}
+            assistant_msg["tool_calls"] = [
+                {
+                    "id": tc.id,
+                    "type": "function",
+                    "function": {"name": tc.name, "arguments": tc.arguments},
+                }
+                for tc in response.tool_calls
+            ]
+            history.append(assistant_msg)
 
-    # Max iterations reached
-    reply = response.content or "I ran into complexity limits processing your request. Try a more specific question."
-    history.append({"role": "assistant", "content": reply})
-    session_store.save_messages(session_id, history)
-    return {
-        "reply": reply,
-        "tools_used": tools_used,
-        "session_id": session_id,
-    }
+            # Execute each tool call
+            for tc in response.tool_calls:
+                tools_used.append(tc.name)
+                try:
+                    args = json.loads(tc.arguments) if tc.arguments else {}
+                    if not isinstance(args, dict):
+                        args = {}
+                except (json.JSONDecodeError, TypeError):
+                    args = {}
+
+                logger.info(f"Tool call: {tc.name} | Args: {args}")
+
+                if tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
+                    result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
+                else:
+                    result = await tool_registry.execute(
+                        tc.name,
+                        db=db,
+                        user_id=user_id,
+                        mongo_client=mongo_client,
+                        **args,
+                    )
+
+                logger.info(f"Tool result ({tc.name}): {result[:500]}")
+
+                history.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
+
+        # Max iterations reached
+        reply = response.content or "I ran into complexity limits processing your request. Try a more specific question."
+        history.append({"role": "assistant", "content": reply})
+        session_store.save_messages(session_id, history)
+        return {
+            "reply": reply,
+            "tools_used": tools_used,
+            "session_id": session_id,
+        }
