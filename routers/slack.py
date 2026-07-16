@@ -82,7 +82,7 @@ async def connect_slack(current_user: str = Depends(get_current_user)):
     return {"auth_url": auth_url}
 
 
-@router.get("/api/connect/slack/callback")
+@router.api_route("/api/connect/slack/callback", methods=["GET", "POST"])
 async def slack_callback(request: Request, response: Response):
     error = request.query_params.get("error")
     if error:
