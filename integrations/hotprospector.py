@@ -7,6 +7,7 @@ import logging
 import os
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
+from pymongo import UpdateOne
 from typing import List, Tuple, Optional, Dict
 import asyncio
 
@@ -417,48 +418,113 @@ class HotProspectorIntegration:
 
     async def fetch_all_leads_from_ghl_location(self, ghl_location_id: str, with_meta: bool = False):
         """
-        Fetch one page (up to max_limit=100) of leads for a GHL location, plus the
-        TRUE lead total reported by HotProspector.
+        Fetch ALL leads for a GHL location by paginating SearchByUserInput.
 
-        We deliberately do NOT page through every lead: the count comes from
-        `total_count`, per-lead call attribution comes from each call's own leadId
-        (so it isn't bounded by this page), and SearchByUserInput is tightly
-        rate-limited — paging hundreds of leads for every client would exhaust it.
+        History: this function used to return only the first page (100 leads).
+        The docstring justified it as a rate-limit concession — but the caller
+        (save_hotprospector_leads_to_collection) then deleted every stored
+        lead and inserted only the returned page, silently truncating any
+        location with more than 100 leads to exactly 100. That was a real UX
+        bug: locations with 700+ leads only ever showed 100 in Sales-Hub, and
+        pruning cost real data on every cron cycle.
+
+        Now: page through everything up to a defensive cap (MAX_PAGES *
+        PAGE_SIZE = 20k leads). If pagination gets interrupted mid-way
+        (transient error, empty page), we abort the loop and flag the result
+        as truncated so callers know not to prune existing leads.
 
         Returns:
             with_meta=False (default): (True, [lead, ...])  — backward compatible
-            with_meta=True:            (True, {"leads": [...], "total_count": int})
+            with_meta=True:  (True, {"leads": [...], "total_count": int, "truncated": bool})
+            on failure:      (False, <error dict>)
         """
         logger.info(f"Fetching leads for GHL location {ghl_location_id}")
 
-        success, data = await self.search_leads_by_ghl_location(
-            ghl_location_id=ghl_location_id,
-            search_field="",  # Empty = all fields
-            search_text=""    # Empty = all leads
-        )
+        PAGE_SIZE = 100          # HP's response page size (informational; API decides)
+        MAX_PAGES = 200          # safety cap — 20k leads before we bail
 
-        if not success:
-            logger.error(f"Failed to fetch leads for location {ghl_location_id}: {data}")
-            return False, data
+        by_id: Dict = {}
+        total_count = 0
+        truncated = False
+        first_call_failed = False
 
-        leads = data.get("leads", []) if isinstance(data, dict) else []
-        total_count = int(data.get("total_count", len(leads))) if isinstance(data, dict) else len(leads)
+        for page_idx in range(MAX_PAGES):
+            offset = page_idx * PAGE_SIZE
+            success, data = await self.search_leads_by_ghl_location(
+                ghl_location_id=ghl_location_id,
+                search_field="",
+                search_text="",
+                offset=offset,
+            )
 
-        # Deduplicate by LeadId (just in case)
-        unique_leads = {}
-        for lead in leads:
-            lead_id = lead.get("LeadId")
-            if lead_id and lead_id not in unique_leads:
-                unique_leads[lead_id] = lead
+            if not success:
+                # First-page failure → this location is unreachable this run.
+                # Later-page failure → return what we have so far, flagged truncated.
+                if page_idx == 0:
+                    logger.error(f"Failed to fetch leads for location {ghl_location_id}: {data}")
+                    first_call_failed = True
+                    break
+                logger.warning(
+                    f"Pagination interrupted at offset={offset} for {ghl_location_id}: {data}"
+                )
+                truncated = True
+                break
 
-        deduplicated_leads = list(unique_leads.values())
+            page_leads = data.get("leads", []) if isinstance(data, dict) else []
+            total_count = int(data.get("total_count", total_count) or total_count or 0)
 
+            # Merge by LeadId (dedup across pages defensively — HP occasionally
+            # returns the same lead twice near page boundaries).
+            new_this_page = 0
+            for lead in page_leads:
+                lead_id = lead.get("LeadId")
+                if not lead_id or lead_id in by_id:
+                    continue
+                by_id[lead_id] = lead
+                new_this_page += 1
+
+            # Done when we've collected the full reported total, or when a page
+            # comes back shorter than a full page (last page).
+            if total_count and len(by_id) >= total_count:
+                break
+            if len(page_leads) < PAGE_SIZE:
+                break
+            # Also stop if a page added nothing new — protects against a loop
+            # in a broken pagination implementation.
+            if new_this_page == 0:
+                logger.warning(
+                    f"Pagination at offset={offset} added 0 new leads for {ghl_location_id}; stopping"
+                )
+                truncated = True
+                break
+        else:
+            # Hit MAX_PAGES without finishing — flag truncated so we don't prune.
+            truncated = True
+            logger.warning(
+                f"Hit MAX_PAGES={MAX_PAGES} for {ghl_location_id}; "
+                f"got {len(by_id)}/{total_count or '?'} leads — flagging truncated"
+            )
+
+        if first_call_failed:
+            # Preserve original failure shape so callers checking `success`
+            # get an error dict, not an empty payload masquerading as success.
+            return False, {"error": "Failed to fetch leads on first page"}
+
+        if total_count and len(by_id) < total_count:
+            truncated = True
+
+        deduplicated_leads = list(by_id.values())
         logger.info(
-            f"✅ Fetched {len(deduplicated_leads)} leads "
-            f"(HotProspector reports {total_count} total) for GHL location {ghl_location_id}"
+            f"✅ Fetched {len(deduplicated_leads)} of {total_count or len(deduplicated_leads)} leads "
+            f"for GHL location {ghl_location_id}{' (truncated)' if truncated else ''}"
         )
+
         if with_meta:
-            return True, {"leads": deduplicated_leads, "total_count": total_count}
+            return True, {
+                "leads": deduplicated_leads,
+                "total_count": total_count or len(deduplicated_leads),
+                "truncated": truncated,
+            }
         return True, deduplicated_leads
 
     async def _fetch_leads_for_char(self, ghl_location_id: str, char: str) -> Tuple[bool, List]:
@@ -851,57 +917,149 @@ async def save_hotprospector_leads_to_collection(
         user_id: str,
         ghl_location_id: str,
         leads: list,
-        mongo_client: AsyncIOMotorClient
+        mongo_client: AsyncIOMotorClient,
+        *,
+        prune_missing: bool = False,
 ):
     """
-    Save Hot Prospector leads WITH CALL LOGS for a specific GHL location.
+    Upsert HP leads (with nested call_logs) for a specific GHL location.
 
-    KEY CHANGE: Now saves call_logs and call_logs_count in the cache
+    History: this function used to `delete_many` every existing lead for the
+    location and then bulk-insert whatever the caller passed. That silently
+    wiped a location's cache on any bad HP day — a rate-limited fetch that
+    returned 0 leads deleted every stored lead. Multiplied by the delete-then-
+    insert running on every cron cycle, real user data was at constant risk.
+
+    Now: upsert by (user_id, ghl_location_id, lead_data.id). Existing leads
+    not in this batch are preserved by default. Two additional protections:
+
+      - If `leads` is empty, do nothing — refuses to wipe on "we got nothing".
+      - When an incoming lead has an empty `call_logs` list, we treat that as
+        "caller didn't fetch calls this run" and preserve whatever call_logs
+        are already stored on that doc, only refreshing scalar fields.
+        The synthetic "Unmatched calls" pseudo-lead is unaffected because
+        it's only created (upstream in hp_service) when unmatched_calls is
+        non-empty — so its call_logs list is never empty at save time.
+
+    Callers that KNOW they've fetched the full lead set (successful
+    pagination, no rate-limit truncation) can pass `prune_missing=True` to
+    drop leads that HP no longer returns. Default stays safe.
     """
     try:
         db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["hotprospector_leads"]
 
-        # Delete existing leads for this user and GHL location
-        delete_result = await leads_collection.delete_many({
-            "user_id": user_id,
-            "ghl_location_id": ghl_location_id
-        })
-        logger.info(f"Deleted {delete_result.deleted_count} existing leads for GHL location {ghl_location_id}")
-
         if not leads:
-            logger.warning(f"No leads to save for GHL location {ghl_location_id}")
+            # Empty input is almost always a fetch failure signal (rate
+            # limit, transient API blip). Skipping the wipe is the whole
+            # point of this rewrite.
+            logger.warning(
+                f"No leads to save for GHL location {ghl_location_id}; "
+                f"skipping (avoids wiping cache on empty fetches)."
+            )
             return
 
         batch_size = HOTPROSPECTOR_CONFIG["batch_size"]
         total_batches = (len(leads) + batch_size - 1) // batch_size
+        logger.info(
+            f"Upserting {len(leads)} leads (call logs when present) for "
+            f"{ghl_location_id} in {total_batches} batches of {batch_size}"
+        )
 
-        logger.info(f"Saving {len(leads)} leads with call logs in {total_batches} batches of {batch_size}")
-
+        seen_lead_ids: set = set()
         total_calls = 0
-        for i in range(0, len(leads), batch_size):
-            batch = leads[i:i + batch_size]
-            batch_num = (i // batch_size) + 1
+        ops: List[UpdateOne] = []
+        now = datetime.now()
 
-            lead_docs = []
-            for lead in batch:
-                # Count calls in this batch
-                total_calls += lead.get("call_logs_count", 0)
+        for lead in leads:
+            lead_id = lead.get("id")
+            if not lead_id:
+                # Can't safely upsert without a stable id; skip.
+                continue
+            seen_lead_ids.add(str(lead_id))
+            total_calls += lead.get("call_logs_count", 0)
 
-                lead_doc = {
+            filt = {
+                "user_id": user_id,
+                "ghl_location_id": ghl_location_id,
+                "lead_data.id": lead_id,
+            }
+            match_keys = compute_match_keys(lead.get("email"), lead.get("phone"))
+            incoming_calls = lead.get("call_logs") or []
+
+            if incoming_calls:
+                # Fresh call data — replace lead_data wholesale.
+                ops.append(UpdateOne(
+                    filt,
+                    {
+                        "$set": {
+                            "user_id": user_id,
+                            "ghl_location_id": ghl_location_id,
+                            "lead_data": lead,
+                            "match_keys": match_keys,
+                            "updated_at": now,
+                        },
+                        "$setOnInsert": {"created_at": now},
+                    },
+                    upsert=True,
+                ))
+            else:
+                # No fresh calls this run — preserve any existing
+                # lead_data.call_logs / call_logs_count already on this doc.
+                # Update all OTHER lead_data.* fields via dot-notation so a
+                # renamed/updated scalar still lands.
+                dotted_set = {
                     "user_id": user_id,
                     "ghl_location_id": ghl_location_id,
-                    "lead_data": lead,
-                    "match_keys": compute_match_keys(lead.get("email"), lead.get("phone")),
-                    "created_at": datetime.now(),
-                    "updated_at": datetime.now()
+                    "match_keys": match_keys,
+                    "updated_at": now,
                 }
-                lead_docs.append(lead_doc)
+                for k, v in lead.items():
+                    if k in ("call_logs", "call_logs_count"):
+                        continue
+                    dotted_set[f"lead_data.{k}"] = v
+                ops.append(UpdateOne(
+                    filt,
+                    {
+                        "$set": dotted_set,
+                        "$setOnInsert": {
+                            "created_at": now,
+                            "lead_data.call_logs": [],
+                            "lead_data.call_logs_count": 0,
+                            "lead_data.id": lead_id,
+                        },
+                    },
+                    upsert=True,
+                ))
 
-            await leads_collection.insert_many(lead_docs, ordered=False)
-            logger.info(f"Inserted batch {batch_num}/{total_batches} ({len(lead_docs)} leads)")
+        # Batch the bulk writes so a location with tens of thousands of
+        # leads doesn't build one giant payload.
+        if ops:
+            for i in range(0, len(ops), batch_size):
+                chunk = ops[i:i + batch_size]
+                await leads_collection.bulk_write(chunk, ordered=False)
+                logger.info(
+                    f"Upserted batch {(i // batch_size) + 1}/{total_batches} "
+                    f"({len(chunk)} leads)"
+                )
 
-        # Update user document with metadata
+        # Optional prune. Callers only pass prune_missing=True when they're
+        # confident the fetch was complete (successful pagination, no
+        # rate-limit truncation) — otherwise stale leads stay put rather
+        # than risk deleting real data.
+        if prune_missing and seen_lead_ids:
+            del_res = await leads_collection.delete_many({
+                "user_id": user_id,
+                "ghl_location_id": ghl_location_id,
+                "lead_data.id": {"$nin": list(seen_lead_ids)},
+            })
+            if del_res.deleted_count:
+                logger.info(
+                    f"Pruned {del_res.deleted_count} stale leads for GHL location "
+                    f"{ghl_location_id}"
+                )
+
+        # User document metadata (unchanged behaviour).
         users_collection = db["users"]
         await users_collection.update_one(
             {"user_id": user_id},
@@ -909,17 +1067,17 @@ async def save_hotprospector_leads_to_collection(
                 "$set": {
                     f"integrations.hotprospector.ghl_locations.{ghl_location_id}": {
                         "total_leads": len(leads),
-                        "total_calls": total_calls,  # NEW: Track total calls
-                        "last_fetched": datetime.now()
+                        "total_calls": total_calls,
+                        "last_fetched": now,
                     },
-                    "updated_at": datetime.now()
+                    "updated_at": now,
                 }
             },
-            upsert=True
+            upsert=True,
         )
 
         logger.info(
-            f"✅ Saved {len(leads)} leads with {total_calls} call logs "
+            f"✅ Upserted {len(leads)} leads with {total_calls} call logs "
             f"for GHL location {ghl_location_id} for user: {user_id}"
         )
 

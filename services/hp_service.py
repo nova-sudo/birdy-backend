@@ -416,9 +416,11 @@ async def fetch_and_cache_hp_call_center(
         mapping = await get_client_group_mapping(user_id, mongo_client)
         client_group_name = mapping.get(ghl_location_id)
 
-    # 1. Leads for this location (single SearchByUserInput call). HotProspector
-    #    paginates leads (max 100/page) but reports the true total under total_count,
-    #    so the lead COUNT comes from there rather than len(the single page).
+    # 1. Leads for this location — now paginates every page of SearchByUserInput
+    #    up to MAX_PAGES (see integrations/hotprospector.py). `truncated` is
+    #    True when the loop stopped short (page-N failure or MAX_PAGES hit) —
+    #    log-only for visibility; the save function is already safe against
+    #    partial data by default (upsert, never delete missing).
     success, leads_info = await integration.fetch_all_leads_from_ghl_location(
         ghl_location_id, with_meta=True
     )
@@ -428,6 +430,12 @@ async def fetch_and_cache_hp_call_center(
 
     hp_leads = leads_info["leads"]
     total_lead_count = leads_info["total_count"]
+    leads_truncated = bool(leads_info.get("truncated"))
+    if leads_truncated:
+        logger.warning(
+            f"HP leads pagination truncated for {ghl_location_id}: "
+            f"got {len(hp_leads)} of {total_lead_count} — existing leads left in place."
+        )
 
     normalized_leads = [
         integration.normalize_lead(lead, ghl_location_id, location_name, client_group_name)
