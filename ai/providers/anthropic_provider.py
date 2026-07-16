@@ -11,10 +11,11 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 
 class AnthropicProvider(BaseLLMProvider):
-    def __init__(self, model: str | None = None):
-        if not ANTHROPIC_API_KEY:
+    def __init__(self, api_key: str | None = None, model: str | None = None):
+        key = api_key or ANTHROPIC_API_KEY
+        if not key:
             raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
-        self.client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+        self.client = AsyncAnthropic(api_key=key)
         self.model = model or "claude-sonnet-4-20250514"
 
     async def chat_completion(

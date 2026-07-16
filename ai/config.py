@@ -28,3 +28,23 @@ DEFAULT_TEMPERATURE = 0.15
 MAX_TOOL_ITERATIONS = 5
 MAX_RESULT_CHARS = 8000
 MAX_RESULT_ITEMS = 20
+
+# ── BYOK curated model lists ────────────────────────────────────────────────
+# Only models known to support tool/function calling. Users pick one of
+# these when connecting their own Anthropic/OpenAI key (see
+# routers/ai_credentials.py); the exact choice is still live-validated at
+# save time (services/ai_credential_service.py), so a stale entry here just
+# means that specific save gets rejected with a clear message, not silent
+# breakage. Review periodically as providers ship new models.
+AVAILABLE_AI_MODELS = {
+    "anthropic": [
+        {"id": "claude-sonnet-5", "label": "Claude Sonnet 5"},
+        {"id": "claude-opus-4-8", "label": "Claude Opus 4.8"},
+        {"id": "claude-haiku-4-5-20251001", "label": "Claude Haiku 4.5"},
+    ],
+    "openai": [
+        {"id": "gpt-5", "label": "GPT-5"},
+        {"id": "gpt-4.1", "label": "GPT-4.1"},
+        {"id": "gpt-4o", "label": "GPT-4o"},
+    ],
+}

@@ -5,8 +5,8 @@ from fastapi import APIRouter, Depends, HTTPException
 from core.models import ChatRequest, ChatResponse
 from core.database import get_db
 from dependencies import get_current_user, get_mongo_client
+from services.ai_credential_service import get_decrypted_credential_for_chat
 
-from ai.config import AI_PROVIDER
 from ai.tools.registry import registry
 from ai.tools.meta_tools import register_meta_tools
 from ai.tools.ghl_tools import register_ghl_tools
@@ -35,20 +35,30 @@ register_custom_metrics_tools()
 register_unified_leads_tools()
 
 
-def _get_provider():
-    """Return the configured AI provider instance."""
-    if AI_PROVIDER == "anthropic":
+class NoAiCredentialError(Exception):
+    """Raised when the user hasn't connected their own AI provider credential."""
+
+
+async def _get_provider(current_user: str, db):
+    """Construct the AI provider from the user's own BYOK credential.
+
+    There is intentionally NO fallback to a Birdy-global provider — chat
+    only works once a user has connected their own Anthropic/OpenAI key via
+    routers/ai_credentials.py.
+    """
+    cred = await get_decrypted_credential_for_chat(db, current_user)
+    if not cred:
+        raise NoAiCredentialError()
+
+    if cred["provider"] == "anthropic":
         from ai.providers.anthropic_provider import AnthropicProvider
-        return AnthropicProvider()
-    elif AI_PROVIDER == "openrouter":
-        from ai.providers.openrouter_provider import OpenRouterProvider
-        return OpenRouterProvider()
-    elif AI_PROVIDER == "mistral":
-        from ai.providers.mistral_provider import MistralProvider
-        return MistralProvider()
+        return AnthropicProvider(api_key=cred["api_key"], model=cred["model"])
+    elif cred["provider"] == "openai":
+        from ai.providers.openai_provider import OpenAIProvider
+        return OpenAIProvider(api_key=cred["api_key"], model=cred["model"])
     else:
-        from ai.providers.groq_provider import GroqProvider
-        return GroqProvider()
+        # Shouldn't happen — provider is validated at save time — but fail loudly rather than guess.
+        raise NoAiCredentialError()
 
 
 @router.post("/api/chat", response_model=ChatResponse)
@@ -59,7 +69,7 @@ async def chat(
     async with get_mongo_client() as mongo_client:
         try:
             db = get_db(mongo_client)
-            provider = _get_provider()
+            provider = await _get_provider(current_user, db)
             result = await run_chat(
                 provider=provider,
                 tool_registry=registry,
@@ -73,6 +83,8 @@ async def chat(
                 client_name=request.client_name,
             )
             return ChatResponse(**result)
+        except NoAiCredentialError:
+            raise HTTPException(status_code=412, detail="no_ai_credentials")
         except ValueError as e:
             raise HTTPException(status_code=500, detail=str(e))
         except Exception as e:

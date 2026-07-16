@@ -130,3 +130,30 @@ class ChatResponse(BaseModel):
 class CreateMcpTokenRequest(BaseModel):
     name: str                          # e.g. "Claude Desktop on my laptop"
     expiry_days: Optional[int] = 365
+
+
+# ── AI Credentials (BYOK) ───────────────────────────────────────────────────
+
+class SaveAiCredentialRequest(BaseModel):
+    provider: str          # "anthropic" | "openai"
+    api_key: str
+    model: str              # must be one of AVAILABLE_AI_MODELS[provider]
+
+
+class AiCredentialStatusResponse(BaseModel):
+    configured: bool
+    provider: Optional[str] = None
+    model: Optional[str] = None
+    key_preview: Optional[str] = None
+    validated: Optional[bool] = None
+    validated_at: Optional[str] = None
+
+
+class AiModelOption(BaseModel):
+    id: str
+    label: str
+
+
+class AiModelsResponse(BaseModel):
+    anthropic: List[AiModelOption]
+    openai: List[AiModelOption]

@@ -14,6 +14,9 @@ patch each module's own imported reference individually.
 import types
 
 import pytest
+from dotenv import load_dotenv
+
+load_dotenv()  # core/crypto.py and other modules read env vars at import time
 
 import core.mongo_client
 from mongomock_motor import AsyncMongoMockClient
