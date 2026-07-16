@@ -121,6 +121,23 @@ async def oauth_callback_facebook(
             response.headers["Location"] = redirect_url
             response.status_code = 302
             return {"redirect_url": redirect_url}
+
+        # Circuit breaker: clear meta_token_error on every client_group this
+        # user owns. Set by services/meta_refresh_manager::_mark_all_auth_error
+        # when a refresh confirms the token is dead; schedule_stale_groups
+        # skips flagged groups, so without this clear the auto cron would
+        # never resume even after the user has reconnected.
+        try:
+            db = mongo_client[DB_NAME]
+            await db["client_groups"].update_many(
+                {"user_id": current_user, "meta_token_error": True},
+                {"$unset": {"meta_token_error": "", "meta_token_error_at": ""}},
+            )
+        except Exception as e:
+            # Don't fail the callback over the cleanup — the user's now
+            # reconnected. Worst case: a refresh runs, succeeds, and
+            # _finalize_job clears the flag itself.
+            logger.warning(f"Failed to clear meta_token_error on reconnect: {e}")
         result_for_cookie = result.copy()
         try:
             cookie_value = json.dumps(result_for_cookie)

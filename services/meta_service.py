@@ -23,6 +23,23 @@ from integrations.facebook_utils.facebook import get_facebook_token
 logger = logging.getLogger(__name__)
 
 
+class MetaAuthError(Exception):
+    """
+    Raised when Meta's Graph API returns a code-190 (invalid/expired token)
+    or code-200 (missing ads_read/ads_management scope) error.
+
+    A distinct exception type — not `Exception` — because both this file
+    and services/meta_refresh_manager.py wrap their fetch call sites in
+    catch-all `except Exception:` blocks that would otherwise swallow the
+    auth signal and let the refresh march on returning empty "success"
+    results. Callers should catch this explicitly (or re-raise it past
+    generic handlers) so downstream circuit-breaker logic in the refresh
+    manager can flag the group with meta_token_error=True and stop
+    re-enqueueing it on every 5h cron cycle.
+    """
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Low-level cache helpers
 # ---------------------------------------------------------------------------
@@ -618,7 +635,14 @@ async def _fetch_meta_campaigns_for_preset(
                             f"Meta API auth/permission error for preset={date_preset} "
                             f"account={ad_account_id}: {body}"
                         )
-                        raise Exception(f"Facebook auth/permission error for account {ad_account_id}: {body[:200]}")
+                        # Use the typed exception so the generic `except
+                        # Exception` at the bottom of this function — and the
+                        # matching one in fetch_meta_all_presets_for_group —
+                        # can't swallow the auth signal. See MetaAuthError
+                        # docstring at the top of this file.
+                        raise MetaAuthError(
+                            f"Facebook auth/permission error for account {ad_account_id}: {body[:200]}"
+                        )
 
                     is_rate_limit = (
                         resp.status_code == 429
@@ -750,6 +774,10 @@ async def _fetch_meta_campaigns_for_preset(
                     break
                 await asyncio.sleep(0.15)
 
+    except MetaAuthError:
+        # Propagate — refresh manager's execute_refresh handles this,
+        # sets meta_token_error=True on the group, and stops the retry loop.
+        raise
     except Exception as e:
         logger.error(
             f"Error fetching Meta preset={date_preset} for {ad_account_id}: {e}",
@@ -895,6 +923,13 @@ async def fetch_meta_all_presets_for_group(
                 )
                 break  # success
 
+            except MetaAuthError:
+                # A dead / underscoped token isn't fixed by retrying — bail
+                # out of the per-preset retry loop AND the preset loop so
+                # execute_refresh can handle it once at the outer level
+                # instead of burning 3 attempts × 13 presets = 39 requests
+                # against a token that's known bad.
+                raise
             except Exception as e:
                 logger.error(f"  Error fetching preset '{preset}' attempt {attempt + 1}: {e}")
                 if attempt < 2:

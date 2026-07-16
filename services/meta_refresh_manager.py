@@ -31,6 +31,7 @@ from core.database import DB_NAME
 from dependencies import get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
 from services.meta_service import (
+    MetaAuthError,
     fetch_meta_all_presets_for_group,
     update_preset_lead_counts,
 )
@@ -201,11 +202,19 @@ async def execute_refresh(
     steps = job["steps"]
 
     async def yield_partial(reason: str):
-        """Save current progress as 'partial' and exit without finalizing."""
+        """Save current progress as 'partial' and exit without finalizing.
+
+        Tags this partial with _partial_kind="budget" so claim_next_jobs
+        knows the yield was due to hitting the tick's wall-clock budget
+        (a normal, expected event on large accounts), NOT a real failure.
+        Budget-partials don't consume the attempt budget and are eligible
+        for immediate reclaim on the next tick.
+        """
         await jobs_col.update_one(
             {"job_id": job_id},
             {"$set": {
                 "status": "partial",
+                "_partial_kind": "budget",
                 "_claimed_at": None,
                 "next_retry_at": datetime.utcnow(),
                 "updated_at": datetime.utcnow(),
@@ -222,7 +231,7 @@ async def execute_refresh(
     token = await get_facebook_token(user_id, mongo_client)
     if not token or not token.get("access_token"):
         logger.error(f"[{job_id}] No valid Facebook token")
-        await _mark_all_auth_error(jobs_col, job_id, "No Facebook token")
+        await _mark_all_auth_error(jobs_col, job_id, "No Facebook token", db=db, group_id=group_id)
         await _finalize_job(db, jobs_col, job_id, group_id)
         return
 
@@ -261,6 +270,16 @@ async def execute_refresh(
             )
             logger.info(f"[{job_id}] Preset '{preset_key}' ✅")
 
+        except MetaAuthError as e:
+            # Typed auth error path — the swallow-friendly string-matching
+            # fallback below is still there for pre-existing raise-Exception
+            # code, but MetaAuthError is the definitive signal.
+            error_msg = str(e)[:200]
+            logger.error(f"[{job_id}] Auth/permission error on '{preset_key}': {error_msg}")
+            await _mark_all_auth_error(jobs_col, job_id, error_msg, db=db, group_id=group_id)
+            auth_failed = True
+            break
+
         except Exception as e:
             error_msg = str(e)[:200]
             is_auth = "auth" in error_msg.lower() or "permission" in error_msg.lower() or "token" in error_msg.lower()
@@ -268,7 +287,7 @@ async def execute_refresh(
 
             if is_auth:
                 logger.error(f"[{job_id}] Auth/permission error on '{preset_key}': {error_msg}")
-                await _mark_all_auth_error(jobs_col, job_id, error_msg)
+                await _mark_all_auth_error(jobs_col, job_id, error_msg, db=db, group_id=group_id)
                 auth_failed = True
                 break
             elif is_rate_limit:
@@ -395,57 +414,15 @@ async def execute_refresh(
     await _finalize_job(db, jobs_col, job_id, group_id)
 
 
-async def retry_pending_jobs():
-    """
-    Called by scheduler every 10 minutes.
-    Finds partial jobs that are due for retry and re-executes them.
-    """
-    async with get_mongo_client() as mongo_client:
-        db = mongo_client[DB_NAME]
-        jobs_col = db["meta_refresh_jobs"]
-
-        now = datetime.utcnow()
-        pending_jobs = await jobs_col.find({
-            "status": "partial",
-            "next_retry_at": {"$lte": now},
-            "attempt": {"$lt": MAX_ATTEMPTS},
-        }).to_list(None)
-
-        if not pending_jobs:
-            return
-
-        logger.info(f"Found {len(pending_jobs)} partial Meta refresh jobs to retry")
-
-        for job in pending_jobs:
-            job_id = job["job_id"]
-            attempt = job["attempt"] + 1
-
-            logger.info(f"[{job_id}] Retrying (attempt {attempt}/{MAX_ATTEMPTS})")
-
-            await jobs_col.update_one(
-                {"job_id": job_id},
-                {"$set": {
-                    "status": "in_progress",
-                    "attempt": attempt,
-                    "next_retry_at": None,
-                    "updated_at": now,
-                }},
-            )
-
-            # Update group status back to running
-            await db["client_groups"].update_one(
-                {"id": job["group_id"]},
-                {"$set": {"meta_refresh_status": "running"}},
-            )
-
-            try:
-                await execute_refresh(job_id, mongo_client)
-            except Exception as e:
-                logger.error(f"[{job_id}] Retry failed: {e}", exc_info=True)
-                await jobs_col.update_one(
-                    {"job_id": job_id},
-                    {"$set": {"status": "failed", "updated_at": datetime.utcnow()}},
-                )
+# NOTE: `retry_pending_jobs` used to live here as the APScheduler-driven
+# retry loop. It's been deleted:
+#   - It was the ONLY caller that incremented job["attempt"], so with
+#     APScheduler disabled on Vercel (see main.py) the counter never
+#     advanced, and MAX_ATTEMPTS was never actually enforced.
+#   - The Vercel path is claim_next_jobs → execute_refresh, which now
+#     handles attempt-bumping inline for failure-partial claims.
+# If APScheduler is ever re-enabled for local/on-prem, the new claim path
+# still works — no scheduler-side loop needed.
 
 
 async def get_refresh_progress(group_id: str, mongo_client) -> dict | None:
@@ -499,8 +476,24 @@ async def get_refresh_progress(group_id: str, mongo_client) -> dict | None:
 # Internal helpers
 # ---------------------------------------------------------------------------
 
-async def _mark_all_auth_error(jobs_col, job_id: str, error_msg: str):
-    """Mark all non-success presets as auth_error and set job to failed."""
+async def _mark_all_auth_error(
+    jobs_col,
+    job_id: str,
+    error_msg: str,
+    *,
+    db=None,
+    group_id: str | None = None,
+):
+    """Mark all non-success presets as auth_error and set the job to failed.
+
+    Also flips `client_groups.meta_token_error=True` when db + group_id
+    are supplied — the circuit-breaker signal. Two consumers read that flag:
+      1. schedule_stale_groups: excludes the group from auto-reschedule so
+         we don't hammer Graph with a token we already know is dead.
+      2. Frontend (MarketingContent.jsx): shows the "Reconnect Meta" banner.
+
+    Cleared on successful OAuth reconnect (routers/meta.py).
+    """
     job = await jobs_col.find_one({"job_id": job_id})
     if not job:
         return
@@ -518,6 +511,19 @@ async def _mark_all_auth_error(jobs_col, job_id: str, error_msg: str):
 
     await jobs_col.update_one({"job_id": job_id}, {"$set": update})
 
+    if db is not None and group_id:
+        await db["client_groups"].update_one(
+            {"id": group_id},
+            {"$set": {
+                "meta_token_error": True,
+                "meta_token_error_at": datetime.utcnow(),
+            }},
+        )
+        logger.warning(
+            f"[{job_id}] Flagged group {group_id} with meta_token_error=True "
+            f"— excluded from auto-reschedule until user reconnects."
+        )
+
 
 async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
     """Check all steps and set final job status + update client_groups."""
@@ -531,6 +537,8 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
     lead_counts = steps.get("lead_counts", {})
 
     all_statuses = [p["status"] for p in presets.values()] + [leads["status"], lead_counts["status"]]
+
+    partial_kind: str | None = None
 
     if all(s == "success" for s in all_statuses):
         final_status = "complete"
@@ -549,6 +557,11 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
         logger.error(f"[{job_id}] Max attempts reached, marking as failed")
     else:
         final_status = "partial"
+        # This is a REAL failure partial (some step failed and we haven't
+        # hit MAX_ATTEMPTS yet), not a budget yield. Tag it so
+        # claim_next_jobs enforces the 10-min backoff and the attempt cap.
+        # Budget yields go through yield_partial() with kind="budget".
+        partial_kind = "failure"
         next_retry = datetime.utcnow() + timedelta(minutes=RETRY_DELAY_MINUTES)
         group_status = "running"  # still in progress, will retry
         failed_presets = [k for k, v in presets.items() if v["status"] != "success"]
@@ -559,15 +572,22 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
             f"retry at: {next_retry.isoformat()}"
         )
 
-    await jobs_col.update_one(
-        {"job_id": job_id},
-        {"$set": {
+    job_update: dict = {
+        "$set": {
             "status": final_status,
             "next_retry_at": next_retry,
             "_claimed_at": None,  # release the claim so a tick can retry partial jobs
             "updated_at": datetime.utcnow(),
-        }},
-    )
+        }
+    }
+    if partial_kind is not None:
+        job_update["$set"]["_partial_kind"] = partial_kind
+    else:
+        # Not partial anymore — drop the kind flag so it doesn't linger
+        # on a completed / failed job (would only confuse observability).
+        job_update["$unset"] = {"_partial_kind": ""}
+
+    await jobs_col.update_one({"job_id": job_id}, job_update)
 
     # Update client group status
     update_fields = {
@@ -590,6 +610,16 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
     update_op = {"$set": update_fields}
     if final_status != "partial":
         update_op["$unset"] = {"facebook_cache._refreshing": ""}
+
+    # A completed refresh proves the token works — clear any lingering
+    # meta_token_error flag (e.g. if the user reconnected but the clear
+    # in routers/meta.py failed for some reason, or if this refresh was
+    # kicked off on-demand from the UI while auto-cron was still skipping
+    # the group).
+    if final_status == "complete":
+        update_op.setdefault("$unset", {})
+        update_op["$unset"]["meta_token_error"] = ""
+        update_op["$unset"]["meta_token_error_at"] = ""
 
     await db["client_groups"].update_one({"id": group_id}, update_op)
 
@@ -622,10 +652,15 @@ async def schedule_stale_groups(
     db = mongo_client[DB_NAME]
     cutoff = datetime.utcnow() - timedelta(hours=cutoff_hours)
 
-    # Stage 1: candidate groups (stale or never refreshed)
+    # Stage 1: candidate groups (stale or never refreshed).
+    # meta_token_error is the circuit-breaker signal — a group flagged
+    # here has a token we already know is dead (see _mark_all_auth_error).
+    # Skipping it prevents unbounded re-enqueueing every 5h forever until
+    # the user reconnects (cleared in routers/meta.py OAuth callback).
     candidates = await db["client_groups"].find(
         {
             "meta_ad_account_id": {"$exists": True, "$ne": None},
+            "meta_token_error": {"$ne": True},
             "$or": [
                 {"last_meta_refresh": {"$lt": cutoff}},
                 {"last_meta_refresh": {"$exists": False}},
@@ -687,43 +722,110 @@ async def claim_next_jobs(
     """
     Atomically claim up to `n` refresh jobs for this tick to work on.
 
-    Picks jobs in this priority:
-      1. status="pending"            (never started)
-      2. status="partial"            (yielded due to budget/rate-limit)
-      3. status="in_progress" AND _claimed_at < now - stale_claim_minutes
-         (crash recovery — previous tick died)
+    Four claim reasons — with DIFFERENT gating semantics. This is the whole
+    point of the recent rewrite: the previous version reclaimed every
+    partial job on the very next tick with no backoff and no attempt cap,
+    creating an infinite retry loop against Meta's Graph API on any group
+    with a persistent failure (dead token, wrong scope, etc.). The old
+    job-level `attempt` counter was only ever incremented by the (now
+    deleted) APScheduler-driven `retry_pending_jobs`, so on Vercel it stayed
+    at 1 forever and MAX_ATTEMPTS was never enforced.
 
-    Each claim sets status="in_progress" and refreshes _claimed_at so other
-    concurrent ticks won't grab the same job.
+    Priority (jobs are picked in `next_retry_at, created_at` order, so
+    older / earlier-scheduled jobs go first):
 
-    Returns the claimed job documents.
+      1. status="pending"
+         Never started. No backoff, no attempt cap. Claim immediately.
+
+      2. status="partial", _partial_kind="budget"
+         Yielded from execute_refresh because the tick's wall-clock budget
+         was exhausted mid-work (see yield_partial). This is a normal event
+         on large accounts — the job is fine, we just ran out of time.
+         Claim immediately with no attempt-cap.
+
+      3. status="partial", _partial_kind="failure" (or missing on legacy rows)
+         Real failure — at least one step actually errored and we haven't
+         hit MAX_ATTEMPTS yet. Enforce `next_retry_at <= now` (the 10-min
+         backoff from _finalize_job) AND `attempt < max_attempts`. On claim
+         we `$inc attempt`, so the third failure-partial claim brings
+         attempt to MAX_ATTEMPTS and the row falls out of this filter —
+         terminal-failure at the next _finalize_job.
+
+      4. status="in_progress" AND _claimed_at < now - stale_claim_minutes
+         Crash recovery — previous tick died mid-execution. Reclaim without
+         touching attempt (we don't know if it was a real failure or an OOM).
+
+    Groups with `meta_token_error=True` don't reach here in the first place
+    because schedule_stale_groups filters them out. Any pre-existing jobs
+    on such groups run out via attempt-cap and stop.
     """
     db = mongo_client[DB_NAME]
     jobs_col = db["meta_refresh_jobs"]
     now = datetime.utcnow()
     stale_before = now - timedelta(minutes=stale_claim_minutes)
 
-    claimed: list[dict] = []
-    for _ in range(n):
-        # find_one_and_update is atomic — guarantees no two ticks claim the same row
-        job = await jobs_col.find_one_and_update(
+    filter_query = {
+        "$or": [
+            # 1. pending
+            {"status": "pending"},
+            # 2. partial + budget
+            {"status": "partial", "_partial_kind": "budget"},
+            # 3. partial + failure (or legacy partial with no kind flag —
+            #    treat as failure for safety so it can't loop forever)
             {
+                "status": "partial",
                 "$or": [
-                    {"status": "pending"},
-                    {"status": "partial"},
-                    {
-                        "status": "in_progress",
-                        "$or": [
-                            {"_claimed_at": {"$lt": stale_before}},
-                            {"_claimed_at": None},
-                            {"_claimed_at": {"$exists": False}},
-                        ],
-                    },
+                    {"_partial_kind": "failure"},
+                    {"_partial_kind": {"$exists": False}},
                 ],
-                # Don't pick up jobs that have exhausted their retries
+                "next_retry_at": {"$lte": now},
                 "$expr": {"$lt": ["$attempt", "$max_attempts"]},
             },
-            {"$set": {"status": "in_progress", "_claimed_at": now, "updated_at": now}},
+            # 4. stale in_progress (crash recovery)
+            {
+                "status": "in_progress",
+                "$or": [
+                    {"_claimed_at": {"$lt": stale_before}},
+                    {"_claimed_at": None},
+                    {"_claimed_at": {"$exists": False}},
+                ],
+            },
+        ],
+    }
+
+    # Aggregation pipeline update: claim atomically AND bump `attempt`
+    # only when the doc was a failure-partial (or a legacy partial with
+    # no kind). Pending / budget-partial / stale-in-progress claims leave
+    # `attempt` untouched, so budget yields never eat into the retry budget.
+    claim_update = [
+        {
+            "$set": {
+                "status": "in_progress",
+                "_claimed_at": now,
+                "updated_at": now,
+                "attempt": {
+                    "$cond": [
+                        {"$and": [
+                            {"$eq": ["$status", "partial"]},
+                            {"$ne": [
+                                {"$ifNull": ["$_partial_kind", "failure"]},
+                                "budget",
+                            ]},
+                        ]},
+                        {"$add": [{"$ifNull": ["$attempt", 1]}, 1]},
+                        {"$ifNull": ["$attempt", 1]},
+                    ],
+                },
+            },
+        },
+    ]
+
+    claimed: list[dict] = []
+    for _ in range(n):
+        # find_one_and_update is atomic — guarantees no two ticks claim the same row.
+        job = await jobs_col.find_one_and_update(
+            filter_query,
+            claim_update,
             sort=[("next_retry_at", 1), ("created_at", 1)],
             # default return_document=BEFORE is fine — execute_refresh re-fetches
             # the job by job_id, so we only need the identifying fields here.
