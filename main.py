@@ -28,9 +28,11 @@ from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions
 from services.call_logs_service import create_call_logs_indexes
 from services.mcp_token_service import create_mcp_tokens_indexes
+from services.slack_bot_service import create_slack_bot_indexes
+from services.slack_interaction_store import create_slack_ui_interaction_indexes
 from billing import router as billing_router
 
 from ai.mcp import mcp_app
@@ -52,6 +54,8 @@ async def lifespan(app: FastAPI):
         await create_ad_insights_indexes(client)
         await create_call_logs_indexes(client)
         await create_mcp_tokens_indexes(client)
+        await create_slack_bot_indexes(client)
+        await create_slack_ui_interaction_indexes(client)
 
     get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
 
@@ -118,6 +122,9 @@ app.include_router(webhooks.router)
 app.include_router(call_logs.router)
 app.include_router(mcp_tokens.router)
 app.include_router(ai_credentials.router)
+app.include_router(slack.router)
+app.include_router(slack_events.router)
+app.include_router(slack_interactions.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py

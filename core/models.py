@@ -157,3 +157,13 @@ class AiModelOption(BaseModel):
 class AiModelsResponse(BaseModel):
     anthropic: List[AiModelOption]
     openai: List[AiModelOption]
+
+
+# ── Slack Bot ────────────────────────────────────────────────────────────────
+
+class SlackBotStatusResponse(BaseModel):
+    installed: bool
+    team_id: Optional[str] = None
+    team_name: Optional[str] = None
+    bot_user_id: Optional[str] = None
+    installed_at: Optional[str] = None

@@ -16,3 +16,5 @@ openai
 cryptography
 fastmcp==2.14.7
 mcp==1.24.0
+slack-sdk
+aiohttp

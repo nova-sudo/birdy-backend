@@ -1,6 +1,6 @@
 """
 services/ai_credential_service.py — BYOK save/get/remove lifecycle, and
-routers/chat.py::_get_provider's "no fallback" behavior. `validate_credential`
+ai/provider_factory.py::get_provider_for_user's "no fallback" behavior. `validate_credential`
 (the live provider API call) is mocked in every test here — it's exercised
 for real in tests/test_ai_credential_validation_live.py instead, which is
 skipped unless a real API key is available.
@@ -88,11 +88,11 @@ async def test_save_then_remove_then_status_is_none(mock_db):
     assert await svc.get_decrypted_credential_for_chat(mock_db, "alice@example.com") is None
 
 
-# ── routers/chat.py::_get_provider — no-fallback behavior ───────────────────
+# ── ai/provider_factory.py::get_provider_for_user — no-fallback behavior ────
 
 @pytest.mark.asyncio
 async def test_get_provider_raises_when_not_configured(mock_db):
-    from routers.chat import _get_provider, NoAiCredentialError
+    from ai.provider_factory import get_provider_for_user as _get_provider, NoAiCredentialError
 
     with pytest.raises(NoAiCredentialError):
         await _get_provider("nobody@example.com", mock_db)
@@ -100,7 +100,7 @@ async def test_get_provider_raises_when_not_configured(mock_db):
 
 @pytest.mark.asyncio
 async def test_get_provider_constructs_anthropic_from_saved_credential(mock_db):
-    from routers.chat import _get_provider
+    from ai.provider_factory import get_provider_for_user as _get_provider
     from ai.providers.anthropic_provider import AnthropicProvider
 
     await svc.save_ai_credential(mock_db, "alice@example.com", "anthropic", "sk-ant-abcd", "claude-sonnet-5")
@@ -111,7 +111,7 @@ async def test_get_provider_constructs_anthropic_from_saved_credential(mock_db):
 
 @pytest.mark.asyncio
 async def test_get_provider_constructs_openai_from_saved_credential(mock_db):
-    from routers.chat import _get_provider
+    from ai.provider_factory import get_provider_for_user as _get_provider
     from ai.providers.openai_provider import OpenAIProvider
 
     await svc.save_ai_credential(mock_db, "bob@example.com", "openai", "sk-openai-abcd", "gpt-4o")
