@@ -1018,6 +1018,13 @@ async def save_hotprospector_leads_to_collection(
                     if k in ("call_logs", "call_logs_count"):
                         continue
                     dotted_set[f"lead_data.{k}"] = v
+                # NOTE: `lead_data.id` is intentionally NOT in $setOnInsert —
+                # it's already written by the `for k, v in lead.items()` loop
+                # above (which does dotted_set["lead_data.id"] = lead["id"]).
+                # MongoDB rejects an update where both $set and $setOnInsert
+                # target the same path with "Updating the path X would create
+                # a conflict at X", failing the whole bulk_write batch and
+                # leaving the group in hp_refresh_status="error".
                 ops.append(UpdateOne(
                     filt,
                     {
@@ -1026,7 +1033,6 @@ async def save_hotprospector_leads_to_collection(
                             "created_at": now,
                             "lead_data.call_logs": [],
                             "lead_data.call_logs_count": 0,
-                            "lead_data.id": lead_id,
                         },
                     },
                     upsert=True,
