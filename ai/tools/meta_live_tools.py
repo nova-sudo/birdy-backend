@@ -194,6 +194,64 @@ async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date
     }
 
 
+async def _fetch_monthly_insights_live(ad_account_id, access_token, year):
+    """
+    Fetch account-level insights broken out by calendar month in ONE Graph API
+    call, using Meta's native `time_increment=monthly` — this is the correct
+    way to get a real per-month breakdown (as opposed to calling
+    _fetch_insights_live once per month, which would be 12x slower, or once
+    for the full year, which collapses everything into a single aggregate).
+    """
+    time_range = f'{{"since":"{year}-01-01","until":"{year}-12-31"}}'
+    params = {
+        "fields": "spend,impressions,clicks,reach,actions,results,cpm,cpc,ctr",
+        "time_range": time_range,
+        "time_increment": "monthly",
+        "access_token": access_token,
+        "limit": 100,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            resp = await client.get(f"{META_API}/{ad_account_id}/insights", params=params)
+            if resp.status_code != 200:
+                body = resp.text[:300]
+                if resp.status_code == 429 or '"code":17' in body or '"code":4' in body:
+                    return {"error": "Meta API rate limit reached. Try again in a few minutes."}
+                if '"code":190' in body or '"code":200' in body:
+                    return {"error": "Meta token expired or missing permissions. Please reconnect Meta."}
+                return {"error": f"Meta API error ({resp.status_code}): {body[:200]}"}
+            data = resp.json()
+    except httpx.TimeoutException:
+        return {"error": "Meta API request timed out."}
+    except Exception as e:
+        logger.error(f"Meta monthly live fetch error for {ad_account_id}: {e}", exc_info=True)
+        return {"error": f"Meta API error: {str(e)[:200]}"}
+
+    months = []
+    for row in data.get("data", []):
+        spend = float(row.get("spend", 0) or 0)
+        impressions = int(row.get("impressions", 0) or 0)
+        clicks = int(row.get("clicks", 0) or 0)
+        reach = int(row.get("reach", 0) or 0)
+        results = get_result_value([row], "lead")
+        months.append(enrich({
+            "month": (row.get("date_start") or "")[:7],  # "YYYY-MM"
+            "date_start": row.get("date_start"),
+            "date_stop": row.get("date_stop"),
+            "spend": round(spend, 2),
+            "impressions": impressions,
+            "clicks": clicks,
+            "reach": reach,
+            "results": results,
+            "cpm": round(spend / impressions * 1000, 2) if impressions else 0,
+            "cpc": round(spend / clicks, 2) if clicks else 0,
+            "ctr": round(clicks / impressions * 100, 2) if impressions else 0,
+        }))
+
+    return {"months": months}
+
+
 async def _fetch_leads_live(ad_account_id, access_token, start_date, end_date):
     """Fetch leads from Meta for a specific date range using filtering."""
     leads = []
@@ -301,6 +359,45 @@ async def get_meta_insights_live(db, user_id, start_date, end_date, group_ids=No
     return {"groups": all_results, "total_groups": len(all_results)}
 
 
+async def get_meta_insights_monthly(db, user_id, year, group_ids=None):
+    """
+    Month-by-month Meta ad account insights (spend, impressions, clicks,
+    results/leads) for a given year — ONE live API call per client group via
+    Meta's time_increment=monthly. Use this instead of calling
+    get_meta_insights_live with a full-year range, which only returns a
+    single aggregate, not a real breakdown.
+    """
+    try:
+        year = int(year)
+    except (TypeError, ValueError):
+        return {"error": "`year` must be an integer like 2026"}
+
+    access_token, groups, err = await _get_token_and_groups(db, user_id, group_ids)
+    if err and not groups:
+        return {"error": err}
+
+    all_results = []
+    for g in groups:
+        ad_account_id = g["meta_ad_account_id"]
+        data = await _fetch_monthly_insights_live(ad_account_id, access_token, year)
+
+        if "error" in data:
+            all_results.append({"group_id": g["id"], "group_name": g["name"], "error": data["error"]})
+            continue
+
+        months = data["months"]
+        all_results.append({
+            "group_id": g["id"],
+            "group_name": g["name"],
+            "year": year,
+            "months": months,
+            "yearly_total_spend": round(sum(m["spend"] for m in months), 2),
+            "yearly_total_results": sum(m["results"] for m in months),
+        })
+
+    return {"groups": all_results, "total_groups": len(all_results)}
+
+
 async def get_meta_leads_live(db, user_id, start_date, end_date, group_ids=None):
     """Fetch leads directly from Meta API for an arbitrary date range."""
     access_token, groups, err = await _get_token_and_groups(db, user_id, group_ids)
@@ -352,6 +449,30 @@ def register_meta_live_tools():
             "required": ["start_date", "end_date"],
         },
         executor=get_meta_insights_live,
+    )
+
+    registry.register(
+        name="get_meta_insights_monthly",
+        description=(
+            "Return month-by-month Meta ad insights (spend, impressions, clicks, results/leads) "
+            "for a given year, in ONE live API call per client group via Meta's time_increment=monthly. "
+            "Use this whenever the user asks for Meta ad spend, leads, or performance 'by month', "
+            "'monthly', or 'each month of [year]'. This is the correct tool for that — NOT "
+            "get_meta_insights_live with a full-year range, which only returns a single aggregate, "
+            "not a real breakdown. Never synthesize a monthly distribution from a yearly total."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "year": {"type": "integer", "description": "The calendar year, e.g. 2026."},
+                "group_ids": {
+                    "type": "array", "items": {"type": "string"},
+                    "description": "Filter to specific group IDs. Omit for all groups.",
+                },
+            },
+            "required": ["year"],
+        },
+        executor=get_meta_insights_monthly,
     )
 
     registry.register(

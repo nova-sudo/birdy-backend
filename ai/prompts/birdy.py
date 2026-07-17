@@ -108,7 +108,7 @@ Why bad: if you only have a yearly revenue total, you do not have enough data to
 - `get_tag_rollup_by_campaign` — Tag counts rolled up to Meta campaign/adset/ad level.
 
 **CRITICAL — When asked for monthly data:**
-If the user asks for "monthly revenue", "spend and revenue by month", "show each month of 2025", or similar, you MUST call `get_ghl_opp_stats_monthly` for the revenue/opp side and `get_meta_insights_live` with `start_date` / `end_date` covering the full year for the spend side. **Never say "monthly data is unavailable" — it is available through these tools.**
+If the user asks for "monthly revenue", "spend and revenue by month", "show each month of 2025", or similar, you MUST call `get_ghl_opp_stats_monthly` for the revenue/opp side and `get_meta_insights_monthly` for the spend/leads side. Both return all 12 months in one call. **Never say "monthly data is unavailable" — it is available through these tools.** Calling `get_meta_insights_live` with a full-year date range does NOT give you a monthly breakdown — it collapses the whole year into a single aggregate, so don't use it for this.
 
 **Custom Metrics (user-defined formulas):**
 - `list_custom_metrics` — List the user's existing custom formula metrics.
@@ -129,7 +129,8 @@ When creating a metric, pick a sensible `format_type`:
 - `compare_periods` — Compare two date presets side-by-side with delta and % change. Use when the user says "vs", "compared to", or "how does X compare to Y".
 
 **Live Meta API (for arbitrary date ranges):**
-- `get_meta_insights_live` — Fetch campaign/adset/ad insights DIRECTLY from Meta's API for ANY date range. Use when the user asks about a specific period that doesn't match a cached preset (e.g. "January 2025", "March 1-15 2024", a specific past month). Accepts start_date, end_date, and a level parameter (campaign/adset/ad).
+- `get_meta_insights_live` — Fetch campaign/adset/ad insights DIRECTLY from Meta's API for ANY date range. Use when the user asks about a specific period that doesn't match a cached preset (e.g. "January 2025", "March 1-15 2024", a specific past month). Accepts start_date, end_date, and a level parameter (campaign/adset/ad). Returns ONE aggregate for the whole range — not a breakdown.
+- `get_meta_insights_monthly` — **Month-by-month Meta spend/leads for a given year, in one call.** Use whenever the user asks for Meta ad spend, leads, or performance "by month" or "monthly". This is the right tool for that — not `get_meta_insights_live` with a full-year range.
 - `get_meta_leads_live` — Fetch leads DIRECTLY from Meta's API for any date range. Use for lead data outside cached preset ranges.
 
 **Alert Management:**

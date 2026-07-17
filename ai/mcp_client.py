@@ -47,7 +47,7 @@ MCP_TOOL_NAMES = {
     # ai/mcp/compare_mcp.py
     "compare_periods",
     # ai/mcp/meta_live_mcp.py
-    "get_meta_insights_live", "get_meta_leads_live",
+    "get_meta_insights_live", "get_meta_leads_live", "get_meta_insights_monthly",
     # ai/mcp/custom_metrics_mcp.py
     "list_custom_metrics", "compute_custom_metric", "list_available_metric_fields",
     "create_custom_metric", "update_custom_metric", "delete_custom_metric",

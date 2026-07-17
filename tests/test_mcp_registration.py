@@ -16,7 +16,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "group_mcp": {"get_client_groups"},
     "summary_mcp": {"get_account_summary"},
     "compare_mcp": {"compare_periods"},
-    "meta_live_mcp": {"get_meta_insights_live", "get_meta_leads_live"},
+    "meta_live_mcp": {"get_meta_insights_live", "get_meta_leads_live", "get_meta_insights_monthly"},
     "custom_metrics_mcp": {
         "list_custom_metrics", "compute_custom_metric", "list_available_metric_fields",
         "create_custom_metric", "update_custom_metric", "delete_custom_metric",
