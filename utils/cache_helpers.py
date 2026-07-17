@@ -139,6 +139,7 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         ("meta_refresh_jobs.idx_mrj_group_created", db["meta_refresh_jobs"].create_index([("group_id", 1), ("created_at", -1)], name="idx_mrj_group_created", background=True)),
         ("meta_refresh_jobs.idx_mrj_group_status", db["meta_refresh_jobs"].create_index([("group_id", 1), ("status", 1)], name="idx_mrj_group_status", background=True)),
         ("meta_refresh_jobs.idx_mrj_status_retry", db["meta_refresh_jobs"].create_index([("status", 1), ("next_retry_at", 1), ("created_at", 1)], name="idx_mrj_status_retry", background=True)),
+        ("waitlist.idx_waitlist_email", db["waitlist"].create_index("email", unique=True, name="idx_waitlist_email", background=True)),
     ]
 
     results = await asyncio.gather(*(coro for _, coro in index_calls), return_exceptions=True)
