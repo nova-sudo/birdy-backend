@@ -96,6 +96,41 @@ def test_bar_chart_over_20_points_folds_remainder_into_other_bucket():
     assert any(d["label"].startswith("Other (") for d in chart_data)
 
 
+def test_third_chart_in_one_reply_falls_back_to_text_bars_under_slacks_two_viz_cap():
+    # Real incident: Slack rejects an ENTIRE message with invalid_blocks if it
+    # contains more than 2 data_visualization blocks — a reply with 3+
+    # single-series charts (or a composed chart's series) must degrade the
+    # excess to text-bars instead of crashing the send.
+    def chart(title):
+        return ':::chart\n' + json.dumps({
+            "type": "bar", "title": title, "data": [{"label": "A", "value": 10}],
+        }) + '\n:::'
+
+    reply = "\n\n".join([chart("First"), chart("Second"), chart("Third")])
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    viz_blocks = [b for b in blocks if b["type"] == "data_visualization"]
+    fallback_blocks = [b for b in blocks if b["type"] == "section" and "```" in b.get("text", {}).get("text", "")]
+    assert len(viz_blocks) == 2
+    assert len(fallback_blocks) == 1
+    assert "Third" in fallback_blocks[0]["text"]["text"]
+
+
+def test_composed_chart_series_beyond_viz_budget_falls_back_individually():
+    reply = (
+        ':::chart\n'
+        '{"type":"composed","title":"Metrics",'
+        '"data":[{"label":"Jan","a":1,"b":2,"c":3}],'
+        '"series":[{"key":"a","name":"A","type":"bar"},{"key":"b","name":"B","type":"bar"},'
+        '{"key":"c","name":"C","type":"line"}]}\n:::'
+    )
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    assert len(blocks) == 3
+    assert blocks[0]["type"] == "data_visualization"
+    assert blocks[1]["type"] == "data_visualization"
+    assert blocks[2]["type"] == "section"  # third series exceeds the 2-per-message cap
+    assert "C" in blocks[2]["text"]["text"]
+
+
 def test_donut_chart_is_native_pie_and_drops_zero_segments():
     reply = (
         ':::chart\n'

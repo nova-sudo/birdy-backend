@@ -45,6 +45,10 @@ _VIZ_MAX_TITLE_CHARS = 50
 _VIZ_MAX_DATA_POINTS = 20
 _VIZ_MAX_PIE_SEGMENTS = 12
 _VIZ_MAX_SERIES = 12
+# Slack caps an entire MESSAGE at 2 data_visualization blocks — not per-block,
+# per-message. Exceeding it makes chat.postMessage reject the whole message
+# (invalid_blocks), so this budget is shared across every :::chart in one reply.
+_MAX_VIZ_BLOCKS_PER_MESSAGE = 2
 
 
 def _format_value(value, fmt: str | None, currency: str = "$") -> str:
@@ -306,7 +310,35 @@ def _native_pie(title: str, rows: list[dict]) -> dict | None:
     }
 
 
-def _chart_block(payload: dict, idx: int) -> list[dict]:
+def _fallback_donut_block(title: str, data: list[dict], currency: str, idx: int) -> dict:
+    total = sum(r.get("value", 0) or 0 for r in data) or 1
+    value_fmt = "currency" if currency else "integer"
+    lines = [
+        f"{r.get('label', '')} — {_format_value(r.get('value', 0), value_fmt, currency)} "
+        f"({(r.get('value', 0) or 0) / total * 100:.0f}%)"
+        for r in data
+    ]
+    body = "\n".join(lines)
+    return {"type": "section", "block_id": f"chart_{idx}",
+             "text": {"type": "mrkdwn", "text": f"*{title}*\n```\n{body}\n```"}}
+
+
+def _fallback_series_block(title: str, data: list[dict], value_key: str, currency: str, sort: bool, block_id: str) -> dict:
+    body = _bar_rows(data, value_key, currency, sort)
+    return {"type": "section", "block_id": block_id,
+             "text": {"type": "mrkdwn", "text": f"*{title}*\n```\n{body}\n```"}}
+
+
+def _chart_block(payload: dict, idx: int, viz_budget: int) -> tuple[list[dict], int]:
+    """Returns (blocks, native_viz_blocks_used).
+
+    Slack caps a single message at _MAX_VIZ_BLOCKS_PER_MESSAGE data_visualization
+    blocks total — exceeding it makes chat.postMessage reject the ENTIRE message
+    (a real incident: a reply with 3+ charts/series 500'd and the user got no
+    reply at all). `viz_budget` is how many more native chart blocks this message
+    can still afford; once it hits 0, remaining charts/series degrade to the
+    text-bar fallback instead of being silently dropped or crashing the send.
+    """
     chart_type = payload.get("type", "bar")
     title = payload.get("title") or "Chart"
     currency = payload.get("currency", "")
@@ -317,62 +349,56 @@ def _chart_block(payload: dict, idx: int) -> list[dict]:
 
     try:
         if chart_type == "donut":
+            if viz_budget <= 0:
+                return [_fallback_donut_block(title, data, currency, idx)], 0
             block = _native_pie(title, data)
             if block is None:
                 return [{"type": "section", "block_id": f"chart_{idx}",
-                          "text": {"type": "mrkdwn", "text": f"*{title}*\n_No non-zero data to chart._"}}]
+                          "text": {"type": "mrkdwn", "text": f"*{title}*\n_No non-zero data to chart._"}}], 0
             block["block_id"] = f"chart_{idx}"
-            return [block]
+            return [block], 1
 
         if series:
             # composed/multi-series: one native chart block per series (Slack's
             # data_visualization block is single-chart-type, so a bar+line combo
             # can't be one block — this mirrors how the frontend renders it anyway).
-            blocks = []
+            blocks, used = [], 0
             for s_idx, s in enumerate(series[:_VIZ_MAX_SERIES]):
                 key = s["key"]
-                native_type = "line" if s.get("type") == "line" else "bar"
                 s_name = s.get("name", key)
                 s_currency = s.get("currency", currency)
                 s_title = f"{title} — {s_name}" if title else s_name
-                s_y_label = f"{s_name} ({s_currency})" if s_currency else None
-                block = _native_series_chart(native_type, s_title, data, key, sort, s_name, s_y_label)
-                block["block_id"] = f"chart_{idx}_{s_idx}"
-                blocks.append(block)
-            return blocks
+                block_id = f"chart_{idx}_{s_idx}"
+                if viz_budget - used > 0:
+                    native_type = "line" if s.get("type") == "line" else "bar"
+                    s_y_label = f"{s_name} ({s_currency})" if s_currency else None
+                    block = _native_series_chart(native_type, s_title, data, key, sort, s_name, s_y_label)
+                    block["block_id"] = block_id
+                    blocks.append(block)
+                    used += 1
+                else:
+                    blocks.append(_fallback_series_block(s_title, data, key, s_currency, sort, block_id))
+            return blocks, used
 
+        if viz_budget <= 0:
+            return [_fallback_series_block(title, data, "value", currency, sort, f"chart_{idx}")], 0
         native_type = "line" if chart_type == "line" else "bar"
         block = _native_series_chart(native_type, title, data, "value", sort, title, y_label)
         block["block_id"] = f"chart_{idx}"
-        return [block]
+        return [block], 1
     except Exception:
         logger.exception(f"Native chart block failed for idx={idx}, falling back to text bars")
-        header = f"*{title}*\n"
         if chart_type == "donut":
-            total = sum(r.get("value", 0) or 0 for r in data) or 1
-            value_fmt = "currency" if currency else "integer"
-            lines = [
-                f"{r.get('label', '')} — {_format_value(r.get('value', 0), value_fmt, currency)} "
-                f"({(r.get('value', 0) or 0) / total * 100:.0f}%)"
-                for r in data
-            ]
-            body = "\n".join(lines)
-            return [{"type": "section", "block_id": f"chart_{idx}",
-                      "text": {"type": "mrkdwn", "text": f"{header}```\n{body}\n```"}}]
+            return [_fallback_donut_block(title, data, currency, idx)], 0
         if series:
-            blocks = []
-            for s_idx, s in enumerate(series):
-                key = s["key"]
-                body = _bar_rows(data, key, s.get("currency", currency), sort)
-                sub_header = f"*{title} — {s.get('name', key)}*\n"
-                blocks.append({
-                    "type": "section", "block_id": f"chart_{idx}_{s_idx}",
-                    "text": {"type": "mrkdwn", "text": f"{sub_header}```\n{body}\n```"},
-                })
-            return blocks
-        body = _bar_rows(data, "value", currency, sort)
-        return [{"type": "section", "block_id": f"chart_{idx}",
-                  "text": {"type": "mrkdwn", "text": f"{header}```\n{body}\n```"}}]
+            return [
+                _fallback_series_block(
+                    f"{title} — {s.get('name', s['key'])}" if title else s.get("name", s["key"]),
+                    data, s["key"], s.get("currency", currency), sort, f"chart_{idx}_{s_idx}",
+                )
+                for s_idx, s in enumerate(series)
+            ], 0
+        return [_fallback_series_block(title, data, "value", currency, sort, f"chart_{idx}")], 0
 
 
 def _ui_option(opt: dict) -> dict:
@@ -496,7 +522,6 @@ _BUILDERS = {
     "metric": _metric_block,
     "stats": _stats_block,
     "status": _status_block,
-    "chart": _chart_block,
 }
 
 
@@ -530,6 +555,7 @@ def build_blocks_from_reply(reply_text: str, *, iid_prefix: str) -> tuple[list[d
     prose_parts: list[str] = []
     last_end = 0
     block_idx = 0
+    viz_remaining = _MAX_VIZ_BLOCKS_PER_MESSAGE
 
     for match in _BLOCK_RE.finditer(reply_text):
         prose = reply_text[last_end:match.start()]
@@ -547,6 +573,9 @@ def build_blocks_from_reply(reply_text: str, *, iid_prefix: str) -> tuple[list[d
             if block_type == "ui":
                 new_blocks, pending = _ui_blocks(payload, block_idx, iid_prefix)
                 ui_pending.append(pending)
+            elif block_type == "chart":
+                new_blocks, viz_used = _chart_block(payload, block_idx, viz_remaining)
+                viz_remaining -= viz_used
             else:
                 new_blocks = _BUILDERS[block_type](payload, block_idx)
             blocks.extend(new_blocks)
