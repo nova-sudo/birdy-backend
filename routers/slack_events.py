@@ -95,12 +95,33 @@ async def slack_events(request: Request):
         from slack_sdk.web.async_client import AsyncWebClient
         slack_client = AsyncWebClient(token=bot_token)
 
+        # Everything from here on can take anywhere from a couple seconds to
+        # a couple minutes (live tool calls, multi-turn reasoning) — with no
+        # ack, the user has no idea the bot even saw the message. Post a
+        # placeholder immediately and edit it in place with the real answer,
+        # rather than leaving the thread silent until the very end.
+        ack_ts = None
+        try:
+            ack = await slack_client.chat_postMessage(
+                channel=channel, thread_ts=thread_key, text="🤔 Thinking…",
+            )
+            ack_ts = ack.get("ts")
+        except Exception:
+            logger.warning("Failed to post Slack 'thinking' ack", exc_info=True)
+
+        async def _reply(text: str | None = None, blocks: list | None = None) -> None:
+            if ack_ts:
+                try:
+                    await slack_client.chat_update(channel=channel, ts=ack_ts, text=text or "", blocks=blocks)
+                    return
+                except Exception:
+                    logger.warning("Failed to update Slack ack message, posting fresh instead", exc_info=True)
+            await slack_client.chat_postMessage(channel=channel, thread_ts=thread_key, text=text or "", blocks=blocks)
+
         try:
             provider = await get_provider_for_user(user_id, db)
         except NoAiCredentialError:
-            await slack_client.chat_postMessage(
-                channel=channel,
-                thread_ts=thread_key,
+            await _reply(
                 text=(
                     "This Birdy account hasn't connected an AI key yet — "
                     "ask the workspace owner to connect one in Settings → Integrations."
@@ -141,9 +162,7 @@ async def slack_events(request: Request):
                     session_id=result["session_id"], fields=pending["fields"], mode=pending["mode"],
                 )
 
-            await slack_client.chat_postMessage(
-                channel=channel, thread_ts=thread_key, blocks=blocks, text=fallback_text,
-            )
+            await _reply(text=fallback_text, blocks=blocks)
 
             await save_thread_session_id(db, team_id, channel, thread_key, user_id, result["session_id"])
         except Exception:
@@ -153,11 +172,7 @@ async def slack_events(request: Request):
                 exc_info=True,
             )
             try:
-                await slack_client.chat_postMessage(
-                    channel=channel,
-                    thread_ts=thread_key,
-                    text="Something went wrong processing that — please try again.",
-                )
+                await _reply(text="Something went wrong processing that — please try again.")
             except Exception:
                 logger.error("Also failed to post the fallback error message to Slack", exc_info=True)
 
