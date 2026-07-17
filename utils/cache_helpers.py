@@ -120,6 +120,15 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         ("client_groups.user_id_1_id_1", db["client_groups"].create_index([("user_id", 1), ("id", 1)], name="user_id_1_id_1", background=True)),
         ("webhooks.user_id_1_event_type_1_received_at_-1", db["webhooks"].create_index([("user_id", 1), ("event_type", 1), ("received_at", -1)], name="user_id_1_event_type_1_received_at_-1", background=True)),
         ("hotprospector_leads.user_id_1_ghl_location_id_1", db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1)], name="user_id_1_ghl_location_id_1", background=True)),
+        # The call-center endpoint (routers/hotprospector.py get_hp_call_center)
+        # sorts every query by created_at desc, but neither index above includes
+        # it — every page fetch forced an in-memory SORT stage over the *entire*
+        # matching set (all of a location's leads, or all of a user's leads
+        # across every location on the "All Clients" view) before it could
+        # skip/limit. These two cover both query shapes so the sort comes
+        # straight from the index instead.
+        ("hotprospector_leads.idx_hpl_user_created", db["hotprospector_leads"].create_index([("user_id", 1), ("created_at", -1)], name="idx_hpl_user_created", background=True)),
+        ("hotprospector_leads.idx_hpl_user_loc_created", db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1), ("created_at", -1)], name="idx_hpl_user_loc_created", background=True)),
         ("hotprospector_member_daily.idx_hpmd_uniq", db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1), ("agentId", 1)], unique=True, name="idx_hpmd_uniq", background=True)),
         ("hotprospector_member_daily.idx_hpmd_date", db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1)], name="idx_hpmd_date", background=True)),
         ("alerts.idx_al_created", db["alerts"].create_index([("user_id", 1), ("created_at", -1)], name="idx_al_created", background=True)),
