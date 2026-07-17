@@ -2,6 +2,8 @@
 ai/prompts/birdy.py for all 5 block types (that file is the wire-format
 source of truth), plus graceful degradation on malformed LLM output."""
 
+import json
+
 from services.slack_block_formatter import build_blocks_from_reply, build_modal_view
 
 
@@ -14,18 +16,21 @@ def test_metric_block_renders_with_delta_and_sparkline():
     )
     blocks, fallback, ui_pending = build_blocks_from_reply(reply, iid_prefix="t1")
     assert ui_pending == []
-    section = blocks[0]
-    assert section["type"] == "section"
-    assert "Total Revenue" in section["text"]["text"]
-    assert "$27,122" in section["text"]["text"]
-    assert "▲" in section["text"]["text"]  # positive delta arrow
-    assert blocks[1]["type"] == "context"  # sparkline
+    header = blocks[0]
+    assert header["type"] == "header"  # native Header — biggest/boldest native text
+    assert header["text"]["type"] == "plain_text"
+    assert "$27,122" in header["text"]["text"]
+    label_ctx = blocks[1]
+    assert label_ctx["type"] == "context"
+    assert "Total Revenue" in label_ctx["elements"][0]["text"]
+    assert "▲" in label_ctx["elements"][0]["text"]  # positive delta arrow
+    assert blocks[2]["type"] == "context"  # sparkline
 
 
 def test_metric_negative_delta_shows_down_arrow():
     reply = ':::metric\n{"label":"CPL","value":12,"format":"currency","delta":-2}\n:::'
     blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
-    assert "▼" in blocks[0]["text"]["text"]
+    assert "▼" in blocks[1]["elements"][0]["text"]
 
 
 def test_stats_block_uses_native_fields_grid():
@@ -49,7 +54,7 @@ def test_status_block_shows_variant_emoji():
     assert "CPL exceeded $15" in blocks[0]["text"]["text"]
 
 
-def test_bar_chart_sorted_descending_with_currency():
+def test_bar_chart_is_native_data_visualization_sorted_descending():
     reply = (
         ':::chart\n'
         '{"type":"bar","title":"Won opps by client",'
@@ -57,24 +62,56 @@ def test_bar_chart_sorted_descending_with_currency():
         '"currency":"£"}\n:::'
     )
     blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
-    text = blocks[0]["text"]["text"]
-    assert "£41" in text and "£40" in text and "£12" in text
+    block = blocks[0]
+    assert block["type"] == "data_visualization"
+    assert block["chart"]["type"] == "bar"
+    data = block["chart"]["series"][0]["data"]
+    values_by_label = {d["label"]: d["value"] for d in data}
+    assert values_by_label == {"Aura": 40, "BBL": 41, "Plush": 12}
     # BBL (41) must appear before Aura (40) — descending sort
-    assert text.index("BBL") < text.index("Aura")
+    labels = [d["label"] for d in data]
+    assert labels.index("BBL") < labels.index("Aura")
+    # currency goes in the axis y_label, not baked into raw values
+    assert "£" in (block["chart"]["axis_config"].get("y_label") or "")
 
 
-def test_donut_chart_shows_percentages():
+def test_bar_chart_zero_value_renders_as_true_zero_not_a_minimum_bar():
+    reply = (
+        ':::chart\n'
+        '{"type":"bar","title":"Spend by client",'
+        '"data":[{"label":"Active","value":100},{"label":"Paused","value":0}]}\n:::'
+    )
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    data = blocks[0]["chart"]["series"][0]["data"]
+    paused = next(d for d in data if d["label"] == "Paused")
+    assert paused["value"] == 0
+
+
+def test_bar_chart_over_20_points_folds_remainder_into_other_bucket():
+    data = [{"label": f"Client {i}", "value": 100 - i} for i in range(25)]
+    reply = ':::chart\n' + json.dumps({"type": "bar", "title": "Spend", "data": data}) + '\n:::'
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    chart_data = blocks[0]["chart"]["series"][0]["data"]
+    assert len(chart_data) == 20  # Slack's own per-series limit
+    assert any(d["label"].startswith("Other (") for d in chart_data)
+
+
+def test_donut_chart_is_native_pie_and_drops_zero_segments():
     reply = (
         ':::chart\n'
         '{"type":"donut","title":"Lead sources",'
-        '"data":[{"label":"Meta","value":600},{"label":"GHL","value":400}]}\n:::'
+        '"data":[{"label":"Meta","value":600},{"label":"GHL","value":400},{"label":"HP","value":0}]}\n:::'
     )
     blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
-    text = blocks[0]["text"]["text"]
-    assert "60%" in text and "40%" in text
+    block = blocks[0]
+    assert block["type"] == "data_visualization"
+    assert block["chart"]["type"] == "pie"
+    labels = [s["label"] for s in block["chart"]["segments"]]
+    assert "Meta" in labels and "GHL" in labels
+    assert "HP" not in labels  # zero-value segments aren't valid in a pie
 
 
-def test_composed_chart_emits_one_block_per_series():
+def test_composed_chart_emits_one_native_chart_block_per_series():
     reply = (
         ':::chart\n'
         '{"type":"composed","title":"Spend vs CPL",'
@@ -83,17 +120,57 @@ def test_composed_chart_emits_one_block_per_series():
     )
     blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
     assert len(blocks) == 2
-    assert "Ad Spend" in blocks[0]["text"]["text"]
-    assert "CPL" in blocks[1]["text"]["text"]
+    assert blocks[0]["type"] == "data_visualization" and blocks[0]["chart"]["type"] == "bar"
+    assert "Ad Spend" in blocks[0]["title"]
+    assert blocks[1]["type"] == "data_visualization" and blocks[1]["chart"]["type"] == "line"
+    assert "CPL" in blocks[1]["title"]
 
 
 def test_malformed_block_degrades_gracefully_without_dropping_rest_of_reply():
     reply = "Before.\n\n:::metric\n{not valid json}\n:::\n\nAfter."
     blocks, fallback, _ = build_blocks_from_reply(reply, iid_prefix="t1")
-    texts = [b["text"]["text"] for b in blocks]
+    texts = [b["text"]["text"] for b in blocks if "text" in b]
     assert any("Before." in t for t in texts)
     assert any("Couldn't render" in t for t in texts)
     assert any("After." in t for t in texts)
+
+
+def test_divider_inserted_between_prose_and_custom_block():
+    reply = "Some context.\n\n:::status\n{\"label\":\"Done\",\"variant\":\"success\"}\n:::"
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    types = [b["type"] for b in blocks]
+    assert types == ["section", "divider", "section"]
+
+
+def test_no_divider_before_first_block_in_reply():
+    reply = ':::status\n{"label":"Done","variant":"success"}\n:::'
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    assert blocks[0]["type"] != "divider"
+
+
+def test_gfm_table_in_prose_becomes_native_table_block():
+    reply = (
+        "Here's the breakdown:\n\n"
+        "| Client | Spend |\n"
+        "| --- | --- |\n"
+        "| Aura | 120 |\n"
+        "| BBL | 90 |\n\n"
+        "That's the summary."
+    )
+    blocks, _, _ = build_blocks_from_reply(reply, iid_prefix="t1")
+    table = next(b for b in blocks if b["type"] == "table")
+    assert table["rows"][0] == [
+        {"type": "raw_text", "text": "Client"}, {"type": "raw_text", "text": "Spend"},
+    ]
+    assert table["rows"][1][0] == {"type": "raw_text", "text": "Aura"}
+    assert table["rows"][1][1] == {"type": "raw_number", "text": "120"}
+    # numeric column right-aligned, text column left-aligned
+    assert table["column_settings"][0]["align"] == "left"
+    assert table["column_settings"][1]["align"] == "right"
+    # surrounding prose still renders
+    texts = [b["text"]["text"] for b in blocks if b["type"] == "section"]
+    assert any("breakdown" in t for t in texts)
+    assert any("summary" in t for t in texts)
 
 
 def test_prose_converted_to_mrkdwn():

@@ -35,6 +35,17 @@ _SPARK_LEVELS = "▁▂▃▄▅▆▇█"
 _INLINE_UI_TYPES = {"select", "checkboxes", "radio", "date"}
 _MODAL_ONLY_UI_TYPES = {"text", "number"}
 
+# Slack's native `data_visualization` block (shipped June 2026) — real bar/line/
+# area/pie charts with no image generation or upload round-trip. Limits below
+# are Slack's own; anything over them gets folded into an "Other" bucket rather
+# than silently dropped, or truncated with an ellipsis for text fields.
+_VIZ_MAX_LABEL_CHARS = 20
+_VIZ_MAX_NAME_CHARS = 20
+_VIZ_MAX_TITLE_CHARS = 50
+_VIZ_MAX_DATA_POINTS = 20
+_VIZ_MAX_PIE_SEGMENTS = 12
+_VIZ_MAX_SERIES = 12
+
 
 def _format_value(value, fmt: str | None, currency: str = "$") -> str:
     try:
@@ -69,6 +80,85 @@ def _prose_to_mrkdwn(text: str) -> str:
     return text.strip()
 
 
+_TABLE_ROW_RE = re.compile(r"^\|(.+)\|\s*$")
+_TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)+\|?\s*$")
+_MAX_TABLE_ROWS = 100  # Slack's own limit (data rows, excluding header)
+
+
+def _looks_numeric(value: str) -> bool:
+    stripped = value.strip().replace(",", "").rstrip("%")
+    for prefix in ("£", "$", "€"):
+        if stripped.startswith(prefix):
+            stripped = stripped[len(prefix):]
+            break
+    try:
+        float(stripped)
+        return bool(stripped)
+    except ValueError:
+        return False
+
+
+def _split_table_row(line: str) -> list[str]:
+    line = line.strip()
+    inner = line[1:-1] if line.startswith("|") and line.endswith("|") else line
+    return [c.strip() for c in inner.split("|")]
+
+
+def _parse_gfm_table(paragraph: str) -> dict | None:
+    """A GFM table (as the prompt instructs the model to emit for dense data)
+    has no native mrkdwn equivalent — Slack's real Table block replaces what
+    used to be broken raw pipe-text. Returns None if `paragraph` isn't a table."""
+    lines = [l for l in paragraph.split("\n") if l.strip()]
+    if len(lines) < 2 or not _TABLE_ROW_RE.match(lines[0]) or not _TABLE_SEP_RE.match(lines[1]):
+        return None
+
+    header = _split_table_row(lines[0])
+    n_cols = len(header)
+    data_rows = [_split_table_row(l) for l in lines[2:] if _TABLE_ROW_RE.match(l)][:_MAX_TABLE_ROWS]
+    if not data_rows:
+        return None
+
+    def cell(value: str) -> dict:
+        return {"type": "raw_number" if _looks_numeric(value) else "raw_text", "text": value}
+
+    rows = [[{"type": "raw_text", "text": h} for h in header]]
+    for row in data_rows:
+        row = (row + [""] * n_cols)[:n_cols]
+        rows.append([cell(v) for v in row])
+
+    numeric_cols = [
+        all(r[c]["type"] == "raw_number" for r in rows[1:]) if rows[1:] else False
+        for c in range(n_cols)
+    ]
+    column_settings = [{"align": "right" if numeric_cols[c] else "left"} for c in range(n_cols)]
+    return {"type": "table", "rows": rows, "column_settings": column_settings}
+
+
+def _prose_to_blocks(prose: str) -> list[dict]:
+    """Converts a prose segment to blocks — GFM tables become native Table
+    blocks; everything else becomes chunked mrkdwn Section blocks."""
+    blocks: list[dict] = []
+    buffer: list[str] = []
+
+    def flush():
+        if not buffer:
+            return
+        mrkdwn = _prose_to_mrkdwn("\n\n".join(buffer))
+        if mrkdwn:
+            blocks.extend(_chunk_section_text({"type": "section", "text": {"type": "mrkdwn", "text": mrkdwn}}))
+        buffer.clear()
+
+    for paragraph in prose.split("\n\n"):
+        table = _parse_gfm_table(paragraph)
+        if table:
+            flush()
+            blocks.append(table)
+        else:
+            buffer.append(paragraph)
+    flush()
+    return blocks
+
+
 def _error_section(block_type: str, raw: str) -> dict:
     return {
         "type": "section",
@@ -81,15 +171,27 @@ def _metric_block(payload: dict, idx: int) -> list[dict]:
     label = payload.get("label", "")
     value = _format_value(payload["value"], payload.get("format"), payload.get("currency", "$"))
 
-    line = f"{icon} *{label}*\n*{value}*".strip()
+    # Header is Slack's biggest/boldest native text (plain_text only, 150 char
+    # cap) — the headline number belongs there, not squeezed into a Section.
+    blocks = [{
+        "type": "header",
+        "block_id": f"metric_{idx}_header",
+        "text": {"type": "plain_text", "text": value[:150]},
+    }]
+
+    sub_line = f"{icon} *{label}*".strip()
     delta = payload.get("delta")
     if delta is not None:
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "→")
         delta_str = _format_value(abs(delta), payload.get("format"), payload.get("currency", "$"))
         delta_label = payload.get("deltaLabel", "")
-        line += f"   {arrow} {delta_str}{f' {delta_label}' if delta_label else ''}"
-
-    blocks = [{"type": "section", "block_id": f"metric_{idx}", "text": {"type": "mrkdwn", "text": line}}]
+        sub_line += f"   {arrow} {delta_str}{f' {delta_label}' if delta_label else ''}"
+    if sub_line.strip():
+        blocks.append({
+            "type": "context",
+            "block_id": f"metric_{idx}_label",
+            "elements": [{"type": "mrkdwn", "text": sub_line}],
+        })
 
     sparkline = payload.get("sparkline")
     if sparkline and len(sparkline) >= 2:
@@ -125,16 +227,34 @@ def _status_block(payload: dict, idx: int) -> list[dict]:
     return [{"type": "section", "block_id": f"status_{idx}", "text": {"type": "mrkdwn", "text": text}}]
 
 
-def _bar_rows(data: list[dict], value_key: str, currency: str, sort: bool) -> str:
-    rows = list(data)
+def _truncate(value, max_len: int) -> str:
+    s = str(value)
+    return s if len(s) <= max_len else s[: max_len - 1].rstrip() + "…"
+
+
+def _cap_data_points(rows: list[dict], value_key: str, sort: bool, limit: int) -> list[dict]:
+    """Cap to Slack's data-point limit. The remainder is folded into a single
+    'Other (N)' bucket rather than silently dropped, so totals stay honest."""
+    rows = list(rows)
     if sort:
-        rows.sort(key=lambda r: r.get(value_key, 0), reverse=True)
-    max_value = max((abs(r.get(value_key, 0)) for r in rows), default=1) or 1
+        rows.sort(key=lambda r: abs(r.get(value_key, 0) or 0), reverse=True)
+    if len(rows) <= limit:
+        return rows
+    kept, rest = rows[: limit - 1], rows[limit - 1:]
+    other_total = sum(r.get(value_key, 0) or 0 for r in rest)
+    kept.append({"label": f"Other ({len(rest)})", value_key: other_total})
+    return kept
+
+
+def _bar_rows(data: list[dict], value_key: str, currency: str, sort: bool) -> str:
+    """Text-bar fallback — used only if native chart construction fails."""
+    rows = _cap_data_points(data, value_key, sort, limit=_VIZ_MAX_DATA_POINTS)
+    max_value = max((abs(r.get(value_key, 0) or 0) for r in rows), default=1) or 1
     label_width = max((len(str(r.get("label", ""))) for r in rows), default=0)
     lines = []
     for row in rows:
-        value = row.get(value_key, 0)
-        bar_width = max(1, round(abs(value) / max_value * 20))
+        value = row.get(value_key, 0) or 0
+        bar_width = max(1, round(abs(value) / max_value * 20)) if value else 0
         bar = "█" * bar_width + "░" * (20 - bar_width)
         label = str(row.get("label", "")).ljust(label_width)
         value_str = _format_value(value, "currency", currency) if currency else f"{value:,.0f}"
@@ -142,47 +262,117 @@ def _bar_rows(data: list[dict], value_key: str, currency: str, sort: bool) -> st
     return "\n".join(lines)
 
 
+def _native_series_chart(
+    native_type: str, title: str, rows: list[dict], value_key: str,
+    sort: bool, series_name: str, y_label: str | None = None,
+) -> dict:
+    """A real Slack `data_visualization` block — bar, line, or area."""
+    rows = _cap_data_points(rows, value_key, sort, limit=_VIZ_MAX_DATA_POINTS)
+    labels = [_truncate(r.get("label", ""), _VIZ_MAX_LABEL_CHARS) for r in rows]
+    chart = {
+        "type": native_type,
+        "series": [{
+            "name": _truncate(series_name or "Value", _VIZ_MAX_NAME_CHARS),
+            "data": [{"label": l, "value": r.get(value_key, 0) or 0} for l, r in zip(labels, rows)],
+        }],
+        "axis_config": {"categories": labels},
+    }
+    if y_label:
+        chart["axis_config"]["y_label"] = _truncate(y_label, 50)
+    return {
+        "type": "data_visualization",
+        "title": _truncate(title or "Chart", _VIZ_MAX_TITLE_CHARS),
+        "chart": chart,
+    }
+
+
+def _native_pie(title: str, rows: list[dict]) -> dict | None:
+    """A real Slack `data_visualization` pie block. Segments must be > 0 —
+    zero/negative rows are dropped (a 0% slice isn't meaningful anyway)."""
+    positive = [r for r in rows if (r.get("value", 0) or 0) > 0]
+    if not positive:
+        return None
+    positive = _cap_data_points(positive, "value", sort=True, limit=_VIZ_MAX_PIE_SEGMENTS)
+    return {
+        "type": "data_visualization",
+        "title": _truncate(title or "Chart", _VIZ_MAX_TITLE_CHARS),
+        "chart": {
+            "type": "pie",
+            "segments": [
+                {"label": _truncate(r.get("label", ""), _VIZ_MAX_LABEL_CHARS), "value": r.get("value", 0)}
+                for r in positive
+            ],
+        },
+    }
+
+
 def _chart_block(payload: dict, idx: int) -> list[dict]:
     chart_type = payload.get("type", "bar")
-    title = payload.get("title")
+    title = payload.get("title") or "Chart"
     currency = payload.get("currency", "")
     sort = payload.get("sort", True)
     data = payload.get("data", [])
     series = payload.get("series")
+    y_label = f"{title.split(' — ')[-1]} ({currency})" if currency else None
 
-    header = f"*{title}*\n" if title else ""
+    try:
+        if chart_type == "donut":
+            block = _native_pie(title, data)
+            if block is None:
+                return [{"type": "section", "block_id": f"chart_{idx}",
+                          "text": {"type": "mrkdwn", "text": f"*{title}*\n_No non-zero data to chart._"}}]
+            block["block_id"] = f"chart_{idx}"
+            return [block]
 
-    if chart_type == "donut":
-        total = sum(r.get("value", 0) for r in data) or 1
-        value_fmt = "currency" if currency else "integer"
-        lines = [
-            f"{r.get('label', '')} — {_format_value(r.get('value', 0), value_fmt, currency)} "
-            f"({r.get('value', 0) / total * 100:.0f}%)"
-            for r in data
-        ]
-        body = "\n".join(lines)
+        if series:
+            # composed/multi-series: one native chart block per series (Slack's
+            # data_visualization block is single-chart-type, so a bar+line combo
+            # can't be one block — this mirrors how the frontend renders it anyway).
+            blocks = []
+            for s_idx, s in enumerate(series[:_VIZ_MAX_SERIES]):
+                key = s["key"]
+                native_type = "line" if s.get("type") == "line" else "bar"
+                s_name = s.get("name", key)
+                s_currency = s.get("currency", currency)
+                s_title = f"{title} — {s_name}" if title else s_name
+                s_y_label = f"{s_name} ({s_currency})" if s_currency else None
+                block = _native_series_chart(native_type, s_title, data, key, sort, s_name, s_y_label)
+                block["block_id"] = f"chart_{idx}_{s_idx}"
+                blocks.append(block)
+            return blocks
+
+        native_type = "line" if chart_type == "line" else "bar"
+        block = _native_series_chart(native_type, title, data, "value", sort, title, y_label)
+        block["block_id"] = f"chart_{idx}"
+        return [block]
+    except Exception:
+        logger.exception(f"Native chart block failed for idx={idx}, falling back to text bars")
+        header = f"*{title}*\n"
+        if chart_type == "donut":
+            total = sum(r.get("value", 0) or 0 for r in data) or 1
+            value_fmt = "currency" if currency else "integer"
+            lines = [
+                f"{r.get('label', '')} — {_format_value(r.get('value', 0), value_fmt, currency)} "
+                f"({(r.get('value', 0) or 0) / total * 100:.0f}%)"
+                for r in data
+            ]
+            body = "\n".join(lines)
+            return [{"type": "section", "block_id": f"chart_{idx}",
+                      "text": {"type": "mrkdwn", "text": f"{header}```\n{body}\n```"}}]
+        if series:
+            blocks = []
+            for s_idx, s in enumerate(series):
+                key = s["key"]
+                body = _bar_rows(data, key, s.get("currency", currency), sort)
+                sub_header = f"*{title} — {s.get('name', key)}*\n"
+                blocks.append({
+                    "type": "section", "block_id": f"chart_{idx}_{s_idx}",
+                    "text": {"type": "mrkdwn", "text": f"{sub_header}```\n{body}\n```"},
+                })
+            return blocks
+        body = _bar_rows(data, "value", currency, sort)
         return [{"type": "section", "block_id": f"chart_{idx}",
                   "text": {"type": "mrkdwn", "text": f"{header}```\n{body}\n```"}}]
-
-    if series:
-        # composed/multi-series: one bar block per series, subheaded by series name
-        blocks = []
-        for s_idx, s in enumerate(series):
-            key = s["key"]
-            s_currency = s.get("currency", currency)
-            body = _bar_rows(data, key, s_currency, sort)
-            sub_header = f"*{title} — {s.get('name', key)}*\n" if title else f"*{s.get('name', key)}*\n"
-            blocks.append({
-                "type": "section",
-                "block_id": f"chart_{idx}_{s_idx}",
-                "text": {"type": "mrkdwn", "text": f"{sub_header}```\n{body}\n```"},
-            })
-        return blocks
-
-    # single-series bar/line — same text-bar treatment for both (Slack can't draw a line either)
-    body = _bar_rows(data, "value", currency, sort)
-    return [{"type": "section", "block_id": f"chart_{idx}",
-              "text": {"type": "mrkdwn", "text": f"{header}```\n{body}\n```"}}]
 
 
 def _ui_option(opt: dict) -> dict:
@@ -343,13 +533,15 @@ def build_blocks_from_reply(reply_text: str, *, iid_prefix: str) -> tuple[list[d
 
     for match in _BLOCK_RE.finditer(reply_text):
         prose = reply_text[last_end:match.start()]
-        mrkdwn = _prose_to_mrkdwn(prose)
-        if mrkdwn:
-            prose_parts.append(mrkdwn)
-            section = {"type": "section", "text": {"type": "mrkdwn", "text": mrkdwn}}
-            blocks.extend(_chunk_section_text(section))
+        if prose.strip():
+            mrkdwn = _prose_to_mrkdwn(prose)
+            if mrkdwn:
+                prose_parts.append(mrkdwn)
+            blocks.extend(_prose_to_blocks(prose))
 
         block_type, raw_json = match.group(1), match.group(2)
+        if blocks:
+            blocks.append({"type": "divider"})
         try:
             payload = json.loads(raw_json)
             if block_type == "ui":
@@ -365,11 +557,12 @@ def build_blocks_from_reply(reply_text: str, *, iid_prefix: str) -> tuple[list[d
         block_idx += 1
         last_end = match.end()
 
-    trailing_prose = _prose_to_mrkdwn(reply_text[last_end:])
-    if trailing_prose:
-        prose_parts.append(trailing_prose)
-        section = {"type": "section", "text": {"type": "mrkdwn", "text": trailing_prose}}
-        blocks.extend(_chunk_section_text(section))
+    trailing_prose = reply_text[last_end:]
+    if trailing_prose.strip():
+        mrkdwn = _prose_to_mrkdwn(trailing_prose)
+        if mrkdwn:
+            prose_parts.append(mrkdwn)
+        blocks.extend(_prose_to_blocks(trailing_prose))
 
     if len(blocks) > _MAX_BLOCKS:
         logger.warning(f"Reply produced {len(blocks)} blocks, truncating to {_MAX_BLOCKS}")
