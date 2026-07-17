@@ -55,7 +55,21 @@ MCP_TOOL_NAMES = {
     "get_unified_leads", "get_unified_lead_stats",
 }
 
-_INTERNAL_TOKEN_TTL_SECONDS = 60
+_INTERNAL_TOKEN_TTL_SECONDS = 280
+# One token is minted per run_chat() call and reused for every tool call across
+# every iteration of that chat turn (see mcp_client_for below) — it is never
+# re-minted mid-turn. Was 60s, which is shorter than a single slow tool call:
+# get_meta_insights_live does a live, unbatched, serial Meta Graph API fetch
+# across every one of the user's ad accounts and can take 2+ minutes on a large
+# account list. Once the token expired mid-turn, every subsequent tool call in
+# that turn failed with 401 "Bearer token rejected", and — because nothing
+# upstream of this catches that — silently killed the whole chat response with
+# no fallback message (see routers/slack_events.py's try/except for the other
+# half of that fix). 280s gives headroom under Vercel's function ceiling while
+# still being bounded; this token never leaves the process (it only
+# authenticates the in-process ASGI transport below), so a longer TTL doesn't
+# widen any real attack surface.
+#
 # No "/mcp" prefix: the ASGITransport below targets mcp_app directly (the raw
 # FastMCP sub-app, built with http_app(path="/")), not the outer FastAPI
 # app's "/mcp" mount — so its own root "/" is the correct path.
