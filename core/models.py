@@ -15,6 +15,10 @@ class LoginRequest(BaseModel):
     rememberMe: bool = False
 
 
+class WaitlistRequest(BaseModel):
+    email: str
+
+
 class LinkClientRequest(BaseModel):
     client_name: str
     ghl_location_id: str
