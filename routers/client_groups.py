@@ -515,6 +515,37 @@ async def create_client_group_optimized(
 
 
 # ---------------------------------------------------------------------------
+# POST /api/client-groups/refresh-all          — start the cycle
+# DELETE /api/client-groups/refresh-all        — stop it
+# GET  /api/client-groups/refresh-all/status   — poll progress
+#
+# Registered here, ahead of every /api/client-groups/{group_id}... route below,
+# because Starlette matches routes in registration order — a {group_id} path
+# param would otherwise swallow "refresh-all" as a literal group id and 404.
+# ---------------------------------------------------------------------------
+
+@router.post("/api/client-groups/refresh-all")
+async def start_refresh_all(current_user: str = Depends(get_current_user)):
+    """Start a staggered refresh cycle: one group every 15 min."""
+    from jobs.refresh_all_job import start_cycle
+    return start_cycle()
+
+
+@router.delete("/api/client-groups/refresh-all")
+async def stop_refresh_all(current_user: str = Depends(get_current_user)):
+    """Cancel a running refresh cycle."""
+    from jobs.refresh_all_job import stop_cycle
+    return stop_cycle()
+
+
+@router.get("/api/client-groups/refresh-all/status")
+async def refresh_all_status(current_user: str = Depends(get_current_user)):
+    """Get progress of the current refresh cycle."""
+    from jobs.refresh_all_job import get_cycle_status
+    return get_cycle_status()
+
+
+# ---------------------------------------------------------------------------
 # GET /api/client-groups/{group_id}/tag-metrics
 # ---------------------------------------------------------------------------
 
@@ -2521,32 +2552,6 @@ async def get_refresh_status(
             "meta_refresh_progress": meta_progress,
         }
 
-
-# ---------------------------------------------------------------------------
-# POST /api/client-groups/refresh-all          — start the cycle
-# DELETE /api/client-groups/refresh-all        — stop it
-# GET  /api/client-groups/refresh-all/status   — poll progress
-# ---------------------------------------------------------------------------
-
-@router.post("/api/client-groups/refresh-all")
-async def start_refresh_all(current_user: str = Depends(get_current_user)):
-    """Start a staggered refresh cycle: one group every 15 min."""
-    from jobs.refresh_all_job import start_cycle
-    return start_cycle()
-
-
-@router.delete("/api/client-groups/refresh-all")
-async def stop_refresh_all(current_user: str = Depends(get_current_user)):
-    """Cancel a running refresh cycle."""
-    from jobs.refresh_all_job import stop_cycle
-    return stop_cycle()
-
-
-@router.get("/api/client-groups/refresh-all/status")
-async def refresh_all_status(current_user: str = Depends(get_current_user)):
-    """Get progress of the current refresh cycle."""
-    from jobs.refresh_all_job import get_cycle_status
-    return get_cycle_status()
 
 # ---------------------------------------------------------------------------
 # DELETE /api/client-groups/{group_id}
