@@ -24,8 +24,16 @@ MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-medium-latest")
 # prose would be fine with 0.5–0.7, but fabrication risk for numbers/names
 # climbs sharply past ~0.3. Hallucinated revenue figures look convincing at
 # 0.5+.
+# DEFAULT_TEMPERATURE kept low, see above. MAX_TOOL_ITERATIONS was 5 — too low
+# for the multi-tool-call patterns ai/prompts/birdy.py itself instructs (e.g. a
+# "last 30/60/90 days" breakdown needs a live call per non-cached window per
+# data source, 6+ calls, since only 13 fixed presets are cached — no 60d/90d
+# preset exists). Hitting the cap forced a no-tools final turn with no signal
+# to the model that it was cut short, which produced fabricated data under
+# user pushback (see ai/orchestrator.py's final-iteration notice, the paired
+# fix for this same incident).
 DEFAULT_TEMPERATURE = 0.15
-MAX_TOOL_ITERATIONS = 5
+MAX_TOOL_ITERATIONS = 12
 MAX_RESULT_CHARS = 8000
 MAX_RESULT_ITEMS = 20
 

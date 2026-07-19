@@ -33,6 +33,7 @@ from services.call_logs_service import create_call_logs_indexes
 from services.mcp_token_service import create_mcp_tokens_indexes
 from services.slack_bot_service import create_slack_bot_indexes
 from services.slack_interaction_store import create_slack_ui_interaction_indexes
+from ai.session_store import create_ai_session_indexes
 from billing import router as billing_router
 
 from ai.mcp import mcp_app
@@ -56,6 +57,7 @@ async def lifespan(app: FastAPI):
         await create_mcp_tokens_indexes(client)
         await create_slack_bot_indexes(client)
         await create_slack_ui_interaction_indexes(client)
+        await create_ai_session_indexes(client)
 
     get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
 

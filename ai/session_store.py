@@ -1,47 +1,75 @@
-"""In-memory chat session store with auto-expiry."""
+"""
+ai/session_store.py
+--------------------
+Persistent (Mongo-backed) chat session store with sliding TTL expiry.
 
-import time
+Was previously an in-process dict — broken on this deployment. Vercel's
+Lambda-style Python runtime does not guarantee the same worker handles two
+requests that are even a few seconds apart (see routers/slack_events.py's
+own comment on this), and a Slack conversation routinely has minutes between
+turns. An in-memory session_id lookup missing on a cold/different worker
+silently fell through to create_session() and returned a BRAND NEW, EMPTY
+history — wiping the system prompt (including every anti-hallucination
+rule) and every prior tool-call result with no error, no log distinguishing
+"resumed" from "lost", and no signal to the caller. The model then had to
+answer follow-up questions ("what's her cost per won opportunity?") with no
+real grounding, which is what produced fabricated numbers under user
+pushback. services/slack_interaction_store.py already documents this exact
+class of bug and was deliberately built Mongo-backed to avoid it — this
+module follows that same, proven pattern instead of the one that broke.
+"""
+
 import uuid
 import logging
+from datetime import datetime, timedelta
 
 logger = logging.getLogger(__name__)
 
-# session_id -> {"user_id": str, "messages": list, "last_active": float}
-_sessions: dict[str, dict] = {}
-
-SESSION_TTL = 60 * 60  # 1 hour of inactivity
+SESSION_TTL_HOURS = 1  # 1 hour of inactivity, matches the old in-memory TTL
 MAX_MESSAGES = 50  # keep last N messages to avoid unbounded growth
 
+_COLLECTION = "ai_chat_sessions"
 
-def create_session(user_id: str) -> str:
+
+def _expiry(now: datetime) -> datetime:
+    return now + timedelta(hours=SESSION_TTL_HOURS)
+
+
+async def create_session(db, user_id: str) -> str:
     """Create a new session and return its ID."""
-    _gc()
     session_id = f"chat_{uuid.uuid4().hex[:12]}"
-    _sessions[session_id] = {
+    now = datetime.utcnow()
+    await db[_COLLECTION].insert_one({
+        "_id": session_id,
         "user_id": user_id,
         "messages": [],
-        "last_active": time.time(),
-    }
+        "last_active": now,
+        "expires_at": _expiry(now),
+    })
     return session_id
 
 
-def get_or_create(session_id: str | None, user_id: str) -> tuple[str, list]:
+async def get_or_create(db, session_id: str | None, user_id: str) -> tuple[str, list]:
     """
     Return (session_id, messages) for an existing session, or create a new one.
-    Validates that the session belongs to the user.
+    Validates that the session belongs to the user. Sliding TTL: every read
+    pushes expires_at forward another SESSION_TTL_HOURS.
     """
-    _gc()
+    if session_id:
+        now = datetime.utcnow()
+        doc = await db[_COLLECTION].find_one_and_update(
+            {"_id": session_id, "user_id": user_id},
+            {"$set": {"last_active": now, "expires_at": _expiry(now)}},
+        )
+        if doc:
+            return session_id, doc.get("messages", [])
+        # Either the id doesn't exist, expired, or belongs to a different
+        # user — indistinguishable from here (TTL deletion looks the same
+        # as "never existed"), so just fall through to a fresh session.
+        logger.info(f"Session {session_id} not found/expired for user {user_id}, creating new")
 
-    if session_id and session_id in _sessions:
-        session = _sessions[session_id]
-        if session["user_id"] == user_id:
-            session["last_active"] = time.time()
-            return session_id, session["messages"]
-        # Wrong user — ignore and create new
-        logger.warning(f"Session {session_id} belongs to different user, creating new")
-
-    new_id = create_session(user_id)
-    return new_id, _sessions[new_id]["messages"]
+    new_id = await create_session(db, user_id)
+    return new_id, []
 
 
 def sanitize_history(messages: list) -> list:
@@ -55,7 +83,8 @@ def sanitize_history(messages: list) -> list:
 
     This function walks the message list and drops any `tool` message or
     `assistant(tool_calls)` message that would be orphaned. It preserves
-    system + user + clean assistant messages.
+    system + user + clean assistant messages. Pure/synchronous — no DB
+    access needed.
     """
     if not messages:
         return messages
@@ -125,11 +154,8 @@ def sanitize_history(messages: list) -> list:
     return final
 
 
-def save_messages(session_id: str, messages: list):
+async def save_messages(db, session_id: str, messages: list) -> None:
     """Update the stored messages for a session (trim safely to MAX_MESSAGES)."""
-    if session_id not in _sessions:
-        return
-
     # First, keep a reference to the system prompt (index 0 if present)
     system_msg = None
     if messages and messages[0].get("role") == "system":
@@ -174,20 +200,24 @@ def save_messages(session_id: str, messages: list):
     # Final sanitize pass to guarantee role-ordering invariants
     combined = sanitize_history(combined)
 
-    _sessions[session_id]["messages"] = combined
-    _sessions[session_id]["last_active"] = time.time()
+    now = datetime.utcnow()
+    await db[_COLLECTION].update_one(
+        {"_id": session_id},
+        {"$set": {
+            "messages": combined,
+            "last_active": now,
+            "expires_at": _expiry(now),
+        }},
+    )
 
 
-def clear_session(session_id: str):
+async def clear_session(db, session_id: str) -> None:
     """Delete a session."""
-    _sessions.pop(session_id, None)
+    await db[_COLLECTION].delete_one({"_id": session_id})
 
 
-def _gc():
-    """Remove expired sessions."""
-    now = time.time()
-    expired = [sid for sid, s in _sessions.items() if now - s["last_active"] > SESSION_TTL]
-    for sid in expired:
-        del _sessions[sid]
-    if expired:
-        logger.info(f"Cleaned up {len(expired)} expired chat sessions")
+async def create_ai_session_indexes(mongo_client):
+    from core.database import DB_NAME
+    db = mongo_client[DB_NAME]
+    await db[_COLLECTION].create_index("expires_at", expireAfterSeconds=0)
+    await db[_COLLECTION].create_index("user_id")

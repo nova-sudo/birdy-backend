@@ -29,6 +29,7 @@ _PAGE_TOOLS = {
         "get_unified_lead_stats",
         "get_ghl_opp_stats_windowed",
         "get_campaign_insights",
+        "get_metrics_by_day_windows",
     ],
     "campaigns": [
         "get_client_groups",
@@ -37,6 +38,7 @@ _PAGE_TOOLS = {
         "get_ad_insights",
         "get_meta_insights_live",
         "compare_periods",
+        "get_metrics_by_day_windows",
     ],
     "leads": [
         "get_client_groups",
@@ -54,6 +56,7 @@ _PAGE_TOOLS = {
         "get_ghl_tag_breakdown",
         "get_tag_rollup_by_campaign",
         "compare_periods",
+        "get_metrics_by_day_windows",
     ],
     "custom_metrics": [
         "get_client_groups",
@@ -80,6 +83,7 @@ _PAGE_TOOLS = {
         "compare_periods",
         "get_alerts",
         "get_meta_insights_live",
+        "get_metrics_by_day_windows",
     ],
 }
 
@@ -318,7 +322,7 @@ async def run_chat(
     client_name: Optional[str] = None,
 ) -> dict:
     # Restore or create session
-    session_id, history = session_store.get_or_create(session_id, user_id)
+    session_id, history = await session_store.get_or_create(db, session_id, user_id)
 
     # Defensive clean-up: remove malformed history that causes Mistral 400s
     history[:] = session_store.sanitize_history(history)
@@ -365,9 +369,44 @@ async def run_chat(
         logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
         for iteration in range(MAX_TOOL_ITERATIONS + 1):
+            is_final_iteration = iteration == MAX_TOOL_ITERATIONS
+            call_messages = history
+            if is_final_iteration:
+                # Forced final turn — no more tool calls allowed (tools=None below).
+                # Without an explicit signal, the model silently treats this like
+                # any other turn and produces a "complete-looking" answer even if
+                # it never finished gathering data — the exact fabrication pattern
+                # already documented as "Incident 2" in ai/prompts/birdy.py, and
+                # what actually happened in production: a "last 30/60/90 days"
+                # question needs 6+ tool calls (no cached 60d/90d preset exists,
+                # so both windows require slower live calls), blew through the
+                # iteration budget, and the model invented plausible-looking
+                # numbers plus a fabricated explanation rather than admitting it
+                # ran out of time. Make the constraint explicit so the model
+                # discloses the gap instead of filling it.
+                final_turn_notice = (
+                    "\n\n---\n[RUNTIME NOTICE: You have used your tool-call budget "
+                    "for this turn and cannot call any more tools now. If you do "
+                    "not yet have tool-verified data for every part of the user's "
+                    "question, you MUST say so explicitly — state plainly which "
+                    "parts you verified with a tool call and which parts you could "
+                    "not fetch in time, and offer to fetch the rest in a follow-up. "
+                    "Do NOT guess, extrapolate, or fill any gap with a "
+                    "plausible-looking number. An honest partial answer is always "
+                    "correct; a complete-looking fabricated one is never "
+                    "acceptable, even under repeated pushback.]"
+                )
+                if history and history[0].get("role") == "system":
+                    call_messages = [
+                        {**history[0], "content": history[0]["content"] + final_turn_notice},
+                        *history[1:],
+                    ]
+                else:
+                    call_messages = history + [{"role": "user", "content": final_turn_notice.strip()}]
+
             response = await provider.chat_completion(
-                messages=history,
-                tools=tool_schemas if iteration < MAX_TOOL_ITERATIONS else None,
+                messages=call_messages,
+                tools=tool_schemas if not is_final_iteration else None,
                 temperature=DEFAULT_TEMPERATURE,
             )
 
@@ -376,7 +415,7 @@ async def run_chat(
                 reply = reply.strip() or "I wasn't able to generate a response."
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 history.append({"role": "assistant", "content": reply})
-                session_store.save_messages(session_id, history)
+                await session_store.save_messages(db, session_id, history)
                 return {
                     "reply": reply,
                     "tools_used": tools_used,
@@ -426,10 +465,14 @@ async def run_chat(
                     "content": result,
                 })
 
-        # Max iterations reached
-        reply = response.content or "I ran into complexity limits processing your request. Try a more specific question."
+        # Max iterations reached AND the model still tried to call more tools on
+        # the final (tools=None) turn — it explicitly signaled it wasn't done
+        # gathering data, so any accompanying response.content here is likely a
+        # mid-stream fragment, not a complete/honest answer. Always use the safe
+        # fallback rather than risk surfacing a partial/fabricated reply.
+        reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
         history.append({"role": "assistant", "content": reply})
-        session_store.save_messages(session_id, history)
+        await session_store.save_messages(db, session_id, history)
         return {
             "reply": reply,
             "tools_used": tools_used,
