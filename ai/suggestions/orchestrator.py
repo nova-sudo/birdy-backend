@@ -68,6 +68,7 @@ async def run_pass_for_user(
 
     stats = {"clients": 0, "analyzed": 0, "findings": 0, "created": 0, "resolved": 0}
     created_docs: list[dict] = []  # brand-new suggestions, to post to Slack after the pass
+    updated_docs: list[dict] = []  # same-window refreshes with a Slack message, to keep in sync
     keep_by_agent: dict[str, set] = {}  # agent → union of kept suggestion ids across ALL clients
 
     for group in groups:
@@ -105,7 +106,7 @@ async def run_pass_for_user(
                 composed = await compose(provider, finding)
                 finding.title = composed["title"]
                 finding.description = composed["description"]
-                doc, created = await store.upsert_finding(
+                doc, created, content_changed = await store.upsert_finding(
                     db, user_id, finding, composer=composed["composer"]
                 )
                 if doc is None:
@@ -125,6 +126,8 @@ async def run_pass_for_user(
                         window=window,
                         label="Suggested by Birdy",
                     )
+                elif content_changed and doc.get("slack_ts"):
+                    updated_docs.append(doc)  # keep the existing Slack message in sync
 
     # Reconcile once across the WHOLE pass (not per client-group): close open
     # suggestions this agent no longer produced for this window in ANY client, so
@@ -146,6 +149,14 @@ async def run_pass_for_user(
                 stats["slack_posted"] = posted
         except Exception as e:
             logger.warning("suggestions: Slack notify failed for %s: %s", user_id, e)
+
+    # Keep already-posted Slack messages in sync when their content is refreshed.
+    if notify and updated_docs:
+        try:
+            from services.slack_suggestion_notifier import update_suggestions
+            await update_suggestions(db, user_id, updated_docs)
+        except Exception as e:
+            logger.warning("suggestions: Slack sync failed for %s: %s", user_id, e)
 
     logger.info("suggestions pass user=%s window=%s → %s", user_id, window, stats)
     return stats

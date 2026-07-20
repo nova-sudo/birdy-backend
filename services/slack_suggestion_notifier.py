@@ -108,3 +108,32 @@ async def post_new_suggestions(db, user_id: str, docs: list[dict]) -> int:
         if await post_suggestion(db, user_id, doc, bot_token=bot_token, channel_id=channel_id):
             posted += 1
     return posted
+
+
+async def update_suggestions(db, user_id: str, docs: list[dict]) -> int:
+    """
+    Re-render already-posted Slack messages so they match the current suggestion
+    content (called when a same-window refresh changes the copy/stats). Each doc
+    must carry the slack_ts + slack_channel set when it was first posted.
+    """
+    if not docs:
+        return 0
+    bot_token, _ = await get_notify_target(db, user_id)
+    if not bot_token:
+        return 0
+
+    from slack_sdk.web.async_client import AsyncWebClient
+    client = AsyncWebClient(token=bot_token)
+    updated = 0
+    for doc in docs:
+        ts = doc.get("slack_ts")
+        channel = doc.get("slack_channel")
+        if not ts or not channel:
+            continue
+        blocks, fallback = build_suggestion_blocks(doc)
+        try:
+            await client.chat_update(channel=channel, ts=ts, text=fallback, blocks=blocks)
+            updated += 1
+        except Exception as e:
+            logger.warning("slack notifier: update failed for suggestion %s: %s", doc.get("id"), e)
+    return updated

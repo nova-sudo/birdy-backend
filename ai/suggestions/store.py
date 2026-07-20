@@ -93,14 +93,23 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
     }
 
 
-async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = "template") -> tuple[dict | None, bool]:
+async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = "template") -> tuple[dict | None, bool, bool]:
     """
     Persist a finding, honouring dedup + decline history.
 
-    Returns (doc, created) where `created` is True only when a brand-new
-    suggestion was inserted (used to decide whether to log a "suggestion created"
-    activity entry). Returns (None, False) when the finding is intentionally
-    suppressed (already applied, or dismissed within the cooldown).
+    Returns (doc, created, content_changed):
+      * created         — a brand-new suggestion was inserted (or a cooled-down
+                          dismissed one was reopened) → log + post to Slack.
+      * content_changed — the visible copy/stats were (re)written → keep Slack in
+                          sync via chat.update.
+    Returns (None, False, False) when suppressed (already applied, or dismissed
+    within the cooldown).
+
+    Content ownership: a suggestion's copy/stats belong to the window that CREATED
+    it (origin_window). Another window (e.g. the monthly pass touching an ad the
+    weekly pass already flagged) only keeps it alive — it does NOT overwrite the
+    content. This stops the same suggestion flipping between the weekly and
+    monthly view (and diverging from what was posted to Slack).
     """
     key = finding.compute_dedup_key()
     now = _now()
@@ -109,14 +118,24 @@ async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = 
     if existing:
         status = existing.get("status")
         if status == STATUS_APPLIED:
-            return None, False  # already acted on — never resurface
+            return None, False, False  # already acted on — never resurface
+        reopening = False
         if status == STATUS_DISMISSED:
             dismissed_at = existing.get("dismissed_at")
             if dismissed_at and dismissed_at > now - timedelta(days=DISMISS_COOLDOWN_DAYS):
-                return None, False  # respect the recent decline
-            # cooldown elapsed → fall through and reopen with fresh numbers
+                return None, False, False  # respect the recent decline
+            reopening = True  # cooldown elapsed → reopen with fresh content
 
-        # Refresh an existing (open or cooled-down) suggestion in place.
+        finding_window = finding.evidence.window
+        owns_content = reopening or finding_window == existing.get("origin_window")
+
+        if not owns_content:
+            # A non-origin window → keep it alive but leave the content untouched.
+            await db[SUGGESTIONS].update_one(
+                {"_id": key}, {"$set": {"status": STATUS_OPEN, "updated_at": now}}
+            )
+            return {**existing, "status": STATUS_OPEN}, False, False
+
         update = {
             "severity": finding.severity,
             "title": finding.title,
@@ -130,18 +149,17 @@ async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = 
             "status": STATUS_OPEN,
             "updated_at": now,
         }
-        unset = {"dismissed_at": "", "applied_at": ""}
-        await db[SUGGESTIONS].update_one({"_id": key}, {"$set": update, "$unset": unset})
+        if reopening:
+            update["origin_window"] = finding_window  # a reopen is a fresh start
+        await db[SUGGESTIONS].update_one({"_id": key}, {"$set": update, "$unset": {"dismissed_at": "", "applied_at": ""}})
         refreshed = {**existing, **update}
         refreshed.pop("dismissed_at", None)
         refreshed.pop("applied_at", None)
-        # `created` is True if we reopened a previously-dismissed one, so the feed
-        # reflects that Birdy is re-raising it.
-        return refreshed, status == STATUS_DISMISSED
+        return refreshed, reopening, True
 
     doc = build_suggestion_doc(user_id, finding, composer=composer)
     await db[SUGGESTIONS].insert_one(doc)
-    return doc, True
+    return doc, True, True
 
 
 async def list_open_suggestions(db, user_id: str, limit: int = 50) -> list[dict]:

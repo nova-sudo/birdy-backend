@@ -141,6 +141,11 @@ async def _cross_window_dedupe():
     assert len(open_sugs) == 1, [s["id"] for s in open_sugs]
     # weekly created it; monthly only refreshed → origin_window stays weekly
     assert open_sugs[0]["origin_window"] == "weekly", open_sugs[0]
+    # content stays the WEEKLY (7d) view — monthly kept it alive but did NOT
+    # overwrite it (this is what keeps Slack and the dashboard consistent).
+    labels = [s["label"] for s in open_sugs[0]["stats"]]
+    assert any("7d" in l for l in labels), labels
+    assert not any("30d" in l for l in labels), labels
 
 
 async def _skips_inactive_clients():
