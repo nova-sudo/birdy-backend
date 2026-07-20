@@ -28,7 +28,7 @@ from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist
 from services.call_logs_service import create_call_logs_indexes
 from services.mcp_token_service import create_mcp_tokens_indexes
 from services.slack_bot_service import create_slack_bot_indexes
@@ -130,6 +130,7 @@ app.include_router(ai_credentials.router)
 app.include_router(slack.router)
 app.include_router(slack_events.router)
 app.include_router(slack_interactions.router)
+app.include_router(waitlist.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py
