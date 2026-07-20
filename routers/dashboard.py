@@ -27,9 +27,8 @@ from pydantic import BaseModel
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
-from services.meta_status_service import set_object_status, MetaStatusError
-from ai.suggestions import store
-from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS, WINDOWS
+from ai.suggestions import actions, store
+from ai.suggestions.contracts import WINDOWS
 from ai.suggestions.orchestrator import run_pass_for_user
 
 logger = logging.getLogger(__name__)
@@ -149,85 +148,37 @@ async def summary(current_user: str = Depends(get_current_user)):
 
 
 # ---------------------------------------------------------------------------
-# Suggestion actions
+# Suggestion actions — shared with the Slack button handler via
+# ai.suggestions.actions so "Do it for me" behaves identically in both places.
 # ---------------------------------------------------------------------------
-
-async def _execute_action(mongo_client, user_id: str, action: dict) -> dict:
-    """Execute a suggestion's action. Returns {ok, succeeded, failed:[...]}."""
-    atype = action.get("type")
-    targets = action.get("targets") or []
-    if atype not in (ACTION_PAUSE_ADS, ACTION_ENABLE_ADS):
-        raise HTTPException(status_code=400, detail=f"Unsupported action type: {atype}")
-
-    desired = "PAUSED" if atype == ACTION_PAUSE_ADS else "ACTIVE"
-    succeeded, failed = [], []
-    for t in targets:
-        object_id = t.get("object_id")
-        object_type = t.get("object_type", "ad")
-        try:
-            await set_object_status(user_id, object_id, object_type, desired, mongo_client)
-            succeeded.append(object_id)
-        except MetaStatusError as e:
-            logger.warning("apply: %s %s failed: %s", desired, object_id, e.message)
-            failed.append({"object_id": object_id, "error": e.message})
-
-    if targets and not succeeded:
-        # Nothing applied — surface the first error so the UI can show it.
-        raise HTTPException(status_code=502, detail=failed[0]["error"] if failed else "Action failed")
-    return {"ok": True, "succeeded": succeeded, "failed": failed}
-
 
 @router.post("/suggestions/{suggestion_id}/apply")
 async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_current_user)):
     """Apply a suggestion's action (approval-only — the user is approving it)."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        doc = await store.get_suggestion(db, current_user, suggestion_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Suggestion not found")
-        if doc.get("status") == store.STATUS_APPLIED:
-            return {"ok": True, "already_applied": True}
-
-        result = {"ok": True}
-        action = doc.get("action")
-        if action:
-            result = await _execute_action(mongo_client, current_user, action)
-
-        await store.mark_applied(db, current_user, suggestion_id)
-        await store.log_activity(
-            db, current_user,
-            actor=store.ACTOR_USER,
-            kind=store.KIND_ACTION_APPLIED,
-            title=doc.get("title") or "Applied suggestion",
-            client_name=doc.get("client_name"),
-            client_group_id=doc.get("client_group_id"),
-            ref_id=suggestion_id,
-            window=doc.get("window"),
-            label="Approved by you",
+        res = await actions.apply_suggestion(
+            db, mongo_client, current_user, suggestion_id,
+            actor=store.ACTOR_USER, source="dashboard",
         )
-        return result
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "failed":
+            raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
+        return {"ok": True, "outcome": res["outcome"],
+                "succeeded": res.get("succeeded", []), "failed": res.get("failed", [])}
 
 
 @router.delete("/suggestions/{suggestion_id}")
 async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        doc = await store.get_suggestion(db, current_user, suggestion_id)
-        if not doc:
-            raise HTTPException(status_code=404, detail="Suggestion not found")
-
-        await store.mark_dismissed(db, current_user, suggestion_id)
-        await store.log_activity(
-            db, current_user,
-            actor=store.ACTOR_USER,
-            kind=store.KIND_SUGGESTION_DISMISSED,
-            title=f"Dismissed: {doc.get('title') or 'suggestion'}",
-            client_name=doc.get("client_name"),
-            client_group_id=doc.get("client_group_id"),
-            ref_id=suggestion_id,
-            window=doc.get("window"),
-            label="Declined by you",
+        res = await actions.dismiss_suggestion(
+            db, mongo_client, current_user, suggestion_id,
+            actor=store.ACTOR_USER, source="dashboard",
         )
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
         return {"ok": True}
 
 

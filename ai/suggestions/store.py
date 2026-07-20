@@ -170,6 +170,14 @@ async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
     return res.modified_count > 0
 
 
+async def set_slack_message(db, user_id: str, suggestion_id: str, channel: str, ts: str) -> None:
+    """Remember where a suggestion was posted in Slack (for later cross-surface sync)."""
+    await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id},
+        {"$set": {"slack_channel": channel, "slack_ts": ts, "updated_at": _now()}},
+    )
+
+
 async def close_stale_open(db, user_id: str, agent: str, window: str,
                            client_group_id: str, keep_ids: set) -> int:
     """
@@ -207,6 +215,7 @@ async def log_activity(
     ref_id: str | None = None,
     window: str | None = None,
     label: str | None = None,
+    source: str | None = None,
 ) -> dict:
     """Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS)."""
     now = _now()
@@ -222,6 +231,7 @@ async def log_activity(
         "ref_id": ref_id,
         "window": window,
         "label": label,
+        "source": source,  # "dashboard" | "slack" | None
         "created_at": now,
         "expires_at": now + timedelta(days=ACTIVITY_TTL_DAYS),
     }

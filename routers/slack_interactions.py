@@ -28,9 +28,14 @@ from fastapi import APIRouter, Request
 from ai.orchestrator import run_chat
 from ai.provider_factory import get_provider_for_user, NoAiCredentialError
 from ai.tools.registry import registry
+from ai.suggestions import actions
 from core.database import get_db
 from dependencies import get_mongo_client
-from services.slack_bot_service import get_decrypted_bot_token_for_user, save_thread_session_id
+from services.slack_bot_service import (
+    get_decrypted_bot_token_for_user,
+    save_thread_session_id,
+    get_user_id_by_team_id,
+)
 from services.slack_block_formatter import build_blocks_from_reply, build_modal_view
 from services.slack_interaction_store import (
     get_pending_interaction,
@@ -187,6 +192,69 @@ async def _handle_view_submission(payload: dict, db, mongo_client) -> dict:
     return {}
 
 
+def _suggestion_outcome_text(action_id: str, res: dict, slack_user: str | None) -> str:
+    """The mrkdwn that replaces the buttons after a suggestion is actioned."""
+    doc = res.get("doc") or {}
+    title = doc.get("title") or "Suggestion"
+    who = f" by <@{slack_user}>" if slack_user else ""
+    outcome = res.get("outcome")
+
+    if action_id == "suggestion_ignore":
+        if outcome == "not_found":
+            return f"~{title}~\n:no_entry_sign: No longer available."
+        return f"~{title}~\n:no_entry_sign: Ignored{who}."
+
+    # suggestion_apply
+    if outcome in ("applied", "partial"):
+        n = len(res.get("succeeded") or [])
+        extra = f" ({len(res['failed'])} failed)" if outcome == "partial" and res.get("failed") else ""
+        return f"*{title}*\n:white_check_mark: Done{who} — paused {n} ad(s){extra}."
+    if outcome == "already":
+        return f"*{title}*\n:white_check_mark: Already applied."
+    if outcome == "not_found":
+        return f"*{title}*\n:warning: No longer available."
+    if outcome == "failed":
+        return f"*{title}*\n:warning: Couldn't apply — {res.get('detail', 'error')}"
+    return f"*{title}*\n:white_check_mark: Done{who}."
+
+
+async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_client) -> dict:
+    """
+    Handle the "Do it for me" / "Ignore" buttons on a suggestion message. Resolves
+    the tenant from the Slack team_id, runs the shared apply/dismiss action, then
+    swaps the buttons out for an outcome line via chat.update.
+    """
+    team_id = (payload.get("team") or {}).get("id")
+    birdy_user_id = await get_user_id_by_team_id(db, team_id) if team_id else None
+    if not birdy_user_id:
+        return {}
+
+    suggestion_id = action.get("value")
+    action_id = action.get("action_id")
+    slack_user = (payload.get("user") or {}).get("id")
+
+    if action_id == "suggestion_apply":
+        res = await actions.apply_suggestion(db, mongo_client, birdy_user_id, suggestion_id, source="slack")
+    else:
+        res = await actions.dismiss_suggestion(db, mongo_client, birdy_user_id, suggestion_id, source="slack")
+
+    channel = (payload.get("channel") or {}).get("id")
+    ts = (payload.get("message") or {}).get("ts")
+    bot_token = await get_decrypted_bot_token_for_user(db, birdy_user_id)
+    if bot_token and channel and ts:
+        from slack_sdk.web.async_client import AsyncWebClient
+        client = AsyncWebClient(token=bot_token)
+        text = _suggestion_outcome_text(action_id, res, slack_user)
+        try:
+            await client.chat_update(
+                channel=channel, ts=ts, text=text,
+                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
+            )
+        except Exception as e:
+            logger.warning(f"suggestion action: chat_update failed: {e}")
+    return {}
+
+
 @router.post("/api/slack/interactions")
 async def slack_interactions(request: Request):
     raw_body = await request.body()
@@ -200,6 +268,9 @@ async def slack_interactions(request: Request):
         db = get_db(mongo_client)
 
         if ptype == "block_actions":
+            action0 = (payload.get("actions") or [{}])[0]
+            if action0.get("action_id") in ("suggestion_apply", "suggestion_ignore"):
+                return await _handle_suggestion_action(payload, action0, db, mongo_client)
             return await _handle_block_actions(payload, db, mongo_client)
         if ptype == "view_submission":
             return await _handle_view_submission(payload, db, mongo_client)

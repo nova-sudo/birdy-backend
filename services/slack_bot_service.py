@@ -88,6 +88,8 @@ async def get_slack_bot_status(db, user_id: str) -> dict | None:
         "team_name": slack_bot.get("team_name"),
         "bot_user_id": slack_bot["bot_user_id"],
         "installed_at": installed_at.isoformat() if installed_at else None,
+        "notify_channel_id": slack_bot.get("notify_channel_id"),
+        "notify_channel_name": slack_bot.get("notify_channel_name"),
     }
 
 
@@ -120,6 +122,58 @@ async def get_decrypted_bot_token_for_user(db, user_id: str) -> str | None:
     if not slack_bot:
         return None
     return decrypt(slack_bot["bot_token_encrypted"])
+
+
+async def set_notify_channel(db, user_id: str, channel_id: str | None,
+                             channel_name: str | None = None) -> bool:
+    """
+    Set (or clear, when channel_id is None) the channel Birdy posts suggestions
+    to. Editable any time from settings. Returns False if the user has no Slack
+    bot installed.
+    """
+    now = datetime.utcnow()
+    if channel_id:
+        update = {"$set": {
+            "integrations.slack_bot.notify_channel_id": channel_id,
+            "integrations.slack_bot.notify_channel_name": channel_name,
+            "integrations.slack_bot.updated_at": now,
+        }}
+    else:
+        update = {
+            "$unset": {
+                "integrations.slack_bot.notify_channel_id": "",
+                "integrations.slack_bot.notify_channel_name": "",
+            },
+            "$set": {"integrations.slack_bot.updated_at": now},
+        }
+    result = await db["users"].update_one(
+        {"user_id": user_id, "integrations.slack_bot": {"$exists": True}},
+        update,
+    )
+    return result.matched_count > 0
+
+
+async def get_notify_target(db, user_id: str) -> tuple[str | None, str | None]:
+    """
+    Return (decrypted_bot_token, channel_id) when the user has BOTH a Slack bot
+    installed and a suggestion channel chosen, else (None, None). Used by the
+    notifier to decide whether to post at all — no config → silent no-op.
+    """
+    user_doc = await db["users"].find_one(
+        {"user_id": user_id},
+        projection={
+            "integrations.slack_bot.bot_token_encrypted": 1,
+            "integrations.slack_bot.notify_channel_id": 1,
+        },
+    )
+    slack_bot = ((user_doc or {}).get("integrations") or {}).get("slack_bot")
+    if not slack_bot:
+        return None, None
+    channel_id = slack_bot.get("notify_channel_id")
+    token_enc = slack_bot.get("bot_token_encrypted")
+    if not channel_id or not token_enc:
+        return None, None
+    return decrypt(token_enc), channel_id
 
 
 async def get_thread_session_id(db, team_id: str, channel: str, thread_key: str) -> str | None:

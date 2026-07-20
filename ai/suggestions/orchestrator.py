@@ -48,6 +48,7 @@ async def run_pass_for_user(
     mongo_client=None,
     agents=REGISTRY,
     client_group_ids: list[str] | None = None,
+    notify: bool = True,
 ) -> dict:
     """Run one suggestion pass for a single user + window. Never raises per-client."""
     if window not in WINDOWS:
@@ -63,6 +64,7 @@ async def run_pass_for_user(
     ctx = AnalyzerContext(db=db, user_id=user_id, mongo_client=mongo_client)
 
     stats = {"clients": 0, "analyzed": 0, "findings": 0, "created": 0, "resolved": 0}
+    created_docs: list[dict] = []  # brand-new suggestions, to post to Slack after the pass
 
     for group in groups:
         stats["clients"] += 1
@@ -107,6 +109,7 @@ async def run_pass_for_user(
                 keep_ids.add(doc["_id"])
                 if created:
                     stats["created"] += 1
+                    created_docs.append(doc)
                     await store.log_activity(
                         db, user_id,
                         actor=store.ACTOR_BIRDY,
@@ -125,6 +128,17 @@ async def run_pass_for_user(
                 db, user_id, getattr(agent, "name", ""), window, client_id, keep_ids
             )
             stats["resolved"] += closed
+
+    # Push brand-new suggestions to the user's Slack channel (no-op if the user
+    # hasn't connected Slack or chosen a channel).
+    if notify and created_docs:
+        try:
+            from services.slack_suggestion_notifier import post_new_suggestions
+            posted = await post_new_suggestions(db, user_id, created_docs)
+            if posted:
+                stats["slack_posted"] = posted
+        except Exception as e:
+            logger.warning("suggestions: Slack notify failed for %s: %s", user_id, e)
 
     logger.info("suggestions pass user=%s window=%s → %s", user_id, window, stats)
     return stats

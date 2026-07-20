@@ -171,3 +171,20 @@ class SlackBotStatusResponse(BaseModel):
     team_name: Optional[str] = None
     bot_user_id: Optional[str] = None
     installed_at: Optional[str] = None
+    notify_channel_id: Optional[str] = None
+    notify_channel_name: Optional[str] = None
+
+
+class SlackChannel(BaseModel):
+    id: str
+    name: str
+    is_private: bool = False
+
+
+class SlackChannelsResponse(BaseModel):
+    channels: List[SlackChannel]
+
+
+class SetSlackChannelRequest(BaseModel):
+    channel_id: Optional[str] = None  # null clears the selection (stops posting)
+    channel_name: Optional[str] = None
