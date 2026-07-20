@@ -75,6 +75,7 @@ def _activity_to_api(doc: dict) -> dict:
         "title": doc.get("title"),
         "client": doc.get("client"),
         "label": doc.get("label"),
+        "source": doc.get("source"),  # "dashboard" | "slack" | None
         "time": _relative_time(doc.get("created_at")),
     }
 

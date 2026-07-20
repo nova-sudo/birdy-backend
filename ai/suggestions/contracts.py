@@ -113,9 +113,11 @@ class Finding:
         target_ids = sorted(
             str(t.get("object_id", "")) for t in (self.action.targets if self.action else [])
         )
+        # window is intentionally EXCLUDED: the same ad(s) flagged in both the
+        # weekly and monthly window is ONE suggestion, not two. (Which window
+        # created it is tracked separately as `origin_window` for reconcile.)
         basis = "|".join([
             self.agent,
-            self.evidence.window,
             self.client_group_id,
             ",".join(target_ids),
         ])

@@ -235,8 +235,7 @@ class UselessAdPurger:
         stats = []
         if worst_cpl is not None:
             stats.append(Stat("CPL", f"{symbol}{worst_cpl:.2f}", bad=True))
-        elif total_leads == 0:
-            stats.append(Stat("Leads", "0", bad=True))
+        # (the trailing Leads stat below already conveys the zero-lead case)
         if target is not None:
             target_label = "Target" if target_source == "alert" else "Acct median"
             stats.append(Stat(target_label, f"{symbol}{target:.2f}"))

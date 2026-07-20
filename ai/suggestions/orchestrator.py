@@ -54,7 +54,10 @@ async def run_pass_for_user(
     if window not in WINDOWS:
         raise ValueError(f"unknown window: {window}")
 
-    query = {"user_id": user_id}
+    # Only analyze ACTIVE clients. Missing status defaults to Active (matching the
+    # rest of the app's `client_status ?? "Active"`), so we exclude only explicit
+    # Inactive clients.
+    query = {"user_id": user_id, "client_status": {"$ne": "Inactive"}}
     if client_group_ids:
         query["id"] = {"$in": client_group_ids}
     groups = await db["client_groups"].find(query, _PROJECTION).to_list(length=500)

@@ -116,6 +116,49 @@ async def _reconcile_resolves_stale():
     print("PASS test_reconcile_resolves_stale")
 
 
+async def _cross_window_dedupe():
+    # A single zero-lead ad flagged identically in BOTH windows (same offender set)
+    # → ONE suggestion, not two. This mirrors the real case (one bad ad per client).
+    single_bad = [
+        _ad("ad_bad", "Wasteful Ad", "ACTIVE", 400, 0),   # 0 leads, over both floors
+        _ad("ad_good1", "Good 1", "ACTIVE", 200, 20),
+        _ad("ad_good2", "Good 2", "ACTIVE", 200, 20),
+    ]
+    client = AsyncMongoMockClient()
+    db = client[DB_NAME]
+    await db["client_groups"].insert_one({
+        "id": "grp1", "user_id": "u1", "name": "Palm Peach", "ad_account_currency": "GBP",
+        "facebook_cache": {"last_7d": {"ads": single_bad}, "last_30d": {"ads": single_bad}},
+    })
+    await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
+    await run_pass_for_user(db, "u1", "monthly", mongo_client=client)
+    open_sugs = await store.list_open_suggestions(db, "u1")
+    assert len(open_sugs) == 1, [s["id"] for s in open_sugs]
+    # weekly created it; monthly only refreshed → origin_window stays weekly
+    assert open_sugs[0]["origin_window"] == "weekly", open_sugs[0]
+
+
+async def _skips_inactive_clients():
+    client = AsyncMongoMockClient()
+    db = client[DB_NAME]
+    g = _group(_BAD_ADS)
+    g["client_status"] = "Inactive"
+    await db["client_groups"].insert_one(g)
+    s = await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
+    assert s["clients"] == 0, s  # inactive client excluded by the query
+    assert await store.list_open_suggestions(db, "u1") == []
+
+
+def test_cross_window_dedupe():
+    asyncio.run(_cross_window_dedupe())
+    print("PASS test_cross_window_dedupe")
+
+
+def test_skips_inactive_clients():
+    asyncio.run(_skips_inactive_clients())
+    print("PASS test_skips_inactive_clients")
+
+
 def test_create_and_dedupe():
     asyncio.run(_create_and_dedupe())
 
@@ -132,4 +175,6 @@ if __name__ == "__main__":
     test_create_and_dedupe()
     test_dismiss_cooldown()
     test_reconcile_resolves_stale()
+    test_cross_window_dedupe()
+    test_skips_inactive_clients()
     print("\nAll suggestion-flow tests passed.")

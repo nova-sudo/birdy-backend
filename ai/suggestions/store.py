@@ -76,6 +76,7 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
         "client_name": finding.client_name,
         "agent": finding.agent,
         "window": finding.evidence.window,
+        "origin_window": finding.evidence.window,  # immutable; `window` may change on refresh
         "severity": finding.severity,
         "platform": finding.platform,
         "icon": finding.icon,
@@ -178,18 +179,19 @@ async def set_slack_message(db, user_id: str, suggestion_id: str, channel: str, 
     )
 
 
-async def close_stale_open(db, user_id: str, agent: str, window: str,
+async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
                            client_group_id: str, keep_ids: set) -> int:
     """
-    Auto-close open suggestions from one agent+window+client that this pass no
-    longer produced (the ad improved, or was paused). Keeps the feed current
-    without touching the user's explicit dismissals or applied history.
+    Auto-close open suggestions this pass no longer produced (the ad improved, or
+    was paused). Scoped by origin_window — the window that CREATED the suggestion
+    — so the monthly pass never closes a weekly-only finding, and vice versa,
+    even though the two windows now share one dedup key.
     """
     res = await db[SUGGESTIONS].update_many(
         {
             "user_id": user_id,
             "agent": agent,
-            "window": window,
+            "origin_window": origin_window,
             "client_group_id": client_group_id,
             "status": STATUS_OPEN,
             "_id": {"$nin": list(keep_ids)},
