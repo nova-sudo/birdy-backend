@@ -1,0 +1,248 @@
+"""
+ai/suggestions/store.py
+-----------------------
+Mongo-backed persistence for the suggestion engine. Two collections:
+
+  ai_suggestions — one doc per live/decided suggestion. `_id` is the finding's
+                   dedup_key so a re-run refreshes the same doc in place rather
+                   than duplicating. A dismissed suggestion is not recreated for
+                   DISMISS_COOLDOWN_DAYS (we respect the user's decline); an
+                   applied one is never recreated.
+
+  ai_activity   — the activity feed. Append-only, TTL-expired after
+                  ACTIVITY_TTL_DAYS so it can't grow unbounded. Records analysis
+                  passes, suggestions created, and actions applied / declined.
+
+Follows the same per-request Motor pattern as the rest of the backend (raw dicts,
+no ODM). Index creation mirrors ai/session_store.py and is wired into main.py's
+lifespan.
+"""
+
+import logging
+import uuid
+from datetime import datetime, timedelta
+
+from core.database import DB_NAME
+from ai.suggestions.contracts import Finding
+
+logger = logging.getLogger(__name__)
+
+SUGGESTIONS = "ai_suggestions"
+ACTIVITY = "ai_activity"
+
+# How long a dismissed suggestion stays suppressed before the same finding may
+# resurface. Long enough that a user isn't nagged, short enough that a genuinely
+# persistent problem eventually comes back.
+DISMISS_COOLDOWN_DAYS = 14
+
+# Activity feed retention.
+ACTIVITY_TTL_DAYS = 60
+
+STATUS_OPEN = "open"
+STATUS_APPLIED = "applied"
+STATUS_DISMISSED = "dismissed"
+# Auto-closed by a later pass because the finding no longer reproduces (e.g. the
+# ad improved or was already paused). Distinct from a user "dismissed".
+STATUS_RESOLVED = "resolved"
+
+# Activity kinds → (actor, human label). actor keeps the frontend's existing
+# birdy/user split working; label is the richer, kind-specific caption.
+ACTOR_BIRDY = "birdy"
+ACTOR_USER = "user"
+
+KIND_ANALYSIS_PASS = "analysis_pass"
+KIND_SUGGESTION_CREATED = "suggestion_created"
+KIND_ACTION_APPLIED = "action_applied"
+KIND_SUGGESTION_DISMISSED = "suggestion_dismissed"
+
+
+def _now() -> datetime:
+    return datetime.utcnow()
+
+
+# ---------------------------------------------------------------------------
+# Suggestions
+# ---------------------------------------------------------------------------
+
+def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "template") -> dict:
+    """Turn a Finding (+ its already-composed copy) into a persistable document."""
+    key = finding.compute_dedup_key()
+    now = _now()
+    return {
+        "_id": key,
+        "id": key,
+        "user_id": user_id,
+        "client_group_id": finding.client_group_id,
+        "client_name": finding.client_name,
+        "agent": finding.agent,
+        "window": finding.evidence.window,
+        "severity": finding.severity,
+        "platform": finding.platform,
+        "icon": finding.icon,
+        "title": finding.title,
+        "description": finding.description,
+        "stats": finding.evidence.stats_as_dicts(),
+        "action": finding.action.to_dict() if finding.action else None,
+        "evidence": finding.evidence.raw,
+        "confidence": finding.confidence,
+        "composer": composer,
+        "status": STATUS_OPEN,
+        "created_at": now,
+        "updated_at": now,
+    }
+
+
+async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = "template") -> tuple[dict | None, bool]:
+    """
+    Persist a finding, honouring dedup + decline history.
+
+    Returns (doc, created) where `created` is True only when a brand-new
+    suggestion was inserted (used to decide whether to log a "suggestion created"
+    activity entry). Returns (None, False) when the finding is intentionally
+    suppressed (already applied, or dismissed within the cooldown).
+    """
+    key = finding.compute_dedup_key()
+    now = _now()
+    existing = await db[SUGGESTIONS].find_one({"_id": key})
+
+    if existing:
+        status = existing.get("status")
+        if status == STATUS_APPLIED:
+            return None, False  # already acted on — never resurface
+        if status == STATUS_DISMISSED:
+            dismissed_at = existing.get("dismissed_at")
+            if dismissed_at and dismissed_at > now - timedelta(days=DISMISS_COOLDOWN_DAYS):
+                return None, False  # respect the recent decline
+            # cooldown elapsed → fall through and reopen with fresh numbers
+
+        # Refresh an existing (open or cooled-down) suggestion in place.
+        update = {
+            "severity": finding.severity,
+            "title": finding.title,
+            "description": finding.description,
+            "stats": finding.evidence.stats_as_dicts(),
+            "action": finding.action.to_dict() if finding.action else None,
+            "evidence": finding.evidence.raw,
+            "confidence": finding.confidence,
+            "icon": finding.icon,
+            "composer": composer,
+            "status": STATUS_OPEN,
+            "updated_at": now,
+        }
+        unset = {"dismissed_at": "", "applied_at": ""}
+        await db[SUGGESTIONS].update_one({"_id": key}, {"$set": update, "$unset": unset})
+        refreshed = {**existing, **update}
+        refreshed.pop("dismissed_at", None)
+        refreshed.pop("applied_at", None)
+        # `created` is True if we reopened a previously-dismissed one, so the feed
+        # reflects that Birdy is re-raising it.
+        return refreshed, status == STATUS_DISMISSED
+
+    doc = build_suggestion_doc(user_id, finding, composer=composer)
+    await db[SUGGESTIONS].insert_one(doc)
+    return doc, True
+
+
+async def list_open_suggestions(db, user_id: str, limit: int = 50) -> list[dict]:
+    cursor = db[SUGGESTIONS].find(
+        {"user_id": user_id, "status": STATUS_OPEN}
+    ).sort("created_at", -1).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
+    return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
+
+
+async def mark_applied(db, user_id: str, suggestion_id: str) -> bool:
+    res = await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id},
+        {"$set": {"status": STATUS_APPLIED, "applied_at": _now(), "updated_at": _now()}},
+    )
+    return res.modified_count > 0
+
+
+async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
+    res = await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id},
+        {"$set": {"status": STATUS_DISMISSED, "dismissed_at": _now(), "updated_at": _now()}},
+    )
+    return res.modified_count > 0
+
+
+async def close_stale_open(db, user_id: str, agent: str, window: str,
+                           client_group_id: str, keep_ids: set) -> int:
+    """
+    Auto-close open suggestions from one agent+window+client that this pass no
+    longer produced (the ad improved, or was paused). Keeps the feed current
+    without touching the user's explicit dismissals or applied history.
+    """
+    res = await db[SUGGESTIONS].update_many(
+        {
+            "user_id": user_id,
+            "agent": agent,
+            "window": window,
+            "client_group_id": client_group_id,
+            "status": STATUS_OPEN,
+            "_id": {"$nin": list(keep_ids)},
+        },
+        {"$set": {"status": STATUS_RESOLVED, "resolved_at": _now(), "updated_at": _now()}},
+    )
+    return res.modified_count
+
+
+# ---------------------------------------------------------------------------
+# Activity feed
+# ---------------------------------------------------------------------------
+
+async def log_activity(
+    db,
+    user_id: str,
+    *,
+    actor: str,
+    kind: str,
+    title: str,
+    client_name: str | None = None,
+    client_group_id: str | None = None,
+    ref_id: str | None = None,
+    window: str | None = None,
+    label: str | None = None,
+) -> dict:
+    """Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS)."""
+    now = _now()
+    doc = {
+        "_id": "act_" + uuid.uuid4().hex[:16],
+        "id": None,  # set below to match _id
+        "user_id": user_id,
+        "actor": actor,
+        "kind": kind,
+        "title": title,
+        "client": client_name,
+        "client_group_id": client_group_id,
+        "ref_id": ref_id,
+        "window": window,
+        "label": label,
+        "created_at": now,
+        "expires_at": now + timedelta(days=ACTIVITY_TTL_DAYS),
+    }
+    doc["id"] = doc["_id"]
+    await db[ACTIVITY].insert_one(doc)
+    return doc
+
+
+async def list_recent_activity(db, user_id: str, limit: int = 30) -> list[dict]:
+    cursor = db[ACTIVITY].find({"user_id": user_id}).sort("created_at", -1).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
+# ---------------------------------------------------------------------------
+# Indexes (wired into main.py lifespan)
+# ---------------------------------------------------------------------------
+
+async def create_suggestion_indexes(mongo_client):
+    db = mongo_client[DB_NAME]
+    await db[SUGGESTIONS].create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
+    await db[SUGGESTIONS].create_index("client_group_id")
+    await db[ACTIVITY].create_index([("user_id", 1), ("created_at", -1)])
+    # TTL index — Mongo drops activity docs once expires_at passes.
+    await db[ACTIVITY].create_index("expires_at", expireAfterSeconds=0)

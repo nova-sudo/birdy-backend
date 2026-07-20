@@ -55,8 +55,25 @@ def start_background_jobs():
         max_instances=1,
     )
 
+    # Birdy suggestion passes: weekly (Mon 06:00) + monthly (1st 06:00).
+    from jobs.ai_suggestion_jobs import run_weekly_suggestions, run_monthly_suggestions
+    scheduler.add_job(
+        run_weekly_suggestions,
+        CronTrigger(day_of_week='mon', hour=6, minute=0),
+        id='ai_suggestions_weekly',
+        replace_existing=True,
+        max_instances=1,
+    )
+    scheduler.add_job(
+        run_monthly_suggestions,
+        CronTrigger(day=1, hour=6, minute=0),
+        id='ai_suggestions_monthly',
+        replace_existing=True,
+        max_instances=1,
+    )
+
     scheduler.start()
-    logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45)")
+    logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45), ai_suggestions (weekly Mon 06:00 / monthly 1st 06:00)")
 
  
 def stop_background_jobs():

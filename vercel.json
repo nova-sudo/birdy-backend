@@ -39,6 +39,14 @@
     {
       "path": "/api/cron/alerts",
       "schedule": "15 * * * *"
+    },
+    {
+      "path": "/api/cron/suggestions-weekly",
+      "schedule": "0 6 * * 1"
+    },
+    {
+      "path": "/api/cron/suggestions-monthly",
+      "schedule": "0 6 1 * *"
     }
   ]
 }

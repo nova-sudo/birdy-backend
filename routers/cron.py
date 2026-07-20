@@ -604,3 +604,41 @@ async def alerts(authorization: str | None = Header(default=None)):
         logger.error(f"[alerts] Evaluation job raised: {e}", exc_info=True)
 
     return {"ok": True, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Birdy suggestion passes — weekly (Mondays) + monthly (1st)
+# ---------------------------------------------------------------------------
+
+@router.get("/suggestions-weekly")
+async def suggestions_weekly(authorization: str | None = Header(default=None)):
+    """Runs a weekly (last_7d) Birdy suggestion pass over all users."""
+    _verify_cron_auth(authorization)
+
+    from jobs.ai_suggestion_jobs import run_weekly_suggestions
+
+    tick_start = time.monotonic()
+    result = None
+    try:
+        result = await run_weekly_suggestions()
+    except Exception as e:
+        logger.error(f"[suggestions-weekly] raised: {e}", exc_info=True)
+
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
+@router.get("/suggestions-monthly")
+async def suggestions_monthly(authorization: str | None = Header(default=None)):
+    """Runs a monthly (last_30d) Birdy suggestion pass over all users."""
+    _verify_cron_auth(authorization)
+
+    from jobs.ai_suggestion_jobs import run_monthly_suggestions
+
+    tick_start = time.monotonic()
+    result = None
+    try:
+        result = await run_monthly_suggestions()
+    except Exception as e:
+        logger.error(f"[suggestions-monthly] raised: {e}", exc_info=True)
+
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
