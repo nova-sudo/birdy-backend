@@ -109,3 +109,62 @@ async def get_current_user(request: Request) -> str:
     except pyjwt.PyJWTError as e:
         logger.error(f"JWT decode error: {e}")
         raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+
+async def get_current_claims(request: Request, verify_exp: bool = True) -> dict:
+    """
+    Return the full decoded JWT claims for the current request — including the
+    impersonation markers `act` (the admin acting) and `imp` (True while
+    impersonating), which get_current_user (which only returns `sub`) drops.
+
+    Unlike get_current_user this does NOT run the refresh-token dance: the
+    admin console and impersonation endpoints are short interactions, and the
+    /impersonate/stop path deliberately needs to read `act` off an already-
+    expired impersonation token (verify_exp=False) so a lapsed session can
+    still be cleanly reverted to the admin.
+    """
+    token = request.cookies.get("auth_token")
+    if not token:
+        raise HTTPException(status_code=401, detail="No authentication token provided")
+    try:
+        return pyjwt.decode(
+            token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
+            options={"verify_exp": verify_exp},
+        )
+    except pyjwt.ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Access token expired, please log in again")
+    except pyjwt.PyJWTError as e:
+        logger.error(f"JWT decode error (claims): {e}")
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+
+
+async def require_admin(request: Request) -> str:
+    """
+    FastAPI dependency gating the internal Admin console. Returns the admin's
+    email on success, else raises 403.
+
+    Two checks:
+      1. Reject any impersonation token (`imp`) — an impersonation session runs
+         as a normal agency owner and must never be able to reach admin
+         endpoints (no privilege re-escalation back into the console).
+      2. Require the user document's `role == "admin"`.
+    """
+    from core.database import DB_NAME
+
+    claims = await get_current_claims(request)
+    if claims.get("imp"):
+        raise HTTPException(
+            status_code=403,
+            detail="Impersonation sessions cannot access the admin console",
+        )
+    email = claims.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    async with get_mongo_client() as mongo_client:
+        user = await mongo_client[DB_NAME]["users"].find_one(
+            {"user_id": email}, {"role": 1}
+        )
+    if not user or user.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Admin access required")
+    return email

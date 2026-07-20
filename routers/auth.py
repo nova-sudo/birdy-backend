@@ -1,7 +1,7 @@
 import logging
 import bcrypt
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Response
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Request, Response
 
 from core.config import (
     JWT_EXPIRY_MINUTES,
@@ -13,7 +13,7 @@ from core.config import (
 from core.database import DB_NAME
 from core.models import RegisterRequest, LoginRequest
 from core.utils import set_cookie
-from dependencies import get_mongo_client, get_current_user, generate_tokens
+from dependencies import get_mongo_client, get_current_user, get_current_claims, generate_tokens
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
@@ -27,6 +27,38 @@ async def check_auth(current_user: str = Depends(get_current_user)):
     return {
         "authenticated": True,
         "user": current_user
+    }
+
+
+@router.get("/api/me")
+async def get_me(request: Request):
+    """
+    Identity for the current session — used by the frontend to gate the Admin
+    UI (`role`) and render the impersonation banner (`impersonating` / `act`).
+    Reads impersonation claims off the token, so during an impersonation
+    session this returns the *target* user's identity plus the acting admin.
+    """
+    claims = await get_current_claims(request)
+    email = claims.get("sub")
+    if not email:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        user = await db["users"].find_one(
+            {"user_id": email},
+            {"name": 1, "role": 1, "default_currency": 1},
+        )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    return {
+        "email": email,
+        "name": user.get("name"),
+        "role": user.get("role", "user"),
+        "default_currency": user.get("default_currency"),
+        "impersonating": bool(claims.get("imp")),
+        "act": claims.get("act"),  # acting admin's email while impersonating, else None
     }
 
 
@@ -177,6 +209,7 @@ async def login_user(request: LoginRequest, response: Response, background_tasks
                     "email": request.email,
                     "name": user_doc.get("name"),
                     "default_currency": default_currency,
+                    "role": user_doc.get("role", "user"),
                 }
             }
 

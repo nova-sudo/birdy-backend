@@ -148,6 +148,7 @@ async def slack_events(request: Request):
                 message=text,
                 session_id=session_id,
                 mongo_client=mongo_client,
+                source="slack",
             )
 
             blocks, fallback_text, ui_pending = build_blocks_from_reply(
