@@ -57,6 +57,8 @@ def _relative_time(dt: datetime | None) -> str:
 def _suggestion_to_api(doc: dict) -> dict:
     return {
         "id": doc.get("id"),
+        "status": doc.get("status", store.STATUS_OPEN),
+        "applied_count": len(doc.get("applied_targets") or []),
         "severity": doc.get("severity"),
         "icon": doc.get("icon", "sparkles"),
         "client": doc.get("client_name"),
@@ -123,7 +125,10 @@ async def summary(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
 
-        suggestions = await store.list_open_suggestions(db, current_user, limit=50)
+        open_docs = await store.list_open_suggestions(db, current_user, limit=50)
+        # Recently-applied are returned too so the card can stay visible with a
+        # lasting Undo (same affordance as the Slack card's Undo button).
+        applied_docs = await store.list_recent_applied(db, current_user, within_hours=24, limit=20)
         activity = await store.list_recent_activity(db, current_user, limit=30)
 
         triggered = await db["alerts"].find(
@@ -132,7 +137,9 @@ async def summary(current_user: str = Depends(get_current_user)):
         alert_docs = [a for a in triggered if a.get("type") != "win"]
         win_docs = [a for a in triggered if a.get("type") == "win"]
 
-        suggestions_api = [_suggestion_to_api(s) for s in suggestions]
+        # Open (actionable) first, then recently-applied (kept only for Undo).
+        suggestions_api = ([_suggestion_to_api(s) for s in open_docs]
+                           + [_suggestion_to_api(s) for s in applied_docs])
         alerts_api = [_alert_to_api(a) for a in alert_docs]
         wins_api = [_win_to_api(w) for w in win_docs]
 
@@ -142,7 +149,8 @@ async def summary(current_user: str = Depends(get_current_user)):
             "wins": wins_api,
             "activity": [_activity_to_api(a) for a in activity],
             "counts": {
-                "suggestions": len(suggestions_api),
+                # Badge counts only actionable (open) suggestions.
+                "suggestions": len(open_docs),
                 "alerts": len(alerts_api),
                 "wins": len(wins_api),
             },

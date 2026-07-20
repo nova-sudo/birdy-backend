@@ -170,6 +170,19 @@ async def list_open_suggestions(db, user_id: str, limit: int = 50) -> list[dict]
     return await cursor.to_list(length=limit)
 
 
+async def list_recent_applied(db, user_id: str, *, within_hours: int = 24,
+                              limit: int = 20) -> list[dict]:
+    """
+    Recently-applied suggestions, so the dashboard can keep showing them with a
+    lasting Undo (mirroring the persistent Undo button on the Slack card).
+    """
+    since = _now() - timedelta(hours=within_hours)
+    cursor = db[SUGGESTIONS].find(
+        {"user_id": user_id, "status": STATUS_APPLIED, "applied_at": {"$gte": since}}
+    ).sort("applied_at", -1).limit(limit)
+    return await cursor.to_list(length=limit)
+
+
 async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
     return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
 
