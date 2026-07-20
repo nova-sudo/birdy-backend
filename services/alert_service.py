@@ -508,8 +508,8 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
     else:
         ghl_date_filter = {"$gte": (now - timedelta(days=period_days)).isoformat()}
 
-    # Fetch all relevant group docs once
-    groups_query = {"user_id": user_id}
+    # Fetch all relevant group docs once — alerts only ever apply to active clients
+    groups_query = {"user_id": user_id, "client_status": {"$ne": "Inactive"}}
     if group_ids:
         groups_query["id"] = {"$in": group_ids}
 
