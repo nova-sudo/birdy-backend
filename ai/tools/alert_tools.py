@@ -72,13 +72,14 @@ async def create_alert(
 
     alert_id = f"alert_{user_id}_{int(datetime.utcnow().timestamp() * 1000)}"
 
-    # Resolve group names
+    # Resolve group names — alerts only ever target active clients
     group_names = []
     if target_group_ids:
         groups = await db["client_groups"].find(
-            {"id": {"$in": target_group_ids}, "user_id": user_id},
+            {"id": {"$in": target_group_ids}, "user_id": user_id, "client_status": {"$ne": "Inactive"}},
             {"name": 1, "id": 1},
         ).to_list(None)
+        target_group_ids = [g["id"] for g in groups]
         group_names = [g["name"] for g in groups]
 
     alert_doc = {
@@ -184,13 +185,13 @@ async def update_alert(
             condition["period"] = period
         update_fields["condition"] = condition
 
-    # Target groups
+    # Target groups — alerts only ever target active clients
     if target_group_ids is not None:
-        update_fields["target_group_ids"] = target_group_ids
         groups = await db["client_groups"].find(
-            {"id": {"$in": target_group_ids}, "user_id": user_id},
-            {"name": 1},
+            {"id": {"$in": target_group_ids}, "user_id": user_id, "client_status": {"$ne": "Inactive"}},
+            {"name": 1, "id": 1},
         ).to_list(None)
+        update_fields["target_group_ids"] = [g["id"] for g in groups]
         update_fields["target_group_names"] = [g["name"] for g in groups]
 
     # Snooze
