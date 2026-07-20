@@ -113,14 +113,15 @@ class Finding:
         target_ids = sorted(
             str(t.get("object_id", "")) for t in (self.action.targets if self.action else [])
         )
-        # window is intentionally EXCLUDED: the same ad(s) flagged in both the
-        # weekly and monthly window is ONE suggestion, not two. (Which window
-        # created it is tracked separately as `origin_window` for reconcile.)
-        basis = "|".join([
-            self.agent,
-            self.client_group_id,
-            ",".join(target_ids),
-        ])
+        # Dedup by the actual object(s) acted on — NOT by client-group or window:
+        #   * the same ad can appear under multiple client-groups that share one
+        #     Meta ad account, so it must be ONE suggestion, not one per group;
+        #   * the same ad flagged in the weekly AND monthly window is also one.
+        # Advisory findings that carry no targets fall back to per-client dedup.
+        if target_ids:
+            basis = "|".join([self.agent, ",".join(target_ids)])
+        else:
+            basis = "|".join([self.agent, self.client_group_id])
         return "sug_" + hashlib.sha1(basis.encode("utf-8")).hexdigest()[:20]
 
 

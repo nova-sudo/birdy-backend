@@ -68,6 +68,7 @@ async def run_pass_for_user(
 
     stats = {"clients": 0, "analyzed": 0, "findings": 0, "created": 0, "resolved": 0}
     created_docs: list[dict] = []  # brand-new suggestions, to post to Slack after the pass
+    keep_by_agent: dict[str, set] = {}  # agent → union of kept suggestion ids across ALL clients
 
     for group in groups:
         stats["clients"] += 1
@@ -98,7 +99,7 @@ async def run_pass_for_user(
                              getattr(agent, "name", agent), user_id, client_id, e, exc_info=True)
                 continue
 
-            keep_ids = set()
+            agent_name = getattr(agent, "name", "")
             for finding in findings:
                 stats["findings"] += 1
                 composed = await compose(provider, finding)
@@ -109,7 +110,7 @@ async def run_pass_for_user(
                 )
                 if doc is None:
                     continue  # suppressed (applied / recently dismissed)
-                keep_ids.add(doc["_id"])
+                keep_by_agent.setdefault(agent_name, set()).add(doc["_id"])
                 if created:
                     stats["created"] += 1
                     created_docs.append(doc)
@@ -125,12 +126,15 @@ async def run_pass_for_user(
                         label="Suggested by Birdy",
                     )
 
-            # Reconcile: close open suggestions from this agent+window+client that
-            # this pass no longer produced.
-            closed = await store.close_stale_open(
-                db, user_id, getattr(agent, "name", ""), window, client_id, keep_ids
-            )
-            stats["resolved"] += closed
+    # Reconcile once across the WHOLE pass (not per client-group): close open
+    # suggestions this agent no longer produced for this window in ANY client, so
+    # a shared ad seen under several client-groups isn't wrongly auto-closed.
+    for agent in agents:
+        agent_name = getattr(agent, "name", "")
+        closed = await store.close_stale_open(
+            db, user_id, agent_name, window, keep_by_agent.get(agent_name, set())
+        )
+        stats["resolved"] += closed
 
     # Push brand-new suggestions to the user's Slack channel (no-op if the user
     # hasn't connected Slack or chosen a channel).

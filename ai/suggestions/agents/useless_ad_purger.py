@@ -171,9 +171,9 @@ class UselessAdPurger:
         if target is None and baseline is not None:
             target, target_source = baseline, "baseline"
 
-        # Evaluate each active ad.
+        # Evaluate each active ad → ONE finding per offending ad (so a shared ad
+        # across client-groups dedupes to a single suggestion downstream).
         offenders = []
-        any_high = False
         for r in rows:
             if not _is_active(r.get("status")):
                 continue
@@ -184,16 +184,12 @@ class UselessAdPurger:
                 continue
 
             reason = None
-            high = False
             if leads == 0 and spend >= zero_floor:
                 reason = "zero_leads"
-                high = True
             elif target is not None and cpl is not None and cpl > target:
                 reason = "over_target"
-                high = cpl > target * HIGH_SEVERITY_MULTIPLIER
 
             if reason:
-                any_high = any_high or high
                 offenders.append({
                     "object_id": str(r.get("id")),
                     "name": r.get("name") or "Ad",
@@ -203,62 +199,58 @@ class UselessAdPurger:
                     "reason": reason,
                 })
 
-        if not offenders:
-            return []
+        return [
+            self._build_ad_finding(
+                client_group_id=client_group_id,
+                client_name=client_name,
+                window=window,
+                preset=preset,
+                symbol=symbol,
+                target=target,
+                target_source=target_source,
+                offender=off,
+            )
+            for off in offenders
+        ]
 
-        finding = self._build_finding(
-            client_group_id=client_group_id,
-            client_name=client_name,
-            window=window,
-            preset=preset,
-            symbol=symbol,
-            target=target,
-            target_source=target_source,
-            baseline=baseline,
-            offenders=offenders,
-            severity=SEVERITY_HIGH if any_high else SEVERITY_MEDIUM,
-        )
-        return [finding]
-
-    def _build_finding(self, *, client_group_id, client_name, window, preset, symbol,
-                       target, target_source, baseline, offenders, severity) -> Finding:
-        n = len(offenders)
-        total_spend = round(sum(o["spend"] for o in offenders), 2)
-        total_leads = sum(o["leads"] for o in offenders)
-        cpls = [o["cpl"] for o in offenders if o["cpl"] is not None]
-        worst_cpl = max(cpls) if cpls else None
-        worst = max(offenders, key=lambda o: (o["cpl"] or 0))
-
+    def _build_ad_finding(self, *, client_group_id, client_name, window, preset, symbol,
+                          target, target_source, offender) -> Finding:
+        """Build one suggestion for a single underperforming ad."""
+        cpl = offender["cpl"]
+        spend = offender["spend"]
+        leads = offender["leads"]
+        name = offender["name"]
         window_label = "7d" if window == WINDOW_WEEKLY else "30d"
 
-        # Display-ready stats for the card (mirrors the mock's rec-1 layout).
+        high = offender["reason"] == "zero_leads" or (
+            cpl is not None and target is not None and cpl > target * HIGH_SEVERITY_MULTIPLIER
+        )
+        severity = SEVERITY_HIGH if high else SEVERITY_MEDIUM
+
         stats = []
-        if worst_cpl is not None:
-            stats.append(Stat("CPL", f"{symbol}{worst_cpl:.2f}", bad=True))
-        # (the trailing Leads stat below already conveys the zero-lead case)
+        if cpl is not None:
+            stats.append(Stat("CPL", f"{symbol}{cpl:.2f}", bad=True))
         if target is not None:
             target_label = "Target" if target_source == "alert" else "Acct median"
             stats.append(Stat(target_label, f"{symbol}{target:.2f}"))
-        stats.append(Stat(f"Spent ({window_label})", f"{symbol}{total_spend:.0f}"))
-        stats.append(Stat("Leads", str(total_leads), bad=(total_leads == 0)))
+        stats.append(Stat(f"Spent ({window_label})", f"{symbol}{spend:.0f}"))
+        stats.append(Stat("Leads", str(leads), bad=(leads == 0)))
 
         # Deterministic template copy — always safe to show even with no LLM.
-        title = f"Pause {n} underperforming ad{'s' if n != 1 else ''}"
-        if target_source == "alert" and target is not None:
-            basis = f"above your {symbol}{target:.0f} cost-per-lead target"
+        if offender["reason"] == "zero_leads":
+            basis = f"spent {symbol}{spend:.0f} over the last {window_label} with 0 leads"
+        elif target_source == "alert" and target is not None:
+            basis = f"is at {symbol}{cpl:.2f} cost-per-lead over the last {window_label}, above your {symbol}{target:.0f} target"
         elif target_source == "baseline" and target is not None:
-            basis = f"well above this account's {symbol}{target:.0f} median cost-per-lead"
+            basis = f"is at {symbol}{cpl:.2f} cost-per-lead over the last {window_label}, well above this account's {symbol}{target:.0f} median"
         else:
-            basis = "burning spend with no leads"
-        lead_clause = "have driven 0 leads" if total_leads == 0 else f"returned only {total_leads} lead{'s' if total_leads != 1 else ''}"
-        description = (
-            f"{n} active ad{'s' if n != 1 else ''} {basis} over the last {window_label} — "
-            f"they {lead_clause} on {symbol}{total_spend:.0f} of spend. Pausing frees that budget for your top performers."
-        )
+            basis = f"spent {symbol}{spend:.0f} over the last {window_label} with poor return"
+        title = f"Pause underperforming ad — {name}"
+        description = f"'{name}' {basis}. Pausing it frees that budget for your top performers."
 
         action = Action(
             type=ACTION_PAUSE_ADS,
-            targets=[{"object_id": o["object_id"], "object_type": "ad", "name": o["name"]} for o in offenders],
+            targets=[{"object_id": offender["object_id"], "object_type": "ad", "name": name}],
             params={},
         )
         evidence = Evidence(
@@ -268,12 +260,12 @@ class UselessAdPurger:
                 "preset": preset,
                 "target": target,
                 "target_source": target_source,
-                "baseline": baseline,
-                "total_spend": total_spend,
-                "total_leads": total_leads,
-                "worst_cpl": worst_cpl,
-                "worst_ad": worst.get("name"),
-                "offenders": offenders,
+                "ad": name,
+                "ad_id": offender["object_id"],
+                "spend": spend,
+                "leads": leads,
+                "cpl": cpl,
+                "reason": offender["reason"],
             },
         )
         return Finding(
@@ -286,6 +278,6 @@ class UselessAdPurger:
             evidence=evidence,
             action=action,
             platform="Meta Ads",
-            confidence=0.9 if any(o["reason"] == "zero_leads" for o in offenders) else 0.75,
+            confidence=0.9 if offender["reason"] == "zero_leads" else 0.75,
             icon="pause",
         )

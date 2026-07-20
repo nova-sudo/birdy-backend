@@ -71,19 +71,21 @@ def test_flags_zero_lead_and_over_baseline():
         _ad("ad_good2", "Good Ad 2", "ACTIVE", 120, 10),    # cpl 12
     ]
     findings = _run([], _group(ads))
-    assert len(findings) == 1
-    f = findings[0]
-    assert f.action.type == ACTION_PAUSE_ADS
-    ids = {t["object_id"] for t in f.action.targets}
+    # One finding per offending ad (ad_zero: zero-lead; ad_exp: cpl 48 > baseline).
+    assert len(findings) == 2, [f.title for f in findings]
+    ids = {t["object_id"] for f in findings for t in f.action.targets}
     assert ids == {"ad_zero", "ad_exp"}, ids
-    assert all(t["object_type"] == "ad" for t in f.action.targets)
-    assert f.severity == SEVERITY_HIGH
-    assert f.evidence.raw["target_source"] == "baseline"
-    # baseline = median([10, 12, 48]) * 1.75 = 12 * 1.75 = 21.0
-    assert f.evidence.raw["target"] == 21.0
-    # A target stat is shown (labelled "Acct median" for the baseline path).
-    labels = [s.label for s in f.evidence.stats]
-    assert "Acct median" in labels
+    for f in findings:
+        assert f.action.type == ACTION_PAUSE_ADS
+        assert len(f.action.targets) == 1  # one ad per suggestion
+        assert f.action.targets[0]["object_type"] == "ad"
+        assert f.severity == SEVERITY_HIGH  # zero-lead, and cpl 48 > 21*1.5
+        assert f.evidence.raw["target_source"] == "baseline"
+        # baseline = median([10, 12, 48]) * 1.75 = 12 * 1.75 = 21.0
+        assert f.evidence.raw["target"] == 21.0
+    # The over-target ad shows a target stat labelled "Acct median" (baseline path).
+    all_labels = {s.label for f in findings for s in f.evidence.stats}
+    assert "Acct median" in all_labels
     print("PASS test_flags_zero_lead_and_over_baseline")
 
 

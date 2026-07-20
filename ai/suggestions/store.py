@@ -180,19 +180,21 @@ async def set_slack_message(db, user_id: str, suggestion_id: str, channel: str, 
 
 
 async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
-                           client_group_id: str, keep_ids: set) -> int:
+                           keep_ids: set) -> int:
     """
     Auto-close open suggestions this pass no longer produced (the ad improved, or
-    was paused). Scoped by origin_window — the window that CREATED the suggestion
-    — so the monthly pass never closes a weekly-only finding, and vice versa,
-    even though the two windows now share one dedup key.
+    was paused). Scoped per (user, agent, origin_window) across ALL of the user's
+    clients — NOT per client-group — because a suggestion dedupes by ad and a
+    shared ad may be evaluated under several client-groups in one pass. `keep_ids`
+    must therefore be the UNION of everything kept across every client this pass.
+    origin_window (the window that CREATED the suggestion) keeps weekly and
+    monthly from closing each other's findings.
     """
     res = await db[SUGGESTIONS].update_many(
         {
             "user_id": user_id,
             "agent": agent,
             "origin_window": origin_window,
-            "client_group_id": client_group_id,
             "status": STATUS_OPEN,
             "_id": {"$nin": list(keep_ids)},
         },

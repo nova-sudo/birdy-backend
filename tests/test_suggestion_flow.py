@@ -67,20 +67,22 @@ async def _create_and_dedupe():
 
     s1 = await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
     open1 = await store.list_open_suggestions(db, "u1")
-    assert len(open1) == 1, f"expected 1 suggestion, got {len(open1)}"
-    assert open1[0]["action"]["type"] == "pause_ads"
-    assert open1[0]["composer"] == "template"  # no LLM in this test
-    assert s1["created"] == 1
+    # _BAD_ADS has two offending ads → one suggestion per ad.
+    assert len(open1) == 2, f"expected 2 (one per ad), got {len(open1)}"
+    assert all(s["action"]["type"] == "pause_ads" for s in open1)
+    assert all(len(s["action"]["targets"]) == 1 for s in open1)  # one ad each
+    assert all(s["composer"] == "template" for s in open1)  # no LLM in this test
+    assert s1["created"] == 2
 
     acts = await store.list_recent_activity(db, "u1", 50)
     kinds = {a["kind"] for a in acts}
     assert "analysis_pass" in kinds, kinds
     assert "suggestion_created" in kinds, kinds
 
-    # Re-run: same finding → refreshed in place, no duplicate, nothing "created".
+    # Re-run: same ads → refreshed in place, no duplicates, nothing "created".
     s2 = await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
     open2 = await store.list_open_suggestions(db, "u1")
-    assert len(open2) == 1, f"dedup failed: {len(open2)} suggestions"
+    assert len(open2) == 2, f"dedup failed: {len(open2)} suggestions"
     assert s2["created"] == 0
     print("PASS test_create_and_dedupe")
 
@@ -88,21 +90,24 @@ async def _create_and_dedupe():
 async def _dismiss_cooldown():
     client, db = await _fresh_db_with(_BAD_ADS)
     await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
-    sug = (await store.list_open_suggestions(db, "u1"))[0]
+    open_sugs = await store.list_open_suggestions(db, "u1")
+    assert len(open_sugs) >= 1
+    for s in open_sugs:
+        await store.mark_dismissed(db, "u1", s["_id"])
 
-    await store.mark_dismissed(db, "u1", sug["_id"])
     # Re-run within cooldown → must NOT be recreated.
     await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
     assert await store.list_open_suggestions(db, "u1") == []
-    doc = await store.get_suggestion(db, "u1", sug["_id"])
-    assert doc["status"] == "dismissed"
+    for s in open_sugs:
+        doc = await store.get_suggestion(db, "u1", s["_id"])
+        assert doc["status"] == "dismissed"
     print("PASS test_dismiss_cooldown")
 
 
 async def _reconcile_resolves_stale():
     client, db = await _fresh_db_with(_BAD_ADS)
     await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
-    assert len(await store.list_open_suggestions(db, "u1")) == 1
+    assert len(await store.list_open_suggestions(db, "u1")) == 2  # one per offending ad
 
     # Ads all become healthy → the finding no longer reproduces.
     await db["client_groups"].update_one(
