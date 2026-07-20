@@ -140,12 +140,15 @@ async def create_alert(request: CreateAlertRequest, current_user: str = Depends(
 
         alert_id = f"alert_{current_user}_{int(datetime.utcnow().timestamp() * 1000)}"
 
+        # Alerts only ever target active clients
         group_names = []
-        if request.target_group_ids:
+        target_group_ids = request.target_group_ids or []
+        if target_group_ids:
             groups = await db["client_groups"].find(
-                {"id": {"$in": request.target_group_ids}, "user_id": current_user},
+                {"id": {"$in": target_group_ids}, "user_id": current_user, "client_status": {"$ne": "Inactive"}},
                 {"name": 1, "id": 1}
             ).to_list(None)
+            target_group_ids = [g["id"] for g in groups]
             group_names = [g["name"] for g in groups]
 
         alert_doc = {
@@ -155,7 +158,7 @@ async def create_alert(request: CreateAlertRequest, current_user: str = Depends(
             "description":           request.description or "",
             "type":                  request.type or "warning",
             "condition":             request.condition.model_dump(),
-            "target_group_ids":      request.target_group_ids or [],
+            "target_group_ids":      target_group_ids,
             "target_group_names":    group_names,
             "notification_channels": request.notification_channels or ["in_app"],
             "frequency":             request.frequency or "daily",
@@ -221,14 +224,15 @@ async def update_alert(
         if request.condition is not None:
             update_fields["condition"] = request.condition.model_dump()
         if request.target_group_ids is not None:
-            update_fields["target_group_ids"] = request.target_group_ids
             if request.target_group_ids:
                 groups = await db["client_groups"].find(
-                    {"id": {"$in": request.target_group_ids}, "user_id": current_user},
-                    {"name": 1}
+                    {"id": {"$in": request.target_group_ids}, "user_id": current_user, "client_status": {"$ne": "Inactive"}},
+                    {"name": 1, "id": 1}
                 ).to_list(None)
+                update_fields["target_group_ids"] = [g["id"] for g in groups]
                 update_fields["target_group_names"] = [g["name"] for g in groups]
             else:
+                update_fields["target_group_ids"] = []
                 update_fields["target_group_names"] = []
         if request.notification_channels is not None:
             update_fields["notification_channels"] = request.notification_channels
