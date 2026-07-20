@@ -9,6 +9,8 @@ from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
 from ai import mcp_client
 from ai import session_store
+from ai import conversation_log
+from services.query_classifier import classify_query
 
 logger = logging.getLogger(__name__)
 
@@ -320,6 +322,7 @@ async def run_chat(
     mongo_client=None,
     client_group_id: Optional[str] = None,
     client_name: Optional[str] = None,
+    source: str = conversation_log.SOURCE_BIRDY,
 ) -> dict:
     # Restore or create session
     session_id, history = await session_store.get_or_create(db, session_id, user_id)
@@ -338,6 +341,22 @@ async def run_chat(
         history.append({"role": "system", "content": system_content})
 
     history.append({"role": "user", "content": message})
+
+    # Durable archive (Admin console + analytics). Skip internal [UI_RESPONSE]
+    # submissions — those are form answers, not real user questions, and the
+    # frontend already filters them out of the visible transcript. Best-effort:
+    # conversation_log never raises.
+    if not message.lstrip().startswith("[UI_RESPONSE]"):
+        await conversation_log.log_message(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            source=source,
+            role="user",
+            content=message,
+            page=page,
+            category=classify_query(message),
+        )
 
     tools_used = []
     allowed = _PAGE_TOOLS.get(page) if page else None
@@ -416,6 +435,16 @@ async def run_chat(
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 history.append({"role": "assistant", "content": reply})
                 await session_store.save_messages(db, session_id, history)
+                await conversation_log.log_message(
+                    db,
+                    user_id=user_id,
+                    session_id=session_id,
+                    source=source,
+                    role="assistant",
+                    content=reply,
+                    page=page,
+                    tools_used=tools_used,
+                )
                 return {
                     "reply": reply,
                     "tools_used": tools_used,
@@ -473,6 +502,16 @@ async def run_chat(
         reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
         history.append({"role": "assistant", "content": reply})
         await session_store.save_messages(db, session_id, history)
+        await conversation_log.log_message(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            source=source,
+            role="assistant",
+            content=reply,
+            page=page,
+            tools_used=tools_used,
+        )
         return {
             "reply": reply,
             "tools_used": tools_used,

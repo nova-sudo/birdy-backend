@@ -74,6 +74,7 @@ async def _run_chat_and_reply(db, mongo_client, slack_client, pending: dict, ans
     result = await run_chat(
         provider=provider, tool_registry=registry, db=db, user_id=birdy_user_id,
         message=message, session_id=pending["session_id"], mongo_client=mongo_client,
+        source="slack",
     )
 
     blocks, fallback_text, ui_pending = build_blocks_from_reply(
