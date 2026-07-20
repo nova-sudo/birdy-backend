@@ -13,15 +13,16 @@ window:
         1. the value of an existing `cost_per_result`/`cpl` ceiling ALERT the
            agency already set for this client (operator "gt"), else
         2. a relative baseline = the median CPL of the client's other converting
-           ads × BASELINE_MULTIPLIER.
+           ads, scaled by the account's strictness profile.
 
-All underperformers in one client+window are grouped into a single finding
-("Pause N underperforming ads") carrying a pause_ads action over every offending
-ad. The LLM composer later rewrites the copy from these exact numbers.
+Each offending ad becomes its own single-ad pause suggestion (so the same ad
+shared across client-groups dedupes to one). How aggressively ads are flagged is
+set by a per-account strictness profile (lenient / balanced / strict), which also
+caps how many ads one client can surface per pass. The LLM composer later
+rewrites the copy from these exact numbers.
 """
 
 import logging
-import os
 import statistics
 
 from ai.tools.derived_metrics import enrich
@@ -47,28 +48,42 @@ _WINDOW_PRESET = {
 }
 
 
-def _f(env_key: str, default: float) -> float:
-    try:
-        return float(os.getenv(env_key, default))
-    except (TypeError, ValueError):
-        return default
+# ── Strictness profiles ───────────────────────────────────────────────────────
+# The user picks one per account (Settings → Birdy suggestions). "strict" is LESS
+# lenient — lower spend bars, tighter CPL tolerance, and more suggestions per
+# client; "lenient" only surfaces the most egregious waste; "balanced" is the
+# default and matches the original behaviour. Values are account-currency.
+# max_per_client caps how many ads one client can surface per pass so a large
+# account (hundreds of ads) can't flood the feed — the worst offenders by spend win.
+STRICTNESS_PROFILES = {
+    "lenient": {
+        "min_spend": {WINDOW_WEEKLY: 60.0, WINDOW_MONTHLY: 200.0},
+        "zero_lead_floor": {WINDOW_WEEKLY: 100.0, WINDOW_MONTHLY: 300.0},
+        "baseline_multiplier": 2.25,
+        "high_multiplier": 2.0,
+        "max_per_client": 2,
+    },
+    "balanced": {
+        "min_spend": {WINDOW_WEEKLY: 30.0, WINDOW_MONTHLY: 100.0},
+        "zero_lead_floor": {WINDOW_WEEKLY: 50.0, WINDOW_MONTHLY: 150.0},
+        "baseline_multiplier": 1.75,
+        "high_multiplier": 1.5,
+        "max_per_client": 3,
+    },
+    "strict": {
+        "min_spend": {WINDOW_WEEKLY: 15.0, WINDOW_MONTHLY: 50.0},
+        "zero_lead_floor": {WINDOW_WEEKLY: 25.0, WINDOW_MONTHLY: 75.0},
+        "baseline_multiplier": 1.35,
+        "high_multiplier": 1.3,
+        "max_per_client": 6,
+    },
+}
+DEFAULT_STRICTNESS = "balanced"
+STRICTNESS_LEVELS = ("lenient", "balanced", "strict")
 
 
-# Tuning knobs (account-currency units). Env-overridable so cadence/strictness
-# can change without a redeploy.
-MIN_SPEND = {
-    WINDOW_WEEKLY: _f("PURGER_MIN_SPEND_WEEKLY", 30.0),
-    WINDOW_MONTHLY: _f("PURGER_MIN_SPEND_MONTHLY", 100.0),
-}
-# Zero leads AND at least this much spend → clear waste, flagged HIGH.
-ZERO_LEAD_FLOOR = {
-    WINDOW_WEEKLY: _f("PURGER_ZERO_LEAD_FLOOR_WEEKLY", 50.0),
-    WINDOW_MONTHLY: _f("PURGER_ZERO_LEAD_FLOOR_MONTHLY", 150.0),
-}
-# How far above the converting-ads median counts as "too expensive".
-BASELINE_MULTIPLIER = _f("PURGER_BASELINE_MULTIPLIER", 1.75)
-# CPL this far over target escalates the whole finding to HIGH.
-HIGH_SEVERITY_MULTIPLIER = _f("PURGER_HIGH_MULTIPLIER", 1.5)
+def _profile(strictness: str | None) -> dict:
+    return STRICTNESS_PROFILES.get(strictness or DEFAULT_STRICTNESS, STRICTNESS_PROFILES[DEFAULT_STRICTNESS])
 
 _CURRENCY_SYMBOLS = {
     "USD": "$", "GBP": "£", "EUR": "€", "AUD": "A$", "CAD": "C$",
@@ -145,8 +160,9 @@ class UselessAdPurger:
         client_group_id = client_group.get("id")
         client_name = client_group.get("name") or "Client"
         symbol = _symbol(client_group.get("ad_account_currency"))
-        min_spend = MIN_SPEND.get(window, 30.0)
-        zero_floor = ZERO_LEAD_FLOOR.get(window, 50.0)
+        profile = _profile((ctx.config or {}).get("strictness") if ctx else None)
+        min_spend = profile["min_spend"].get(window, 30.0)
+        zero_floor = profile["zero_lead_floor"].get(window, 50.0)
 
         # Enrich a copy of each ad so we don't mutate the cached doc.
         rows = []
@@ -164,7 +180,7 @@ class UselessAdPurger:
         ]
         baseline = None
         if len(converting_cpls) >= 2:
-            baseline = round(statistics.median(converting_cpls) * BASELINE_MULTIPLIER, 2)
+            baseline = round(statistics.median(converting_cpls) * profile["baseline_multiplier"], 2)
 
         # Target: alert ceiling first, else baseline.
         target, target_source = await _resolve_target_cpl(ctx, client_group_id)
@@ -199,6 +215,10 @@ class UselessAdPurger:
                     "reason": reason,
                 })
 
+        # Cap to the worst offenders by spend so a large account can't flood the feed.
+        offenders.sort(key=lambda o: o["spend"], reverse=True)
+        offenders = offenders[: profile["max_per_client"]]
+
         return [
             self._build_ad_finding(
                 client_group_id=client_group_id,
@@ -208,13 +228,14 @@ class UselessAdPurger:
                 symbol=symbol,
                 target=target,
                 target_source=target_source,
+                high_multiplier=profile["high_multiplier"],
                 offender=off,
             )
             for off in offenders
         ]
 
     def _build_ad_finding(self, *, client_group_id, client_name, window, preset, symbol,
-                          target, target_source, offender) -> Finding:
+                          target, target_source, high_multiplier, offender) -> Finding:
         """Build one suggestion for a single underperforming ad."""
         cpl = offender["cpl"]
         spend = offender["spend"]
@@ -223,7 +244,7 @@ class UselessAdPurger:
         window_label = "7d" if window == WINDOW_WEEKLY else "30d"
 
         high = offender["reason"] == "zero_leads" or (
-            cpl is not None and target is not None and cpl > target * HIGH_SEVERITY_MULTIPLIER
+            cpl is not None and target is not None and cpl > target * high_multiplier
         )
         severity = SEVERITY_HIGH if high else SEVERITY_MEDIUM
 

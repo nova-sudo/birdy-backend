@@ -149,10 +149,35 @@ def test_monthly_window_reads_last_30d():
     print("PASS test_monthly_window_reads_last_30d")
 
 
+def test_strictness_levels_and_cap():
+    """strict flags more (lower bars) than balanced than lenient, and the
+    per-client cap keeps only the highest-spend offenders."""
+    zeros = [_ad(f"z{i}", f"Zero {i}", "ACTIVE", 20 + i * 10, 0) for i in range(8)]  # spend 20..90
+    goods = [_ad("g1", "Good1", "ACTIVE", 100, 10), _ad("g2", "Good2", "ACTIVE", 100, 10)]
+    group = _group(zeros + goods)
+
+    def run(strictness):
+        ctx = AnalyzerContext(db=_FakeDB(alerts=[]), user_id="u1", config={"strictness": strictness})
+        return asyncio.run(UselessAdPurger().analyze(ctx, group, "weekly"))
+
+    lenient = run("lenient")   # zero_lead_floor 100 > max spend 90 → nothing
+    balanced = run("balanced")  # 5 qualify (spend>=50), capped at 3
+    strict = run("strict")      # 7 qualify (spend>=25), capped at 6
+
+    assert len(lenient) == 0, [f.title for f in lenient]
+    assert len(balanced) == 3, len(balanced)
+    assert len(strict) == 6, len(strict)
+    strict_ids = {t["object_id"] for f in strict for t in f.action.targets}
+    assert "z7" in strict_ids           # highest spend kept
+    assert "z1" not in strict_ids       # lowest qualifier dropped by the cap
+    print("PASS test_strictness_levels_and_cap")
+
+
 if __name__ == "__main__":
     test_flags_zero_lead_and_over_baseline()
     test_uses_alert_threshold_as_target()
     test_no_offenders_when_healthy()
     test_ignores_paused_and_low_spend()
     test_monthly_window_reads_last_30d()
+    test_strictness_levels_and_cap()
     print("\nAll useless_ad_purger tests passed.")

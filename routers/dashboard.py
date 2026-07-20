@@ -30,6 +30,7 @@ from dependencies import get_current_user, get_mongo_client
 from ai.suggestions import actions, store
 from ai.suggestions.contracts import WINDOWS
 from ai.suggestions.orchestrator import run_pass_for_user
+from ai.suggestions.agents.useless_ad_purger import STRICTNESS_LEVELS, DEFAULT_STRICTNESS
 
 logger = logging.getLogger(__name__)
 
@@ -226,3 +227,34 @@ async def refresh(body: RefreshRequest | None = None,
         for w in windows:
             results[w] = await run_pass_for_user(db, current_user, w, mongo_client=mongo_client)
     return {"ok": True, "results": results}
+
+
+# ---------------------------------------------------------------------------
+# Suggestion settings (how strict the analyzer is)
+# ---------------------------------------------------------------------------
+
+class SettingsRequest(BaseModel):
+    strictness: str  # "lenient" | "balanced" | "strict"
+
+
+@router.get("/settings")
+async def get_settings(current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        strictness = await store.get_user_strictness(db, current_user)
+    return {
+        "strictness": strictness,
+        "options": list(STRICTNESS_LEVELS),
+        "default": DEFAULT_STRICTNESS,
+    }
+
+
+@router.put("/settings")
+async def put_settings(body: SettingsRequest,
+                       current_user: str = Depends(get_current_user)):
+    if body.strictness not in STRICTNESS_LEVELS:
+        raise HTTPException(status_code=400, detail=f"strictness must be one of {list(STRICTNESS_LEVELS)}")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await store.set_user_strictness(db, current_user, body.strictness)
+    return {"ok": True, "strictness": body.strictness}

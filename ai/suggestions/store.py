@@ -271,6 +271,22 @@ async def list_recent_activity(db, user_id: str, limit: int = 30) -> list[dict]:
 # Indexes (wired into main.py lifespan)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Per-user suggestion settings (strictness)
+# ---------------------------------------------------------------------------
+
+async def get_user_strictness(db, user_id: str) -> str:
+    """The account's chosen strictness level, defaulting to 'balanced'."""
+    doc = await db["users"].find_one({"user_id": user_id}, projection={"suggestion_strictness": 1})
+    return (doc or {}).get("suggestion_strictness") or "balanced"
+
+
+async def set_user_strictness(db, user_id: str, level: str) -> None:
+    await db["users"].update_one(
+        {"user_id": user_id}, {"$set": {"suggestion_strictness": level}}
+    )
+
+
 async def create_suggestion_indexes(mongo_client):
     db = mongo_client[DB_NAME]
     await db[SUGGESTIONS].create_index([("user_id", 1), ("status", 1), ("created_at", -1)])

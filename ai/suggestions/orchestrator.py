@@ -64,7 +64,9 @@ async def run_pass_for_user(
 
     # One provider per user (BYOK, else global key, else None → template copy).
     provider = await get_composer_provider(user_id, db)
-    ctx = AnalyzerContext(db=db, user_id=user_id, mongo_client=mongo_client)
+    strictness = await store.get_user_strictness(db, user_id)
+    ctx = AnalyzerContext(db=db, user_id=user_id, mongo_client=mongo_client,
+                          config={"strictness": strictness})
 
     stats = {"clients": 0, "analyzed": 0, "findings": 0, "created": 0, "resolved": 0}
     created_docs: list[dict] = []  # brand-new suggestions, to post to Slack after the pass
