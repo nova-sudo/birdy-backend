@@ -54,6 +54,7 @@ KIND_ANALYSIS_PASS = "analysis_pass"
 KIND_SUGGESTION_CREATED = "suggestion_created"
 KIND_ACTION_APPLIED = "action_applied"
 KIND_SUGGESTION_DISMISSED = "suggestion_dismissed"
+KIND_ACTION_UNDONE = "action_undone"
 
 
 def _now() -> datetime:
@@ -173,10 +174,34 @@ async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
     return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
 
 
-async def mark_applied(db, user_id: str, suggestion_id: str) -> bool:
+async def mark_applied(db, user_id: str, suggestion_id: str, *,
+                       applied_targets: list | None = None,
+                       applied_action_type: str | None = None) -> bool:
+    """
+    Mark applied, recording exactly which objects were changed so the action can
+    be UNDONE later (undo re-applies the inverse to these targets only).
+    """
+    now = _now()
+    update = {"status": STATUS_APPLIED, "applied_at": now, "updated_at": now}
+    if applied_targets is not None:
+        update["applied_targets"] = applied_targets
+    if applied_action_type:
+        update["applied_action_type"] = applied_action_type
+    res = await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id}, {"$set": update}
+    )
+    return res.modified_count > 0
+
+
+async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
+    """Revert an applied suggestion back to open once its action was undone."""
+    now = _now()
     res = await db[SUGGESTIONS].update_one(
         {"_id": suggestion_id, "user_id": user_id},
-        {"$set": {"status": STATUS_APPLIED, "applied_at": _now(), "updated_at": _now()}},
+        {
+            "$set": {"status": STATUS_OPEN, "updated_at": now},
+            "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": ""},
+        },
     )
     return res.modified_count > 0
 

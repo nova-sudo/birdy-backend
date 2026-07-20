@@ -192,37 +192,33 @@ async def _handle_view_submission(payload: dict, db, mongo_client) -> dict:
     return {}
 
 
-def _suggestion_outcome_text(action_id: str, res: dict, slack_user: str | None) -> str:
-    """The mrkdwn that replaces the buttons after a suggestion is actioned."""
-    doc = res.get("doc") or {}
-    title = doc.get("title") or "Suggestion"
-    who = f" by <@{slack_user}>" if slack_user else ""
-    outcome = res.get("outcome")
-
-    if action_id == "suggestion_ignore":
-        if outcome == "not_found":
-            return f"~{title}~\n:no_entry_sign: No longer available."
-        return f"~{title}~\n:no_entry_sign: Ignored{who}."
-
-    # suggestion_apply
-    if outcome in ("applied", "partial"):
-        n = len(res.get("succeeded") or [])
-        extra = f" ({len(res['failed'])} failed)" if outcome == "partial" and res.get("failed") else ""
-        return f"*{title}*\n:white_check_mark: Done{who} — paused {n} ad(s){extra}."
-    if outcome == "already":
-        return f"*{title}*\n:white_check_mark: Already applied."
-    if outcome == "not_found":
-        return f"*{title}*\n:warning: No longer available."
-    if outcome == "failed":
-        return f"*{title}*\n:warning: Couldn't apply — {res.get('detail', 'error')}"
-    return f"*{title}*\n:white_check_mark: Done{who}."
+async def _post_action_error(db, birdy_user_id: str, payload: dict, res: dict) -> None:
+    """Reply in-thread when a Slack-triggered action couldn't be completed."""
+    bot_token = await get_decrypted_bot_token_for_user(db, birdy_user_id)
+    channel = (payload.get("channel") or {}).get("id")
+    ts = (payload.get("message") or {}).get("ts")
+    if not bot_token or not channel:
+        return
+    msg = {
+        "not_found": "That suggestion is no longer available.",
+        "not_applied": "Nothing to undo — this suggestion isn't applied.",
+        "failed": f"Couldn't complete that — {res.get('detail', 'error')}",
+    }.get(res.get("outcome"), "Couldn't complete that action.")
+    from slack_sdk.web.async_client import AsyncWebClient
+    try:
+        await AsyncWebClient(token=bot_token).chat_postMessage(
+            channel=channel, thread_ts=ts, text=f":warning: {msg}"
+        )
+    except Exception as e:
+        logger.warning(f"suggestion action: error notice failed: {e}")
 
 
 async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_client) -> dict:
     """
-    Handle the "Do it for me" / "Ignore" buttons on a suggestion message. Resolves
-    the tenant from the Slack team_id, runs the shared apply/dismiss action, then
-    swaps the buttons out for an outcome line via chat.update.
+    Handle the "Do it for me" / "Ignore" / "Undo" buttons on a suggestion message.
+    Resolves the tenant from the Slack team_id and runs the shared action — which
+    also re-renders the Slack card, so we don't update the message here (the same
+    path runs when the action is taken from the dashboard, keeping both in sync).
     """
     team_id = (payload.get("team") or {}).get("id")
     birdy_user_id = await get_user_id_by_team_id(db, team_id) if team_id else None
@@ -234,24 +230,17 @@ async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_clien
     slack_user = (payload.get("user") or {}).get("id")
 
     if action_id == "suggestion_apply":
-        res = await actions.apply_suggestion(db, mongo_client, birdy_user_id, suggestion_id, source="slack")
+        res = await actions.apply_suggestion(
+            db, mongo_client, birdy_user_id, suggestion_id, source="slack", by=slack_user)
+    elif action_id == "suggestion_undo":
+        res = await actions.undo_suggestion(
+            db, mongo_client, birdy_user_id, suggestion_id, source="slack", by=slack_user)
     else:
-        res = await actions.dismiss_suggestion(db, mongo_client, birdy_user_id, suggestion_id, source="slack")
+        res = await actions.dismiss_suggestion(
+            db, mongo_client, birdy_user_id, suggestion_id, source="slack", by=slack_user)
 
-    channel = (payload.get("channel") or {}).get("id")
-    ts = (payload.get("message") or {}).get("ts")
-    bot_token = await get_decrypted_bot_token_for_user(db, birdy_user_id)
-    if bot_token and channel and ts:
-        from slack_sdk.web.async_client import AsyncWebClient
-        client = AsyncWebClient(token=bot_token)
-        text = _suggestion_outcome_text(action_id, res, slack_user)
-        try:
-            await client.chat_update(
-                channel=channel, ts=ts, text=text,
-                blocks=[{"type": "section", "text": {"type": "mrkdwn", "text": text}}],
-            )
-        except Exception as e:
-            logger.warning(f"suggestion action: chat_update failed: {e}")
+    if not res.get("ok"):
+        await _post_action_error(db, birdy_user_id, payload, res)
     return {}
 
 
@@ -269,7 +258,7 @@ async def slack_interactions(request: Request):
 
         if ptype == "block_actions":
             action0 = (payload.get("actions") or [{}])[0]
-            if action0.get("action_id") in ("suggestion_apply", "suggestion_ignore"):
+            if action0.get("action_id") in ("suggestion_apply", "suggestion_ignore", "suggestion_undo"):
                 return await _handle_suggestion_action(payload, action0, db, mongo_client)
             return await _handle_block_actions(payload, db, mongo_client)
         if ptype == "view_submission":

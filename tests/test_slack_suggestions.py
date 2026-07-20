@@ -110,6 +110,56 @@ async def _apply_not_found():
     assert res["ok"] is False and res["outcome"] == "not_found", res
 
 
+async def _undo_flow():
+    calls = []
+
+    async def fake_set(user_id, object_id, object_type, status, mongo_client):
+        calls.append((object_id, status))
+        return {"success": True}
+
+    original = actions_mod.set_object_status
+    actions_mod.set_object_status = fake_set
+    try:
+        db = AsyncMongoMockClient()[DB_NAME]
+        await _seed(db, action={"type": "pause_ads",
+                                "targets": [{"object_id": "ad_1", "object_type": "ad", "name": "Ad One"}]})
+
+        applied = await actions.apply_suggestion(db, None, "u1", "sug_x", source="dashboard")
+        assert applied["outcome"] == "applied", applied
+        assert calls == [("ad_1", "PAUSED")], calls
+        doc = await store.get_suggestion(db, "u1", "sug_x")
+        assert doc["status"] == "applied"
+        assert [t["object_id"] for t in doc["applied_targets"]] == ["ad_1"]
+
+        undone = await actions.undo_suggestion(db, None, "u1", "sug_x", source="dashboard")
+        assert undone["ok"] and undone["outcome"] == "undone", undone
+        assert calls[-1] == ("ad_1", "ACTIVE"), calls   # exactly the paused ad re-enabled
+        doc2 = await store.get_suggestion(db, "u1", "sug_x")
+        assert doc2["status"] == "open"                  # back on the board
+        assert not doc2.get("applied_targets")
+        acts = await store.list_recent_activity(db, "u1", 10)
+        assert any(a["kind"] == "action_undone" and a["label"] == "Undone by you" for a in acts)
+    finally:
+        actions_mod.set_object_status = original
+
+
+async def _undo_requires_applied():
+    db = AsyncMongoMockClient()[DB_NAME]
+    await _seed(db, action={"type": "pause_ads", "targets": [{"object_id": "ad_1", "object_type": "ad"}]})
+    res = await actions.undo_suggestion(db, None, "u1", "sug_x")
+    assert res["ok"] is False and res["outcome"] == "not_applied", res
+
+
+def test_undo_reenables_and_reopens():
+    asyncio.run(_undo_flow())
+    print("PASS test_undo_reenables_and_reopens")
+
+
+def test_undo_requires_applied():
+    asyncio.run(_undo_requires_applied())
+    print("PASS test_undo_requires_applied")
+
+
 def test_actions_dismiss():
     asyncio.run(_dismiss_flow())
     print("PASS test_actions_dismiss")
@@ -131,4 +181,6 @@ if __name__ == "__main__":
     test_actions_dismiss()
     test_actions_apply()
     test_actions_apply_not_found()
+    test_undo_reenables_and_reopens()
+    test_undo_requires_applied()
     print("\nAll slack-suggestion tests passed.")

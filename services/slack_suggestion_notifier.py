@@ -15,7 +15,7 @@ including in tests (which have neither).
 import logging
 
 from ai.suggestions import store
-from services.slack_bot_service import get_notify_target
+from services.slack_bot_service import get_notify_target, get_decrypted_bot_token_for_user
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +67,74 @@ def build_suggestion_blocks(doc: dict) -> tuple[list[dict], str]:
     actions_block = {"type": "actions", "block_id": f"suggestion|{doc['id']}", "elements": elements}
 
     return [section, actions_block], f"Birdy suggestion: {title} — {client}"
+
+
+def _undo_button(suggestion_id: str) -> dict:
+    return {
+        "type": "button",
+        "action_id": "suggestion_undo",
+        "text": {"type": "plain_text", "text": "Undo"},
+        "value": suggestion_id,
+    }
+
+
+def build_state_blocks(doc: dict, by: str | None = None) -> tuple[list[dict], str]:
+    """
+    Render the Slack card for a suggestion's CURRENT state. Every state change —
+    whether it happened in the dashboard or in Slack — re-renders through here,
+    so the two surfaces can't drift apart.
+    """
+    status = doc.get("status") or store.STATUS_OPEN
+    title = doc.get("title") or "Suggestion"
+    client = doc.get("client_name") or "Client"
+    who = f" by <@{by}>" if by else ""
+
+    if status == store.STATUS_OPEN:
+        return build_suggestion_blocks(doc)
+
+    if status == store.STATUS_APPLIED:
+        n = len(doc.get("applied_targets") or [])
+        verb = "Re-enabled" if doc.get("applied_action_type") == "enable_ads" else "Paused"
+        text = f"*{title}*\n:white_check_mark: {verb} {n} ad{'s' if n != 1 else ''}{who} · {client}"
+        blocks = [
+            {"type": "section", "text": {"type": "mrkdwn", "text": text}},
+            {"type": "actions", "block_id": f"suggestion|{doc.get('id')}",
+             "elements": [_undo_button(doc.get("id"))]},
+        ]
+        return blocks, f"{verb} {n} ad(s) — {client}"
+
+    if status == store.STATUS_DISMISSED:
+        text = f"~{title}~\n:no_entry_sign: Ignored{who} · {client}"
+        return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}], f"Ignored — {client}"
+
+    # resolved (auto-closed because it no longer reproduces) / anything else
+    text = f"~{title}~\n:heavy_check_mark: Resolved — no longer underperforming · {client}"
+    return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}], f"Resolved — {client}"
+
+
+async def sync_suggestion_message(db, user_id: str, doc: dict, by: str | None = None) -> bool:
+    """
+    Re-render this suggestion's existing Slack message to match its current
+    state. No-op when the suggestion was never posted to Slack.
+    """
+    ts = doc.get("slack_ts")
+    channel = doc.get("slack_channel")
+    if not ts or not channel:
+        return False
+    bot_token = await get_decrypted_bot_token_for_user(db, user_id)
+    if not bot_token:
+        return False
+
+    blocks, fallback = build_state_blocks(doc, by=by)
+    from slack_sdk.web.async_client import AsyncWebClient
+    try:
+        await AsyncWebClient(token=bot_token).chat_update(
+            channel=channel, ts=ts, text=fallback, blocks=blocks
+        )
+        return True
+    except Exception as e:
+        logger.warning("slack notifier: state sync failed for %s: %s", doc.get("id"), e)
+        return False
 
 
 async def post_suggestion(db, user_id: str, doc: dict, *,
@@ -130,7 +198,7 @@ async def update_suggestions(db, user_id: str, docs: list[dict]) -> int:
         channel = doc.get("slack_channel")
         if not ts or not channel:
             continue
-        blocks, fallback = build_suggestion_blocks(doc)
+        blocks, fallback = build_state_blocks(doc)
         try:
             await client.chat_update(channel=channel, ts=ts, text=fallback, blocks=blocks)
             updated += 1

@@ -184,6 +184,24 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
         return {"ok": True}
 
 
+@router.post("/suggestions/{suggestion_id}/undo")
+async def undo_suggestion(suggestion_id: str, current_user: str = Depends(get_current_user)):
+    """Reverse an applied suggestion — re-enables exactly the ads it paused."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        res = await actions.undo_suggestion(
+            db, mongo_client, current_user, suggestion_id,
+            actor=store.ACTOR_USER, source="dashboard",
+        )
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "not_applied":
+            raise HTTPException(status_code=409, detail="Suggestion is not in an applied state")
+        if res["outcome"] == "failed":
+            raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
+        return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
+
+
 # ---------------------------------------------------------------------------
 # Alert + win actions (lightweight; the alerts system owns the heavy lifting)
 # ---------------------------------------------------------------------------
