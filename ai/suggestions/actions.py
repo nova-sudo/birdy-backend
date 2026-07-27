@@ -153,7 +153,12 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
     if not doc:
         return {"ok": False, "outcome": "not_found", "doc": None}
     if doc.get("status") != store.STATUS_APPLIED:
-        return {"ok": False, "outcome": "not_applied", "doc": doc}
+        # Idempotent: nothing is currently applied to reverse. Either it was
+        # already undone, or this is a historical / seeded activity row whose
+        # suggestion is no longer in an applied state. Treat undo as a benign
+        # no-op instead of a 409 so the UI settles quietly (no "couldn't undo"
+        # error toast) — undoing an un-applied thing is a success by definition.
+        return {"ok": True, "outcome": "noop", "doc": doc, "succeeded": []}
 
     targets = doc.get("applied_targets") or []
     applied_type = doc.get("applied_action_type") or (doc.get("action") or {}).get("type")
