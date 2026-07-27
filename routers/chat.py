@@ -18,6 +18,7 @@ from ai.tools.meta_live_tools import register_meta_live_tools
 from ai.tools.custom_metrics_tools import register_custom_metrics_tools
 from ai.tools.unified_leads_tools import register_unified_leads_tools
 from ai.tools.multi_window_tools import register_multi_window_tools
+from ai.tools.hp_tools import register_hp_tools
 from ai.orchestrator import run_chat
 
 logger = logging.getLogger(__name__)
@@ -35,6 +36,7 @@ register_meta_live_tools()
 register_custom_metrics_tools()
 register_unified_leads_tools()
 register_multi_window_tools()
+register_hp_tools()
 
 
 @router.post("/api/chat", response_model=ChatResponse)

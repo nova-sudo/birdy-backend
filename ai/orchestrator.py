@@ -34,6 +34,7 @@ _PAGE_TOOLS = {
         "get_ghl_opp_stats_windowed",
         "get_campaign_insights",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "campaigns": [
         "get_client_groups",
@@ -43,6 +44,7 @@ _PAGE_TOOLS = {
         "get_meta_insights_live",
         "compare_periods",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "leads": [
         "get_client_groups",
@@ -51,6 +53,7 @@ _PAGE_TOOLS = {
         "get_ghl_contacts",
         "get_unified_leads",
         "get_unified_lead_stats",
+        "get_call_center_stats",
     ],
     "opportunities": [
         "get_client_groups",
@@ -61,6 +64,7 @@ _PAGE_TOOLS = {
         "get_tag_rollup_by_campaign",
         "compare_periods",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "custom_metrics": [
         "get_client_groups",
@@ -73,6 +77,7 @@ _PAGE_TOOLS = {
     ],
     "call_center": [
         "get_client_groups",
+        "get_call_center_stats",
     ],
     "client_detail": [
         "get_client_groups",
@@ -88,6 +93,7 @@ _PAGE_TOOLS = {
         "get_alerts",
         "get_meta_insights_live",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
 }
 
