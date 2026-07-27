@@ -129,6 +129,13 @@ class ChatResponse(BaseModel):
     session_id: str = ""
 
 
+# ── Capabilities (per-user agent toggles) ─────────────────────────────────────
+
+class CapabilitiesRequest(BaseModel):
+    # Optional so callers can send a partial update; only provided flags change.
+    media_buying: Optional[bool] = None
+
+
 # ── External MCP Access Tokens ────────────────────────────────────────────────
 
 class CreateMcpTokenRequest(BaseModel):

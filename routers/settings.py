@@ -5,12 +5,42 @@ from fastapi import APIRouter, Depends, HTTPException, Response
 
 from core.config import COOKIE_DOMAIN, COOKIE_SAMESITE, COOKIE_SECURE
 from core.database import DB_NAME
-from core.models import SaveViewRequest
+from core.models import SaveViewRequest, CapabilitiesRequest
 from dependencies import get_mongo_client, get_current_user
+from services import capabilities_service
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+@router.get("/api/capabilities")
+async def get_capabilities(current_user: str = Depends(get_current_user)):
+    """
+    Return the current user's Birdy AI capability flags (Settings -> Capabilities).
+    Defaults are applied for anything not yet set. Response: { "media_buying": false }
+    """
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        return await capabilities_service.get_capabilities(db, current_user)
+
+
+@router.put("/api/capabilities")
+async def update_capabilities(
+    request: CapabilitiesRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Enable/disable one or more capabilities. Body is a partial set of flags —
+    only the fields sent are changed (e.g. { "media_buying": true }). Returns the
+    full resolved capability set after the update.
+    """
+    updates = request.model_dump(exclude_none=True)
+    if not updates:
+        raise HTTPException(status_code=400, detail="No capability flags provided")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        return await capabilities_service.set_capabilities(db, current_user, updates)
 
 
 @router.delete("/api/integrations/gohighlevel/remove")
