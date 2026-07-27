@@ -203,10 +203,10 @@ async def undo_suggestion(suggestion_id: str, current_user: str = Depends(get_cu
         )
         if res["outcome"] == "not_found":
             raise HTTPException(status_code=404, detail="Suggestion not found")
-        if res["outcome"] == "not_applied":
-            raise HTTPException(status_code=409, detail="Suggestion is not in an applied state")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
+        # "undone" (reversed) and "noop" (nothing was applied to reverse) are
+        # both successes — undo is idempotent, so re-undoing settles quietly.
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
 
 

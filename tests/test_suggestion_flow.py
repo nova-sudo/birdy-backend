@@ -159,6 +159,38 @@ async def _skips_inactive_clients():
     assert await store.list_open_suggestions(db, "u1") == []
 
 
+async def _undo_not_applied_is_noop():
+    # Regression guard for the "Suggestion is not in an applied state" (409) bug:
+    # the activity feed can offer an Undo on a row whose suggestion isn't in an
+    # applied state (already undone, or a historical / seeded activity row). Undo
+    # must be idempotent — a benign no-op, not an error.
+    from ai.suggestions import actions
+
+    client, db = await _fresh_db_with(_BAD_ADS)
+    await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
+    open_sugs = await store.list_open_suggestions(db, "u1")
+    assert open_sugs, "expected an open suggestion to test against"
+    sid = open_sugs[0]["_id"]
+
+    # Undo a never-applied (status == open) suggestion → noop, nothing reversed,
+    # status untouched. Reaches no Meta write (returns before execute_action).
+    res = await actions.undo_suggestion(db, client, "u1", sid, source="dashboard")
+    assert res["ok"] is True, res
+    assert res["outcome"] == "noop", res
+    assert res["succeeded"] == [], res
+    doc = await store.get_suggestion(db, "u1", sid)
+    assert doc["status"] == "open", doc
+
+    # A genuinely missing id is still not_found (surfaces as 404, not a silent ok).
+    missing = await actions.undo_suggestion(db, client, "u1", "sug_nope", source="dashboard")
+    assert missing["outcome"] == "not_found", missing
+    print("PASS test_undo_not_applied_is_noop")
+
+
+def test_undo_not_applied_is_noop():
+    asyncio.run(_undo_not_applied_is_noop())
+
+
 def test_cross_window_dedupe():
     asyncio.run(_cross_window_dedupe())
     print("PASS test_cross_window_dedupe")
@@ -185,6 +217,7 @@ if __name__ == "__main__":
     test_create_and_dedupe()
     test_dismiss_cooldown()
     test_reconcile_resolves_stale()
+    test_undo_not_applied_is_noop()
     test_cross_window_dedupe()
     test_skips_inactive_clients()
     print("\nAll suggestion-flow tests passed.")
