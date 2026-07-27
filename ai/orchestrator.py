@@ -7,10 +7,12 @@ from ai.config import MAX_TOOL_ITERATIONS, DEFAULT_TEMPERATURE
 from ai.providers.base import BaseLLMProvider
 from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
+from ai.prompts.media_buying import get_media_buying_module
 from ai import mcp_client
 from ai import session_store
 from ai import conversation_log
 from services.query_classifier import classify_query
+from services import capabilities_service
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +34,7 @@ _PAGE_TOOLS = {
         "get_ghl_opp_stats_windowed",
         "get_campaign_insights",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "campaigns": [
         "get_client_groups",
@@ -41,6 +44,7 @@ _PAGE_TOOLS = {
         "get_meta_insights_live",
         "compare_periods",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "leads": [
         "get_client_groups",
@@ -49,6 +53,7 @@ _PAGE_TOOLS = {
         "get_ghl_contacts",
         "get_unified_leads",
         "get_unified_lead_stats",
+        "get_call_center_stats",
     ],
     "opportunities": [
         "get_client_groups",
@@ -59,6 +64,7 @@ _PAGE_TOOLS = {
         "get_tag_rollup_by_campaign",
         "compare_periods",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
     "custom_metrics": [
         "get_client_groups",
@@ -71,6 +77,7 @@ _PAGE_TOOLS = {
     ],
     "call_center": [
         "get_client_groups",
+        "get_call_center_stats",
     ],
     "client_detail": [
         "get_client_groups",
@@ -86,6 +93,7 @@ _PAGE_TOOLS = {
         "get_alerts",
         "get_meta_insights_live",
         "get_metrics_by_day_windows",
+        "get_call_center_stats",
     ],
 }
 
@@ -286,6 +294,12 @@ _PAGE_SYSTEM_PROMPTS = {
     "dashboard": _DASHBOARD_SYSTEM_PROMPT,
 }
 
+# Surfaces where the optional "media_buying" capability (Settings -> Capabilities)
+# may inject the senior-media-buyer analysis module. Deliberately excludes the
+# narrow alerts / custom_metrics assistants (strict single-purpose scopes) — their
+# behaviour must not change. `None` is the general Ask-Birdy chat.
+_MEDIA_BUYING_PAGES = {None, "campaigns", "dashboard", "client_detail", "opportunities", "leads"}
+
 
 def _build_client_detail_prompt(client_name: str, client_group_id: str) -> str:
     return f"""You are Birdy AI, a marketing analyst assistant scoped exclusively to the client "{client_name}" (group ID: {client_group_id}).
@@ -338,6 +352,13 @@ async def run_chat(
             system_content = _PAGE_SYSTEM_PROMPTS.get(page, get_system_prompt())
         else:
             system_content = get_system_prompt()
+        # Optionally layer the media-buying analyst module on the analysis
+        # surfaces, gated by the per-user `media_buying` capability. Read once
+        # per session (prompt is built once), so cost is one extra Mongo lookup.
+        if page in _MEDIA_BUYING_PAGES:
+            capabilities = await capabilities_service.get_capabilities(db, user_id)
+            if capabilities.get("media_buying"):
+                system_content = system_content + "\n\n" + get_media_buying_module()
         history.append({"role": "system", "content": system_content})
 
     history.append({"role": "user", "content": message})
