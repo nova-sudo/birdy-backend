@@ -29,6 +29,7 @@ matched back to the account by ``metadata.user_id`` (when a checkout session set
 it) and otherwise by the buyer's Whop email.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -103,44 +104,82 @@ def _secret_fingerprint() -> str:
     return hashlib.sha256(WHOP_WEBHOOK_SECRET.encode()).hexdigest()[:12]
 
 
+def _candidate_hmac_keys():
+    """Every plausible HMAC key derivable from the configured webhook secret.
+
+    Whop's ``ws_<hex>`` secret can be consumed as the raw string, as the 32
+    bytes it hex-encodes, or (for ``whsec_`` secrets) as base64 — and Whop's
+    own tooling isn't consistent about which. All derivations come from the
+    same legitimate secret, so trying each keeps verification secure while being
+    robust to the format Whop actually signs with.
+    """
+    secret = WHOP_WEBHOOK_SECRET
+    keys = [("raw", secret.encode("utf-8"))]  # @whop/api makeWebhookValidator uses the raw string
+    if secret.startswith("ws_"):
+        try:
+            keys.append(("hex", bytes.fromhex(secret[3:])))  # ws_<hex> -> 32 raw bytes
+        except ValueError:
+            pass
+    b64_part = secret[len("whsec_"):] if secret.startswith("whsec_") else secret
+    try:
+        keys.append(("base64", base64.b64decode(b64_part + "==")))  # Standard Webhooks default
+    except Exception:
+        pass
+    return keys
+
+
 def _verify_webhook_signature(headers: dict, body: str) -> None:
     """Verify a Whop webhook signature, raising on any mismatch.
 
-    Whop's dashboard webhooks use Whop's *own* scheme (mirrors the official
-    `@whop/api` `makeWebhookValidator`), NOT vanilla Standard Webhooks:
+    Whop signs with the account webhook secret, but the framing depends on the
+    delivery:
 
-      * header  ``x-whop-signature: t=<unix_ts>,v1=<hex>``
-      * key     the raw secret string (the ``ws_...`` value, used verbatim as
-                UTF-8 bytes — not base64/hex-decoded)
-      * content HMAC-SHA256 over ``f"{t}.{body}"``, compared as lowercase hex
+      * ``x-whop-signature: t=<ts>,v1=<hex>`` — HMAC-SHA256 over ``"{t}.{body}"``
+        keyed by the raw secret string (matches @whop/api makeWebhookValidator).
+      * Standard Webhooks headers (``webhook-id`` / ``webhook-timestamp`` /
+        ``webhook-signature: v1,<base64>``) — HMAC over ``"{id}.{ts}.{body}"``,
+        base64-encoded.
 
-    A ``whsec_``-style secret (older/app webhooks) is handled via the Standard
-    Webhooks fallback. Verification is what matters here; the ±300s replay
-    window Whop's JS enforces is intentionally skipped because this handler is
-    idempotent (it rebuilds state from the full membership), so a replayed
-    event is harmless — and skipping it avoids rejecting re-sent test events.
+    Whop's ``ws_...`` secret isn't the base64 vanilla Standard Webhooks assumes,
+    so for the base64 header we try each plausible key derivation and accept the
+    first that matches (logging which one, so it can be pinned later). The
+    handler is idempotent, so the ±300s replay window is intentionally skipped.
     """
     lower = {k.lower(): v for k, v in headers.items()}
 
+    # ── Whop-native scheme: x-whop-signature ──
     xwhop = lower.get("x-whop-signature")
     if xwhop:
         fields = dict(p.split("=", 1) for p in xwhop.split(",") if "=" in p)
         ts, sent_sig = fields.get("t"), fields.get("v1")
         if not ts or not sent_sig:
             raise ValueError(f"malformed x-whop-signature: {xwhop!r}")
-        expected = hmac.new(
-            WHOP_WEBHOOK_SECRET.encode("utf-8"),
-            f"{ts}.{body}".encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        if not hmac.compare_digest(expected, sent_sig.strip()):
-            raise ValueError("x-whop-signature HMAC mismatch")
-        return
+        for name, key in _candidate_hmac_keys():
+            expected = hmac.new(key, f"{ts}.{body}".encode("utf-8"), hashlib.sha256).hexdigest()
+            if hmac.compare_digest(expected, sent_sig.strip()):
+                if name != "raw":
+                    logger.info("Whop webhook verified (x-whop-signature, key=%s)", name)
+                return
+        raise ValueError("x-whop-signature HMAC mismatch")
 
-    # Fallback: Standard Webhooks (whsec_ secret + webhook-signature header).
-    if StandardWebhook is not None and lower.get("webhook-signature"):
-        StandardWebhook(WHOP_WEBHOOK_SECRET).verify(body, headers)
-        return
+    # ── Standard Webhooks headers: webhook-signature ──
+    msg_id = lower.get("webhook-id")
+    msg_ts = lower.get("webhook-timestamp")
+    sig_hdr = lower.get("webhook-signature")
+    if msg_id and msg_ts and sig_hdr:
+        signed = f"{msg_id}.{msg_ts}.{body}".encode("utf-8")
+        # webhook-signature is a space-separated list of "v1,<base64>" entries.
+        sent = [part.split(",", 1)[1] for part in sig_hdr.split(" ")
+                if part.startswith("v1,") and "," in part]
+        if not sent:
+            raise ValueError(f"no v1 signature in webhook-signature: {sig_hdr!r}")
+        for name, key in _candidate_hmac_keys():
+            expected = base64.b64encode(hmac.new(key, signed, hashlib.sha256).digest()).decode()
+            if any(hmac.compare_digest(expected, s) for s in sent):
+                if name != "base64":
+                    logger.info("Whop webhook verified (webhook-signature, key=%s)", name)
+                return
+        raise ValueError("No matching signature found")
 
     raise ValueError("no recognized Whop signature header (x-whop-signature / webhook-signature)")
 
