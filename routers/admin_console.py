@@ -46,15 +46,11 @@ IMPERSONATION_TTL_MINUTES = 45
 
 # ── Plan resolution ────────────────────────────────────────────────────────────
 def _resolve_plan(subscription: dict | None) -> str:
-    """Human plan name for a user's subscription doc. Import lazily so a
-    billing/paddle import problem can never take down the admin console."""
+    """Human plan name for a user's subscription doc. The billing webhook stores
+    the resolved plan name on the subscription, so read it straight off the doc."""
     if not subscription:
         return "Free"
-    try:
-        from billing import _plan_meta
-        return _plan_meta(subscription.get("price_id", "")).get("name", "Unknown")
-    except Exception:
-        return "Unknown"
+    return subscription.get("plan_name") or "Unknown"
 
 
 async def _names_for(db, user_ids: list[str]) -> dict[str, str]:

@@ -9,7 +9,7 @@ bcrypt==4.2.0
 PyJWT[crypto]==2.10.1
 apscheduler==3.10.4
 CurrencyConverter==0.18.15
-paddle-python-sdk
+whop-sdk[webhooks]
 groq
 anthropic
 openai
