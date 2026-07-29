@@ -30,6 +30,7 @@ it) and otherwise by the buyer's Whop email.
 """
 
 import hashlib
+import hmac
 import json
 import logging
 import os
@@ -40,7 +41,14 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 
 from whop_sdk import AsyncWhop
-from standardwebhooks import Webhook as StandardWebhook
+
+# Standard Webhooks is only used as a fallback for `whsec_`-style secrets; Whop's
+# dashboard webhooks use their own scheme (see `_verify_webhook_signature`), so
+# keep this import soft.
+try:
+    from standardwebhooks import Webhook as StandardWebhook
+except ImportError:  # pragma: no cover
+    StandardWebhook = None
 
 from dependencies import get_mongo_client, get_current_user
 
@@ -93,6 +101,48 @@ def _secret_fingerprint() -> str:
     if not WHOP_WEBHOOK_SECRET:
         return "UNSET"
     return hashlib.sha256(WHOP_WEBHOOK_SECRET.encode()).hexdigest()[:12]
+
+
+def _verify_webhook_signature(headers: dict, body: str) -> None:
+    """Verify a Whop webhook signature, raising on any mismatch.
+
+    Whop's dashboard webhooks use Whop's *own* scheme (mirrors the official
+    `@whop/api` `makeWebhookValidator`), NOT vanilla Standard Webhooks:
+
+      * header  ``x-whop-signature: t=<unix_ts>,v1=<hex>``
+      * key     the raw secret string (the ``ws_...`` value, used verbatim as
+                UTF-8 bytes — not base64/hex-decoded)
+      * content HMAC-SHA256 over ``f"{t}.{body}"``, compared as lowercase hex
+
+    A ``whsec_``-style secret (older/app webhooks) is handled via the Standard
+    Webhooks fallback. Verification is what matters here; the ±300s replay
+    window Whop's JS enforces is intentionally skipped because this handler is
+    idempotent (it rebuilds state from the full membership), so a replayed
+    event is harmless — and skipping it avoids rejecting re-sent test events.
+    """
+    lower = {k.lower(): v for k, v in headers.items()}
+
+    xwhop = lower.get("x-whop-signature")
+    if xwhop:
+        fields = dict(p.split("=", 1) for p in xwhop.split(",") if "=" in p)
+        ts, sent_sig = fields.get("t"), fields.get("v1")
+        if not ts or not sent_sig:
+            raise ValueError(f"malformed x-whop-signature: {xwhop!r}")
+        expected = hmac.new(
+            WHOP_WEBHOOK_SECRET.encode("utf-8"),
+            f"{ts}.{body}".encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        if not hmac.compare_digest(expected, sent_sig.strip()):
+            raise ValueError("x-whop-signature HMAC mismatch")
+        return
+
+    # Fallback: Standard Webhooks (whsec_ secret + webhook-signature header).
+    if StandardWebhook is not None and lower.get("webhook-signature"):
+        StandardWebhook(WHOP_WEBHOOK_SECRET).verify(body, headers)
+        return
+
+    raise ValueError("no recognized Whop signature header (x-whop-signature / webhook-signature)")
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -228,17 +278,15 @@ async def whop_webhook(request: Request):
 
     if WHOP_WEBHOOK_SECRET:
         try:
-            # Standard Webhooks: verifies webhook-id / webhook-timestamp /
-            # webhook-signature headers against the shared secret.
-            StandardWebhook(WHOP_WEBHOOK_SECRET).verify(payload_str, dict(request.headers))
+            _verify_webhook_signature(dict(request.headers), payload_str)
         except Exception as e:
             present = {k.lower() for k in request.headers}
             logger.warning(
                 "Whop webhook signature verification FAILED: %s "
                 "| backend secret_fp=%s secret_len=%d body_len=%d "
-                "| headers present: webhook-id=%s webhook-timestamp=%s webhook-signature=%s",
+                "| headers present: x-whop-signature=%s webhook-signature=%s",
                 e, _secret_fingerprint(), len(WHOP_WEBHOOK_SECRET), len(payload_str),
-                "webhook-id" in present, "webhook-timestamp" in present, "webhook-signature" in present,
+                "x-whop-signature" in present, "webhook-signature" in present,
             )
             raise HTTPException(status_code=400, detail="Invalid signature")
     else:
