@@ -29,6 +29,7 @@ matched back to the account by ``metadata.user_id`` (when a checkout session set
 it) and otherwise by the buyer's Whop email.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -80,6 +81,18 @@ def _whop() -> AsyncWhop:
     if not WHOP_API_KEY:
         raise HTTPException(status_code=500, detail="Billing is not configured (missing WHOP_API_KEY).")
     return AsyncWhop(api_key=WHOP_API_KEY, webhook_key=WHOP_WEBHOOK_SECRET or None)
+
+
+def _secret_fingerprint() -> str:
+    """A short, non-reversible fingerprint of the configured webhook secret, so
+    a config mismatch (wrong value / not redeployed) can be diagnosed from logs
+    WITHOUT ever logging the secret itself. Compare it to the expected value:
+        printf %s 'the-sandbox-signing-secret' | \
+          python3 -c "import sys,hashlib;print(hashlib.sha256(sys.stdin.buffer.read()).hexdigest()[:12])"
+    """
+    if not WHOP_WEBHOOK_SECRET:
+        return "UNSET"
+    return hashlib.sha256(WHOP_WEBHOOK_SECRET.encode()).hexdigest()[:12]
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -219,7 +232,14 @@ async def whop_webhook(request: Request):
             # webhook-signature headers against the shared secret.
             StandardWebhook(WHOP_WEBHOOK_SECRET).verify(payload_str, dict(request.headers))
         except Exception as e:
-            logger.warning(f"Whop webhook: signature verification failed: {e}")
+            present = {k.lower() for k in request.headers}
+            logger.warning(
+                "Whop webhook signature verification FAILED: %s "
+                "| backend secret_fp=%s secret_len=%d body_len=%d "
+                "| headers present: webhook-id=%s webhook-timestamp=%s webhook-signature=%s",
+                e, _secret_fingerprint(), len(WHOP_WEBHOOK_SECRET), len(payload_str),
+                "webhook-id" in present, "webhook-timestamp" in present, "webhook-signature" in present,
+            )
             raise HTTPException(status_code=400, detail="Invalid signature")
     else:
         logger.warning("Whop webhook received but WHOP_WEBHOOK_SECRET is not set — skipping verification")
