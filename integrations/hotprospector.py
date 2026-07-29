@@ -102,6 +102,19 @@ _HP_MAX_TOTAL_BACKOFF = float(os.getenv("HP_MAX_TOTAL_BACKOFF", "180"))
 # stampede HP's rate-limit window together on the next request.
 _HP_JITTER_FRACTION = float(os.getenv("HP_JITTER_FRACTION", "0.15"))
 
+# ── Shared v2 token coordination ─────────────────────────────────────────────
+# The v2 access token is cached in Mongo (collection `hp_tokens`, _id = api_uId)
+# so EVERY server instance shares ONE token instead of each minting its own.
+# HooksCall invalidates an account's previous token whenever a new one is issued,
+# so per-instance in-memory tokens kept invalidating each other across concurrent
+# serverless instances — producing the constant "401 → refresh 401 → re-auth →
+# 200" churn (which also tripped HP's per-endpoint 429 limits). With a shared
+# token, exactly one instance re-auths per expiry window (guarded by a Mongo
+# `lock_until` lease) and everyone else reuses the published token.
+_TOKEN_COLLECTION = os.getenv("HP_TOKEN_COLLECTION", "hp_tokens")
+_TOKEN_LOCK_TTL = float(os.getenv("HP_TOKEN_LOCK_TTL", "20"))          # secs to hold the refresh lease
+_TOKEN_WAIT_TIMEOUT = float(os.getenv("HP_TOKEN_WAIT_TIMEOUT", "12"))  # secs to await another instance's refresh
+
 
 async def _throttle_method(method: str):
     """Proactively space out same-Method requests to respect per-endpoint limits."""
@@ -165,9 +178,10 @@ class HotProspectorIntegration:
         # capped at _HP_MAX_TOTAL_BACKOFF so a burst of rate limits can't run for minutes.
         self._backoff_used = 0.0
 
-    # ── v2 Bearer-token management ───────────────────────────────────────────
+    # ── v2 Bearer-token management (shared across instances) ─────────────────
     async def _token_lock(self) -> asyncio.Lock:
-        """Per-api_uId lock so concurrent calls don't each hit /auth/token."""
+        """Per-api_uId in-process lock so concurrent calls in ONE instance don't
+        each hit the shared store / auth endpoints."""
         async with _token_locks_guard:
             lock = _token_locks.get(self.api_uid)
             if lock is None:
@@ -175,8 +189,13 @@ class HotProspectorIntegration:
                 _token_locks[self.api_uid] = lock
             return lock
 
-    def _store_token_response(self, response) -> Optional[str]:
-        """Parse an /auth/token or /auth/refresh response and cache the token."""
+    @staticmethod
+    def _token_valid(tok: Optional[dict]) -> bool:
+        return bool(tok and tok.get("access_token") and tok.get("expires_at", 0) > time.time())
+
+    def _parse_token_response(self, response) -> Optional[dict]:
+        """Parse an /auth/token or /auth/refresh response into a token dict
+        (does NOT persist — callers publish it to the in-memory + shared caches)."""
         if response.status_code != 200:
             logger.warning(f"HP auth failed: {response.status_code} {response.text[:200]}")
             return None
@@ -196,17 +215,14 @@ class HotProspectorIntegration:
             logger.warning(f"HP auth: no access_token in response: {str(body)[:200]}")
             return None
         expires_in = int(data.get("expires_in") or 21600)
-        prev = _token_cache.get(self.api_uid) or {}
-        _token_cache[self.api_uid] = {
+        return {
             "access_token": access,
-            # Keep the previous refresh token if the refresh response omits a new one.
-            "refresh_token": data.get("refresh_token") or prev.get("refresh_token"),
+            "refresh_token": data.get("refresh_token"),  # may be None; merged with prior on publish
             # 60s safety buffer so we never use a token that's about to expire.
             "expires_at": time.time() + max(expires_in - 60, 60),
         }
-        return access
 
-    async def _exchange_credentials(self, client: httpx.AsyncClient) -> Optional[str]:
+    async def _exchange_credentials(self, client: httpx.AsyncClient) -> Optional[dict]:
         """Exchange api_uId/api_key for a fresh access + refresh token."""
         try:
             resp = await client.post(
@@ -217,9 +233,9 @@ class HotProspectorIntegration:
         except httpx.RequestError as e:
             logger.error(f"HP auth token network error: {e}")
             return None
-        return self._store_token_response(resp)
+        return self._parse_token_response(resp)
 
-    async def _refresh_access_token(self, client: httpx.AsyncClient, refresh_token: str) -> Optional[str]:
+    async def _refresh_access_token(self, client: httpx.AsyncClient, refresh_token: str) -> Optional[dict]:
         """Use a refresh token to obtain a new access token."""
         try:
             resp = await client.post(
@@ -230,35 +246,125 @@ class HotProspectorIntegration:
         except httpx.RequestError as e:
             logger.error(f"HP auth refresh network error: {e}")
             return None
-        return self._store_token_response(resp)
+        return self._parse_token_response(resp)
 
-    async def _get_access_token(self, force: bool = False) -> Optional[str]:
+    async def _mint_new_token(self, coll, bad_token: Optional[str]) -> Optional[str]:
+        """Obtain a new token. When `coll` (the shared Mongo store) is available,
+        coordinate via a `lock_until` lease so only ONE instance re-auths at a
+        time; others wait for the winner to publish. `coll=None` degrades to the
+        old per-instance behaviour (shared store unavailable)."""
+        got_lock = True
+        if coll is not None:
+            try:
+                # Ensure the doc exists so the conditional lock update needs no upsert
+                # (upsert + non-matching filter would raise a duplicate-key error).
+                await coll.update_one({"_id": self.api_uid}, {"$setOnInsert": {"_id": self.api_uid}}, upsert=True)
+                now = time.time()
+                res = await coll.update_one(
+                    {"_id": self.api_uid,
+                     "$or": [{"lock_until": {"$exists": False}}, {"lock_until": {"$lte": now}}]},
+                    {"$set": {"lock_until": now + _TOKEN_LOCK_TTL}},
+                )
+                got_lock = res.modified_count == 1
+            except Exception as e:
+                logger.warning(f"HP token: lock acquire failed ({e}); minting without lock")
+                got_lock = True
+
+            if not got_lock:
+                # Another instance is minting — wait for it to publish a fresh token.
+                deadline = time.time() + _TOKEN_WAIT_TIMEOUT
+                while time.time() < deadline:
+                    await asyncio.sleep(0.75)
+                    try:
+                        db_tok = await coll.find_one({"_id": self.api_uid})
+                    except Exception:
+                        break
+                    if self._token_valid(db_tok) and db_tok.get("access_token") != bad_token:
+                        _token_cache[self.api_uid] = db_tok
+                        return db_tok["access_token"]
+                logger.warning("HP token: another instance's refresh didn't publish in time; minting our own")
+
+        async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
+            db_tok = None
+            if coll is not None:
+                try:
+                    db_tok = await coll.find_one({"_id": self.api_uid})
+                except Exception:
+                    db_tok = None
+            refresh_token = (db_tok or {}).get("refresh_token") or (_token_cache.get(self.api_uid) or {}).get("refresh_token")
+
+            parsed = None
+            if refresh_token:
+                parsed = await self._refresh_access_token(client, refresh_token)
+            if not parsed:
+                parsed = await self._exchange_credentials(client)
+
+            if not parsed:
+                # Auth failed — release the lease so another instance can try.
+                if coll is not None:
+                    try:
+                        await coll.update_one({"_id": self.api_uid}, {"$unset": {"lock_until": ""}})
+                    except Exception:
+                        pass
+                return None
+
+            # Preserve a still-valid refresh token if this response didn't return one.
+            if not parsed.get("refresh_token"):
+                parsed["refresh_token"] = (db_tok or {}).get("refresh_token") or \
+                    (_token_cache.get(self.api_uid) or {}).get("refresh_token")
+
+            _token_cache[self.api_uid] = parsed  # L1
+            if coll is not None:                  # L2 (shared) + release lease
+                try:
+                    await coll.update_one(
+                        {"_id": self.api_uid},
+                        {"$set": {
+                            "access_token": parsed["access_token"],
+                            "refresh_token": parsed.get("refresh_token"),
+                            "expires_at": parsed["expires_at"],
+                            "updated_at": time.time(),
+                        }, "$unset": {"lock_until": ""}},
+                        upsert=True,
+                    )
+                except Exception as e:
+                    logger.warning(f"HP token: publish to shared store failed ({e})")
+            return parsed["access_token"]
+
+    async def _get_access_token(self, force: bool = False, bad_token: Optional[str] = None) -> Optional[str]:
         """
-        Return a valid v2 access token. Serves the cached token until it nears
-        expiry; otherwise refreshes (preferred) or re-exchanges credentials.
-        `force=True` always fetches a new token (used after a 401).
+        Return a valid v2 access token, shared across server instances.
+
+        Fast path: a still-valid in-memory token. Otherwise consult the shared
+        Mongo token (another instance may already hold a valid one) before
+        re-authing. `force=True` (after a 401) skips the in-memory token and
+        ignores a shared token equal to `bad_token`, so we never re-use the exact
+        token HP just rejected. If the shared store is unreachable, this degrades
+        to the previous per-instance behaviour.
         """
         cached = _token_cache.get(self.api_uid)
-        if (not force and cached and cached.get("access_token")
-                and cached.get("expires_at", 0) > time.time()):
+        if not force and self._token_valid(cached):
             return cached["access_token"]
 
         lock = await self._token_lock()
         async with lock:
-            # Re-check inside the lock — another coroutine may have just refreshed.
+            # Re-check inside the in-process lock — another coroutine may have refreshed.
             cached = _token_cache.get(self.api_uid)
-            if (not force and cached and cached.get("access_token")
-                    and cached.get("expires_at", 0) > time.time()):
+            if not force and self._token_valid(cached):
                 return cached["access_token"]
 
-            async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
-                refresh_token = (cached or {}).get("refresh_token")
-                token = None
-                if refresh_token:
-                    token = await self._refresh_access_token(client, refresh_token)
-                if not token:
-                    token = await self._exchange_credentials(client)
-                return token
+            try:
+                from dependencies import get_mongo_client
+                async with get_mongo_client() as mc:
+                    coll = mc[os.getenv("MONGODB_DB", "birdyaidev")][_TOKEN_COLLECTION]
+                    db_tok = await coll.find_one({"_id": self.api_uid})
+                    if self._token_valid(db_tok) and (not force or db_tok.get("access_token") != bad_token):
+                        _token_cache[self.api_uid] = db_tok
+                        return db_tok["access_token"]
+                    return await self._mint_new_token(coll, bad_token)
+            except Exception as e:
+                # Shared store unavailable — degrade to per-instance auth (old behaviour).
+                logger.warning(f"HP token: shared store unavailable ({e}); using per-instance auth")
+                return await self._mint_new_token(None, bad_token)
 
     # ── Transport ────────────────────────────────────────────────────────────
     async def _post_and_parse(self, client, url, body, headers):
@@ -327,9 +433,12 @@ class HotProspectorIntegration:
                 ok, data, status = await self._post_and_parse(client, url, body, headers)
 
                 # Token expired/invalid mid-flight — force a new one and retry once.
+                # Pass the rejected token as `bad_token` so we don't re-adopt it
+                # from the shared store (another instance may have already minted
+                # a newer one, in which case we pick that up without re-authing).
                 if status == 401 and not is_v1 and not did_refresh:
                     did_refresh = True
-                    token = await self._get_access_token(force=True)
+                    token = await self._get_access_token(force=True, bad_token=token)
                     if not token:
                         return False, {"error": "HotProspector authentication failed", "status_code": 401}
                     headers["Authorization"] = f"Bearer {token}"
