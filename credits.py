@@ -53,6 +53,13 @@ BYOK_CREDITS_PER_1K = 0.5   # flat, any model
 # Default charging mode until the Managed path ships. "byok" | "managed".
 DEFAULT_RATE_MODE = os.getenv("CREDITS_RATE_MODE", "byok")
 
+# Staged rollout: while OFF, usage is metered and the balance is shown, but the
+# stopper never blocks (so shipping metering can't lock existing users out of
+# AI). The frontend reads this to decide whether to hard-block or just warn.
+# Flip CREDITS_ENFORCE=true to turn the hard stop on. (credits_middleware reads
+# the same flag for the server-side gate.)
+CREDITS_ENFORCE = os.getenv("CREDITS_ENFORCE", "false").strip().lower() in ("1", "true", "yes", "on")
+
 # Included monthly credits per plan.
 PLAN_ALLOWANCE = {"starter": 2000, "growth": 6000, "scale": 10000}
 ACTIVE_STATUSES = {"active", "trialing", "past_due", "canceling"}
@@ -181,6 +188,7 @@ def _status_payload(credits: dict, sub: dict) -> dict:
         "subscribed": (sub or {}).get("status") in ACTIVE_STATUSES,
         "current_period_end": (sub or {}).get("current_period_end"),
         "rate_mode": DEFAULT_RATE_MODE,
+        "enforced": CREDITS_ENFORCE,
         "low": balance <= low_threshold,
         "out": balance <= 0,
     }

@@ -10,20 +10,13 @@ request through rather than block the product on a credits bug.
 """
 
 import logging
-import os
 
 from fastapi import HTTPException
 
 from core.database import get_db
-from credits import _load_and_sync, _available, _status_payload
+from credits import _load_and_sync, _available, _status_payload, CREDITS_ENFORCE
 
 logger = logging.getLogger(__name__)
-
-# Staged rollout (per the billing strategy: "measure first, then enforce with
-# notice"). While this is off, usage is still metered and the balance is shown,
-# but the stopper never blocks — so shipping metering can't lock existing users
-# out of AI. Flip CREDITS_ENFORCE=true to turn the hard stop on.
-CREDITS_ENFORCE = os.getenv("CREDITS_ENFORCE", "false").strip().lower() in ("1", "true", "yes", "on")
 
 
 async def check_credits(user_id: str, mongo_client) -> None:
