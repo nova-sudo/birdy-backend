@@ -345,6 +345,8 @@ async def whop_webhook(request: Request):
     async with get_mongo_client() as mc:
         if event_type.startswith("membership."):
             await _handle_membership(data, mc)
+        elif event_type in ("payment.succeeded", "payment_succeeded"):
+            await _handle_payment(data, mc)
         elif event_type.startswith("payment."):
             logger.info(f"💳 Whop payment {event_type}: {data.get('id')}")
 
@@ -373,6 +375,50 @@ async def _resolve_user_id(data: dict, mongo_client) -> Optional[str]:
         return email
 
     return None
+
+
+async def _handle_payment(data: dict, mongo_client):
+    """Credit a purchased Birdy Credits top-up. Fires on Whop ``payment.succeeded``.
+
+    Only the configured top-up plans (``WHOP_PLAN_TOPUP_*``) grant credits here.
+    A subscription's recurring payment carries a *subscription* plan id, which
+    maps to 0 top-up credits and is skipped — the membership webhook already
+    tracks the subscription (and its monthly allowance) on its own.
+
+    ``add_topup`` dedups on the Whop payment id, so Whop's at-least-once
+    redelivery credits the account exactly once.
+    """
+    # Lazy import: keeps billing.py importable without the credits module loaded,
+    # and sidesteps any import cycle at module load time.
+    from credits import topup_plan_credits, add_topup
+
+    payment_id   = data.get("id")
+    plan_id      = (data.get("plan") or {}).get("id", "")
+    pack_credits = topup_plan_credits(plan_id)
+
+    if not pack_credits:
+        logger.info(f"💳 Whop payment {payment_id}: plan {plan_id or '—'} is not a top-up pack; skipping credit")
+        return
+    if not payment_id:
+        logger.error("Whop payment webhook missing id; cannot credit a top-up idempotently")
+        return
+
+    user_id = await _resolve_user_id(data, mongo_client)
+    if not user_id:
+        # Existing subscribers may check out while logged into Whop without an
+        # email on the payment — fall back to the Whop user id linked on their sub.
+        whop_user_id = (data.get("user") or {}).get("id")
+        if whop_user_id:
+            row = await _db(mongo_client)["users"].find_one(
+                {"subscription.whop_user_id": whop_user_id},
+                projection={"user_id": 1, "_id": 0},
+            )
+            user_id = row.get("user_id") if row else None
+    if not user_id:
+        logger.error(f"Whop payment {payment_id}: cannot resolve user for top-up (plan {plan_id})")
+        return
+
+    await add_topup(_db(mongo_client), user_id, pack_credits, payment_id)
 
 
 async def _handle_membership(data: dict, mongo_client):

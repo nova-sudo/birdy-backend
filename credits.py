@@ -133,7 +133,9 @@ def _effective_credits(user_doc: dict) -> tuple[dict, bool]:
         credits = {
             "allowance": allowance,
             "used": 0.0,
+            # Top-ups (and their dedup set) carry across billing periods.
             "topup_balance": float(credits.get("topup_balance", 0.0) or 0.0),
+            "credited_topup_ids": credits.get("credited_topup_ids", []),
             "period_key": pk,
         }
         changed = True
@@ -144,6 +146,7 @@ def _effective_credits(user_doc: dict) -> tuple[dict, bool]:
     credits.setdefault("allowance", allowance)
     credits.setdefault("used", 0.0)
     credits.setdefault("topup_balance", 0.0)
+    credits.setdefault("credited_topup_ids", [])
     return credits, changed
 
 
@@ -262,6 +265,54 @@ async def record_usage(
         # Metering must never break the AI request.
         logger.error(f"Credit metering failed for {user_id}: {e}", exc_info=True)
         return 0.0
+
+
+# ── Top-ups (credited from the Whop webhook on a top-up purchase) ───────────
+
+def topup_plan_credits(plan_id: Optional[str]) -> int:
+    """How many credits a purchased Whop plan grants, or 0 if it isn't a
+    configured top-up plan (subscription plans return 0 here)."""
+    if not plan_id:
+        return 0
+    for pack in TOPUP_PACKS:
+        if os.getenv(pack["plan_env"]) == plan_id:
+            return pack["credits"]
+    return 0
+
+
+async def add_topup(db, user_id: str, credits_amount: int, payment_id: str) -> bool:
+    """Add purchased top-up credits to a user's balance, idempotently.
+
+    Whop redelivers webhooks at-least-once, so we dedup on the Whop payment id:
+    the update only applies when payment_id isn't already in credited_topup_ids,
+    which the same atomic op records. Returns True if credited this call.
+    """
+    try:
+        res = await db["users"].update_one(
+            {"user_id": user_id, "credits.credited_topup_ids": {"$ne": payment_id}},
+            {
+                "$inc": {"credits.topup_balance": float(credits_amount)},
+                "$addToSet": {"credits.credited_topup_ids": payment_id},
+                "$set": {"credits.updated_at": datetime.now(timezone.utc)},
+            },
+            upsert=False,  # a real purchase always has an existing account row
+        )
+        if res.modified_count:
+            # Audit trail in the usage ledger (top-ups show as a negative charge).
+            await db["ai_usage"].insert_one({
+                "user_id": user_id,
+                "feature": "topup",
+                "credits": -float(credits_amount),
+                "payment_id": payment_id,
+                "created_at": datetime.now(timezone.utc),
+            })
+            logger.info(f"💳 Credits: {user_id} +{credits_amount} top-up (payment {payment_id})")
+            return True
+        logger.info(f"💳 Top-up {payment_id} already applied (or no account) for {user_id}; skipping")
+        return False
+    except Exception as e:
+        logger.error(f"add_topup failed for {user_id}: {e}", exc_info=True)
+        return False
 
 
 async def create_ai_usage_indexes(mongo_client):
