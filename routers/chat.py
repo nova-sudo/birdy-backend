@@ -6,6 +6,7 @@ from core.models import ChatRequest, ChatResponse
 from core.database import get_db
 from dependencies import get_current_user, get_mongo_client
 from ai.provider_factory import get_provider_for_user, NoAiCredentialError
+from credits_middleware import check_credits
 
 from ai.tools.registry import registry
 from ai.tools.meta_tools import register_meta_tools
@@ -47,6 +48,9 @@ async def chat(
     async with get_mongo_client() as mongo_client:
         try:
             db = get_db(mongo_client)
+            # Stopper: block when the user is out of Birdy Credits (raises 402
+            # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
+            await check_credits(current_user, mongo_client)
             provider = await get_provider_for_user(current_user, db)
             result = await run_chat(
                 provider=provider,
@@ -61,6 +65,10 @@ async def chat(
                 client_name=request.client_name,
             )
             return ChatResponse(**result)
+        except HTTPException:
+            # Preserve deliberate status codes (e.g. 402 OUT_OF_CREDITS) instead
+            # of collapsing them into the generic 500 below.
+            raise
         except NoAiCredentialError:
             raise HTTPException(status_code=412, detail="no_ai_credentials")
         except ValueError as e:

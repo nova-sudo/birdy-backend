@@ -380,6 +380,33 @@ async def run_chat(
         )
 
     tools_used = []
+
+    # ── Birdy Credits metering ──────────────────────────────────────────────
+    # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
+    # token usage across all of them and debit the user's credit balance once at
+    # the end. Best-effort — record_usage never raises into the chat path.
+    usage_in = 0
+    usage_out = 0
+    model_calls = 0
+    _model = getattr(provider, "model", None)
+
+    async def _debit_credits():
+        try:
+            from credits import record_usage
+            await record_usage(
+                db,
+                user_id,
+                model=_model,
+                prompt_tokens=usage_in,
+                completion_tokens=usage_out,
+                model_calls=model_calls,
+                source=source,
+                feature="ask_birdy",
+                session_id=session_id,
+            )
+        except Exception:
+            logger.debug("Credit metering skipped", exc_info=True)
+
     allowed = _PAGE_TOOLS.get(page) if page else None
 
     async with contextlib.AsyncExitStack() as stack:
@@ -449,6 +476,9 @@ async def run_chat(
                 tools=tool_schemas if not is_final_iteration else None,
                 temperature=DEFAULT_TEMPERATURE,
             )
+            model_calls += 1
+            usage_in += getattr(response.usage, "input_tokens", 0) or 0
+            usage_out += getattr(response.usage, "output_tokens", 0) or 0
 
             if not response.tool_calls:
                 reply = response.content or "I wasn't able to generate a response."
@@ -466,6 +496,7 @@ async def run_chat(
                     page=page,
                     tools_used=tools_used,
                 )
+                await _debit_credits()
                 return {
                     "reply": reply,
                     "tools_used": tools_used,
@@ -533,6 +564,7 @@ async def run_chat(
             page=page,
             tools_used=tools_used,
         )
+        await _debit_credits()
         return {
             "reply": reply,
             "tools_used": tools_used,

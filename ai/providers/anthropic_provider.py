@@ -3,7 +3,7 @@ import logging
 import json
 from anthropic import AsyncAnthropic
 
-from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall
+from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -67,10 +67,17 @@ class AnthropicProvider(BaseLLMProvider):
                     arguments=json.dumps(block.input),
                 ))
 
+        u = getattr(response, "usage", None)
+        usage = Usage(
+            input_tokens=getattr(u, "input_tokens", 0) or 0,
+            output_tokens=getattr(u, "output_tokens", 0) or 0,
+        ) if u else Usage()
+
         return ProviderResponse(
             content=content_text,
             tool_calls=tool_calls,
             finish_reason="tool_calls" if response.stop_reason == "tool_use" else "stop",
+            usage=usage,
         )
 
     def _convert_tools(self, openai_tools: list[dict]) -> list[dict]:

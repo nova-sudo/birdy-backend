@@ -1,7 +1,7 @@
 import logging
 from openai import AsyncOpenAI, APIStatusError
 
-from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall
+from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall, Usage
 
 logger = logging.getLogger(__name__)
 
@@ -59,8 +59,15 @@ class OpenAIProvider(BaseLLMProvider):
                     arguments=tc.function.arguments,
                 ))
 
+        u = getattr(response, "usage", None)
+        usage = Usage(
+            input_tokens=getattr(u, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(u, "completion_tokens", 0) or 0,
+        ) if u else Usage()
+
         return ProviderResponse(
             content=message.content,
             tool_calls=tool_calls,
             finish_reason=choice.finish_reason or "stop",
+            usage=usage,
         )

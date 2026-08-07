@@ -37,6 +37,7 @@ from ai.session_store import create_ai_session_indexes
 from ai.suggestions.store import create_suggestion_indexes
 from ai.conversation_log import create_conversation_log_indexes
 from billing import router as billing_router
+from credits import router as credits_router, create_ai_usage_indexes
 
 from ai.mcp import mcp_app
 
@@ -62,6 +63,7 @@ async def lifespan(app: FastAPI):
         await create_ai_session_indexes(client)
         await create_suggestion_indexes(client)
         await create_conversation_log_indexes(client)
+        await create_ai_usage_indexes(client)
 
     get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
 
@@ -122,6 +124,7 @@ app.include_router(alerts.router)
 app.include_router(admin.router)
 app.include_router(admin_console.router)
 app.include_router(billing_router)
+app.include_router(credits_router)
 app.include_router(chat.router)
 app.include_router(metrics.router)
 app.include_router(cron.router)

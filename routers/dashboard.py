@@ -250,6 +250,9 @@ async def refresh(body: RefreshRequest | None = None,
     results = {}
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
+        # Stopper: don't run AI suggestions for a user who's out of Birdy Credits.
+        from credits_middleware import check_credits
+        await check_credits(current_user, mongo_client)
         for w in windows:
             results[w] = await run_pass_for_user(db, current_user, w, mongo_client=mongo_client)
     return {"ok": True, "results": results}
