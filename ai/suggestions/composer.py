@@ -61,6 +61,7 @@ def _template_result(finding: Finding) -> dict:
         "description": finding.description,
         "severity": finding.severity,
         "composer": "template",
+        "usage": {"in": 0, "out": 0, "model": None},  # no LLM call → nothing to bill
     }
 
 
@@ -125,15 +126,22 @@ async def compose(provider, finding: Finding) -> dict:
             temperature=0.3,
             max_tokens=300,
         )
+        usage = {
+            "in": getattr(resp.usage, "input_tokens", 0),
+            "out": getattr(resp.usage, "output_tokens", 0),
+            "model": getattr(provider, "model", None),
+        }
         data = _parse_json(resp.content or "")
         if not data:
             logger.info("composer: unparseable LLM output for %s, using template", finding.agent)
-            return _template_result(finding)
+            # The model still ran and consumed tokens — bill for them.
+            return {**_template_result(finding), "usage": usage}
         return {
             "title": str(data["title"])[:120].strip(),
             "description": str(data["description"]).strip(),
             "severity": finding.severity,  # never LLM-controlled
             "composer": "llm",
+            "usage": usage,
         }
     except Exception as e:
         logger.warning("composer: LLM call failed (%s), using template", e)

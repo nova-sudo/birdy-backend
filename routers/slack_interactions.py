@@ -76,6 +76,14 @@ async def _run_chat_and_reply(db, mongo_client, slack_client, pending: dict, ans
         )
         return
 
+    from credits import is_blocked
+    if await is_blocked(db, birdy_user_id):
+        await slack_client.chat_postMessage(
+            channel=pending["channel_id"], thread_ts=pending["thread_ts"],
+            text="You're out of Birdy Credits, so I can't run this right now. Top up in the Birdy app under *Credits* to continue.",
+        )
+        return
+
     result = await run_chat(
         provider=provider, tool_registry=registry, db=db, user_id=birdy_user_id,
         message=message, session_id=pending["session_id"], mongo_client=mongo_client,

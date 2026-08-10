@@ -129,6 +129,18 @@ async def slack_events(request: Request):
             )
             return {}
 
+        # Credit stopper: an out-of-credits account gets a heads-up instead of an
+        # answer (only when enforcement is on; is_blocked is non-raising).
+        from credits import is_blocked
+        if await is_blocked(db, user_id):
+            await _reply(
+                text=(
+                    "You're out of Birdy Credits, so I can't answer right now. "
+                    "Top up in the Birdy app under *Credits* to keep chatting."
+                ),
+            )
+            return {}
+
         # Everything below can throw (run_chat, block formatting, the interaction
         # store, Slack's own API) and nothing upstream of this was catching it —
         # an unhandled exception here means Slack silently gets nothing back,

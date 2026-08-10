@@ -475,6 +475,7 @@ async def credits_config(admin_email: str = Depends(require_admin)):
     return {
         "markup": s["markup"],
         "rate_mode": s["rate_mode"],
+        "enforce": s["enforce"],
         "markup_min": MARKUP_MIN,
         "markup_max": MARKUP_MAX,
         "model": DEFAULT_MODEL,
@@ -487,17 +488,19 @@ async def credits_config(admin_email: str = Depends(require_admin)):
 class CreditsConfigUpdate(BaseModel):
     markup: float | None = None
     rate_mode: str | None = None
+    enforce: bool | None = None
 
 
 @router.put("/api/admin/credits/config")
 async def update_credits_config(body: CreditsConfigUpdate, admin_email: str = Depends(require_admin)):
-    """Set the Managed markup (clamped to a sane range) and/or the active rate
-    mode. Takes effect on the next charge; audited to admin_audit."""
+    """Set the Managed markup (clamped to a sane range), the active rate mode,
+    and/or enforcement (the hard stopper). Takes effect on the next
+    charge/check; audited to admin_audit."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         try:
             s = await set_credits_settings(
-                db, markup=body.markup, rate_mode=body.rate_mode, admin=admin_email
+                db, markup=body.markup, rate_mode=body.rate_mode, enforce=body.enforce, admin=admin_email
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -506,9 +509,10 @@ async def update_credits_config(body: CreditsConfigUpdate, admin_email: str = De
             "action": "credits_config_update",
             "markup": s["markup"],
             "rate_mode": s["rate_mode"],
+            "enforce": s["enforce"],
             "ts": datetime.utcnow(),
         })
-    logger.info(f"[admin] {admin_email} set credits config → markup={s['markup']} mode={s['rate_mode']}")
+    logger.info(f"[admin] {admin_email} set credits config → markup={s['markup']} mode={s['rate_mode']} enforce={s['enforce']}")
     return s
 
 
@@ -541,6 +545,10 @@ async def credits_accounts(
             {"$group": {
                 "_id": "$user_id",
                 "used_total": {"$sum": {"$cond": [{"$gt": ["$credits", 0]}, "$credits", 0]}},
+                # Where the credits went, by source: internal app, Slack, or the cron.
+                "used_internal": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "birdy"]}]}, "$credits", 0]}},
+                "used_slack": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "slack"]}]}, "$credits", 0]}},
+                "used_cron": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "cron"]}]}, "$credits", 0]}},
                 "purchased_total": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, {"$abs": "$credits"}, 0]}},
                 "topups": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, 1, 0]}},
                 "questions": {"$sum": {"$cond": [{"$ne": ["$feature", "topup"]}, 1, 0]}},
@@ -549,7 +557,8 @@ async def credits_accounts(
         ]).to_list(None)}
 
         rows = []
-        totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "topup_balance": 0.0}
+        totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "topup_balance": 0.0,
+                  "used_internal": 0.0, "used_slack": 0.0, "used_cron": 0.0}
         for u in users:
             uid = u["user_id"]
             credits, _ = _effective_credits(u)  # in-memory period rollover; no write
@@ -565,6 +574,10 @@ async def credits_accounts(
                 "topup_balance": round(topup_balance, 2),
                 "balance": round(balance, 2),
                 "used_total": round(float(a.get("used_total", 0.0) or 0.0), 2),
+                # Credit consumption split by where it came from.
+                "used_internal": round(float(a.get("used_internal", 0.0) or 0.0), 2),
+                "used_slack": round(float(a.get("used_slack", 0.0) or 0.0), 2),
+                "used_cron": round(float(a.get("used_cron", 0.0) or 0.0), 2),
                 "purchased_total": round(float(a.get("purchased_total", 0.0) or 0.0), 2),
                 "topups": int(a.get("topups", 0) or 0),
                 "questions": int(a.get("questions", 0) or 0),
@@ -575,6 +588,9 @@ async def credits_accounts(
             totals["used_total"] += row["used_total"]
             totals["purchased_total"] += row["purchased_total"]
             totals["topup_balance"] += topup_balance
+            totals["used_internal"] += row["used_internal"]
+            totals["used_slack"] += row["used_slack"]
+            totals["used_cron"] += row["used_cron"]
 
         # Most-active first (all-time consumption, then purchases).
         rows.sort(key=lambda r: (r["used_total"], r["purchased_total"]), reverse=True)

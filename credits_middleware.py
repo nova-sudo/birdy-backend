@@ -14,23 +14,29 @@ import logging
 from fastapi import HTTPException
 
 from core.database import get_db
-from credits import _load_and_sync, _available, _status_payload, CREDITS_ENFORCE
+from credits import _load_and_sync, _available, _status_payload, get_credits_settings
 
 logger = logging.getLogger(__name__)
 
 
 async def check_credits(user_id: str, mongo_client) -> None:
     """Raise HTTP 402 ``OUT_OF_CREDITS`` when the user has no Birdy Credits left
-    (only when CREDITS_ENFORCE is on).
+    (only when enforcement is on — the admin-toggleable ``enforce`` setting).
 
     The detail carries the current balance snapshot so the frontend can show the
     out-of-credits state + a top-up prompt without a second round-trip.
     """
-    if not CREDITS_ENFORCE:
+    try:
+        db = get_db(mongo_client)
+        settings = await get_credits_settings(db)
+    except Exception as e:
+        logger.error(f"Credit settings read failed for {user_id}: {e}", exc_info=True)
+        return  # fail open — never block on a settings error
+
+    if not settings["enforce"]:
         return  # measurement/rollout mode — meter, but never block
 
     try:
-        db = get_db(mongo_client)
         credits, sub = await _load_and_sync(db, user_id)
     except Exception as e:
         logger.error(f"Credit check failed for {user_id}: {e}", exc_info=True)
@@ -42,6 +48,6 @@ async def check_credits(user_id: str, mongo_client) -> None:
             detail={
                 "code": "OUT_OF_CREDITS",
                 "message": "You're out of Birdy Credits. Top up to keep using Birdy AI.",
-                **_status_payload(credits, sub),
+                **_status_payload(credits, sub, rate_mode=settings["rate_mode"], enforce=True),
             },
         )

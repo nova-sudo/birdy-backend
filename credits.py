@@ -117,6 +117,9 @@ async def get_credits_settings(db, *, fresh: bool = False) -> dict:
     data = {
         "markup": float(doc.get("markup") or DEFAULT_MARKUP),
         "rate_mode": doc.get("rate_mode") or DEFAULT_RATE_MODE,
+        # Enforcement (the hard stopper) is admin-toggleable; the env var is just
+        # the initial default until an admin sets it.
+        "enforce": bool(doc["enforce"]) if doc.get("enforce") is not None else CREDITS_ENFORCE,
         "updated_at": doc.get("updated_at"),
         "updated_by": doc.get("updated_by"),
     }
@@ -125,10 +128,10 @@ async def get_credits_settings(db, *, fresh: bool = False) -> dict:
     return data
 
 
-async def set_credits_settings(db, *, markup=None, rate_mode=None, admin: Optional[str] = None) -> dict:
-    """Update the markup and/or rate mode. Clamps markup to a sane range and
-    validates the mode; invalidates the in-process cache so the change takes
-    effect on the next charge."""
+async def set_credits_settings(db, *, markup=None, rate_mode=None, enforce=None, admin: Optional[str] = None) -> dict:
+    """Update the markup, rate mode, and/or enforcement. Clamps markup to a sane
+    range and validates the mode; invalidates the in-process cache so the change
+    takes effect on the next charge/check."""
     update: dict = {}
     if markup is not None:
         update["markup"] = round(max(MARKUP_MIN, min(float(markup), MARKUP_MAX)), 2)
@@ -137,6 +140,8 @@ async def set_credits_settings(db, *, markup=None, rate_mode=None, admin: Option
         if rate_mode not in ("byok", "managed"):
             raise ValueError("rate_mode must be 'byok' or 'managed'")
         update["rate_mode"] = rate_mode
+    if enforce is not None:
+        update["enforce"] = bool(enforce)
     if update:
         update["updated_at"] = datetime.now(timezone.utc)
         if admin:
@@ -229,6 +234,21 @@ def _available(credits: dict) -> float:
     return remaining_allowance + (credits.get("topup_balance", 0.0) or 0.0)
 
 
+async def is_blocked(db, user_id: str) -> bool:
+    """True when enforcement is on AND the user has no credits left. Non-raising
+    (unlike credits_middleware.check_credits) for background/non-HTTP paths —
+    the suggestions cron and Slack. Fails open on any error."""
+    try:
+        settings = await get_credits_settings(db)
+        if not settings["enforce"]:
+            return False
+        credits, _ = await _load_and_sync(db, user_id)
+        return _available(credits) <= 0
+    except Exception as e:
+        logger.error(f"is_blocked check failed for {user_id}: {e}", exc_info=True)
+        return False
+
+
 async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
     """Load the user's credits, persisting a period rollover / plan change if
     needed. Returns (credits, subscription)."""
@@ -245,7 +265,7 @@ async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
     return credits, (user or {}).get("subscription") or {}
 
 
-def _status_payload(credits: dict, sub: dict, rate_mode: Optional[str] = None) -> dict:
+def _status_payload(credits: dict, sub: dict, rate_mode: Optional[str] = None, enforce: Optional[bool] = None) -> dict:
     allowance = credits.get("allowance", 0) or 0
     used = credits.get("used", 0.0) or 0.0
     topup = credits.get("topup_balance", 0.0) or 0.0
@@ -265,7 +285,7 @@ def _status_payload(credits: dict, sub: dict, rate_mode: Optional[str] = None) -
         "subscribed": (sub or {}).get("status") in ACTIVE_STATUSES,
         "current_period_end": (sub or {}).get("current_period_end"),
         "rate_mode": rate_mode or DEFAULT_RATE_MODE,
-        "enforced": CREDITS_ENFORCE,
+        "enforced": CREDITS_ENFORCE if enforce is None else enforce,
         "low": balance <= low_threshold,
         "out": balance <= 0,
     }
@@ -408,7 +428,10 @@ async def credits_status(current_user: str = Depends(get_current_user)):
         db = get_db(mc)
         credits, sub = await _load_and_sync(db, current_user)
         settings = await get_credits_settings(db)
-        return {**_status_payload(credits, sub, rate_mode=settings["rate_mode"]), "_user_id": current_user}
+        return {
+            **_status_payload(credits, sub, rate_mode=settings["rate_mode"], enforce=settings["enforce"]),
+            "_user_id": current_user,
+        }
 
 
 @router.get("/api/credits/usage")
@@ -417,6 +440,7 @@ async def credits_usage(days: int = 30, current_user: str = Depends(get_current_
     async with get_mongo_client() as mc:
         db = get_db(mc)
         credits, sub = await _load_and_sync(db, current_user)
+        _st = await get_credits_settings(db)
         since = datetime.now(timezone.utc) - timedelta(days=days)
         # Consumption only — top-up purchases live in the same ledger (as a
         # negative "topup" charge) but belong on the billing view, not here.
@@ -443,7 +467,7 @@ async def credits_usage(days: int = 30, current_user: str = Depends(get_current_
             "by_day": sorted(by_day.values(), key=lambda x: x["date"]),
             "by_feature": by_feature,
             "recent": rows[:50],
-            "status": _status_payload(credits, sub, rate_mode=(await get_credits_settings(db))["rate_mode"]),
+            "status": _status_payload(credits, sub, rate_mode=_st["rate_mode"], enforce=_st["enforce"]),
         }
 
 

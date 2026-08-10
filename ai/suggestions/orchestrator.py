@@ -64,6 +64,18 @@ async def run_pass_for_user(
 
     # One provider per user (BYOK, else global key, else None → template copy).
     provider = await get_composer_provider(user_id, db)
+    # Enforcement: an out-of-credits user still gets template suggestions, but we
+    # don't run (or bill) the LLM composer for them.
+    if provider is not None:
+        try:
+            from credits import is_blocked
+            if await is_blocked(db, user_id):
+                logger.info("suggestions: %s is out of credits — composing from templates (no AI)", user_id)
+                provider = None
+        except Exception as e:
+            logger.debug("suggestions: credit gate skipped for %s: %s", user_id, e)
+    # Sum the composer's token usage across the pass and bill it once at the end.
+    _usage = {"in": 0, "out": 0, "calls": 0, "model": None}
     strictness = await store.get_user_strictness(db, user_id)
     ctx = AnalyzerContext(db=db, user_id=user_id, mongo_client=mongo_client,
                           config={"strictness": strictness})
@@ -106,6 +118,12 @@ async def run_pass_for_user(
             for finding in findings:
                 stats["findings"] += 1
                 composed = await compose(provider, finding)
+                u = composed.get("usage") or {}
+                if u.get("in") or u.get("out"):
+                    _usage["in"] += u.get("in", 0)
+                    _usage["out"] += u.get("out", 0)
+                    _usage["calls"] += 1
+                    _usage["model"] = u.get("model") or _usage["model"]
                 finding.title = composed["title"]
                 finding.description = composed["description"]
                 doc, created, content_changed = await store.upsert_finding(
@@ -159,6 +177,22 @@ async def run_pass_for_user(
             await update_suggestions(db, user_id, updated_docs)
         except Exception as e:
             logger.warning("suggestions: Slack sync failed for %s: %s", user_id, e)
+
+    # Bill the pass's AI cost once (source=cron), like the chat orchestrator does.
+    if _usage["in"] or _usage["out"]:
+        try:
+            from credits import record_usage
+            await record_usage(
+                db, user_id,
+                model=_usage["model"],
+                prompt_tokens=_usage["in"],
+                completion_tokens=_usage["out"],
+                model_calls=_usage["calls"],
+                source="cron",
+                feature="suggestions",
+            )
+        except Exception as e:
+            logger.debug("suggestions: credit metering skipped for %s: %s", user_id, e)
 
     logger.info("suggestions pass user=%s window=%s → %s", user_id, window, stats)
     return stats
