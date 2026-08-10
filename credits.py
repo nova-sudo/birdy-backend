@@ -9,8 +9,10 @@ allowance (Starter 2,000 / Growth 6,000 / Scale 10,000) that resets every Whop
 billing period; usage draws it down, and customers top up when it runs out.
 Two rates, per the billing strategy:
 
-  * BYOK    (customer's own model key)  — a flat 0.5 credit / 1,000 tokens.
-  * Managed (Birdy runs the model)      — cost¢ × the model's markup.
+  * BYOK    (customer's own model key)  — a 0.5-credit/1,000-token base × markup.
+  * Managed (Birdy runs the model)      — cost¢ × markup.
+
+The markup is a single admin-set profit multiplier that applies to both rates.
 
 The app runs on BYOK today, so ``CREDITS_RATE_MODE`` defaults to ``byok``; the
 Managed math is implemented and ready to switch on.
@@ -168,9 +170,11 @@ def managed_credits(model: Optional[str], in_tokens: int, out_tokens: int, marku
     return round(cost_cents * m, 2)
 
 
-def byok_credits(in_tokens: int, out_tokens: int) -> float:
-    """BYOK rate: a flat 0.5 credit per 1,000 tokens, any model."""
-    return round(BYOK_CREDITS_PER_1K * (in_tokens + out_tokens) / 1000.0, 2)
+def byok_credits(in_tokens: int, out_tokens: int, markup: Optional[float] = None) -> float:
+    """BYOK rate: a 0.5-credit-per-1,000-tokens base (any model) scaled by the
+    markup. The markup is the single profit multiplier and applies to both rates."""
+    m = float(markup) if markup is not None else 1.0
+    return round(BYOK_CREDITS_PER_1K * (in_tokens + out_tokens) / 1000.0 * m, 2)
 
 
 def credits_for_usage(mode: str, model: Optional[str], in_tokens: int, out_tokens: int, markup: Optional[float] = None) -> float:
@@ -178,9 +182,11 @@ def credits_for_usage(mode: str, model: Optional[str], in_tokens: int, out_token
     out_tokens = int(out_tokens or 0)
     if in_tokens <= 0 and out_tokens <= 0:
         return 0.0
+    # The markup applies to both rates: Managed scales real model cost, Own-key
+    # scales the flat per-token base.
     if mode == "managed":
         return managed_credits(model, in_tokens, out_tokens, markup=markup)
-    return byok_credits(in_tokens, out_tokens)
+    return byok_credits(in_tokens, out_tokens, markup=markup)
 
 
 # ── Balance model (users.credits) ───────────────────────────────────────────
