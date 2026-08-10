@@ -23,6 +23,7 @@ via :func:`record_usage`.
 
 import logging
 import os
+import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
@@ -64,16 +65,87 @@ CREDITS_ENFORCE = os.getenv("CREDITS_ENFORCE", "false").strip().lower() in ("1",
 PLAN_ALLOWANCE = {"starter": 2000, "growth": 6000, "scale": 10000}
 ACTIVE_STATUSES = {"active", "trialing", "past_due", "canceling"}
 
-# Top-up packs (Whop plan IDs wired later; the buy button opens Whop checkout).
+# Top-up packs. Each pack's Whop plan id comes from its env var, falling back to
+# the wired-in default below so the buy buttons work out of the box; set the env
+# var to point a pack at a different plan (e.g. a sandbox plan) without a deploy.
 TOPUP_PACKS = [
-    {"id": "small",  "credits": 1000, "price": 10, "plan_env": "WHOP_PLAN_TOPUP_SMALL"},
-    {"id": "medium", "credits": 2500, "price": 25, "plan_env": "WHOP_PLAN_TOPUP_MEDIUM"},
-    {"id": "large",  "credits": 5000, "price": 50, "plan_env": "WHOP_PLAN_TOPUP_LARGE"},
+    {"id": "small",  "credits": 1000, "price": 10, "plan_env": "WHOP_PLAN_TOPUP_SMALL",  "plan_id": "plan_Kz3g3c4VyOWAF"},
+    {"id": "medium", "credits": 2500, "price": 25, "plan_env": "WHOP_PLAN_TOPUP_MEDIUM", "plan_id": "plan_wY3HbDVa0JX1E"},
+    {"id": "large",  "credits": 5000, "price": 50, "plan_env": "WHOP_PLAN_TOPUP_LARGE",  "plan_id": "plan_wQMhklGNLIwgf"},
 ]
+
+
+def _pack_plan_id(pack: dict) -> str:
+    """A pack's active Whop plan id: env override, else the wired-in default."""
+    return os.getenv(pack["plan_env"]) or pack.get("plan_id", "")
 
 # Warn when the balance drops under 10% of the allowance (or under 100 credits).
 LOW_BALANCE_FRACTION = 0.10
 LOW_BALANCE_MIN = 100
+
+
+# ── Runtime-adjustable pricing (admin-controlled, DB-backed) ────────────────
+# The Managed markup and the active rate mode are editable at runtime from the
+# admin console (no redeploy), stored in one small settings doc. Reads are cached
+# in-process for a few seconds so metering doesn't hit the DB on every AI call.
+_SETTINGS_COLLECTION = "platform_settings"
+_SETTINGS_ID = "credits"
+_SETTINGS_TTL = 20.0  # seconds
+_settings_cache = {"data": None, "ts": 0.0}
+
+DEFAULT_MARKUP = float(MODEL_PRICING[DEFAULT_MODEL]["markup"])  # gpt-4o → 4.0
+MARKUP_MIN, MARKUP_MAX = 1.0, 20.0
+
+
+def _default_settings() -> dict:
+    return {"markup": DEFAULT_MARKUP, "rate_mode": DEFAULT_RATE_MODE, "updated_at": None, "updated_by": None}
+
+
+async def get_credits_settings(db, *, fresh: bool = False) -> dict:
+    """The current Managed markup + rate mode. Cached briefly; pass fresh=True to
+    bypass the cache (used right after a write, and by the admin read endpoint)."""
+    now = time.monotonic()
+    cached = _settings_cache["data"]
+    if not fresh and cached is not None and (now - _settings_cache["ts"]) < _SETTINGS_TTL:
+        return cached
+    doc = None
+    try:
+        doc = await db[_SETTINGS_COLLECTION].find_one({"_id": _SETTINGS_ID})
+    except Exception as e:  # never let a settings read break metering
+        logger.debug(f"credits settings read failed, using defaults: {e}")
+    doc = doc or {}
+    data = {
+        "markup": float(doc.get("markup") or DEFAULT_MARKUP),
+        "rate_mode": doc.get("rate_mode") or DEFAULT_RATE_MODE,
+        "updated_at": doc.get("updated_at"),
+        "updated_by": doc.get("updated_by"),
+    }
+    _settings_cache["data"] = data
+    _settings_cache["ts"] = now
+    return data
+
+
+async def set_credits_settings(db, *, markup=None, rate_mode=None, admin: Optional[str] = None) -> dict:
+    """Update the markup and/or rate mode. Clamps markup to a sane range and
+    validates the mode; invalidates the in-process cache so the change takes
+    effect on the next charge."""
+    update: dict = {}
+    if markup is not None:
+        update["markup"] = round(max(MARKUP_MIN, min(float(markup), MARKUP_MAX)), 2)
+    if rate_mode is not None:
+        rate_mode = str(rate_mode).strip().lower()
+        if rate_mode not in ("byok", "managed"):
+            raise ValueError("rate_mode must be 'byok' or 'managed'")
+        update["rate_mode"] = rate_mode
+    if update:
+        update["updated_at"] = datetime.now(timezone.utc)
+        if admin:
+            update["updated_by"] = admin
+        await db[_SETTINGS_COLLECTION].update_one(
+            {"_id": _SETTINGS_ID}, {"$set": update}, upsert=True
+        )
+        _settings_cache["data"] = None  # force a fresh read next time
+    return await get_credits_settings(db, fresh=True)
 
 
 # ── Credit math ─────────────────────────────────────────────────────────────
@@ -82,11 +154,13 @@ def _pricing(model: Optional[str]) -> dict:
     return MODEL_PRICING.get(model or "", MODEL_PRICING[DEFAULT_MODEL])
 
 
-def managed_credits(model: Optional[str], in_tokens: int, out_tokens: int) -> float:
-    """Managed rate: real model cost in cents × the model's markup."""
+def managed_credits(model: Optional[str], in_tokens: int, out_tokens: int, markup: Optional[float] = None) -> float:
+    """Managed rate: real model cost in cents × the markup. Uses the admin-set
+    markup when provided, else the model's default markup."""
     p = _pricing(model)
+    m = float(markup) if markup is not None else p["markup"]
     cost_cents = (in_tokens * p["in"] + out_tokens * p["out"]) / 1_000_000 * 100
-    return round(cost_cents * p["markup"], 2)
+    return round(cost_cents * m, 2)
 
 
 def byok_credits(in_tokens: int, out_tokens: int) -> float:
@@ -94,13 +168,13 @@ def byok_credits(in_tokens: int, out_tokens: int) -> float:
     return round(BYOK_CREDITS_PER_1K * (in_tokens + out_tokens) / 1000.0, 2)
 
 
-def credits_for_usage(mode: str, model: Optional[str], in_tokens: int, out_tokens: int) -> float:
+def credits_for_usage(mode: str, model: Optional[str], in_tokens: int, out_tokens: int, markup: Optional[float] = None) -> float:
     in_tokens = int(in_tokens or 0)
     out_tokens = int(out_tokens or 0)
     if in_tokens <= 0 and out_tokens <= 0:
         return 0.0
     if mode == "managed":
-        return managed_credits(model, in_tokens, out_tokens)
+        return managed_credits(model, in_tokens, out_tokens, markup=markup)
     return byok_credits(in_tokens, out_tokens)
 
 
@@ -171,7 +245,7 @@ async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
     return credits, (user or {}).get("subscription") or {}
 
 
-def _status_payload(credits: dict, sub: dict) -> dict:
+def _status_payload(credits: dict, sub: dict, rate_mode: Optional[str] = None) -> dict:
     allowance = credits.get("allowance", 0) or 0
     used = credits.get("used", 0.0) or 0.0
     topup = credits.get("topup_balance", 0.0) or 0.0
@@ -190,7 +264,7 @@ def _status_payload(credits: dict, sub: dict) -> dict:
         "plan_name": (sub or {}).get("plan_name"),
         "subscribed": (sub or {}).get("status") in ACTIVE_STATUSES,
         "current_period_end": (sub or {}).get("current_period_end"),
-        "rate_mode": DEFAULT_RATE_MODE,
+        "rate_mode": rate_mode or DEFAULT_RATE_MODE,
         "enforced": CREDITS_ENFORCE,
         "low": balance <= low_threshold,
         "out": balance <= 0,
@@ -215,8 +289,9 @@ async def record_usage(
     """Charge a question's token usage to the user's balance and append to the
     ``ai_usage`` ledger. Best-effort: never raises into the AI request path."""
     try:
-        mode = mode or DEFAULT_RATE_MODE
-        charge = credits_for_usage(mode, model, prompt_tokens, completion_tokens)
+        settings = await get_credits_settings(db)
+        mode = mode or settings["rate_mode"]
+        charge = credits_for_usage(mode, model, prompt_tokens, completion_tokens, markup=settings["markup"])
         if charge <= 0:
             return 0.0
 
@@ -275,7 +350,9 @@ def topup_plan_credits(plan_id: Optional[str]) -> int:
     if not plan_id:
         return 0
     for pack in TOPUP_PACKS:
-        if os.getenv(pack["plan_env"]) == plan_id:
+        # Match the env override AND the wired-in default, so a purchase credits
+        # whether the plan id is set via env or falls back to the built-in one.
+        if plan_id in {os.getenv(pack["plan_env"], ""), pack.get("plan_id", "")} - {""}:
             return pack["credits"]
     return 0
 
@@ -330,7 +407,8 @@ async def credits_status(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mc:
         db = get_db(mc)
         credits, sub = await _load_and_sync(db, current_user)
-        return {**_status_payload(credits, sub), "_user_id": current_user}
+        settings = await get_credits_settings(db)
+        return {**_status_payload(credits, sub, rate_mode=settings["rate_mode"]), "_user_id": current_user}
 
 
 @router.get("/api/credits/usage")
@@ -340,8 +418,10 @@ async def credits_usage(days: int = 30, current_user: str = Depends(get_current_
         db = get_db(mc)
         credits, sub = await _load_and_sync(db, current_user)
         since = datetime.now(timezone.utc) - timedelta(days=days)
+        # Consumption only — top-up purchases live in the same ledger (as a
+        # negative "topup" charge) but belong on the billing view, not here.
         rows = await db["ai_usage"].find(
-            {"user_id": current_user, "created_at": {"$gte": since}},
+            {"user_id": current_user, "created_at": {"$gte": since}, "feature": {"$ne": "topup"}},
             {"_id": 0},
         ).sort("created_at", -1).to_list(3000)
 
@@ -363,7 +443,7 @@ async def credits_usage(days: int = 30, current_user: str = Depends(get_current_
             "by_day": sorted(by_day.values(), key=lambda x: x["date"]),
             "by_feature": by_feature,
             "recent": rows[:50],
-            "status": _status_payload(credits, sub),
+            "status": _status_payload(credits, sub, rate_mode=(await get_credits_settings(db))["rate_mode"]),
         }
 
 
@@ -376,7 +456,7 @@ async def topup_packs(current_user: str = Depends(get_current_user)):
                 "id": p["id"],
                 "credits": p["credits"],
                 "price": p["price"],
-                "plan_id": os.getenv(p["plan_env"], ""),
+                "plan_id": _pack_plan_id(p),
             }
             for p in TOPUP_PACKS
         ]

@@ -33,6 +33,16 @@ from dependencies import (
     require_admin,
 )
 from services.query_classifier import CATEGORY_LABELS
+from credits import (
+    get_credits_settings,
+    set_credits_settings,
+    _effective_credits,
+    _available,
+    MARKUP_MIN,
+    MARKUP_MAX,
+    DEFAULT_MODEL,
+    MODEL_PRICING,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -449,4 +459,127 @@ async def conversation_detail(session_id: str, admin_email: str = Depends(requir
                 }
                 for m in msgs
             ],
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# View 4 — Birdy Credits: pricing controls + per-account balances
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.get("/api/admin/credits/config")
+async def credits_config(admin_email: str = Depends(require_admin)):
+    """Current Managed markup + active rate mode, plus the model rate card the
+    markup multiplies (so the console can preview what a question costs)."""
+    async with get_mongo_client() as mongo_client:
+        s = await get_credits_settings(mongo_client[DB_NAME], fresh=True)
+    return {
+        "markup": s["markup"],
+        "rate_mode": s["rate_mode"],
+        "markup_min": MARKUP_MIN,
+        "markup_max": MARKUP_MAX,
+        "model": DEFAULT_MODEL,
+        "model_pricing": MODEL_PRICING.get(DEFAULT_MODEL),
+        "updated_at": s.get("updated_at"),
+        "updated_by": s.get("updated_by"),
+    }
+
+
+class CreditsConfigUpdate(BaseModel):
+    markup: float | None = None
+    rate_mode: str | None = None
+
+
+@router.put("/api/admin/credits/config")
+async def update_credits_config(body: CreditsConfigUpdate, admin_email: str = Depends(require_admin)):
+    """Set the Managed markup (clamped to a sane range) and/or the active rate
+    mode. Takes effect on the next charge; audited to admin_audit."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            s = await set_credits_settings(
+                db, markup=body.markup, rate_mode=body.rate_mode, admin=admin_email
+            )
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        await db["admin_audit"].insert_one({
+            "admin": admin_email,
+            "action": "credits_config_update",
+            "markup": s["markup"],
+            "rate_mode": s["rate_mode"],
+            "ts": datetime.utcnow(),
+        })
+    logger.info(f"[admin] {admin_email} set credits config → markup={s['markup']} mode={s['rate_mode']}")
+    return s
+
+
+@router.get("/api/admin/credits")
+async def credits_accounts(
+    search: str = "",
+    skip: int = 0,
+    limit: int = 50,
+    admin_email: str = Depends(require_admin),
+):
+    """Per-account credit view: current balance, this period's usage, and
+    all-time credits used vs. purchased (from the ai_usage ledger)."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+
+        user_query = {}
+        if search:
+            user_query = {"$or": [
+                {"user_id": {"$regex": search, "$options": "i"}},
+                {"name": {"$regex": search, "$options": "i"}},
+            ]}
+        users = await db["users"].find(
+            user_query,
+            {"user_id": 1, "name": 1, "subscription": 1, "credits": 1},
+        ).to_list(None)
+
+        # One ledger aggregation → all-time used / purchased / counts per user.
+        # Usage rows carry a positive charge; top-ups a negative "topup" charge.
+        agg = {d["_id"]: d for d in await db["ai_usage"].aggregate([
+            {"$group": {
+                "_id": "$user_id",
+                "used_total": {"$sum": {"$cond": [{"$gt": ["$credits", 0]}, "$credits", 0]}},
+                "purchased_total": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, {"$abs": "$credits"}, 0]}},
+                "topups": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, 1, 0]}},
+                "questions": {"$sum": {"$cond": [{"$ne": ["$feature", "topup"]}, 1, 0]}},
+                "last_used": {"$max": "$created_at"},
+            }},
+        ]).to_list(None)}
+
+        rows = []
+        totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "topup_balance": 0.0}
+        for u in users:
+            uid = u["user_id"]
+            credits, _ = _effective_credits(u)  # in-memory period rollover; no write
+            a = agg.get(uid, {})
+            balance = _available(credits)
+            topup_balance = float(credits.get("topup_balance", 0.0) or 0.0)
+            row = {
+                "email": uid,
+                "name": u.get("name") or uid,
+                "plan": _resolve_plan(u.get("subscription")),
+                "allowance": int(credits.get("allowance", 0) or 0),
+                "used_period": round(float(credits.get("used", 0.0) or 0.0), 2),
+                "topup_balance": round(topup_balance, 2),
+                "balance": round(balance, 2),
+                "used_total": round(float(a.get("used_total", 0.0) or 0.0), 2),
+                "purchased_total": round(float(a.get("purchased_total", 0.0) or 0.0), 2),
+                "topups": int(a.get("topups", 0) or 0),
+                "questions": int(a.get("questions", 0) or 0),
+                "last_used": a.get("last_used"),
+            }
+            rows.append(row)
+            totals["balance"] += balance
+            totals["used_total"] += row["used_total"]
+            totals["purchased_total"] += row["purchased_total"]
+            totals["topup_balance"] += topup_balance
+
+        # Most-active first (all-time consumption, then purchases).
+        rows.sort(key=lambda r: (r["used_total"], r["purchased_total"]), reverse=True)
+        return {
+            "total": len(rows),
+            "accounts": rows[skip: skip + limit],
+            "totals": {k: round(v, 2) for k, v in totals.items()},
         }
