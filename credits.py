@@ -245,11 +245,14 @@ async def is_blocked(db, user_id: str) -> bool:
     (unlike credits_middleware.check_credits) for background/non-HTTP paths —
     the suggestions cron and Slack. Fails open on any error."""
     try:
-        settings = await get_credits_settings(db)
+        settings = await get_credits_settings(db, fresh=True)
         if not settings["enforce"]:
             return False
         credits, _ = await _load_and_sync(db, user_id)
-        return _available(credits) <= 0
+        blocked = _available(credits) <= 0
+        if blocked:
+            logger.info(f"credits gate: BLOCK user={user_id} (non-HTTP) available={_available(credits)}")
+        return blocked
     except Exception as e:
         logger.error(f"is_blocked check failed for {user_id}: {e}", exc_info=True)
         return False

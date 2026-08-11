@@ -28,12 +28,15 @@ async def check_credits(user_id: str, mongo_client) -> None:
     """
     try:
         db = get_db(mongo_client)
-        settings = await get_credits_settings(db)
+        # Read fresh so flipping the admin enforcement toggle takes effect on the
+        # very next request (no cross-instance cache lag on the stopper).
+        settings = await get_credits_settings(db, fresh=True)
     except Exception as e:
         logger.error(f"Credit settings read failed for {user_id}: {e}", exc_info=True)
         return  # fail open — never block on a settings error
 
     if not settings["enforce"]:
+        logger.debug(f"credits gate: user={user_id} enforce=off → allow")
         return  # measurement/rollout mode — meter, but never block
 
     try:
@@ -42,7 +45,9 @@ async def check_credits(user_id: str, mongo_client) -> None:
         logger.error(f"Credit check failed for {user_id}: {e}", exc_info=True)
         return  # fail open — never block on a metering error
 
-    if _available(credits) <= 0:
+    avail = _available(credits)
+    if avail <= 0:
+        logger.info(f"credits gate: BLOCK user={user_id} enforce=on available={avail}")
         raise HTTPException(
             status_code=402,
             detail={
@@ -51,3 +56,4 @@ async def check_credits(user_id: str, mongo_client) -> None:
                 **_status_payload(credits, sub, rate_mode=settings["rate_mode"], enforce=True),
             },
         )
+    logger.info(f"credits gate: allow user={user_id} enforce=on available={avail}")
