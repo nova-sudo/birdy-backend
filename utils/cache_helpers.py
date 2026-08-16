@@ -157,6 +157,31 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         # field — so each one was a COLLSCAN of the whole collection (~17,600
         # executions measured, 34 docs scanned per 1 returned).
         ("client_groups.idx_cg_id", db["client_groups"].create_index("id", name="idx_cg_id", background=True)),
+        # The every-minute meta-refresh claim scan in
+        # services/meta_refresh_manager.py::schedule_stale_groups: it filters on
+        # meta_ad_account_id/meta_token_error/last_meta_refresh and then SORTS by
+        # last_meta_refresh, so with no index it COLLSCANned the collection AND
+        # sorted the result in memory on every tick.
+        #
+        # PARTIAL, keyed on last_meta_refresh alone — this beat the alternatives
+        # when measured (docs examined for the real query, 76-doc collection):
+        #   no index                                76  + in-memory SORT
+        #   (meta_ad_account_id, last_meta_refresh) 67  + in-memory SORT
+        #   (last_meta_refresh) plain               38  sort from index
+        #   (last_meta_refresh) partial             20  sort from index  <-- this
+        # The compound index loses because meta_ad_account_id is matched by
+        # $exists/$ne rather than equality, so it cannot pin a prefix and the
+        # sort field stays unusable. Pushing that same predicate into a
+        # partialFilterExpression instead keeps the index to the rows the query
+        # can ever want, and leaves last_meta_refresh free to serve the sort.
+        # Query eligibility: the filter says meta_ad_account_id $exists True,
+        # which is a provable subset of the partial expression below.
+        ("client_groups.idx_cg_meta_stale", db["client_groups"].create_index(
+            [("last_meta_refresh", 1)],
+            name="idx_cg_meta_stale",
+            partialFilterExpression={"meta_ad_account_id": {"$exists": True}},
+            background=True,
+        )),
         # Counts filtered by all three fields fell back to the (user_id,
         # client_group_id, ...) index and re-fetched each doc to test
         # ad_account_id: 469 documents scanned per single-number result.

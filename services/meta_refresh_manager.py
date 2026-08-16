@@ -679,9 +679,17 @@ async def schedule_stale_groups(
         {
             "meta_ad_account_id": {"$exists": True, "$ne": None},
             "meta_token_error": {"$ne": True},
+            # Two branches, not three: in MongoDB {field: None} already matches
+            # documents where the field is absent, so the old {"$exists": False}
+            # branch was pure duplication (verified against the live collection —
+            # both forms match the same 9 never-refreshed groups, and the whole
+            # filter returns identical result sets either way). What is left is
+            # two plain ranges over last_meta_refresh, which is exactly what
+            # idx_cg_meta_stale (partial, see utils/cache_helpers.py) indexes —
+            # that index also serves the .sort() below, so this no longer
+            # COLLSCANs the collection and sorts it in memory every minute.
             "$or": [
                 {"last_meta_refresh": {"$lt": cutoff}},
-                {"last_meta_refresh": {"$exists": False}},
                 {"last_meta_refresh": None},
             ],
         },
