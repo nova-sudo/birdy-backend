@@ -137,6 +137,30 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         ("alert_notifications.idx_notif_trig", db["alert_notifications"].create_index([("user_id", 1), ("triggered_at", -1)], name="idx_notif_trig", background=True)),
         ("alert_notifications.idx_notif_read", db["alert_notifications"].create_index([("user_id", 1), ("read", 1)], name="idx_notif_read", background=True)),
         ("ghl_contacts.idx_ghl_date", db["ghl_contacts"].create_index([("user_id", 1), ("client_group_id", 1), ("contact_data.dateAdded", -1)], name="idx_ghl_date", background=True)),
+        # The single worst query on the cluster before this index existed.
+        # services/ghl_service.py::fetch_and_cache_ghl_data_optimized ends every
+        # run with count_documents({user_id, location_id}), and /api/cron/ghl-tick
+        # invokes it once a minute per claimed group. The only usable index was
+        # location_contact_unique (location_id, contact_id): Mongo could IXSCAN on
+        # location_id but had to FETCH every contact in the location just to test
+        # user_id, then discard them all and return one number.
+        # Measured live on birdyaidev via $queryStats: 19,063,597 documents
+        # examined across 7,238 executions — ~2,634 scanned per single-number
+        # result, and ~80% of every document scanned cluster-wide. That is the
+        # "Query Targeting: Scanned Objects / Returned > 1000" Atlas alert.
+        # With (user_id, location_id) the plan collapses to a pure COUNT_SCAN and
+        # examines ZERO documents.
+        ("ghl_contacts.idx_ghl_user_location", db["ghl_contacts"].create_index([("user_id", 1), ("location_id", 1)], name="idx_ghl_user_location", background=True)),
+        # client_groups is looked up by bare {"id": ...} in a dozen call paths
+        # (meta_refresh_manager, ghl_service, refresh jobs). user_id_1_id_1 above
+        # cannot serve those — a compound index is unusable without its leading
+        # field — so each one was a COLLSCAN of the whole collection (~17,600
+        # executions measured, 34 docs scanned per 1 returned).
+        ("client_groups.idx_cg_id", db["client_groups"].create_index("id", name="idx_cg_id", background=True)),
+        # Counts filtered by all three fields fell back to the (user_id,
+        # client_group_id, ...) index and re-fetched each doc to test
+        # ad_account_id: 469 documents scanned per single-number result.
+        ("facebook_leads.idx_fbl_user_acct_group", db["facebook_leads"].create_index([("user_id", 1), ("ad_account_id", 1), ("client_group_id", 1)], name="idx_fbl_user_acct_group", background=True)),
         # meta_refresh_jobs previously had NO indexes beyond the default _id_, so
         # every read in services/meta_refresh_manager.py (job_id lookups, the
         # per-group "latest job" query, the stale-claim atomic $or, and the

@@ -317,14 +317,30 @@ async def get_ghl_refresh_status(current_user: str = Depends(get_current_user)):
             status_list = []
             now = datetime.utcnow()
 
+            # One grouped count for every location instead of a count_documents()
+            # per group inside the loop. The old shape issued N round-trips and,
+            # before idx_ghl_user_location existed, each one re-scanned that
+            # location's entire contact set.
+            location_ids = [
+                g["ghl_location_id"] for g in groups if g.get("ghl_location_id")
+            ]
+            counts_by_location = {}
+            if location_ids:
+                counts_by_location = {
+                    row["_id"]: row["n"]
+                    for row in await contacts_collection.aggregate([
+                        {"$match": {
+                            "user_id": current_user,
+                            "location_id": {"$in": location_ids},
+                        }},
+                        {"$group": {"_id": "$location_id", "n": {"$sum": 1}}},
+                    ]).to_list(None)
+                }
+
             for group in groups:
                 last_refresh = group.get("last_ghl_refresh")
 
-                # Get actual contact count from database
-                contact_count = await contacts_collection.count_documents({
-                    "user_id": current_user,
-                    "location_id": group["ghl_location_id"]
-                })
+                contact_count = counts_by_location.get(group["ghl_location_id"], 0)
 
                 time_since_refresh = None
                 if last_refresh:

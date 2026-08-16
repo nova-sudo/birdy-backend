@@ -1295,49 +1295,18 @@ async def get_user_contacts_summary(user_id: str, mongo_client):
         }
 
 
-# SOLUTION 2: Add compound indexes for hierarchical queries
-
-async def create_contacts_indexes(mongo_client):
-    """
-    Create indexes for efficient hierarchical queries
-    user > client_group > contacts
-    """
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
-    contacts_collection = db["ghl_contacts"]
-
-    # Index 1: Primary hierarchy lookup (user > client_group)
-    await contacts_collection.create_index([
-        ("user_id", 1),
-        ("client_group_id", 1)
-    ], name="user_client_group_idx")
-
-    # Index 2: Location-based lookup (user > location)
-    await contacts_collection.create_index([
-        ("user_id", 1),
-        ("location_id", 1)
-    ], name="user_location_idx")
-
-    # Index 3: Individual contact lookup
-    await contacts_collection.create_index([
-        ("user_id", 1),
-        ("contact_id", 1)
-    ], name="user_contact_idx", unique=True)
-
-    # Index 4: For aggregation queries (summary statistics)
-    await contacts_collection.create_index([
-        ("user_id", 1),
-        ("client_group_id", 1),
-        ("location_id", 1)
-    ], name="hierarchy_aggregation_idx")
-
-    # Index 5: For timestamp-based queries (most recent contacts)
-    await contacts_collection.create_index([
-        ("user_id", 1),
-        ("created_at", -1)
-    ], name="user_timestamp_idx")
-
-    logger.info("✅ Created hierarchical indexes for ghl_contacts collection")
-
+# NOTE: a create_contacts_indexes() helper used to live here. It declared the
+# (user_id, location_id) index that ghl_contacts actually needed, but nothing
+# ever called it, so the index never existed and the per-minute contact count
+# scanned the whole location on every cron tick. ghl_contacts indexes now live
+# with every other index in utils/cache_helpers.py::create_performance_indexes,
+# which main.py runs on startup — one place, actually invoked.
+#
+# Two of the five indexes it declared were deliberately NOT carried over:
+# a unique (user_id, contact_id) — uniqueness is already enforced by
+# location_contact_unique and a second unique constraint would fail on existing
+# data — and (user_id, client_group_id, location_id), which is a redundant
+# prefix-extension of idx_ghl_date.
 
 
 async def get_location_contacts(

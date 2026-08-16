@@ -199,8 +199,17 @@ async def list_agencies(
         subs = {d["_id"]: d["n"] for d in await db["client_groups"].aggregate(
             [{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}]
         ).to_list(None)}
+        # The hint is load-bearing, not a micro-optimisation. Left to itself the
+        # planner COLLSCANs facebook_leads for this roll-up and FETCHes every lead
+        # document just to read one field off each (~30,700 docs scanned per call
+        # here, ~182,000 in the shape $queryStats recorded). Pinned to the user_id
+        # prefix of user_account_lead_unique it becomes
+        # GROUP -> PROJECTION_COVERED -> IXSCAN and examines ZERO documents.
+        # Depends on that index existing; it is the collection's unique key, so it
+        # is not going anywhere, but rename it and this call must be updated too.
         leads = {d["_id"]: d["n"] for d in await db["facebook_leads"].aggregate(
-            [{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}]
+            [{"$group": {"_id": "$user_id", "n": {"$sum": 1}}}],
+            hint="user_account_lead_unique",
         ).to_list(None)}
         queries = {d["_id"]: d for d in await db["ai_conversation_log"].aggregate([
             {"$match": {"role": "user"}},
@@ -239,9 +248,16 @@ async def platform_stats(admin_email: str = Depends(require_admin)):
         week_ago = now - timedelta(days=7)
         six_weeks_ago = now - timedelta(weeks=6)
 
-        agencies_total = await db["users"].count_documents({})
-        sub_accounts_total = await db["client_groups"].count_documents({})
-        leads_total = await db["facebook_leads"].count_documents({})
+        # estimated_document_count() reads the collection's stored metadata and
+        # examines ZERO documents; count_documents({}) makes Mongo walk every doc.
+        # On facebook_leads that was ~182,000 documents scanned to produce one
+        # number — 30,450 scanned per document returned, the worst ratio on the
+        # cluster ($queryStats). For a headline total tile the estimate is exactly
+        # as useful; it can lag slightly after an unclean shutdown, which does not
+        # matter for a dashboard counter.
+        agencies_total = await db["users"].estimated_document_count()
+        sub_accounts_total = await db["client_groups"].estimated_document_count()
+        leads_total = await db["facebook_leads"].estimated_document_count()
         ai_queries_total = await db["ai_conversation_log"].count_documents({"role": "user"})
         ai_queries_7d = await db["ai_conversation_log"].count_documents(
             {"role": "user", "created_at": {"$gte": week_ago}}
@@ -271,11 +287,14 @@ async def platform_stats(admin_email: str = Depends(require_admin)):
         ]
 
         # Top agencies by leads
-        top = await db["facebook_leads"].aggregate([
-            {"$group": {"_id": "$user_id", "leads": {"$sum": 1}}},
-            {"$sort": {"leads": -1}},
-            {"$limit": 5},
-        ]).to_list(None)
+        top = await db["facebook_leads"].aggregate(
+            [
+                {"$group": {"_id": "$user_id", "leads": {"$sum": 1}}},
+                {"$sort": {"leads": -1}},
+                {"$limit": 5},
+            ],
+            hint="user_account_lead_unique",  # keeps the roll-up index-covered, see above
+        ).to_list(None)
         names = await _names_for(db, [t["_id"] for t in top])
         top_agencies = [
             {"email": t["_id"], "owner": names.get(t["_id"], t["_id"]), "leads": t["leads"]}
