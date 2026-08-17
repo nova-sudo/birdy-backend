@@ -29,12 +29,20 @@ logger = logging.getLogger(__name__)
 async def _api_get_with_retry(
         client: httpx.AsyncClient,
         url: str,
-        params: dict,
+        params: Optional[dict],
         max_retries: int = 4
 ) -> Optional[dict]:
     """
     GET with exponential backoff on 429 / 503 responses.
     Returns parsed JSON or None on permanent failure.
+
+    Pass `params=None` — never `{}` — when following a paging `next` URL.
+    httpx builds the request as `URL(url, params=params)`, which *replaces*
+    the query string rather than merging into it, so an empty dict silently
+    strips the access_token and the `after` cursor Meta embedded in that URL.
+    The request then goes out bare and Meta answers "An access token is
+    required to request this resource" (code 104) for a URL that visibly
+    contains one. See the note on the leads pagination loop.
     """
     for attempt in range(max_retries):
         try:
@@ -124,7 +132,9 @@ async def _fetch_account_insights_today(
             data = await _api_get_with_retry(
                 client,
                 base_url if page == 1 else next_url,
-                params if page == 1 else {}
+                # None, not {} — an empty dict wipes the cursor and token off
+                # the paging URL. See _api_get_with_retry.
+                params if page == 1 else None
             )
 
             if data is None:
@@ -411,6 +421,17 @@ async def fetch_todays_facebook_leads_incremental(
     on each ad. `date_preset: "maximum"` explicitly gives us all leads
     with no time filter; Meta returns them newest-first, so the watermark
     stops us within a few pages of a healthy cron cadence.
+
+      3. Those two fixes shipped with a third bug that undid them. The
+         watermark was a single account-wide value handed to every ad, and
+         the first ad to reach it ended the scan for the entire account —
+         see the comment on _per_ad_watermarks. Between 2026-07-16 and this
+         fix roughly 63% of leads were never stored, and accounts with more
+         ads lost proportionally more.
+
+    Fix: one watermark per ad, and a per-ad "already up to date" signal that
+    stops that ad's pagination and nothing else. Every ad on the account is
+    scanned on every run.
     """
     try:
         # Late import so the two files stay decoupled at module load time.
@@ -419,25 +440,29 @@ async def fetch_todays_facebook_leads_incremental(
         db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
         leads_collection = db["facebook_leads"]
 
-        last_known_lead = await leads_collection.find_one(
-            {
-                "user_id": user_id,
-                "ad_account_id": ad_account_id,
-                "client_group_id": client_group_id,
-            },
-            sort=[("lead_data.created_time", -1)],
+        # One watermark PER AD, not one for the account.
+        #
+        # This is the bug that cost ~63% of leads between 2026-07-16 and the
+        # fix. Ads are fetched independently and each returns its own leads
+        # newest-first, so "we reached a lead we already have" is a statement
+        # about ONE ad. The previous code held a single account-wide watermark
+        # — the newest lead anywhere on the account — handed it to every ad,
+        # and treated the first ad that reached it as proof the whole account
+        # was up to date: it broke out of the batch (discarding leads already
+        # fetched for the other ads in it) and set should_continue = False,
+        # abandoning every ad not yet scanned.
+        #
+        # Since almost any established ad holds leads older than the account's
+        # newest, that fired on the first batch or two and the rest of the
+        # account was never read. Accounts with more ads lost more.
+        #
+        # An ad with no watermark simply walks its whole history. That is safe
+        # — writes are upserts keyed on (user_id, ad_account_id, lead_id) — and
+        # self-healing for the rows written before ad_id was recorded.
+        watermarks = await _per_ad_watermarks(
+            leads_collection, user_id, ad_account_id, client_group_id
         )
-
-        last_known_lead_id = None
-        last_known_created_time = None
-
-        if last_known_lead:
-            last_known_lead_id = last_known_lead.get("lead_id")
-            last_known_created_time = last_known_lead.get("lead_data", {}).get("created_time")
-            logger.info(f"Last known lead: {last_known_lead_id} from {last_known_created_time}")
-        else:
-            logger.info("No previous leads — this ad account has never had a lead fetched. "
-                        "Fetching everything (watermark will not trigger).")
+        logger.info(f"Per-ad watermarks known for {len(watermarks)} ads")
 
         # Full ad list — the previous implementation used a "today's active
         # ads" filter which silently dropped ads paused today with unread
@@ -451,13 +476,8 @@ async def fetch_todays_facebook_leads_incremental(
         logger.info(f"Found {len(ad_ids)} ads (all lifetime), scanning for new leads since watermark")
 
         all_new_leads = []
-        should_continue = True
 
         for i in range(0, len(ad_ids), max_concurrent_ads):
-            if not should_continue:
-                logger.info("Stopped early - found last known lead")
-                break
-
             batch = ad_ids[i:i + max_concurrent_ads]
             batch_num = (i // max_concurrent_ads) + 1
             total_batches = (len(ad_ids) + max_concurrent_ads - 1) // max_concurrent_ads
@@ -465,7 +485,7 @@ async def fetch_todays_facebook_leads_incremental(
 
             tasks = [
                 _get_todays_leads_for_ad(
-                    ad_id, access_token, last_known_lead_id, last_known_created_time
+                    ad_id, access_token, *watermarks.get(ad_id, (None, None))
                 )
                 for ad_id in batch
             ]
@@ -476,14 +496,14 @@ async def fetch_todays_facebook_leads_incremental(
                 if isinstance(result, Exception):
                     logger.error(f"Error in leads batch: {result}")
                     continue
-                new_leads, hit_last_known = result
+                # `hit_last_known` is per-ad and has already done its job:
+                # _get_todays_leads_for_ad stopped paging that ad. It says
+                # nothing about any other ad, so the scan continues.
+                new_leads, _hit_last_known = result
                 if new_leads:
                     all_new_leads.extend(new_leads)
-                if hit_last_known:
-                    should_continue = False
-                    break
 
-            if should_continue and i + max_concurrent_ads < len(ad_ids):
+            if i + max_concurrent_ads < len(ad_ids):
                 await asyncio.sleep(0.5)
 
         normalized = _normalize_leads(
@@ -495,6 +515,38 @@ async def fetch_todays_facebook_leads_incremental(
     except Exception as e:
         logger.error(f"Error in incremental leads fetch: {e}", exc_info=True)
         return 0, []
+
+
+async def _per_ad_watermarks(
+        leads_collection,
+        user_id: str,
+        ad_account_id: str,
+        client_group_id: str,
+) -> dict:
+    """
+    Newest stored lead for each ad: {ad_id: (lead_id, created_time)}.
+
+    Ads missing from the map are fetched in full. That is the correct
+    behaviour for a genuinely new ad, and it is also what heals the rows
+    written between 2026-07-16 and this fix, which carry no ad_id — those ads
+    look new, get walked once, and gain a watermark from then on.
+    """
+    rows = await leads_collection.aggregate([
+        {"$match": {
+            "user_id": user_id,
+            "ad_account_id": ad_account_id,
+            "client_group_id": client_group_id,
+            "lead_data.ad_id": {"$nin": [None, ""]},
+        }},
+        {"$sort": {"lead_data.created_time": -1}},
+        {"$group": {
+            "_id": "$lead_data.ad_id",
+            "lead_id": {"$first": "$lead_id"},
+            "created_time": {"$first": "$lead_data.created_time"},
+        }},
+    ]).to_list(None)
+
+    return {r["_id"]: (r.get("lead_id"), r.get("created_time")) for r in rows}
 
 
 async def _get_todays_active_ad_ids(ad_account_id: str, access_token: str) -> List[str]:
@@ -515,7 +567,9 @@ async def _get_todays_active_ad_ids(ad_account_id: str, access_token: str) -> Li
             data = await _api_get_with_retry(
                 client,
                 base_url if page == 1 else next_url,
-                params if page == 1 else {}
+                # None, not {} — an empty dict wipes the cursor and token off
+                # the paging URL. See _api_get_with_retry.
+                params if page == 1 else None
             )
             if not data:
                 break
@@ -558,7 +612,7 @@ async def _get_todays_leads_for_ad(
             leads_data = data.get("leads", {})
 
             page_leads, hit_last_known = _collect_new_leads(
-                leads_data.get("data", []), ad_name,
+                leads_data.get("data", []), ad_name, ad_id,
                 last_known_lead_id, last_known_created_time
             )
             new_leads.extend(page_leads)
@@ -569,14 +623,20 @@ async def _get_todays_leads_for_ad(
             next_url = leads_data.get("paging", {}).get("next")
 
             while next_url and not hit_last_known:
-                page_data = await _api_get_with_retry(client, next_url, {})
+                # `None`, not `{}`. Meta pages the leads edge 25 at a time, so
+                # any ad with more than 25 leads in the window relied on this
+                # call — and with `{}` httpx stripped the token and cursor, so
+                # every page after the first came back 400 and those leads
+                # were dropped. Sibling modules (facebook_ads, facebook_adsets,
+                # facebook_leads) already pass None here; this file did not.
+                page_data = await _api_get_with_retry(client, next_url, None)
                 if not page_data:
                     break
                 more = page_data.get("data", [])
                 if not more:
                     break
                 page_leads, hit_last_known = _collect_new_leads(
-                    more, ad_name, last_known_lead_id, last_known_created_time
+                    more, ad_name, ad_id, last_known_lead_id, last_known_created_time
                 )
                 new_leads.extend(page_leads)
                 next_url = page_data.get("paging", {}).get("next")
@@ -591,6 +651,7 @@ async def _get_todays_leads_for_ad(
 def _collect_new_leads(
         leads: List[dict],
         ad_name: str,
+        ad_id: str,
         last_known_lead_id: Optional[str],
         last_known_created_time: Optional[str],
 ) -> Tuple[List[dict], bool]:
@@ -617,6 +678,10 @@ def _collect_new_leads(
                 pass
 
         lead["ad_name"] = ad_name
+        # Carried through to storage so the next run can build a per-ad
+        # watermark. Its absence is why rows written by the broken incremental
+        # path cannot be used as watermarks and get re-walked once.
+        lead["ad_id"] = ad_id
         new_leads.append(lead)
 
     return new_leads, hit_last_known
@@ -640,6 +705,7 @@ def _normalize_leads(
         result.append({
             "lead_id": lead.get("id"),
             "ad_name": lead.get("ad_name", ""),
+            "ad_id": lead.get("ad_id", ""),
             "platform": lead.get("platform", ""),
             "created_time": lead.get("created_time", ""),
             "full_name": field_data.get("full_name", ""),
