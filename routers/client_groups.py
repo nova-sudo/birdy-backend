@@ -198,6 +198,7 @@ async def get_client_groups(
                     f"ghl_opp_cache.{resolved_preset}": 1,
                     "ghl_opp_cache.maximum": 1,
                     f"ghl_funnel_cache.{resolved_preset}": 1,
+                    "meta_daily_spend": 1,
                     **fb_projection,
                     "hotprospector_cache": 1,
                     f"hotprospector_call_cache.{resolved_preset}": 1,
@@ -292,6 +293,14 @@ async def get_client_groups(
                 facebook_cache = group.get("facebook_cache") or {}
                 preset_doc = facebook_cache.get(resolved_preset)
 
+                # Measured per-day spend for the whole retained window. The
+                # caller slices it to the selected range — it is a few hundred
+                # small entries, and serving it whole means the chart does not
+                # need a second request when the range changes.
+                daily_spend = group.get("meta_daily_spend")
+                if not isinstance(daily_spend, list):
+                    daily_spend = None
+
                 if preset_doc and isinstance(preset_doc, dict):
                     group_data["facebook"] = {
                         "ad_account_id": facebook_cache.get("ad_account_id", group.get("meta_ad_account_id", "")),
@@ -303,9 +312,12 @@ async def get_client_groups(
                         "ads": preset_doc.get("ads", []),
                         "metrics": preset_doc.get("metrics", {}),
                         "date_preset": resolved_preset,
+                        "daily_spend": daily_spend,
                     }
                 else:
-                    group_data["facebook"] = facebook_cache
+                    group_data["facebook"] = {**facebook_cache, "daily_spend": daily_spend}
+
+                group_data.pop("meta_daily_spend", None)
 
                 group_data.pop("gohighlevel_cache", None)
                 group_data.pop("facebook_cache", None)

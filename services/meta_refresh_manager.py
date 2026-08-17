@@ -428,6 +428,37 @@ async def execute_refresh(
             )
             logger.error(f"[{job_id}] Lead counts failed: {error_msg}")
 
+    # ── OPTIONAL: daily spend ────────────────────────────────────────────
+    # Deliberately NOT a step in job["steps"].
+    #
+    # The chart wants measured per-day spend rather than a preset total spread
+    # across days by lead share. That is worth one extra call per group, but it
+    # is not worth degrading the refresh everything else depends on, so it sits
+    # outside the state machine:
+    #
+    #   - it runs only with budget to spare, after the real steps are done
+    #   - it is not in _finalize_job's all_statuses, so a failure can never
+    #     mark a job partial/failed and trigger the 10-minute retry backoff
+    #   - it swallows its own errors; the worst case is a stale spend curve
+    #
+    # A failed fetch leaves the previous cache in place rather than blanking
+    # it — see cache_account_daily_spend.
+    if not out_of_budget():
+        try:
+            from integrations.facebook_utils.meta_daily_spend import (
+                cache_account_daily_spend,
+            )
+
+            days = await cache_account_daily_spend(
+                group_id=group_id,
+                ad_account_id=ad_account_id,
+                access_token=token["access_token"],
+                mongo_client=mongo_client,
+            )
+            logger.info(f"[{job_id}] Daily spend: {days} days cached")
+        except Exception as e:
+            logger.warning(f"[{job_id}] Daily spend skipped: {str(e)[:200]}")
+
     # ── FINALIZE ─────────────────────────────────────────────────────────
     await _finalize_job(db, jobs_col, job_id, group_id)
 
