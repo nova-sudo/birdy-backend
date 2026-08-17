@@ -100,6 +100,91 @@ async def cache_ghl_opp_stats_all_presets(
 
 
 # ------------------------------------------------------------------
+# cache_ghl_cohort_funnel_all_presets — the dashboard's close-rate funnel
+# ------------------------------------------------------------------
+async def cache_ghl_cohort_funnel_all_presets(
+    group_id: str,
+    user_id: str,
+    location_id: str,
+    mongo_client,
+):
+    """
+    Derive the cohort funnel for every preset and cache it per preset.
+
+    Reads the group's contacts once and buckets them into all 13 windows in
+    memory, mirroring cache_ghl_opp_stats_all_presets. That single read is the
+    reason this belongs on the refresh path rather than in the
+    /api/client-groups handler: counting ghl_contacts per request was the
+    largest single source of collection scans on this cluster.
+
+    Failure handling matches the opp-stats cache — if the contact read comes
+    back empty while the stored cohort is non-empty, assume a transient problem
+    and write nothing rather than zeroing a good cache.
+    """
+    from core.constants import META_CACHE_PRESETS, ghl_date_bounds
+    from integrations.gohighlevel import compute_cohort_funnel
+
+    db = mongo_client[DB_NAME]
+    groups_col = db["client_groups"]
+
+    contacts = await db["ghl_contacts"].find(
+        {"user_id": user_id, "client_group_id": group_id},
+        {
+            "contact_data.dateAdded": 1,
+            "contact_data.opportunities": 1,
+            "match_keys": 1,
+            "_id": 0,
+        },
+    ).to_list(length=None)
+
+    if not contacts:
+        existing = await groups_col.find_one(
+            {"id": group_id}, {"ghl_funnel_cache.maximum": 1}
+        )
+        existing_max = (existing or {}).get("ghl_funnel_cache", {}).get("maximum", {}) or {}
+        if (existing_max.get("leads") or 0) > 0:
+            logger.warning(
+                "Cohort funnel read 0 contacts for %s but cache holds %s leads — "
+                "skipping to preserve",
+                group_id, existing_max.get("leads"),
+            )
+            return
+
+    # Every match key HotProspector has a call logged against, gathered once so
+    # the per-contact "was this lead called?" test is a set lookup rather than
+    # a query per contact.
+    called_keys: set = set()
+    if location_id:
+        cursor = db["hotprospector_leads"].find(
+            {
+                "user_id": user_id,
+                "ghl_location_id": location_id,
+                "lead_data.call_logs_count": {"$gt": 0},
+            },
+            {"match_keys": 1, "_id": 0},
+        )
+        async for doc in cursor:
+            called_keys.update(doc.get("match_keys") or [])
+
+    funnel_cache = {
+        preset: compute_cohort_funnel(contacts, called_keys, *ghl_date_bounds(preset))
+        for preset in META_CACHE_PRESETS
+    }
+
+    update_fields = {f"ghl_funnel_cache.{p}": s for p, s in funnel_cache.items()}
+    update_fields["ghl_funnel_cache.updated_at"] = datetime.utcnow().isoformat()
+    await groups_col.update_one({"id": group_id}, {"$set": update_fields})
+
+    maximum = funnel_cache.get("maximum") or {}
+    logger.info(
+        "Cached GHL cohort funnel for group %s: %d contacts, %d called-keys, "
+        "lifetime leads=%d closes=%d",
+        group_id, len(contacts), len(called_keys),
+        maximum.get("leads", 0), maximum.get("closes", 0),
+    )
+
+
+# ------------------------------------------------------------------
 # fetch_ghl_contacts_for_group  (line ~2790)
 # ------------------------------------------------------------------
 async def fetch_ghl_contacts_for_group(
@@ -228,6 +313,18 @@ async def refresh_ghl_data_for_user(user_id: str):
                             opp_stats = g_doc["ghl_opp_cache"]["maximum"]
                     except Exception:
                         pass  # Keep existing opp_stats
+
+                # The dashboard funnel reads contacts, not the opportunity
+                # feed, so it is cached separately and must not be skipped
+                # when the group has no GHL access token.
+                try:
+                    await cache_ghl_cohort_funnel_all_presets(
+                        group["id"], user_id, location_id, mongo_client
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Failed to cache cohort funnel for %s: %s", group["id"], e
+                    )
 
                 cache_data = {
                     "location_id": location_id,
@@ -645,6 +742,15 @@ async def fetch_and_cache_ghl_data_optimized(
             )
         except Exception as e:
             logger.warning(f"Failed to cache opp stats presets for {ghl_location_id}: {e}")
+
+        # The dashboard funnel is derived from contacts rather than the
+        # opportunity feed, so it gets its own pass over the same refresh.
+        try:
+            await cache_ghl_cohort_funnel_all_presets(
+                group_id, user_id, ghl_location_id, mongo_client
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache cohort funnel for {ghl_location_id}: {e}")
 
         # Read back opp stats — prefer fresh "maximum" from ghl_opp_cache, fall back to existing
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,

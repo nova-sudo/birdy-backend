@@ -129,6 +129,69 @@ def compute_opp_stats(
     return stats
 
 
+def compute_cohort_funnel(
+    contacts: List[Dict],
+    called_keys: Optional[set] = None,
+    window_start: Optional[str] = None,
+    window_end: Optional[str] = None,
+) -> Dict:
+    """
+    A funnel whose stages all describe the same cohort of people.
+
+    compute_opp_stats answers "what happened in this window" — it counts an
+    opportunity that changed status yesterday however long ago it was created.
+    That is the right question for activity and the wrong one for a close rate:
+    dividing this window's wins by this window's new contacts compares two
+    different populations, so the ratio means nothing.
+
+    This counts one cohort instead — contacts whose `dateAdded` falls in the
+    window — and asks how far *those people* got, whenever they got there:
+
+        leads   every contact created in the window
+        in_crm  ...of whom an opportunity was opened for
+        called  ...of whom HotProspector has logged at least one call to
+        closes  ...of whom an opportunity has since been won
+
+    `in_crm` and `closes` are true subsets of `leads`, and `closes` is a subset
+    of `in_crm`, so closes/leads is a real close rate. `called` is a subset of
+    `leads` measured independently of `in_crm`, because a lead can be dialled
+    without anyone opening an opportunity for them.
+
+    **The recent end of the range under-reports.** A cohort goes on closing
+    after its window ends, so "last 7 days" describes leads that have had a
+    week to convert and reads low beside "last month". That is a property of
+    cohort reporting rather than a fault in the data: compare like windows.
+
+    @param contacts     ghl_contacts docs, each with contact_data + match_keys
+    @param called_keys  normalized match keys HotProspector has a call against
+    @param window_start yyyy-mm-dd, or None for all time
+    @param window_end   yyyy-mm-dd, or None for all time
+    """
+    called_keys = called_keys or set()
+    stats = {"leads": 0, "in_crm": 0, "called": 0, "closes": 0, "won_revenue": 0.0}
+
+    for contact in contacts:
+        data = contact.get("contact_data") or {}
+        if not _in_window(data.get("dateAdded") or "", window_start, window_end):
+            continue
+
+        stats["leads"] += 1
+
+        opps = data.get("opportunities") or []
+        if opps:
+            stats["in_crm"] += 1
+            won = [o for o in opps if (o.get("status") or "").lower() == "won"]
+            if won:
+                stats["closes"] += 1
+                stats["won_revenue"] += sum(_opp_monetary_value(o) for o in won)
+
+        if any(k in called_keys for k in (contact.get("match_keys") or [])):
+            stats["called"] += 1
+
+    stats["won_revenue"] = round(stats["won_revenue"], 2)
+    return stats
+
+
 class GHLIntegration:
     def __init__(self, client_id, client_secret, redirect_uri):
         self.client_id = client_id
