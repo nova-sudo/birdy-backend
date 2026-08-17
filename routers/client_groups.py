@@ -92,6 +92,11 @@ async def get_client_groups(
     GHL contacts  -> total_contacts always lifetime (from gohighlevel_cache);
                      new_contacts aggregated live from ghl_contacts filtered
                      by contact_data.dateAdded for the requested window.
+    GHL funnel    -> metrics.funnel is the cohort funnel for the requested
+                     preset (leads/in_crm/called/closes for the contacts
+                     created in that window), read from ghl_funnel_cache.
+                     None when that preset has not been cached yet — there is
+                     deliberately no lifetime fallback, see below.
 
     Accepted date_preset values:
         maximum (default) | today | yesterday | this_week | this_week_mon_today |
@@ -192,6 +197,7 @@ async def get_client_groups(
                     "gohighlevel_cache": 1,
                     f"ghl_opp_cache.{resolved_preset}": 1,
                     "ghl_opp_cache.maximum": 1,
+                    f"ghl_funnel_cache.{resolved_preset}": 1,
                     **fb_projection,
                     "hotprospector_cache": 1,
                     f"hotprospector_call_cache.{resolved_preset}": 1,
@@ -239,11 +245,21 @@ async def get_client_groups(
                     # No per-preset cache at all — fall back to legacy (pre-migration) data
                     preset_opp = legacy_stats
 
+                # The cohort funnel deliberately has NO lifetime fallback. Every
+                # other cache here quietly serves "maximum" when the requested
+                # preset is missing, which is how the dashboard funnel ended up
+                # showing all-time call counts beside a windowed lead count. An
+                # absent preset is reported as absent so the UI can say so.
+                preset_funnel = (group.get("ghl_funnel_cache") or {}).get(resolved_preset)
+                if not isinstance(preset_funnel, dict):
+                    preset_funnel = None
+
                 if is_all_time:
                     ghl_cache_copy = {**ghl_cache}
+                    metrics = ghl_cache_copy.get("metrics") or {}
                     if preset_opp:
-                        metrics = ghl_cache_copy.get("metrics") or {}
-                        ghl_cache_copy["metrics"] = {**metrics, "opportunity_stats": preset_opp}
+                        metrics = {**metrics, "opportunity_stats": preset_opp}
+                    ghl_cache_copy["metrics"] = {**metrics, "funnel": preset_funnel}
                     group_data["gohighlevel"] = ghl_cache_copy
                 else:
                     windowed = ghl_windowed.get(gid, {})
@@ -255,6 +271,7 @@ async def get_client_groups(
                             "total_contacts": windowed.get("new_contacts", 0),
                             "tag_breakdown": windowed.get("tag_breakdown", {}),
                             "opportunity_stats": preset_opp,
+                            "funnel": preset_funnel,
                             "lifetime_total_contacts": cached_metrics.get("total_contacts", 0),
                         },
                     }
@@ -294,6 +311,7 @@ async def get_client_groups(
                 group_data.pop("facebook_cache", None)
                 group_data.pop("hotprospector_cache", None)
                 group_data.pop("ghl_opp_cache", None)
+                group_data.pop("ghl_funnel_cache", None)
 
                 result.append(group_data)
 

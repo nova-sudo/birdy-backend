@@ -848,6 +848,120 @@ async def get_facebook_leads_filtered(
 
 
 # ---------------------------------------------------------------------------
+# GET /api/facebook-leads/series
+# ---------------------------------------------------------------------------
+
+@router.get("/api/facebook-leads/series")
+async def get_facebook_leads_series(
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    groups: Optional[str] = None,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    One bucket per day: how many leads arrived, and how many of them closed.
+
+    /api/facebook-leads/filtered returns lead rows newest-first under a 5,000
+    cap, which is fine for a list and wrong for a chart. Any range holding more
+    leads than the cap only ever yielded its recent end, so the curve was
+    missing its early buckets rather than merely under-scaled — "all time"
+    drew the last few weeks and called itself all time.
+
+    Counting in Mongo removes the cap and shrinks the payload from thousands of
+    lead records to a few hundred small objects. Callers roll the days up into
+    weeks or months; a day is the finest bucket the chart offers, so nothing is
+    lost by fixing the grain here.
+
+    `closes` counts leads whose matched GHL contact holds a won opportunity —
+    the same join /filtered does row by row, done once as a key set.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            start_time = time.time()
+            db = mongo_client[DB_NAME]
+
+            query = {"user_id": current_user}
+
+            if groups:
+                group_ids = [g.strip() for g in groups.split(",") if g.strip()]
+                if group_ids:
+                    query["client_group_id"] = {"$in": group_ids}
+
+            if start_date or end_date:
+                date_filter = {}
+                if start_date:
+                    date_filter["$gte"] = start_date
+                if end_date:
+                    date_filter["$lte"] = end_date
+                query["lead_data.created_time"] = date_filter
+
+            # created_time is an ISO string, so the day is its first ten
+            # characters — the same slice the date filter above compares on.
+            by_day = [
+                {"$match": query},
+                {"$group": {
+                    "_id": {"$substrBytes": ["$lead_data.created_time", 0, 10]},
+                    "leads": {"$sum": 1},
+                }},
+                {"$sort": {"_id": 1}},
+            ]
+            day_rows = await db["facebook_leads"].aggregate(by_day).to_list(None)
+
+            # Match keys of every contact carrying a won opportunity. Gathered
+            # once so the close count is one extra aggregation rather than a
+            # per-lead lookup.
+            won_keys = set()
+            async for doc in db["ghl_contacts"].find(
+                {"user_id": current_user, "contact_data.opportunities.status": "won"},
+                {"match_keys": 1, "_id": 0},
+            ):
+                won_keys.update(doc.get("match_keys") or [])
+
+            closes_by_day = {}
+            if won_keys:
+                close_pipeline = [
+                    {"$match": {**query, "match_keys": {"$in": list(won_keys)}}},
+                    {"$group": {
+                        "_id": {"$substrBytes": ["$lead_data.created_time", 0, 10]},
+                        "closes": {"$sum": 1},
+                    }},
+                ]
+                async for row in db["facebook_leads"].aggregate(close_pipeline):
+                    closes_by_day[row["_id"]] = row["closes"]
+
+            series = [
+                {
+                    "date": row["_id"],
+                    "leads": row["leads"],
+                    "closes": closes_by_day.get(row["_id"], 0),
+                }
+                for row in day_rows
+                if row.get("_id")
+            ]
+
+            elapsed = time.time() - start_time
+            logger.info(
+                f"Built lead series: {len(series)} days, "
+                f"{sum(s['leads'] for s in series)} leads "
+                f"(range: {start_date} to {end_date}) in {elapsed:.3f}s"
+            )
+
+            return {
+                "series": series,
+                "meta": {
+                    "days": len(series),
+                    "start_date": start_date,
+                    "end_date": end_date,
+                },
+                "performance": {"response_time_ms": int(elapsed * 1000)},
+            }
+
+        except Exception as e:
+            logger.error(f"Error building lead series: {str(e)}", exc_info=True)
+            raise HTTPException(status_code=500, detail=f"Failed to build series: {str(e)}")
+
+
+# ---------------------------------------------------------------------------
 # POST /api/facebook/update-status
 # ---------------------------------------------------------------------------
 
