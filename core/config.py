@@ -19,4 +19,5 @@ COOKIE_DOMAIN = os.getenv("COOKIE_DOMAIN", None)
 CORS_ORIGINS = [
     "https://birdy-beta.vercel.app",
     "http://localhost:3000",
+    "http://localhost:3005",
 ]

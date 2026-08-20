@@ -6,6 +6,7 @@ HotProspector helper / service functions extracted from main.py.
 
 import hashlib
 import logging
+from collections import Counter
 from datetime import datetime, date, timedelta
 
 from pymongo import UpdateOne
@@ -102,6 +103,60 @@ def _compute_call_stats_all_presets(calls, total_leads):
             "total_talk_min": round(talk_seconds / 60, 1),
         }
     return cache
+
+
+def _compute_daily_call_series(calls):
+    """
+    One row per calendar day, from ALL calls (matched or not) — same input as
+    _compute_call_stats_all_presets, bucketed by day instead of by preset.
+
+    Powers Sales-Hub's trend chart without paging the call-log endpoint: that
+    chart used to fetch and bucket the account's entire call history client-
+    side on every page load. This does it once, here, over the whole retained
+    history — the API then serves the small result and the chart slices it to
+    whatever window is selected (mirrors meta_daily_spend / ghl_daily_leads).
+
+    `called` is a lifetime cohort count: each lead is counted once, on the day
+    of their first-ever call, not "first call within whatever window is later
+    selected". Slicing this series to a window therefore reads a lead
+    contacted before the window started as zero even if they were called
+    again inside it — the same tradeoff GHL's cohort funnel already accepts
+    (see compute_cohort_funnel's "recent end under-reports" note). The
+    Overview tile's leads_with_calls figure is unaffected — it's still the
+    correct per-window count from _compute_call_stats_all_presets above.
+    """
+    days: dict = {}
+    first_call: dict = {}
+
+    for c in calls:
+        iso = c.get("call_time_iso")
+        if not iso:
+            continue
+        day = iso[:10]
+        row = days.setdefault(day, {"calls": 0, "inbound": 0, "talk_seconds": 0.0})
+        row["calls"] += 1
+        if c.get("call_status") == "inbound":
+            row["inbound"] += 1
+        row["talk_seconds"] += _dur_seconds(c)
+
+        lid = c.get("matched_lead_id") or c.get("lead_id")
+        if lid is not None:
+            lid = str(lid)
+            if lid not in first_call or iso < first_call[lid]:
+                first_call[lid] = iso
+
+    called_by_day = Counter(iso[:10] for iso in first_call.values())
+
+    return [
+        {
+            "date": day,
+            "calls": row["calls"],
+            "inbound": row["inbound"],
+            "talk_min": round(row["talk_seconds"] / 60, 1),
+            "called": called_by_day.get(day, 0),
+        }
+        for day, row in sorted(days.items())
+    ]
 
 
 async def fetch_hp_leads_for_group(
@@ -244,6 +299,23 @@ async def _load_stored_calls(user_id, ghl_location_id, mongo_client):
     ):
         calls.extend((doc.get("lead_data") or {}).get("call_logs") or [])
     return calls
+
+
+async def cache_hp_daily_calls_from_stored(group_id: str, user_id: str, ghl_location_id: str, mongo_client) -> int:
+    """
+    Recompute hp_daily_calls from already-stored call logs — no HotProspector
+    API call. For backfilling groups refreshed before this field existed;
+    fetch_and_cache_hp_call_center keeps it current on every live refresh.
+    """
+    db = mongo_client[DB_NAME]
+    calls = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
+    rows = _compute_daily_call_series(calls)
+
+    await db["client_groups"].update_many(
+        {"user_id": user_id, "ghl_location_id": ghl_location_id},
+        {"$set": {"hp_daily_calls": rows}},
+    )
+    return len(rows)
 
 
 def _hp_call_source_event_id(call: dict, user_id: str) -> str:
@@ -552,6 +624,7 @@ async def fetch_and_cache_hp_call_center(
     #    Sales-Hub Overview shows date-filtered KPIs per client — mirrors GHL's
     #    cache_ghl_opp_stats_all_presets (fetch once, bucket every preset).
     call_cache = _compute_call_stats_all_presets(normalized_calls, total_lead_count)
+    daily_call_series = _compute_daily_call_series(normalized_calls)
 
     # 5. Persist leads (with nested call logs) to the cache collection.
     await save_hotprospector_leads_to_collection(
@@ -574,6 +647,7 @@ async def fetch_and_cache_hp_call_center(
     for preset, stats in call_cache.items():
         set_fields[f"hotprospector_call_cache.{preset}"] = stats
     set_fields["hotprospector_call_cache.updated_at"] = datetime.utcnow().isoformat()
+    set_fields["hp_daily_calls"] = daily_call_series
 
     await client_groups_collection.update_many(
         {"user_id": user_id, "ghl_location_id": ghl_location_id},

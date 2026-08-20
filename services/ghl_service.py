@@ -752,6 +752,17 @@ async def fetch_and_cache_ghl_data_optimized(
         except Exception as e:
             logger.warning(f"Failed to cache cohort funnel for {ghl_location_id}: {e}")
 
+        # Daily lead counts for the Leads page chart — see ghl_daily_leads.py.
+        # A local count over the contacts just synced above, not a fetch, so
+        # it's cheap enough to run on every refresh alongside the others.
+        try:
+            from services.ghl_daily_leads import cache_ghl_daily_leads
+            await cache_ghl_daily_leads(
+                group_id, user_id, ghl_location_id, mongo_client
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache daily leads for {ghl_location_id}: {e}")
+
         # Read back opp stats — prefer fresh "maximum" from ghl_opp_cache, fall back to existing
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
                      "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}

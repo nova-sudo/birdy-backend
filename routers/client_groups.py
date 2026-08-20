@@ -198,11 +198,13 @@ async def get_client_groups(
                     f"ghl_opp_cache.{resolved_preset}": 1,
                     "ghl_opp_cache.maximum": 1,
                     f"ghl_funnel_cache.{resolved_preset}": 1,
+                    "ghl_daily_leads": 1,
                     "meta_daily_spend": 1,
                     **fb_projection,
                     "hotprospector_cache": 1,
                     f"hotprospector_call_cache.{resolved_preset}": 1,
                     "hotprospector_call_cache.maximum": 1,
+                    "hp_daily_calls": 1,
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
                     "status": 1,
                     "meta_token_error": 1,
@@ -255,12 +257,21 @@ async def get_client_groups(
                 if not isinstance(preset_funnel, dict):
                     preset_funnel = None
 
+                # Daily new-lead counts for the Leads page chart — whole
+                # retained window, same reasoning as Meta's daily_spend: a
+                # few hundred small rows, served once so the chart doesn't
+                # need a second request when the range changes.
+                daily_leads = group.get("ghl_daily_leads")
+                if not isinstance(daily_leads, list):
+                    daily_leads = None
+
                 if is_all_time:
                     ghl_cache_copy = {**ghl_cache}
                     metrics = ghl_cache_copy.get("metrics") or {}
                     if preset_opp:
                         metrics = {**metrics, "opportunity_stats": preset_opp}
                     ghl_cache_copy["metrics"] = {**metrics, "funnel": preset_funnel}
+                    ghl_cache_copy["daily_leads"] = daily_leads
                     group_data["gohighlevel"] = ghl_cache_copy
                 else:
                     windowed = ghl_windowed.get(gid, {})
@@ -275,6 +286,7 @@ async def get_client_groups(
                             "funnel": preset_funnel,
                             "lifetime_total_contacts": cached_metrics.get("total_contacts", 0),
                         },
+                        "daily_leads": daily_leads,
                     }
 
                 # -- HP cache + per-preset windowed call stats (Sales-Hub Overview) --
@@ -287,7 +299,18 @@ async def get_client_groups(
                         if isinstance(hp_call_cache.get("maximum"), dict)
                         else {}
                     )
-                group_data["hotprospector"] = {**hp_cache, "call_stats": hp_preset_stats}
+                # Daily call series for the Sales-Hub trend chart — whole
+                # retained window, sliced client-side to the selected range.
+                # See hp_service.py's _compute_daily_call_series.
+                daily_calls = group.get("hp_daily_calls")
+                if not isinstance(daily_calls, list):
+                    daily_calls = None
+
+                group_data["hotprospector"] = {
+                    **hp_cache,
+                    "call_stats": hp_preset_stats,
+                    "daily_calls": daily_calls,
+                }
 
                 # -- Meta: read preset sub-document --
                 facebook_cache = group.get("facebook_cache") or {}
@@ -318,6 +341,8 @@ async def get_client_groups(
                     group_data["facebook"] = {**facebook_cache, "daily_spend": daily_spend}
 
                 group_data.pop("meta_daily_spend", None)
+                group_data.pop("ghl_daily_leads", None)
+                group_data.pop("hp_daily_calls", None)
 
                 group_data.pop("gohighlevel_cache", None)
                 group_data.pop("facebook_cache", None)
