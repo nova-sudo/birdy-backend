@@ -2341,6 +2341,32 @@ async def get_unified_leads(
 
             total_opportunities = sum(opportunity_stats.values())
 
+            # ── Top missing-email client group (Lead Hub insight card) ───────
+            #
+            # Names the client group with the most contacts missing an email,
+            # under the same filter as everything else above. Only meaningful
+            # as a *comparison* across groups — with exactly one group_id
+            # selected there is nothing to compare it to, so it's left null
+            # rather than reporting "the worst of one".
+            top_missing_email_group = None
+            if len(group_ids) != 1:
+                missing_email_pipeline = [
+                    {"$match": {
+                        **query,
+                        "$or": [
+                            {"contact_data.email": {"$exists": False}},
+                            {"contact_data.email": None},
+                            {"contact_data.email": ""},
+                        ],
+                    }},
+                    {"$group": {"_id": "$client_group_name", "count": {"$sum": 1}}},
+                    {"$sort": {"count": -1}},
+                    {"$limit": 1},
+                ]
+                async for row in ghl_col.aggregate(missing_email_pipeline):
+                    if row.get("_id") and row.get("count"):
+                        top_missing_email_group = {"name": row["_id"], "count": int(row["count"])}
+
             # Format contacts with enrichment
             contacts = []
             for doc in contact_docs:
@@ -2459,6 +2485,7 @@ async def get_unified_leads(
                             (opportunity_stats["won"] / total_opportunities) * 100, 1
                         ) if total_opportunities > 0 else 0,
                         "total_value": round(total_value, 2),
+                        "top_missing_email_group": top_missing_email_group,
                     },
                 },
                 "message": f"Retrieved {len(contacts)} unified leads (newest first)",

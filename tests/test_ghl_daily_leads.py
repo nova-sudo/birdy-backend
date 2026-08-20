@@ -59,6 +59,9 @@ class FakeMongo:
         return self._db
 
 
+EMPTY_ROW = {"new_leads": 0, "new_contacts": 0, "open": 0, "won": 0, "lost": 0, "abandoned": 0}
+
+
 @pytest.mark.asyncio
 async def test_buckets_contacts_by_day():
     contacts = FakeContacts([
@@ -70,8 +73,8 @@ async def test_buckets_contacts_by_day():
     rows = await compute_daily_leads("u1", "loc1", FakeMongo(contacts, FakeGroups()))
 
     assert rows == [
-        {"date": "2026-08-14", "leads": 1},
-        {"date": "2026-08-16", "leads": 2},
+        {"date": "2026-08-14", "leads": 1, **EMPTY_ROW, "new_contacts": 1},
+        {"date": "2026-08-16", "leads": 2, **EMPTY_ROW, "new_contacts": 2},
     ]
 
 
@@ -84,7 +87,53 @@ async def test_contacts_without_a_date_are_skipped():
 
     rows = await compute_daily_leads("u1", "loc1", FakeMongo(contacts, FakeGroups()))
 
-    assert rows == [{"date": "2026-08-16", "leads": 1}]
+    assert rows == [{"date": "2026-08-16", "leads": 1, **EMPTY_ROW, "new_contacts": 1}]
+
+
+@pytest.mark.asyncio
+async def test_splits_leads_from_contacts_and_snapshots_opportunity_status():
+    contacts = FakeContacts([
+        # A lead with an open opportunity.
+        {
+            "lead_type": "lead",
+            "contact_data": {
+                "dateAdded": "2026-08-16T09:00:00.000Z",
+                "opportunities": [{"status": "open"}],
+            },
+        },
+        # A lead with two opportunities — each counts on its own status,
+        # unwound just like get_unified_leads' opp_pipeline.
+        {
+            "lead_type": "lead",
+            "contact_data": {
+                "dateAdded": "2026-08-16T10:00:00.000Z",
+                "opportunities": [{"status": "Won"}, {"status": "lost"}],
+            },
+        },
+        # A lead with no opportunity yet — counted as a lead, no status bucket.
+        {
+            "lead_type": "lead",
+            "contact_data": {"dateAdded": "2026-08-16T11:00:00.000Z"},
+        },
+        # A plain contact — never counted toward open/won/lost/abandoned.
+        {
+            "lead_type": "contact",
+            "contact_data": {"dateAdded": "2026-08-16T12:00:00.000Z"},
+        },
+    ])
+
+    rows = await compute_daily_leads("u1", "loc1", FakeMongo(contacts, FakeGroups()))
+
+    assert rows == [{
+        "date": "2026-08-16",
+        "leads": 4,
+        "new_leads": 3,
+        "new_contacts": 1,
+        "open": 1,
+        "won": 1,
+        "lost": 1,
+        "abandoned": 0,
+    }]
 
 
 @pytest.mark.asyncio
@@ -96,7 +145,9 @@ async def test_a_successful_count_replaces_the_cache():
 
     assert written == 1
     _filt, update = groups.updates[0]
-    assert update["$set"]["ghl_daily_leads"] == [{"date": "2026-08-16", "leads": 1}]
+    assert update["$set"]["ghl_daily_leads"] == [
+        {"date": "2026-08-16", "leads": 1, **EMPTY_ROW, "new_contacts": 1}
+    ]
 
 
 @pytest.mark.asyncio
