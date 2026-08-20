@@ -36,12 +36,19 @@ from services.query_classifier import CATEGORY_LABELS
 from credits import (
     get_credits_settings,
     set_credits_settings,
+    grant_credits,
     _effective_credits,
     _available,
     MARKUP_MIN,
     MARKUP_MAX,
     DEFAULT_MODEL,
     MODEL_PRICING,
+)
+from billing import (
+    _targetable_plans,
+    list_promo_codes,
+    create_promo_code,
+    delete_promo_code,
 )
 
 logger = logging.getLogger(__name__)
@@ -569,6 +576,7 @@ async def credits_accounts(
                 "used_slack": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "slack"]}]}, "$credits", 0]}},
                 "used_cron": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "cron"]}]}, "$credits", 0]}},
                 "purchased_total": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, {"$abs": "$credits"}, 0]}},
+                "granted_total": {"$sum": {"$cond": [{"$eq": ["$feature", "admin_grant"]}, {"$abs": "$credits"}, 0]}},
                 "topups": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, 1, 0]}},
                 "questions": {"$sum": {"$cond": [{"$ne": ["$feature", "topup"]}, 1, 0]}},
                 "last_used": {"$max": "$created_at"},
@@ -576,7 +584,7 @@ async def credits_accounts(
         ]).to_list(None)}
 
         rows = []
-        totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "topup_balance": 0.0,
+        totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "granted_total": 0.0, "topup_balance": 0.0,
                   "used_internal": 0.0, "used_slack": 0.0, "used_cron": 0.0}
         for u in users:
             uid = u["user_id"]
@@ -598,6 +606,7 @@ async def credits_accounts(
                 "used_slack": round(float(a.get("used_slack", 0.0) or 0.0), 2),
                 "used_cron": round(float(a.get("used_cron", 0.0) or 0.0), 2),
                 "purchased_total": round(float(a.get("purchased_total", 0.0) or 0.0), 2),
+                "granted_total": round(float(a.get("granted_total", 0.0) or 0.0), 2),
                 "topups": int(a.get("topups", 0) or 0),
                 "questions": int(a.get("questions", 0) or 0),
                 "last_used": a.get("last_used"),
@@ -606,6 +615,7 @@ async def credits_accounts(
             totals["balance"] += balance
             totals["used_total"] += row["used_total"]
             totals["purchased_total"] += row["purchased_total"]
+            totals["granted_total"] += row["granted_total"]
             totals["topup_balance"] += topup_balance
             totals["used_internal"] += row["used_internal"]
             totals["used_slack"] += row["used_slack"]
@@ -618,3 +628,163 @@ async def credits_accounts(
             "accounts": rows[skip: skip + limit],
             "totals": {k: round(v, 2) for k, v in totals.items()},
         }
+
+
+class CreditsGrantRequest(BaseModel):
+    email: str
+    amount: float
+    note: str | None = None
+
+
+@router.post("/api/admin/credits/grant")
+async def credits_grant(body: CreditsGrantRequest, admin_email: str = Depends(require_admin)):
+    """Grant free Birdy Credits to a user, outside of any Whop purchase."""
+    if body.amount <= 0:
+        raise HTTPException(status_code=400, detail="Amount must be positive")
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        target = body.email.strip().lower()
+        granted = await grant_credits(db, target, body.amount, admin_email, note=body.note)
+        if not granted:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        await db["admin_audit"].insert_one({
+            "admin": admin_email,
+            "action": "credits_grant",
+            "target": target,
+            "amount": body.amount,
+            "note": body.note,
+            "ts": datetime.utcnow(),
+        })
+    logger.info(f"[admin] {admin_email} granted {body.amount} credits to {target}")
+    return {"granted": True, "email": target, "amount": body.amount}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# View 5 — Whop promo codes
+# ══════════════════════════════════════════════════════════════════════════════
+# Whop's read model (list/retrieve) only echoes back a single `product` scope,
+# not the `plan_ids` a code was created with — so the plan-level targeting an
+# admin picked would be unrecoverable from Whop alone. We keep our own small
+# side record (promo_codes_meta, keyed by the Whop-assigned id) purely for
+# display; Whop itself remains the source of truth for the code's validity,
+# discount, and usage.
+
+@router.get("/api/admin/promo-codes")
+async def promo_codes_list(admin_email: str = Depends(require_admin)):
+    codes = await list_promo_codes()
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        meta_docs = await db["promo_codes_meta"].find(
+            {"_id": {"$in": [c.id for c in codes]}}
+        ).to_list(None)
+    meta_by_id = {m["_id"]: m for m in meta_docs}
+
+    rows = []
+    for c in codes:
+        meta = meta_by_id.get(c.id, {})
+        rows.append({
+            "id": c.id,
+            "code": c.code,
+            "promo_type": c.promo_type,
+            "amount_off": c.amount_off,
+            "currency": c.currency,
+            "status": c.status,
+            "uses": c.uses,
+            "stock": c.stock,
+            "unlimited_stock": c.unlimited_stock,
+            "expires_at": c.expires_at,
+            "promo_duration_months": c.promo_duration_months,
+            "new_users_only": c.new_users_only,
+            "existing_memberships_only": c.existing_memberships_only,
+            "churned_users_only": c.churned_users_only,
+            "one_per_customer": c.one_per_customer,
+            "created_at": c.created_at,
+            "target_labels": meta.get("labels", []),
+            "created_by": meta.get("admin"),
+        })
+    return {"targets": _targetable_plans(), "codes": rows}
+
+
+class PromoCodeCreateRequest(BaseModel):
+    code: str
+    promo_type: str  # "percentage" | "flat_amount"
+    amount_off: float
+    plan_ids: list[str]
+    new_users_only: bool = False
+    existing_memberships_only: bool | None = None
+    churned_users_only: bool | None = None
+    one_per_customer: bool | None = None
+    unlimited_stock: bool = True
+    stock: int | None = None
+    expires_at: str | None = None
+    promo_duration_months: int = 1
+
+
+@router.post("/api/admin/promo-codes")
+async def promo_codes_create(body: PromoCodeCreateRequest, admin_email: str = Depends(require_admin)):
+    if body.promo_type not in ("percentage", "flat_amount"):
+        raise HTTPException(status_code=400, detail="promo_type must be 'percentage' or 'flat_amount'")
+    if not body.plan_ids:
+        raise HTTPException(status_code=400, detail="Select at least one plan to target")
+
+    targets = {t["plan_id"]: t["label"] for t in _targetable_plans()}
+    unknown = [p for p in body.plan_ids if p not in targets]
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown plan id(s): {', '.join(unknown)}")
+
+    code = await create_promo_code(
+        code=body.code.strip().upper(),
+        promo_type=body.promo_type,
+        amount_off=body.amount_off,
+        base_currency="usd",
+        new_users_only=body.new_users_only,
+        promo_duration_months=body.promo_duration_months,
+        plan_ids=body.plan_ids,
+        existing_memberships_only=body.existing_memberships_only,
+        churned_users_only=body.churned_users_only,
+        one_per_customer=body.one_per_customer,
+        unlimited_stock=body.unlimited_stock,
+        stock=body.stock,
+        expires_at=body.expires_at,
+    )
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await db["promo_codes_meta"].update_one(
+            {"_id": code.id},
+            {"$set": {
+                "plan_ids": body.plan_ids,
+                "labels": [targets[p] for p in body.plan_ids],
+                "admin": admin_email,
+                "created_at": datetime.utcnow(),
+            }},
+            upsert=True,
+        )
+        await db["admin_audit"].insert_one({
+            "admin": admin_email,
+            "action": "promo_code_create",
+            "promo_id": code.id,
+            "code": code.code,
+            "plan_ids": body.plan_ids,
+            "ts": datetime.utcnow(),
+        })
+    logger.info(f"[admin] {admin_email} created promo code {code.code} ({code.id}) → {body.plan_ids}")
+    return {"id": code.id, "code": code.code}
+
+
+@router.delete("/api/admin/promo-codes/{promo_id}")
+async def promo_codes_delete(promo_id: str, admin_email: str = Depends(require_admin)):
+    await delete_promo_code(promo_id)
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await db["promo_codes_meta"].delete_one({"_id": promo_id})
+        await db["admin_audit"].insert_one({
+            "admin": admin_email,
+            "action": "promo_code_delete",
+            "promo_id": promo_id,
+            "ts": datetime.utcnow(),
+        })
+    logger.info(f"[admin] {admin_email} deleted promo code {promo_id}")
+    return {"deleted": True}

@@ -61,6 +61,9 @@ router = APIRouter()
 
 WHOP_API_KEY        = os.getenv("WHOP_API_KEY", "")
 WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "")
+# Only needed for the promo-codes admin surface (list/create/delete); the
+# membership/payment webhook flow above never needs it.
+WHOP_COMPANY_ID     = os.getenv("WHOP_COMPANY_ID", "")
 
 WHOP_PLAN_STARTER      = os.getenv("WHOP_PLAN_STARTER", "")
 WHOP_PLAN_GROWTH       = os.getenv("WHOP_PLAN_GROWTH", "")
@@ -90,6 +93,67 @@ def _whop() -> AsyncWhop:
     if not WHOP_API_KEY:
         raise HTTPException(status_code=500, detail="Billing is not configured (missing WHOP_API_KEY).")
     return AsyncWhop(api_key=WHOP_API_KEY, webhook_key=WHOP_WEBHOOK_SECRET or None)
+
+
+def _require_company_id() -> str:
+    if not WHOP_COMPANY_ID:
+        raise HTTPException(status_code=500, detail="Promo codes are not configured (missing WHOP_COMPANY_ID).")
+    return WHOP_COMPANY_ID
+
+
+def _targetable_plans() -> list[dict]:
+    """The admin-facing list of plans a promo code can be scoped to: the
+    subscription tiers + extra-client add-on (this module) and the credit
+    top-up packs (credits.py). Lazy-imports credits for the same reason
+    _handle_payment does — sidesteps an import cycle at module load time."""
+    from credits import TOPUP_PACKS, _pack_plan_id
+
+    targets = []
+    for plan_id, meta in PLAN_METADATA.items():
+        targets.append({"plan_id": plan_id, "label": meta["name"], "group": "subscription"})
+    if WHOP_PLAN_EXTRA_CLIENT:
+        targets.append({"plan_id": WHOP_PLAN_EXTRA_CLIENT, "label": "Extra client slot", "group": "subscription"})
+    for pack in TOPUP_PACKS:
+        plan_id = _pack_plan_id(pack)
+        if plan_id:
+            targets.append({"plan_id": plan_id, "label": f"{pack['credits']:,} credits pack", "group": "credits"})
+    return targets
+
+
+async def list_promo_codes() -> list:
+    company_id = _require_company_id()
+    try:
+        async with _whop() as whop:
+            return [code async for code in whop.promo_codes.list(company_id=company_id)]
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Whop promo_codes.list failed: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not reach Whop to list promo codes")
+
+
+async def create_promo_code(**kwargs):
+    kwargs.setdefault("company_id", _require_company_id())
+    try:
+        async with _whop() as whop:
+            return await whop.promo_codes.create(**kwargs)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Whop promo_codes.create failed: {e}", exc_info=True)
+        raise HTTPException(status_code=400, detail=f"Whop rejected the promo code: {e}")
+
+
+async def delete_promo_code(promo_id: str) -> bool:
+    _require_company_id()
+    try:
+        async with _whop() as whop:
+            return bool(await whop.promo_codes.delete(promo_id))
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Whop promo_codes.delete failed: {e}", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not delete the promo code")
 
 
 def _secret_fingerprint() -> str:

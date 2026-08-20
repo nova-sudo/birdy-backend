@@ -421,6 +421,39 @@ async def add_topup(db, user_id: str, credits_amount: int, payment_id: str) -> b
         return False
 
 
+async def grant_credits(db, user_id: str, amount: float, admin: str, note: Optional[str] = None) -> bool:
+    """Grant free credits to a user's balance from the admin console — no Whop
+    purchase involved. Adds to the same ``topup_balance`` pool real top-ups
+    use, so it spends and displays identically. Logged with ``feature:
+    "admin_grant"`` (distinct from ``"topup"``) so it never counts as a paid
+    purchase in the accounts view. Returns False if the user doesn't exist."""
+    amount = float(amount)
+    if amount <= 0:
+        return False
+
+    res = await db["users"].update_one(
+        {"user_id": user_id},
+        {
+            "$inc": {"credits.topup_balance": amount},
+            "$set": {"credits.updated_at": datetime.now(timezone.utc)},
+        },
+        upsert=False,
+    )
+    if not res.matched_count:
+        return False
+
+    await db["ai_usage"].insert_one({
+        "user_id": user_id,
+        "feature": "admin_grant",
+        "credits": -amount,
+        "admin": admin,
+        "note": note,
+        "created_at": datetime.now(timezone.utc),
+    })
+    logger.info(f"💳 Credits: {user_id} +{amount} admin grant (by {admin})")
+    return True
+
+
 async def create_ai_usage_indexes(mongo_client):
     """Index the usage ledger for the per-user usage view (called at startup)."""
     try:
