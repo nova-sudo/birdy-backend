@@ -20,7 +20,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE, ghl_date_bounds
 from core.models import ClientGroupRequest
-from core.utils import mongo_to_dict, get_result_value
+from core.utils import mongo_to_dict, get_result_value, iso_day_end, iso_day_range
 from dependencies import get_current_user, get_mongo_client
 from billing_middleware import check_client_limit
 
@@ -123,53 +123,41 @@ async def get_client_groups(
             if not is_all_time:
                 contacts_col = db["ghl_contacts"]
                 # Two-stage aggregation: count contacts, then unwind tags in Mongo
+                # Bounds come from ghl_date_bounds, not from the caller, so a
+                # ValueError here would be our bug rather than bad input — let
+                # it surface instead of quietly filtering on nonsense.
                 ghl_date_match = {
                     "user_id": current_user,
-                    "contact_data.dateAdded": {
-                        "$gte": f"{ghl_start}T00:00:00.000Z",
-                        "$lte": f"{ghl_end}T23:59:59.999Z",
-                    },
+                    "contact_data.dateAdded": iso_day_range(ghl_start, ghl_end),
                 }
+                # Counts only. The tag breakdown used to be the other half of a
+                # $facet here, and its $unwind forced a FETCH of every contact
+                # in the window — 180,106 documents, 1,530 ms, on every page
+                # load. It is precomputed per preset now
+                # (services/ghl_tag_cache.py) and read below.
                 pipeline = [
                     {"$match": ghl_date_match},
-                    {"$facet": {
-                        "counts": [
-                            {"$group": {
-                                "_id": "$client_group_id",
-                                "new_contacts": {"$sum": 1},
-                            }},
-                        ],
-                        "tags": [
-                            {"$unwind": {"path": "$contact_data.tags", "preserveNullAndEmptyArrays": False}},
-                            {"$group": {
-                                "_id": {"group": "$client_group_id", "tag": "$contact_data.tags"},
-                                "count": {"$sum": 1},
-                            }},
-                            {"$sort": {"count": -1}},
-                            {"$group": {
-                                "_id": "$_id.group",
-                                "tags": {"$push": {"tag": "$_id.tag", "count": "$count"}},
-                            }},
-                        ],
+                    {"$group": {
+                        "_id": "$client_group_id",
+                        "new_contacts": {"$sum": 1},
                     }},
                 ]
-                facet_result = await contacts_col.aggregate(pipeline).to_list(1)
-                if facet_result:
-                    facet = facet_result[0]
-                    # Build counts map
-                    for row in facet.get("counts", []):
-                        ghl_windowed[row["_id"]] = {
-                            "new_contacts": row["new_contacts"],
-                            "tag_breakdown": {},
-                        }
-                    # Merge tags
-                    for row in facet.get("tags", []):
-                        group_id = row["_id"]
-                        if group_id not in ghl_windowed:
-                            ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}}
-                        ghl_windowed[group_id]["tag_breakdown"] = {
-                            t["tag"]: t["count"] for t in row.get("tags", [])
-                        }
+                for row in await contacts_col.aggregate(pipeline).to_list(None):
+                    ghl_windowed[row["_id"]] = {
+                        "new_contacts": row["new_contacts"],
+                        "tag_breakdown": {},
+                    }
+
+                # Tag columns, from the cache. A group with no cached row is a
+                # group that has not been refreshed since the cache was added —
+                # it renders empty tag columns rather than blocking the page.
+                from services.ghl_tag_cache import get_tag_breakdowns
+                for group_id, tags in (
+                    await get_tag_breakdowns(current_user, resolved_preset, mongo_client)
+                ).items():
+                    if group_id not in ghl_windowed:
+                        ghl_windowed[group_id] = {"new_contacts": 0, "tag_breakdown": {}}
+                    ghl_windowed[group_id]["tag_breakdown"] = tags
                     # NOTE: Opportunity stats are now read from ghl_opp_cache (per-preset),
                     # no longer aggregated live from contact_data.opportunities
 
@@ -1548,22 +1536,15 @@ async def get_ghl_contacts_paginated_v2(
             if group_ids:
                 query["client_group_id"] = {"$in": group_ids}
 
+            # Shared by the source / tags / contact_type filters below.
             _EMPTY = {None, "", "null", "undefined", "None"}
 
-            date_filter: dict = {}
-            if start_date not in _EMPTY:
-                try:
-                    norm = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    date_filter["$gte"] = f"{norm}T00:00:00.000Z"
-                except ValueError:
-                    logger.warning(f"Invalid start_date: {start_date!r} — ignored")
-
-            if end_date not in _EMPTY:
-                try:
-                    norm = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    date_filter["$lte"] = f"{norm}T23:59:59.999Z"
-                except ValueError:
-                    logger.warning(f"Invalid end_date: {end_date!r} — ignored")
+            try:
+                date_filter = iso_day_range(start_date, end_date)
+            except ValueError as exc:
+                # Previously this logged and dropped the bound, which quietly
+                # widened the window and returned more rows than were asked for.
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             if date_filter:
                 query["contact_data.dateAdded"] = date_filter
@@ -1979,7 +1960,10 @@ async def get_campaign_opp_rollup(
                 if start_date:
                     date_filter["$gte"] = start_date
                 if end_date:
-                    date_filter["$lte"] = end_date
+                    try:
+                        date_filter["$lte"] = iso_day_end(end_date)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
                 lead_query["lead_data.created_time"] = date_filter
 
             lead_docs = await leads_collection.find(
@@ -2114,12 +2098,11 @@ async def get_unified_leads(
             query = {"user_id": current_user}
             if group_ids:
                 query["client_group_id"] = {"$in": group_ids}
-            if start_date or end_date:
-                date_filter = {}
-                if start_date:
-                    date_filter["$gte"] = f"{start_date}T00:00:00.000Z"
-                if end_date:
-                    date_filter["$lte"] = f"{end_date}T23:59:59.999Z"
+            try:
+                date_filter = iso_day_range(start_date, end_date)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
+            if date_filter:
                 query["contact_data.dateAdded"] = date_filter
 
             # ── source filter (EXACT match within comma-separated values) ────
@@ -2776,22 +2759,10 @@ async def get_leads_filter_options(
                 match_q["client_group_id"] = {"$in": group_ids}
 
             # ── date filter ──────────────────────────────────────────────────
-            _EMPTY = {None, "", "null", "undefined", "None"}
-            date_filter: dict = {}
-
-            if start_date not in _EMPTY:
-                try:
-                    norm = datetime.strptime(start_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    date_filter["$gte"] = f"{norm}T00:00:00.000Z"
-                except ValueError:
-                    logger.warning(f"Invalid start_date: {start_date!r} — ignored")
-
-            if end_date not in _EMPTY:
-                try:
-                    norm = datetime.strptime(end_date, "%Y-%m-%d").strftime("%Y-%m-%d")
-                    date_filter["$lte"] = f"{norm}T23:59:59.999Z"
-                except ValueError:
-                    logger.warning(f"Invalid end_date: {end_date!r} — ignored")
+            try:
+                date_filter = iso_day_range(start_date, end_date)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             if date_filter:
                 match_q["contact_data.dateAdded"] = date_filter

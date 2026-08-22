@@ -763,6 +763,16 @@ async def fetch_and_cache_ghl_data_optimized(
         except Exception as e:
             logger.warning(f"Failed to cache daily leads for {ghl_location_id}: {e}")
 
+        # Windowed tag counts for the Clients-page tag columns. Same
+        # fire-and-forget shape as the daily-leads cache above: a failure
+        # leaves the previous rows in place and costs a stale tag column,
+        # never a failed refresh.
+        try:
+            from services.ghl_tag_cache import cache_group_tag_breakdown
+            await cache_group_tag_breakdown(user_id, group_id, mongo_client)
+        except Exception as e:
+            logger.warning(f"Failed to cache tag breakdown for {group_id}: {e}")
+
         # Read back opp stats — prefer fresh "maximum" from ghl_opp_cache, fall back to existing
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
                      "total_opportunities": 0, "won_revenue": 0.0, "total_revenue": 0.0}

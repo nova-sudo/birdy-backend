@@ -137,6 +137,20 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         ("alert_notifications.idx_notif_trig", db["alert_notifications"].create_index([("user_id", 1), ("triggered_at", -1)], name="idx_notif_trig", background=True)),
         ("alert_notifications.idx_notif_read", db["alert_notifications"].create_index([("user_id", 1), ("read", 1)], name="idx_notif_read", background=True)),
         ("ghl_contacts.idx_ghl_date", db["ghl_contacts"].create_index([("user_id", 1), ("client_group_id", 1), ("contact_data.dateAdded", -1)], name="idx_ghl_date", background=True)),
+        # The Clients-page facet (routers/client_groups.py, the counts branch)
+        # matches on user_id + a contact_data.dateAdded RANGE and groups by
+        # client_group_id — it never filters client_group_id. idx_ghl_date above
+        # puts that field in the MIDDLE, and a compound index cannot skip an
+        # interior key to reach the range beyond it, so the planner degrades to
+        # a generic multi-interval scan (ixscan_generic).
+        # Measured live on birdyaidev, one user, a 7-week window:
+        #   idx_ghl_date            16,791 keys examined -> 62 groups returned
+        # Ordering the same three fields by ESR (equality, then range, then the
+        # group key) turns that into one contiguous range scan. Both indexes
+        # earn their keep: idx_ghl_date still serves the per-group queries that
+        # DO pin client_group_id (18,983 ops measured), which this one cannot
+        # since its second key is the range.
+        ("ghl_contacts.idx_ghl_user_date_group", db["ghl_contacts"].create_index([("user_id", 1), ("contact_data.dateAdded", 1), ("client_group_id", 1)], name="idx_ghl_user_date_group", background=True)),
         # The single worst query on the cluster before this index existed.
         # services/ghl_service.py::fetch_and_cache_ghl_data_optimized ends every
         # run with count_documents({user_id, location_id}), and /api/cron/ghl-tick
@@ -198,6 +212,11 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         ("meta_refresh_jobs.idx_mrj_group_status", db["meta_refresh_jobs"].create_index([("group_id", 1), ("status", 1)], name="idx_mrj_group_status", background=True)),
         ("meta_refresh_jobs.idx_mrj_status_retry", db["meta_refresh_jobs"].create_index([("status", 1), ("next_retry_at", 1), ("created_at", 1)], name="idx_mrj_status_retry", background=True)),
         ("waitlist.idx_waitlist_email", db["waitlist"].create_index("email", unique=True, name="idx_waitlist_email", background=True)),
+        # Windowed tag counts, one row per (group, preset) — see
+        # services/ghl_tag_cache.py. Read once per Clients page load by
+        # (user_id, preset); written by (group_id, preset).
+        ("client_group_tag_cache.idx_cgtc_uniq", db["client_group_tag_cache"].create_index([("group_id", 1), ("preset", 1)], unique=True, name="idx_cgtc_uniq", background=True)),
+        ("client_group_tag_cache.idx_cgtc_user_preset", db["client_group_tag_cache"].create_index([("user_id", 1), ("preset", 1)], name="idx_cgtc_user_preset", background=True)),
     ]
 
     results = await asyncio.gather(*(coro for _, coro in index_calls), return_exceptions=True)
