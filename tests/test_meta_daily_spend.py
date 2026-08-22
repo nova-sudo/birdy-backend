@@ -125,8 +125,17 @@ async def test_no_spend_in_the_window_is_an_empty_list(patch_client):
 
 
 class FakeGroups:
-    def __init__(self):
+    def __init__(self, doc=None):
         self.updates = []
+        # Caching reads the group back to work out what currency its rows
+        # should be denominated in. Default to a GBP-native account so the
+        # no-conversion path is what the older tests exercise.
+        self._doc = doc if doc is not None else {
+            "user_id": "u1", "ad_account_currency": "GBP",
+        }
+
+    async def find_one(self, _filt, _projection=None):
+        return self._doc
 
     async def update_one(self, filt, update):
         self.updates.append((filt, update))
@@ -165,6 +174,49 @@ async def test_a_successful_fetch_replaces_the_window(patch_client):
     rewritten rather than appended to."""
     patch_client([{"body": {"data": [{"date_start": "2026-08-16", "spend": "718.52"}]}}])
     groups = FakeGroups()
+
+    written = await cache_account_daily_spend(
+        "g1", "act_1", "T", FakeMongo(groups),
+        user_currency="GBP", ad_account_currency="GBP",
+    )
+
+    assert written == 1
+    _filt, update = groups.updates[0]
+    assert update["$set"]["meta_daily_spend"] == [{
+        "date": "2026-08-16", "spend": 718.52,
+        "currency": "GBP", "source_currency": "GBP", "fx_rate": 1.0,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_spend_is_converted_into_the_users_currency(patch_client):
+    """The chart used to be drawn in the ad account's currency while the preset
+    totals above it were converted, so USD was added to GBP under one symbol.
+    Rows now carry their denomination and the rate that produced it."""
+    patch_client([{"body": {"data": [{"date_start": "2026-08-16", "spend": "100.00"}]}}])
+    groups = FakeGroups()
+
+    written = await cache_account_daily_spend(
+        "g1", "act_1", "T", FakeMongo(groups),
+        user_currency="GBP", ad_account_currency="USD",
+    )
+
+    assert written == 1
+    _filt, update = groups.updates[0]
+    row = update["$set"]["meta_daily_spend"][0]
+    assert row["currency"] == "GBP"
+    assert row["source_currency"] == "USD"
+    assert 0 < row["fx_rate"] < 1          # USD is worth less than a pound
+    assert row["spend"] < 100.00           # and so the figure comes down
+    assert row["spend"] == pytest.approx(100.00 * row["fx_rate"], abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_account_currency_leaves_rows_unstamped(patch_client):
+    """Stamping a denomination we cannot justify would be worse than stamping
+    none — a wrong label is harder to spot downstream than a missing one."""
+    patch_client([{"body": {"data": [{"date_start": "2026-08-16", "spend": "718.52"}]}}])
+    groups = FakeGroups(doc={"user_id": "u1"})   # no ad_account_currency anywhere
 
     written = await cache_account_daily_spend("g1", "act_1", "T", FakeMongo(groups))
 

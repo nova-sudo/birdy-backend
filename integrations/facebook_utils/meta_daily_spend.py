@@ -19,9 +19,26 @@ single call per account and one small row per account per day.
 
 Stored on the client group as `meta_daily_spend`:
 
-    [{"date": "2026-08-16", "spend": 718.52}, ...]
+    [{"date": "2026-08-16", "spend": 718.52, "currency": "GBP",
+      "source_currency": "USD", "fx_rate": 0.743}, ...]
 
 sorted by date, one entry per day the account spent anything.
+
+`spend` is denominated in `currency`, matching what `facebook_cache` holds, so
+the chart and the preset totals above it are in the same money. Rows used to be
+written in the ad account's own currency while `facebook_cache` was converted
+(services/meta_service.py), which quietly added USD to GBP totals under a single
+symbol. Every row now carries its denomination, the currency Meta reported, and
+the rate applied, so a row's provenance is legible and a later backfill can tell
+converted rows from untouched ones.
+
+A row is only stamped as converted once the conversion actually succeeded: if
+the rate lookup fails the row keeps its source currency and says so, which the
+chart can exclude, rather than being silently mislabelled.
+
+One caveat worth knowing: the rate is the one current at write time, applied to
+the whole window. `facebook_cache` does the same, so the two agree — but neither
+reconstructs the rate that held on each historical day.
 """
 
 import logging
@@ -47,6 +64,89 @@ def _num(value) -> float:
         return float(value)
     except (TypeError, ValueError):
         return 0.0
+
+
+async def _resolve_currencies(
+        db,
+        group_id: str,
+        user_currency: Optional[str],
+        ad_account_currency: Optional[str],
+) -> tuple:
+    """Work out (target, source) currencies for one group's spend rows.
+
+    Callers that already hold both (the refresh manager reads them off the job)
+    pass them in. Everyone else — the backfill script, ad-hoc runs — gets them
+    looked up off the group, so the signature stays optional and no caller is
+    forced to thread currency through just to cache spend.
+    """
+    if user_currency and ad_account_currency:
+        return user_currency, ad_account_currency
+
+    group = await db["client_groups"].find_one(
+        {"id": group_id}, {"user_id": 1, "ad_account_currency": 1}
+    ) or {}
+
+    source = ad_account_currency or group.get("ad_account_currency")
+    target = user_currency
+    if not target and group.get("user_id"):
+        try:
+            from utils.currency_exchange import CurrencyService
+            target = await CurrencyService.get_user_currency(group["user_id"])
+        except (ValueError, RuntimeError) as e:
+            # No default currency set, or the lookup failed. Leaving target
+            # unset means _convert_rows stamps the source currency and skips
+            # conversion, which is the honest outcome.
+            logger.warning(
+                "Daily spend for %s: could not resolve user currency (%s)", group_id, e
+            )
+    return target, source
+
+
+def _convert_rows(rows: List[Dict], source: Optional[str], target: Optional[str]) -> List[Dict]:
+    """Denominate every row, converting when source and target differ.
+
+    Returns rows unchanged when the source currency is unknown — stamping a
+    denomination we cannot justify would be worse than stamping none.
+    """
+    if not source:
+        logger.warning("Daily spend: unknown ad account currency, rows left unstamped")
+        return rows
+
+    target = target or source
+    rate = 1.0
+    if target != source:
+        try:
+            from utils.currency_exchange import CurrencyService
+            rate = CurrencyService.get_rate(source, target)
+        except ValueError as e:
+            # Fall back to the source currency rather than writing a converted
+            # figure we could not compute. The row stays truthful and the chart
+            # can see it is not in the account's display currency.
+            logger.warning(
+                "Daily spend: no %s->%s rate (%s); rows stay in %s", source, target, e, source
+            )
+            target = source
+            rate = 1.0
+
+    if rate == 1.0:
+        return [
+            {**r, "currency": target, "source_currency": source, "fx_rate": 1.0}
+            for r in rows
+        ]
+
+    from utils.currency_exchange import CurrencyService
+    return [
+        {
+            **r,
+            # Convert through the same call meta_service uses, so the daily
+            # rows and the preset totals round identically.
+            "spend": CurrencyService.convert(r["spend"], source, target),
+            "currency": target,
+            "source_currency": source,
+            "fx_rate": rate,
+        }
+        for r in rows
+    ]
 
 
 async def fetch_account_daily_spend(
@@ -114,12 +214,18 @@ async def cache_account_daily_spend(
         access_token: str,
         mongo_client,
         days: int = 400,
+        user_currency: Optional[str] = None,
+        ad_account_currency: Optional[str] = None,
 ) -> int:
     """
     Refresh one group's daily spend history and store it on the group.
 
     Rewrites the whole window rather than appending: Meta restates recent days
     as attribution settles, so the last few rows are not final when first seen.
+
+    Rows are denominated in `user_currency` so they match `facebook_cache`.
+    Both currencies are optional: pass them if you already hold them (the
+    refresh manager does), otherwise they are read off the group.
 
     Returns the number of days stored, or 0 if nothing was written. A failed
     fetch leaves the existing cache untouched.
@@ -134,6 +240,12 @@ async def cache_account_daily_spend(
         return 0
 
     db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+    target, source = await _resolve_currencies(
+        db, group_id, user_currency, ad_account_currency
+    )
+    rows = _convert_rows(rows, source, target)
+
     await db["client_groups"].update_one(
         {"id": group_id},
         {"$set": {
@@ -143,7 +255,9 @@ async def cache_account_daily_spend(
     )
 
     total = sum(r["spend"] for r in rows)
+    denom = rows[0].get("currency") if rows else (target or source or "?")
     logger.info(
-        "Cached daily spend for %s: %d days, %.2f total", group_id, len(rows), total
+        "Cached daily spend for %s: %d days, %.2f %s total",
+        group_id, len(rows), total, denom,
     )
     return len(rows)

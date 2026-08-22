@@ -48,6 +48,22 @@ MAX_ATTEMPTS = 3
 # (function crash, OOM, network drop) and may be reclaimed by the next tick.
 STALE_CLAIM_MINUTES = 10
 
+# How many times a job may be reclaimed after dying mid-execution before we
+# give up on it.
+#
+# Crash-reclaims deliberately do not consume `attempt` — that counter tracks
+# steps that actually ran and errored, and a crash tells us nothing about the
+# steps. But counting nothing at all meant a job that died every single time
+# was reclaimed forever: `attempt` stayed at 1, MAX_ATTEMPTS was never reached,
+# the job never went terminal, and nothing ever alerted. Because
+# schedule_stale_groups skips any group with an open job, its client group
+# silently stopped being refreshed while still reporting status "complete" —
+# one group sat frozen for three months that way, serving stale spend figures
+# to the dashboard.
+#
+# So crashes get their own budget, separate from `attempt`.
+MAX_RECLAIMS = 3
+
 # Minimum remaining budget required to start the leads phase. Leads can be
 # slow, so if we're below this we skip and let the next tick handle it.
 LEADS_MIN_BUDGET_SECONDS = 60
@@ -454,6 +470,9 @@ async def execute_refresh(
                 ad_account_id=ad_account_id,
                 access_token=token["access_token"],
                 mongo_client=mongo_client,
+                # Already on the job — hand them over so the rows land in the
+                # same currency as facebook_cache without a second lookup.
+                ad_account_currency=currency,
             )
             logger.info(f"[{job_id}] Daily spend: {days} days cached")
         except Exception as e:
@@ -669,6 +688,12 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
         update_op.setdefault("$unset", {})
         update_op["$unset"]["meta_token_error"] = ""
         update_op["$unset"]["meta_token_error_at"] = ""
+        # Clear the error text too. It was only ever written on failure and
+        # never cleared, so a group that failed once and has succeeded every
+        # time since still reports the original error alongside
+        # meta_refresh_status="complete" — which reads as a current fault and
+        # sends anyone debugging it down the wrong path.
+        update_op["$unset"]["meta_refresh_error"] = ""
 
     await db["client_groups"].update_one({"id": group_id}, update_op)
 
@@ -809,8 +834,13 @@ async def claim_next_jobs(
          terminal-failure at the next _finalize_job.
 
       4. status="in_progress" AND _claimed_at < now - stale_claim_minutes
+         AND _reclaim_count < MAX_RECLAIMS
          Crash recovery — previous tick died mid-execution. Reclaim without
-         touching attempt (we don't know if it was a real failure or an OOM).
+         touching `attempt` (we don't know if it was a real failure or an OOM),
+         but do count the reclaim: a job that dies every time it is picked up
+         must eventually stop, or it loops forever and quietly freezes its
+         group. See MAX_RECLAIMS. Jobs past that budget are swept to "failed"
+         at the top of this function so they stop blocking the group.
 
     Groups with `meta_token_error=True` don't reach here in the first place
     because schedule_stale_groups filters them out. Any pre-existing jobs
@@ -820,6 +850,32 @@ async def claim_next_jobs(
     jobs_col = db["meta_refresh_jobs"]
     now = datetime.utcnow()
     stale_before = now - timedelta(minutes=stale_claim_minutes)
+
+    # Sweep crash-looping jobs out of the way before claiming. A job that has
+    # burnt its reclaim budget has died mid-execution every time; leaving it
+    # in_progress would block schedule_stale_groups from ever scheduling the
+    # group again. Marking it failed both surfaces the problem and frees the
+    # group to get a fresh job on the next pass.
+    swept = await jobs_col.update_many(
+        {
+            "status": "in_progress",
+            "_claimed_at": {"$lt": stale_before},
+            "$expr": {"$gte": [{"$ifNull": ["$_reclaim_count", 0]}, MAX_RECLAIMS]},
+        },
+        {"$set": {
+            "status": "failed",
+            "error": (
+                f"Died mid-execution on {MAX_RECLAIMS} consecutive claims; "
+                f"giving up so the group can be rescheduled."
+            ),
+            "updated_at": now,
+        }},
+    )
+    if swept.modified_count:
+        logger.warning(
+            "[claim] Swept %d crash-looping job(s) to failed after %d reclaims",
+            swept.modified_count, MAX_RECLAIMS,
+        )
 
     filter_query = {
         "$or": [
@@ -838,7 +894,7 @@ async def claim_next_jobs(
                 "next_retry_at": {"$lte": now},
                 "$expr": {"$lt": ["$attempt", "$max_attempts"]},
             },
-            # 4. stale in_progress (crash recovery)
+            # 4. stale in_progress (crash recovery), while reclaims remain
             {
                 "status": "in_progress",
                 "$or": [
@@ -846,20 +902,34 @@ async def claim_next_jobs(
                     {"_claimed_at": None},
                     {"_claimed_at": {"$exists": False}},
                 ],
+                "$expr": {
+                    "$lt": [{"$ifNull": ["$_reclaim_count", 0]}, MAX_RECLAIMS]
+                },
             },
         ],
     }
 
-    # Aggregation pipeline update: claim atomically AND bump `attempt`
-    # only when the doc was a failure-partial (or a legacy partial with
-    # no kind). Pending / budget-partial / stale-in-progress claims leave
-    # `attempt` untouched, so budget yields never eat into the retry budget.
+    # Aggregation pipeline update: claim atomically, bump `attempt` only when
+    # the doc was a failure-partial (or a legacy partial with no kind), and
+    # bump `_reclaim_count` only when we are re-taking a job that was already
+    # in_progress. Pending / budget-partial / stale-in-progress claims leave
+    # `attempt` untouched, so budget yields never eat into the retry budget —
+    # crashes are counted separately instead of not at all.
     claim_update = [
         {
             "$set": {
                 "status": "in_progress",
                 "_claimed_at": now,
                 "updated_at": now,
+                "_reclaim_count": {
+                    "$cond": [
+                        {"$eq": ["$status", "in_progress"]},
+                        {"$add": [{"$ifNull": ["$_reclaim_count", 0]}, 1]},
+                        # Any other claim reason is a fresh start for the
+                        # crash budget: the job did reach a finalizer.
+                        0,
+                    ],
+                },
                 "attempt": {
                     "$cond": [
                         {"$and": [

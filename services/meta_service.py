@@ -620,6 +620,36 @@ def _classify_meta_error(status_code: int, body: str) -> str | None:
     return None
 
 
+def _failed_result(date_preset: str, error: str) -> dict:
+    """A preset whose fetch broke.
+
+    Distinct from a preset that legitimately returned nothing. Without this
+    marker the two are byte-identical once `_finalize_preset_result` packages
+    an empty accumulator: both become `spend: 0` with empty campaign lists, and
+    the caller writes that over the last good cache as though the account had
+    genuinely stopped spending.
+
+    `cache_account_daily_spend` states the same rule for the daily series —
+    "None on failure, distinct from [], which legitimately means the account
+    spent nothing. Callers must not treat a failure as an empty history and
+    overwrite good data with it." This is that rule for presets.
+    """
+    return {
+        "_failed": True,
+        "_error": error[:200],
+        "campaigns": [],
+        "adsets": [],
+        "ads": [],
+        "date_preset": date_preset,
+        "metrics": {
+            "total_campaigns": 0,
+            "total_adsets": 0,
+            "total_ads": 0,
+            "insights": {},
+        },
+    }
+
+
 def _rate_limited_result(date_preset: str) -> dict:
     return {
         "_rate_limited": True,
@@ -745,6 +775,43 @@ def _accumulate_campaigns_page(
             })
 
 
+# Account-level insights for the headline totals. `reach` is deduplicated by
+# Meta across the account, so this is also more correct than summing campaign
+# reach, which double-counts people who saw more than one campaign.
+_ACCOUNT_INSIGHTS_FIELDS = "spend,impressions,clicks,reach,actions"
+
+
+def _totals_from_account_insights(body: dict):
+    """Account-level totals for one preset, or None if Meta returned no row.
+
+    The preset headline used to be the sum of the campaigns Meta returns for
+    `/{account}/campaigns`. That edge omits deleted and archived campaigns, so
+    any spend on them vanished from the headline while `meta_daily_spend` --
+    which asks the account-level insights edge -- still counted it. The gap
+    scaled with how much of an account's history sat on campaigns Meta no
+    longer lists: one account returning zero campaigns reported GBP 0 against
+    GBP 4,532 of real spend.
+
+    Returning None means "no account figure available"; callers keep the
+    campaign sum rather than replacing a real number with nothing.
+    """
+    rows = (body or {}).get("data") or []
+    if not rows:
+        return None
+    ins = rows[0]
+    try:
+        return {
+            "spend": float(ins.get("spend", 0) or 0),
+            "impressions": int(ins.get("impressions", 0) or 0),
+            "clicks": int(ins.get("clicks", 0) or 0),
+            "reach": int(ins.get("reach", 0) or 0),
+            "results": get_result_value(rows, "lead"),
+        }
+    except (ValueError, TypeError):
+        logger.warning("Account insights row not parseable: %r", ins)
+        return None
+
+
 def _finalize_preset_result(
     date_preset: str,
     campaigns_list: list[dict],
@@ -840,7 +907,12 @@ async def _fetch_meta_campaigns_for_preset(
                     )
                     if kind == "rate_limit":
                         return _rate_limited_result(date_preset)
-                    break
+                    # Anything else: report the failure rather than falling
+                    # through with a half-filled accumulator, which would be
+                    # written over the last good cache as a real zero.
+                    return _failed_result(
+                        date_preset, f"HTTP {resp.status_code}: {body}"
+                    )
 
                 data = resp.json()
                 _accumulate_campaigns_page(
@@ -862,8 +934,42 @@ async def _fetch_meta_campaigns_for_preset(
             f"Error fetching Meta preset={date_preset} for {ad_account_id}: {e}",
             exc_info=True,
         )
+        # Whatever was accumulated before the exception is a partial page, not
+        # the account's real spend. Report the failure so the caller keeps the
+        # previous cache instead of blanking it.
+        return _failed_result(date_preset, str(e))
 
-    return _finalize_preset_result(date_preset, campaigns_list, adsets_list, ads_list, totals)
+    # Headline totals come from the account-level edge; see
+    # _totals_from_account_insights. A failure here is not fatal — the preset
+    # falls back to the campaign sum, which is what it always used.
+    account_totals = None
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            r = await client.get(
+                f"https://graph.facebook.com/v25.0/{ad_account_id}/insights",
+                params={
+                    "date_preset": date_preset,
+                    "fields": _ACCOUNT_INSIGHTS_FIELDS,
+                    "access_token": access_token,
+                },
+            )
+        if r.status_code == 200:
+            account_totals = _totals_from_account_insights(r.json())
+        else:
+            logger.warning(
+                f"Account insights HTTP {r.status_code} for preset={date_preset} "
+                f"account={ad_account_id} — falling back to campaign sum"
+            )
+    except Exception as e:
+        logger.warning(
+            f"Account insights failed for preset={date_preset} "
+            f"account={ad_account_id}: {e} — falling back to campaign sum"
+        )
+
+    return _finalize_preset_result(
+        date_preset, campaigns_list, adsets_list, ads_list,
+        account_totals or totals,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -904,10 +1010,16 @@ async def _fetch_meta_presets_batch(
     if not presets:
         return {}
 
-    # Meta batch cap is 50; we send 13 so this is theoretical, but guard anyway.
-    if len(presets) > 50:
-        raise ValueError(f"Meta batch cap is 50 subrequests, got {len(presets)}")
+    # Two subrequests per preset now (campaigns + account insights), so the
+    # cap bites at 25 presets rather than 50. We send 13.
+    if len(presets) * 2 > 50:
+        raise ValueError(
+            f"Meta batch cap is 50 subrequests; {len(presets)} presets needs "
+            f"{len(presets) * 2}"
+        )
 
+    # Campaign subrequests first, then account-insight subrequests, so the
+    # response halves can be sliced apart by index below.
     batch = [
         {
             "method": "GET",
@@ -915,6 +1027,16 @@ async def _fetch_meta_presets_batch(
                 f"{ad_account_id}/campaigns"
                 f"?fields={_campaigns_fields_for_preset(p)}"
                 f"&limit=500"
+            ),
+        }
+        for p in presets
+    ] + [
+        {
+            "method": "GET",
+            "relative_url": (
+                f"{ad_account_id}/insights"
+                f"?date_preset={p}"
+                f"&fields={_ACCOUNT_INSIGHTS_FIELDS}"
             ),
         }
         for p in presets
@@ -946,14 +1068,31 @@ async def _fetch_meta_presets_batch(
         )
 
     subresponses = resp.json()
-    if not isinstance(subresponses, list) or len(subresponses) != len(presets):
+    if not isinstance(subresponses, list) or len(subresponses) != len(batch):
         raise RuntimeError(
             f"Meta batch API returned {len(subresponses) if isinstance(subresponses, list) else '<not-a-list>'} "
-            f"subresponses, expected {len(presets)}"
+            f"subresponses, expected {len(batch)}"
         )
 
+    # Split the halves back apart: campaigns first, then account insights.
+    campaign_subs = subresponses[: len(presets)]
+    insight_subs = subresponses[len(presets):]
+
+    # A failed or missing account-insights subresponse is not fatal — the
+    # preset keeps its campaign-summed totals, which is what it had before.
+    account_totals: dict[str, dict] = {}
+    for preset, sr in zip(presets, insight_subs):
+        if not sr or sr.get("code") != 200:
+            continue
+        try:
+            parsed = _totals_from_account_insights(json.loads(sr.get("body") or "{}"))
+        except json.JSONDecodeError:
+            parsed = None
+        if parsed:
+            account_totals[preset] = parsed
+
     out: dict[str, dict] = {}
-    for preset, sr in zip(presets, subresponses):
+    for preset, sr in zip(presets, campaign_subs):
         # `None` subresponse can happen when a batch item times out server-side
         if sr is None:
             logger.warning(
@@ -1024,7 +1163,11 @@ async def _fetch_meta_presets_batch(
             continue
 
         out[preset] = _finalize_preset_result(
-            preset, campaigns_list, adsets_list, ads_list, totals,
+            preset, campaigns_list, adsets_list, ads_list,
+            # Prefer the account-level figures for the headline. The campaign
+            # lists stay exactly as fetched — they are the drill-down, and are
+            # allowed to account for less than the whole.
+            account_totals.get(preset) or totals,
         )
 
     return out
@@ -1146,6 +1289,16 @@ async def fetch_meta_all_presets_for_group(
             presets_needing_retry.append(preset)
             continue
 
+        if result.get("_failed"):
+            # Broken fetch, not an empty account. Leave the preset out of
+            # preset_data so the previous cached values survive.
+            logger.warning(
+                f"  Preset '{preset}' fetch failed, keeping previous cache: "
+                f"{result.get('_error')}"
+            )
+            presets_needing_retry.append(preset)
+            continue
+
         result["campaigns"] = [_convert(c) for c in result.get("campaigns", [])]
         result["adsets"] = [_convert(a) for a in result.get("adsets", [])]
         result["ads"] = [_convert(a) for a in result.get("ads", [])]
@@ -1174,6 +1327,17 @@ async def fetch_meta_all_presets_for_group(
                         f"waiting {wait}s (attempt {attempt + 1}/3)"
                     )
                     await asyncio.sleep(wait)
+                    continue
+
+                if result.get("_failed"):
+                    # Retry, but never write the empty result — on the last
+                    # attempt the preset is simply left untouched in cache.
+                    logger.warning(
+                        f"  Preset '{preset}' failed "
+                        f"(attempt {attempt + 1}/3): {result.get('_error')}"
+                    )
+                    if attempt < 2:
+                        await asyncio.sleep(5 * (attempt + 1))
                     continue
 
                 result["campaigns"] = [_convert(c) for c in result.get("campaigns", [])]
