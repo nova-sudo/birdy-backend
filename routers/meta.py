@@ -17,7 +17,7 @@ import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 
 from core.database import DB_NAME
-from core.utils import mongo_to_dict
+from core.utils import iso_day_end, mongo_to_dict
 from dependencies import get_current_user, get_mongo_client
 from integrations.facebook_utils.facebook import (
     facebook_integration,
@@ -726,7 +726,10 @@ async def get_facebook_leads_filtered(
                 if start_date:
                     date_filter["$gte"] = start_date
                 if end_date:
-                    date_filter["$lte"] = end_date
+                    try:
+                        date_filter["$lte"] = iso_day_end(end_date)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
                 query["lead_data.created_time"] = date_filter
 
             # Fetch leads (sorted newest first) — include match_keys for GHL enrichment
@@ -892,7 +895,10 @@ async def get_facebook_leads_series(
                 if start_date:
                     date_filter["$gte"] = start_date
                 if end_date:
-                    date_filter["$lte"] = end_date
+                    try:
+                        date_filter["$lte"] = iso_day_end(end_date)
+                    except ValueError as exc:
+                        raise HTTPException(status_code=400, detail=str(exc)) from exc
                 query["lead_data.created_time"] = date_filter
 
             # created_time is an ISO string, so the day is its first ten

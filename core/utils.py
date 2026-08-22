@@ -1,7 +1,84 @@
+import re
+
 from bson import ObjectId
 from datetime import datetime
 
 from core.config import COOKIE_SECURE, COOKIE_SAMESITE, COOKIE_DOMAIN
+
+_DATE_ONLY = re.compile(r"\d{4}-\d{2}-\d{2}")
+
+# Values the frontend sends for "no date": empty inputs and stringified nulls
+# both arrive as query params, so they are absence, not malformed input.
+_EMPTY_DATE = {None, "", "null", "undefined", "None"}
+
+
+def _validate_day(d) -> str:
+    """Reject anything that is not a real, zero-padded YYYY-MM-DD.
+
+    Both checks are needed. The regex alone accepts "2026-13-99" — correctly
+    shaped, not a date. strptime alone accepts "2026-8-2", which would then be
+    string-compared against zero-padded stored values and silently sort wrong.
+    """
+    if not isinstance(d, str) or not _DATE_ONLY.fullmatch(d):
+        raise ValueError(f"expected YYYY-MM-DD, got {d!r}")
+    try:
+        datetime.strptime(d, "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError(f"not a real date: {d!r}") from exc
+    return d
+
+
+def iso_day_start(d: str) -> str:
+    """Inclusive lower bound for a field holding full ISO-8601 timestamps."""
+    return f"{_validate_day(d)}T00:00:00.000Z"
+
+
+def iso_day_end(d: str) -> str:
+    """Inclusive upper bound for a field holding full ISO-8601 timestamps.
+
+    A bare ``YYYY-MM-DD`` used as ``$lte`` against a timestamp string such as
+    ``'2026-05-25T19:38:41+0000'`` excludes the whole final day, because
+    ``"2026-05-25T19:38:41+0000" <= "2026-05-25"`` is false. Widen the bound to
+    the end of that day.
+
+    Only for timestamp-valued fields. Date-only fields (e.g. the Meta insights
+    ``date_start``, a bare ``YYYY-MM-DD``) already compare correctly and must
+    not be passed through here.
+    """
+    return f"{_validate_day(d)}T23:59:59.999Z"
+
+
+def iso_day_range(start_date, end_date) -> dict:
+    """Build a Mongo range filter over a string-ISO timestamp field.
+
+    Returns ``{}`` when neither bound is given, so callers can do::
+
+        rng = iso_day_range(start_date, end_date)
+        if rng:
+            query["contact_data.dateAdded"] = rng
+
+    Absent bounds (``None``, ``""``, ``"null"``, ``"undefined"``, ``"None"``)
+    are dropped. Anything else that is not ``YYYY-MM-DD`` raises ``ValueError``.
+
+    Raising is the point. Malformed dates were previously handled three
+    different ways across these routers: logged-and-ignored (which silently
+    widened the window and returned MORE rows than asked for), passed straight
+    through (which mis-filtered against a timestamp field), or rejected. The
+    first two are worse than an error — they answer a question nobody asked and
+    look like a correct result. Callers turn this into a 400.
+    """
+    rng = {}
+    if start_date not in _EMPTY_DATE:
+        try:
+            rng["$gte"] = iso_day_start(start_date)
+        except ValueError as exc:
+            raise ValueError(f"start_date: {exc}") from exc
+    if end_date not in _EMPTY_DATE:
+        try:
+            rng["$lte"] = iso_day_end(end_date)
+        except ValueError as exc:
+            raise ValueError(f"end_date: {exc}") from exc
+    return rng
 
 
 def mongo_to_dict(obj):
