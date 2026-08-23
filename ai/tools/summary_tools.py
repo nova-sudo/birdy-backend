@@ -22,6 +22,10 @@ async def get_account_summary(db, user_id, preset="last_7d", group_ids=None):
         query,
         {
             "id": 1, "name": 1,
+            # Metrics only — this reads the account-level insights, never the
+            # entity lists, so it needs the preset's metrics from whichever
+            # shape the document is in but no entity identity to rehydrate.
+            f"facebook_cache.presets.{preset}.metrics": 1,
             f"facebook_cache.{preset}.metrics": 1,
             "facebook_cache.currency": 1,
             "facebook_cache.total_leads": 1,
@@ -38,8 +42,10 @@ async def get_account_summary(db, user_id, preset="last_7d", group_ids=None):
 
     for g in groups:
         fb = g.get("facebook_cache", {})
-        preset_data = fb.get(preset, {})
-        insights = preset_data.get("metrics", {}).get("insights", {})
+        # Split shape first, legacy bucket second.
+        preset_data = ((fb.get("presets") or {}).get(preset)
+                       or fb.get(preset) or {})
+        insights = (preset_data.get("metrics") or {}).get("insights") or {}
         ghl = g.get("gohighlevel_cache", {}).get("metrics", {})
 
         row = {

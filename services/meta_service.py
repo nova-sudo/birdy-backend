@@ -1556,18 +1556,20 @@ async def update_preset_lead_counts(
         bucket = facet_doc.get(preset_key, [])
         preset_leads = bucket[0]["n"] if bucket else 0
 
-        spend = (
-            facebook_cache
-            .get(preset_key, {})
-            .get("metrics", {})
-            .get("insights", {})
-            .get("spend", 0) or 0
-        )
+        _bucket = ((facebook_cache.get("presets") or {}).get(preset_key)
+                   or facebook_cache.get(preset_key) or {})
+        spend = ((_bucket.get("metrics") or {}).get("insights") or {}).get("spend", 0) or 0
 
         cpl = round(spend / preset_leads, 2) if preset_leads > 0 else 0
 
+        # Patch BOTH shapes while the split is dual-writing. Writing only the
+        # legacy bucket would leave presets.<key> holding stale lead counts,
+        # and readers prefer the split shape — so the dashboard would show the
+        # older number.
         update_fields[f"facebook_cache.{preset_key}.metrics.insights.total_leads"] = preset_leads
         update_fields[f"facebook_cache.{preset_key}.metrics.insights.cost_per_result"] = cpl
+        update_fields[f"facebook_cache.presets.{preset_key}.metrics.insights.total_leads"] = preset_leads
+        update_fields[f"facebook_cache.presets.{preset_key}.metrics.insights.cost_per_result"] = cpl
 
         logger.info(f"  Updated preset '{preset_key}': {preset_leads} leads, CPL={cpl}")
 

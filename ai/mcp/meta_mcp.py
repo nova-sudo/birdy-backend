@@ -124,19 +124,23 @@ async def _get_cached_data(db, user_id, level, group_ids=None, start_date=None, 
         query,
         {
             "id": 1, "name": 1,
+            # Split shape: identity once, plus this preset's metrics.
+            "facebook_cache.entities": 1,
+            f"facebook_cache.presets.{preset}": 1,
+            # Legacy bucket, for groups not yet refreshed since the split.
             f"facebook_cache.{preset}": 1,
-            "facebook_cache.campaigns": 1,
-            "facebook_cache.adsets": 1,
-            "facebook_cache.ads": 1,
         },
     ).to_list(None)
 
     results = []
     for g in groups:
         cache = g.get("facebook_cache", {})
-        # Try preset-specific data first, fall back to top-level (backward compat)
-        preset_data = cache.get(preset, {})
-        items = preset_data.get(level, []) or cache.get(level, [])
+        # read_preset prefers the split shape and falls back to the legacy
+        # bucket, so this works either side of the migration. The flat
+        # top-level campaigns/adsets/ads are deliberately no longer consulted:
+        # they are the ALL-TIME copies, so falling back to them served
+        # lifetime rows under whatever window was asked for.
+        items = read_preset(cache, preset).get(level, [])
 
         for item in items:
             item["client_group_id"] = g.get("id")

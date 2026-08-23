@@ -23,10 +23,13 @@ def _evaluate_formula_parts(formula_parts: list, row_data: dict) -> float:
 
 def _get_insights(group: dict, preset: str) -> dict:
     fb = group.get("facebook_cache") or {}
-    preset_data = fb.get(preset, {})
-    insights = preset_data.get("metrics", {}).get("insights", {})
+    # Split shape first (facebook_cache.presets.<preset>), then the legacy
+    # bucket for groups not yet refreshed since the split, then the flat
+    # lifetime metrics as a last resort.
+    preset_data = (fb.get("presets") or {}).get(preset) or fb.get(preset) or {}
+    insights = (preset_data.get("metrics") or {}).get("insights") or {}
     if not insights:
-        insights = fb.get("metrics", {}).get("insights", {})
+        insights = (fb.get("metrics") or {}).get("insights") or {}
     return insights
 
 
@@ -129,9 +132,11 @@ async def _evaluate_scope(
     total_spend = total_impressions = total_clicks = total_reach = total_results = 0.0
     for g in client_groups:
         fb = g.get("facebook_cache") or {}
-        ins = fb.get(meta_preset, {}).get("metrics", {}).get("insights", {})
+        # Split shape first, legacy bucket second, flat lifetime last.
+        bucket = (fb.get("presets") or {}).get(meta_preset) or fb.get(meta_preset) or {}
+        ins = (bucket.get("metrics") or {}).get("insights") or {}
         if not ins:
-            ins = fb.get("metrics", {}).get("insights", {})
+            ins = (fb.get("metrics") or {}).get("insights") or {}
         total_spend       += float(ins.get("spend", 0) or 0)
         total_impressions += float(ins.get("impressions", 0) or 0)
         total_clicks      += float(ins.get("clicks", 0) or 0)
@@ -484,6 +489,8 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
     # Projection — include current + comparison presets
     projection = {
         "id": 1, "name": 1,
+        # Split shape and legacy bucket — _get_insights prefers the former.
+        f"facebook_cache.presets.{meta_preset}.metrics.insights": 1,
         f"facebook_cache.{meta_preset}.metrics.insights": 1,
         "facebook_cache.metrics.insights": 1,
         # Call Center (HotProspector) per-preset call stats + lifetime summary
@@ -492,8 +499,10 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
         "hotprospector_cache.metrics": 1,
     }
     if pct_config.get("mode") == "subtract":
+        projection[f"facebook_cache.presets.{pct_config['wider']}.metrics.insights"] = 1
         projection[f"facebook_cache.{pct_config['wider']}.metrics.insights"] = 1
     elif pct_config.get("mode") == "direct":
+        projection[f"facebook_cache.presets.{pct_config['previous']}.metrics.insights"] = 1
         projection[f"facebook_cache.{pct_config['previous']}.metrics.insights"] = 1
 
     # GHL date filter — built once, shared

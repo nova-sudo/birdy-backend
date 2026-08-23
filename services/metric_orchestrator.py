@@ -35,7 +35,9 @@ logger = logging.getLogger(__name__)
 def _meta_insights(group: dict, preset: str) -> dict:
     """Read Meta insights for a specific preset, falling back to legacy flat location."""
     fb = group.get("facebook_cache") or {}
-    preset_doc = fb.get(preset) or {}
+    # Split shape first (facebook_cache.presets.<preset>), then the legacy
+    # per-preset bucket for groups not yet refreshed since the split.
+    preset_doc = (fb.get("presets") or {}).get(preset) or fb.get(preset) or {}
     insights = (preset_doc.get("metrics") or {}).get("insights") or {}
     if not insights:
         # Legacy flat shape

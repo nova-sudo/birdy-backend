@@ -45,6 +45,9 @@ async def compare_periods(db, user_id, preset_a, preset_b, group_ids=None):
         query,
         {
             "id": 1, "name": 1,
+            # Split shape and legacy bucket — preferred in that order below.
+            f"facebook_cache.presets.{preset_a}.metrics": 1,
+            f"facebook_cache.presets.{preset_b}.metrics": 1,
             f"facebook_cache.{preset_a}.metrics": 1,
             f"facebook_cache.{preset_b}.metrics": 1,
             "facebook_cache.currency": 1,
@@ -58,8 +61,14 @@ async def compare_periods(db, user_id, preset_a, preset_b, group_ids=None):
 
     for g in groups:
         fb = g.get("facebook_cache", {})
-        ins_a = fb.get(preset_a, {}).get("metrics", {}).get("insights", {})
-        ins_b = fb.get(preset_b, {}).get("metrics", {}).get("insights", {})
+        _split = fb.get("presets") or {}
+
+        def _insights(preset):
+            bucket = _split.get(preset) or fb.get(preset) or {}
+            return (bucket.get("metrics") or {}).get("insights") or {}
+
+        ins_a = _insights(preset_a)
+        ins_b = _insights(preset_b)
 
         row_a = {k: _safe_float(ins_a.get(k)) or 0 for k in _COMPARE_METRICS}
         row_b = {k: _safe_float(ins_b.get(k)) or 0 for k in _COMPARE_METRICS}

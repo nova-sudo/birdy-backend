@@ -102,7 +102,12 @@ async def _rewrite_cached_status(mongo_client, user_id: str, object_type: str,
     new_status = status.capitalize()  # "Active"/"Paused" — matches Meta's cached format
     collection_key = _COLLECTION_KEY[object_type]
 
-    paths = [f"facebook_cache.{p}.{collection_key}" for p in META_CACHE_PRESETS]
+    # In the split shape `status` lives once, on the entity identity, rather
+    # than being repeated in every preset bucket — so this is one update
+    # instead of thirteen. The legacy paths stay for groups not yet refreshed
+    # since the split.
+    paths = [f"facebook_cache.entities.{collection_key}"]
+    paths += [f"facebook_cache.{p}.{collection_key}" for p in META_CACHE_PRESETS]
     paths.append(f"facebook_cache.{collection_key}")  # backward-compat top-level
 
     for path in paths:

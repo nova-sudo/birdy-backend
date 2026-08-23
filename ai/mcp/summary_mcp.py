@@ -54,6 +54,7 @@ async def get_account_summary(preset: str = "last_7d", group_ids: list[str] | No
         query,
         {
             "id": 1, "name": 1,
+            f"facebook_cache.presets.{preset}.metrics": 1,
             f"facebook_cache.{preset}.metrics": 1,
             "facebook_cache.currency": 1,
             "facebook_cache.total_leads": 1,
@@ -70,7 +71,8 @@ async def get_account_summary(preset: str = "last_7d", group_ids: list[str] | No
 
     for g in groups:
         fb = g.get("facebook_cache", {})
-        preset_data = fb.get(preset, {})
+        # Split shape first, legacy bucket second.
+        preset_data = (fb.get("presets") or {}).get(preset) or fb.get(preset) or {}
         insights = preset_data.get("metrics", {}).get("insights", {})
         ghl = g.get("gohighlevel_cache", {}).get("metrics", {})
 

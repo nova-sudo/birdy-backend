@@ -2235,17 +2235,20 @@ async def get_unified_leads(
                     group_docs = await db["client_groups"].find(
                         {"user_id": current_user},
                         {
+                            # Only id -> name maps are built below, which is
+                            # exactly what facebook_cache.entities holds — and
+                            # it holds it once rather than per preset. Falls
+                            # back to the legacy maximum bucket for groups not
+                            # yet refreshed since the split.
+                            "facebook_cache.entities": 1,
                             "facebook_cache.maximum.ads": 1,
                             "facebook_cache.maximum.campaigns": 1,
                             "facebook_cache.maximum.adsets": 1,
-                            "facebook_cache.ads": 1,
-                            "facebook_cache.campaigns": 1,
-                            "facebook_cache.adsets": 1,
                         }
                     ).to_list(None)
                     for gdoc in group_docs:
                         fb = gdoc.get("facebook_cache") or {}
-                        preset = fb.get("maximum") or fb
+                        preset = fb.get("entities") or fb.get("maximum") or {}
                         camp_map = {
                             c["id"]: c.get("name", "")
                             for c in (preset.get("campaigns") or [])
