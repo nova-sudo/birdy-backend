@@ -84,10 +84,20 @@ router = APIRouter()
 @router.get("/api/client-groups")
 async def get_client_groups(
     date_preset: Optional[str] = "maximum",
+    include_daily: bool = False,
     current_user: str = Depends(get_current_user),
 ):
     """
     Return all client groups for the current user.
+
+    include_daily  serve the per-day series (`gohighlevel.daily_leads`,
+                   `facebook.daily_spend`, `hotprospector.daily_calls`).
+                   Off by default: only the hubs that draw trend charts read
+                   them, but every caller was paying for them — 6.38 MB across
+                   67 groups, of which the Clients page alone carried 3.79 MB
+                   of lead history it never plots. When omitted the fields are
+                   absent rather than empty, so a chart reading them can tell
+                   "not requested" from "no data".
 
     Meta metrics  -> served from facebook_cache.<preset_key> sub-document.
     GHL contacts  -> total_contacts always lifetime (from gohighlevel_cache);
@@ -179,9 +189,13 @@ async def get_client_groups(
                 "facebook_cache.original_currency": 1,
                 "facebook_cache.total_leads": 1,
                 "facebook_cache.metrics": 1,
-                "facebook_cache.campaigns": 1,
-                "facebook_cache.adsets": 1,
-                "facebook_cache.ads": 1,
+                # facebook_cache.campaigns/.adsets/.ads are deliberately NOT
+                # projected. They are the flat all-time copies kept for
+                # backward compatibility, and the only path that read them was
+                # the no-cached-window fallback — which served a lifetime
+                # campaign list under whatever window was asked for. Measured
+                # on this user: 4.25 MB of a 17.90 MB response, for data no
+                # correct branch uses.
             }
             client_groups = await client_groups_collection.find(
                 {"user_id": current_user},
@@ -194,13 +208,14 @@ async def get_client_groups(
                     f"ghl_opp_cache.{resolved_preset}": 1,
                     "ghl_opp_cache.maximum": 1,
                     f"ghl_funnel_cache.{resolved_preset}": 1,
-                    "ghl_daily_leads": 1,
-                    "meta_daily_spend": 1,
+                    # Per-day series, only when the caller charts them.
+                    **({"ghl_daily_leads": 1,
+                        "meta_daily_spend": 1,
+                        "hp_daily_calls": 1} if include_daily else {}),
                     **fb_projection,
                     "hotprospector_cache": 1,
                     f"hotprospector_call_cache.{resolved_preset}": 1,
                     "hotprospector_call_cache.maximum": 1,
-                    "hp_daily_calls": 1,
                     "last_ghl_refresh": 1, "last_meta_refresh": 1, "last_hp_refresh": 1,
                     "status": 1,
                     "meta_token_error": 1,
@@ -339,7 +354,26 @@ async def get_client_groups(
                         "daily_spend": daily_spend,
                     }
                 else:
-                    group_data["facebook"] = {**facebook_cache, "daily_spend": daily_spend}
+                    # No cached data for this window. Build the same shape with
+                    # empty entity lists rather than spreading the raw cache:
+                    # that used to fall back to facebook_cache's flat
+                    # campaigns/adsets/ads, which are the *all-time* copies, so
+                    # a group with nothing in the last 30 days was served its
+                    # lifetime campaign list under a 30-day heading. Spreading
+                    # the cache would now also leak the `entities` and `presets`
+                    # sub-documents, which no consumer understands.
+                    group_data["facebook"] = {
+                        "ad_account_id": facebook_cache.get("ad_account_id", group.get("meta_ad_account_id", "")),
+                        "name": facebook_cache.get("name", ""),
+                        "currency": facebook_cache.get("currency", ""),
+                        "total_leads": facebook_cache.get("total_leads", 0),
+                        "campaigns": [],
+                        "adsets": [],
+                        "ads": [],
+                        "metrics": {},
+                        "date_preset": resolved_preset,
+                        "daily_spend": daily_spend,
+                    }
 
                 group_data.pop("meta_daily_spend", None)
                 group_data.pop("ghl_daily_leads", None)
