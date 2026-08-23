@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE
 from core.utils import get_result_value, preset_date_bounds
+from services.facebook_cache_shape import split_preset_data
 from integrations.facebook_utils.facebook import get_facebook_token
 
 logger = logging.getLogger(__name__)
@@ -1444,6 +1445,24 @@ async def fetch_meta_all_presets_for_group(
         "last_meta_refresh": datetime.utcnow(),
         "last_meta_refresh_mode": "full_presets" if len(preset_data) >= 10 else "frequent_only",
     }
+
+    # ── Dual-write: split shape alongside the legacy buckets ──────────────
+    #
+    # Each legacy bucket carries a full copy of the account's campaigns, adsets
+    # and ads — the same 489 ad ids, byte-identical, in all thirteen. Only the
+    # numbers differ. Storing identity once takes the largest group from
+    # 7.48 MB to about 1.03 MB, i.e. 45% of MongoDB's 16 MB hard limit down
+    # to 6%.
+    #
+    # Both shapes are written until every reader is on the new one; readers use
+    # services/facebook_cache_shape.read_preset, which prefers the split shape
+    # and falls back to the legacy bucket. Dropping the legacy keys before the
+    # readers move would blank the dashboard for any group that has not
+    # refreshed since.
+    entities, split_presets = split_preset_data(preset_data)
+    facebook_cache_update["facebook_cache.entities"] = entities
+    for preset_key, bucket in split_presets.items():
+        facebook_cache_update[f"facebook_cache.presets.{preset_key}"] = bucket
 
     for preset_key, data in preset_data.items():
         facebook_cache_update[f"facebook_cache.{preset_key}"] = data

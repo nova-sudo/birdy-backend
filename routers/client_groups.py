@@ -70,6 +70,7 @@ from services.ghl_service import (
     get_tag_metrics_from_cache,
 )
 from services.contact_classifier import classify_contact_type
+from services.facebook_cache_shape import read_preset
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +165,13 @@ async def get_client_groups(
             # -- Fetch groups from DB --
             # Only project the specific preset bucket requested, not all 13
             fb_projection = {
+                # Split shape: entity identity once, plus this preset's metrics.
+                # Projecting only the requested preset is the whole point —
+                # pulling all thirteen was most of the 13.5 MB this endpoint
+                # used to return.
+                "facebook_cache.entities": 1,
+                f"facebook_cache.presets.{resolved_preset}": 1,
+                # Legacy bucket, for groups not yet refreshed since the split.
                 f"facebook_cache.{resolved_preset}": 1,
                 "facebook_cache.ad_account_id": 1,
                 "facebook_cache.name": 1,
@@ -302,7 +310,12 @@ async def get_client_groups(
 
                 # -- Meta: read preset sub-document --
                 facebook_cache = group.get("facebook_cache") or {}
-                preset_doc = facebook_cache.get(resolved_preset)
+                # Prefers facebook_cache.entities + .presets.<key> and falls
+                # back to the legacy per-preset bucket, so a group that has not
+                # refreshed since the split still serves. The rehydrated shape
+                # is identical either way — this is a storage change, and the
+                # response must not move.
+                preset_doc = read_preset(facebook_cache, resolved_preset)
 
                 # Measured per-day spend for the whole retained window. The
                 # caller slices it to the selected range — it is a few hundred
