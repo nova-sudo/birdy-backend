@@ -127,6 +127,19 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         # across every location on the "All Clients" view) before it could
         # skip/limit. These two cover both query shapes so the sort comes
         # straight from the index instead.
+        # save_hotprospector_leads_to_collection upserts one UpdateOne per lead,
+        # filtering on (user_id, ghl_location_id, lead_data.id). The index above
+        # stops one field short, so each upsert IXSCANned every lead in the
+        # location and fetched them all to test lead_data.id.
+        # Measured live: 1,707 documents examined to return 1, on a location
+        # holding 1,707 leads — so a full sync of that location is roughly
+        # 1,707 x 1,707 document examinations. It is why
+        # user_id_1_ghl_location_id_1 is the hottest index on the cluster at
+        # ~957,000 ops, ahead of every read path.
+        # Unique because (user_id, ghl_location_id, lead_data.id) IS the
+        # logical key this collection is keyed by — verified zero duplicates
+        # across all 54,792 rows before adding the constraint.
+        ("hotprospector_leads.idx_hpl_user_loc_leadid", db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1), ("lead_data.id", 1)], unique=True, name="idx_hpl_user_loc_leadid", background=True)),
         ("hotprospector_leads.idx_hpl_user_created", db["hotprospector_leads"].create_index([("user_id", 1), ("created_at", -1)], name="idx_hpl_user_created", background=True)),
         ("hotprospector_leads.idx_hpl_user_loc_created", db["hotprospector_leads"].create_index([("user_id", 1), ("ghl_location_id", 1), ("created_at", -1)], name="idx_hpl_user_loc_created", background=True)),
         ("hotprospector_member_daily.idx_hpmd_uniq", db["hotprospector_member_daily"].create_index([("user_id", 1), ("date", 1), ("agentId", 1)], unique=True, name="idx_hpmd_uniq", background=True)),
