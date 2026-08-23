@@ -223,3 +223,54 @@ async def test_an_unknown_account_currency_leaves_rows_unstamped(patch_client):
     assert written == 1
     _filt, update = groups.updates[0]
     assert update["$set"]["meta_daily_spend"] == [{"date": "2026-08-16", "spend": 718.52}]
+
+
+@pytest.mark.asyncio
+async def test_impressions_and_clicks_are_carried_when_meta_reports_them(patch_client):
+    """The Impressions chart preferred measured rows "where the backend puts it
+    on the cached row" — but the request only ever asked for spend, so 0 of
+    18,019 rows carried the field and the measured branch was dead code."""
+    patch_client([{"body": {"data": [
+        {"date_start": "2026-08-16", "spend": "718.52",
+         "impressions": "41233", "clicks": "812"},
+    ]}}])
+
+    rows = await fetch_account_daily_spend("act_1", "T", "2026-08-16", "2026-08-16")
+
+    assert rows == [{
+        "date": "2026-08-16", "spend": 718.52, "impressions": 41233, "clicks": 812,
+    }]
+
+
+@pytest.mark.asyncio
+async def test_a_missing_impression_count_is_omitted_not_zeroed(patch_client):
+    """A day with no impression figure is a gap in what Meta returned, not an
+    ad that served to nobody. The chart plots only days that have the field, so
+    a zero here would draw a trough that never happened."""
+    patch_client([{"body": {"data": [
+        {"date_start": "2026-08-16", "spend": "718.52"},
+    ]}}])
+
+    rows = await fetch_account_daily_spend("act_1", "T", "2026-08-16", "2026-08-16")
+
+    assert rows == [{"date": "2026-08-16", "spend": 718.52}]
+    assert "impressions" not in rows[0]
+
+
+@pytest.mark.asyncio
+async def test_impressions_survive_currency_conversion(patch_client):
+    """Only spend is money. Converting a count would be nonsense, and dropping
+    it would undo the fix above on every non-native-currency account."""
+    patch_client([{"body": {"data": [
+        {"date_start": "2026-08-16", "spend": "100.00", "impressions": "41233"},
+    ]}}])
+    groups = FakeGroups()
+
+    await cache_account_daily_spend(
+        "g1", "act_1", "T", FakeMongo(groups),
+        user_currency="GBP", ad_account_currency="USD",
+    )
+
+    row = groups.updates[0][1]["$set"]["meta_daily_spend"][0]
+    assert row["impressions"] == 41233
+    assert row["spend"] < 100.00

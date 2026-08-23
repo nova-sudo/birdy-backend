@@ -19,10 +19,15 @@ single call per account and one small row per account per day.
 
 Stored on the client group as `meta_daily_spend`:
 
-    [{"date": "2026-08-16", "spend": 718.52, "currency": "GBP",
-      "source_currency": "USD", "fx_rate": 0.743}, ...]
+    [{"date": "2026-08-16", "spend": 718.52, "impressions": 41233, "clicks": 812,
+      "currency": "GBP", "source_currency": "USD", "fx_rate": 0.743}, ...]
 
 sorted by date, one entry per day the account spent anything.
+
+`impressions` and `clicks` are present only when Meta reported them. Rows
+written before they were requested carry neither, and the Impressions chart
+falls back to scaling the spend curve onto the period's real total for those —
+labelled as an estimate rather than passed off as measured.
 
 `spend` is denominated in `currency`, matching what `facebook_cache` holds, so
 the chart and the preset totals above it are in the same money. Rows used to be
@@ -169,7 +174,13 @@ async def fetch_account_daily_spend(
         # No `level` — account-level totals are what the portfolio chart sums.
         "time_increment": "1",
         "time_range": f'{{"since":"{since}","until":"{until}"}}',
-        "fields": "spend,date_start",
+        # impressions and clicks ride along on the same row Meta already
+        # returns, at no extra request. Without them the Impressions chart had
+        # nothing measured to draw: it fell back to scaling the spend curve
+        # onto the period's real impression total, so the shape was inferred
+        # from spend while the headline was a measurement. That fallback stays
+        # for dates before this shipped, but it should not be the only path.
+        "fields": "spend,impressions,clicks,date_start",
         "limit": PAGE_LIMIT,
     }
 
@@ -193,8 +204,18 @@ async def fetch_account_daily_spend(
 
             for row in data.get("data", []):
                 day = row.get("date_start")
-                if day:
-                    rows.append({"date": day, "spend": _num(row.get("spend"))})
+                if not day:
+                    continue
+                entry = {"date": day, "spend": _num(row.get("spend"))}
+                # Only carried when Meta actually reported them. A missing
+                # figure is a gap, not a day that served to nobody, and the
+                # chart distinguishes the two — it plots only the days whose
+                # row has an impression count, rather than drawing a zero.
+                if row.get("impressions") is not None:
+                    entry["impressions"] = int(_num(row.get("impressions")))
+                if row.get("clicks") is not None:
+                    entry["clicks"] = int(_num(row.get("clicks")))
+                rows.append(entry)
 
             next_url = (data.get("paging") or {}).get("next")
             if not next_url:
