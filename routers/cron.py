@@ -20,6 +20,8 @@ Endpoints (Vercel crons invoke with GET):
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
     GET /api/cron/alerts            — hourly       (alert evaluation)
+    GET /api/cron/prune-call-payloads — daily 03:40 (strip call_logs raw bodies
+                                                     past the retention window)
 """
 
 import asyncio
@@ -642,3 +644,75 @@ async def suggestions_monthly(authorization: str | None = Header(default=None)):
         logger.error(f"[suggestions-monthly] raised: {e}", exc_info=True)
 
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
+# ---------------------------------------------------------------------------
+# Call-log payload pruning — daily
+# ---------------------------------------------------------------------------
+
+@router.get("/prune-call-payloads")
+async def prune_call_payloads(authorization: str | None = Header(default=None)):
+    """
+    Drop `raw_payload` and `headers` from call_logs older than the retention
+    window, keeping the row itself.
+
+    Why a cron rather than a TTL index: MongoDB TTL removes the whole
+    document, and there is no per-field expiry. A TTL on call_logs would
+    delete the call history itself, which every Sales Hub and Call Centre
+    figure would notice.
+
+    What is kept: every normalized field — direction, status, duration,
+    started_at, ended_at, recording_url, contact details. No date preset,
+    chart or report reads the two fields being removed. The call statistics
+    are computed from `hotprospector_leads`, not from here
+    (services/hp_service.py::_load_stored_calls), so nothing user-facing
+    changes at any window including "maximum".
+
+    What is lost: the verbatim webhook body, past the window. That is a
+    forensic artifact for "the provider says they sent this call, did we
+    receive it?" — not reporting data.
+
+    Why it is needed: ingestion started in earnest in July 2026 and runs at
+    roughly 50,000 calls a month. raw_payload + headers average ~1 KB per
+    row, so this grows about 50 MB a month, unbounded. Pruning caps it near
+    RETAIN_DAYS' worth.
+
+    Idempotent — rows already pruned no longer match the filter.
+    """
+    _verify_cron_auth(authorization)
+
+    RETAIN_DAYS = 90
+    tick_start = time.monotonic()
+    cutoff = datetime.utcnow() - timedelta(days=RETAIN_DAYS)
+
+    modified = 0
+    try:
+        async with get_mongo_client() as mongo_client:
+            db = mongo_client[DB_NAME]
+            result = await db["call_logs"].update_many(
+                {
+                    "received_at": {"$lt": cutoff},
+                    # Only rows that still carry a payload, so a re-run is a
+                    # no-op rather than a full-collection write.
+                    "$or": [
+                        {"raw_payload": {"$exists": True}},
+                        {"headers": {"$exists": True}},
+                    ],
+                },
+                {"$unset": {"raw_payload": "", "headers": ""}},
+            )
+            modified = result.modified_count
+        if modified:
+            logger.info(
+                "[prune-call-payloads] Stripped payloads from %d call_logs rows "
+                "older than %d days", modified, RETAIN_DAYS,
+            )
+    except Exception as e:
+        logger.error(f"[prune-call-payloads] raised: {e}", exc_info=True)
+
+    return {
+        "ok": True,
+        "retain_days": RETAIN_DAYS,
+        "pruned": modified,
+        "elapsed_seconds": round(time.monotonic() - tick_start, 2),
+    }

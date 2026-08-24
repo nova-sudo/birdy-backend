@@ -220,6 +220,16 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         # "Query Targeting: Scanned Objects / Returned > 1000" Atlas alert
         # (measured live: ~18,000 docs scanned per 1-doc job_id lookup, on a
         # cron that runs every minute). These cover every query shape in that file.
+        # Job records are refresh bookkeeping, not product data — nothing in
+        # the app reads them beyond debugging a recent failure, and no date
+        # preset touches them. They were never pruned: 20,841 of 28,078 rows
+        # were over 30 days old, ~26 MB. 30-day TTL.
+        ("meta_refresh_jobs.idx_mrj_ttl", db["meta_refresh_jobs"].create_index(
+            [("created_at", 1)],
+            name="idx_mrj_ttl",
+            expireAfterSeconds=30 * 24 * 3600,
+            background=True,
+        )),
         ("meta_refresh_jobs.idx_mrj_job_id", db["meta_refresh_jobs"].create_index("job_id", name="idx_mrj_job_id", background=True)),
         ("meta_refresh_jobs.idx_mrj_group_created", db["meta_refresh_jobs"].create_index([("group_id", 1), ("created_at", -1)], name="idx_mrj_group_created", background=True)),
         ("meta_refresh_jobs.idx_mrj_group_status", db["meta_refresh_jobs"].create_index([("group_id", 1), ("status", 1)], name="idx_mrj_group_status", background=True)),

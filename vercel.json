@@ -47,6 +47,10 @@
     {
       "path": "/api/cron/suggestions-monthly",
       "schedule": "0 6 1 * *"
+    },
+    {
+      "path": "/api/cron/prune-call-payloads",
+      "schedule": "40 3 * * *"
     }
   ]
 }
