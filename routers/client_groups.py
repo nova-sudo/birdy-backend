@@ -84,7 +84,7 @@ router = APIRouter()
 @router.get("/api/client-groups")
 async def get_client_groups(
     date_preset: Optional[str] = "maximum",
-    include_daily: bool = False,
+    include_daily: bool = True,
     current_user: str = Depends(get_current_user),
 ):
     """
@@ -92,12 +92,23 @@ async def get_client_groups(
 
     include_daily  serve the per-day series (`gohighlevel.daily_leads`,
                    `facebook.daily_spend`, `hotprospector.daily_calls`).
-                   Off by default: only the hubs that draw trend charts read
-                   them, but every caller was paying for them — 6.38 MB across
-                   67 groups, of which the Clients page alone carried 3.79 MB
-                   of lead history it never plots. When omitted the fields are
-                   absent rather than empty, so a chart reading them can tell
-                   "not requested" from "no data".
+
+                   Defaults to TRUE, and deliberately so. Only the hubs that
+                   draw trend charts read these — 6.38 MB across 67 groups, of
+                   which the Clients page alone carried 3.79 MB of lead history
+                   it never plots — so the saving comes from callers opting
+                   OUT, not from callers having to know to opt in.
+
+                   Defaulting it off was a mistake, shipped and reverted: any
+                   caller unaware of the parameter silently lost its data. A
+                   stale bundle, a cached page, a direct API consumer or the AI
+                   tools would all render zeros with no error, which is exactly
+                   what happened — the Lead Hub tiles read 0 while its own
+                   table, served by a different endpoint, read 1,459.
+
+                   A new parameter must not change what existing callers get.
+                   Opting out costs a caller nothing worse than a larger
+                   payload; opting in wrongly costs it correctness.
 
     Meta metrics  -> served from facebook_cache.<preset_key> sub-document.
     GHL contacts  -> total_contacts always lifetime (from gohighlevel_cache);
