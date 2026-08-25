@@ -295,7 +295,7 @@ async def set_slack_brief(
 # review endpoint can serve partial results while the job runs.
 
 REVIEW_PREP_STALE_MINUTES = 10
-AI_MATCH_MODEL = "claude-haiku-4-5-20251001"
+AI_MATCH_MODEL = "gpt-4o"
 
 
 async def _latest_contact(location_id: str, access_token: str) -> tuple[Optional[str], int]:
@@ -333,14 +333,18 @@ async def _latest_contact(location_id: str, access_token: str) -> tuple[Optional
 
 async def _ai_match_accounts(unmatched: list[dict], fb_accounts: list[dict]) -> dict[str, str]:
     """Match remaining GHL sub-accounts to Meta ad accounts with one call to
-    Birdy's own Anthropic account. Returns {location_id: ad_account_id};
-    degrades to {} on any failure — similarity matches already cover the
-    obvious cases, so this only ever adds."""
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key or not unmatched or not fb_accounts:
+    Birdy's own OpenAI account (OPENAI_API_KEY — not the users' BYOK keys).
+    Returns {location_id: ad_account_id}; degrades to {} on any failure —
+    similarity matches already cover the obvious cases, so this only ever
+    adds."""
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not unmatched or not fb_accounts:
+        return {}
+    if not api_key:
+        logger.warning("AI account matching skipped: OPENAI_API_KEY is not set")
         return {}
     try:
-        from anthropic import AsyncAnthropic
+        from openai import AsyncOpenAI
 
         subaccount_lines = "\n".join(f"- {u['location_id']}: {u['name']}" for u in unmatched[:100])
         account_lines = "\n".join(f"- {a['id']}: {a.get('name', '')}" for a in fb_accounts[:200])
@@ -354,13 +358,14 @@ async def _ai_match_accounts(unmatched: list[dict], fb_accounts: list[dict]) -> 
             "confident matches only. Never map two sub-accounts to the same ad account. "
             "Omit sub-accounts with no plausible match. No prose, no code fences."
         )
-        client = AsyncAnthropic(api_key=api_key)
-        message = await client.messages.create(
+        client = AsyncOpenAI(api_key=api_key)
+        completion = await client.chat.completions.create(
             model=AI_MATCH_MODEL,
             max_tokens=2000,
+            response_format={"type": "json_object"},
             messages=[{"role": "user", "content": prompt}],
         )
-        text = "".join(b.text for b in message.content if getattr(b, "type", "") == "text").strip()
+        text = (completion.choices[0].message.content or "").strip()
         text = re.sub(r"^```(?:json)?|```$", "", text, flags=re.M).strip()
         raw = json.loads(text)
         valid_locations = {u["location_id"] for u in unmatched}
