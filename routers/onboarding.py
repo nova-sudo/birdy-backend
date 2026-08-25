@@ -63,6 +63,7 @@ ALLOWED_DATA_KEYS = {
     "kpi",                   # {cpa, wins, conv_rate, save_default}
     "slack",                 # {channel_id, channel_name, frequency, time, day, brief_items}
     "wants_sync",
+    "skipped",               # step keys the user skipped past (un-set if later completed)
 }
 
 BRIEF_ITEM_KEYS = {"spend", "leads", "conversion", "top", "alerts", "underperform"}
