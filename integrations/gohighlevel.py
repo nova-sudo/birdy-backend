@@ -721,51 +721,67 @@ class GHLIntegration:
                 "page": page
             }
 
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                response = await client.post(url, json=payload, headers=headers)
-
-                if response.status_code == 200:
-                    data = response.json()
-
-                    # Extract from ACTUAL response format
-                    contacts = data.get("contacts", [])
-                    total = data.get("total", 0)
-                    trace_id = data.get("traceId", "")
-
-                    # Calculate pagination metadata ourselves
-                    total_pages = (total + limit - 1) // limit if total > 0 else 0
-                    has_next = page < total_pages
-                    has_prev = page > 1
-
-                    logger.info(
-                        f"✅ Fetched page {page}: {len(contacts)} contacts "
-                        f"(total: {total}, pages: {total_pages})"
+            # Retry a timed-out/dropped request a couple of times before giving
+            # up — a single slow page used to kill the whole FULL LOAD (see
+            # fetch_and_cache_ghl_data_optimized), so transient network hiccups
+            # deserve a retry, not an immediate failure.
+            max_attempts = 3
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        response = await client.post(url, json=payload, headers=headers)
+                    break
+                except (httpx.TimeoutException, httpx.TransportError) as e:
+                    if attempt == max_attempts:
+                        raise
+                    logger.warning(
+                        f"⏱️ Contacts page {page} attempt {attempt}/{max_attempts} "
+                        f"failed ({e.__class__.__name__}); retrying"
                     )
+                    await asyncio.sleep(1.5 * attempt)
 
-                    return True, {
-                        "contacts": contacts,
+            if response.status_code == 200:
+                data = response.json()
+
+                # Extract from ACTUAL response format
+                contacts = data.get("contacts", [])
+                total = data.get("total", 0)
+                trace_id = data.get("traceId", "")
+
+                # Calculate pagination metadata ourselves
+                total_pages = (total + limit - 1) // limit if total > 0 else 0
+                has_next = page < total_pages
+                has_prev = page > 1
+
+                logger.info(
+                    f"✅ Fetched page {page}: {len(contacts)} contacts "
+                    f"(total: {total}, pages: {total_pages})"
+                )
+
+                return True, {
+                    "contacts": contacts,
+                    "total": total,
+                    "traceId": trace_id,
+                    # Add calculated metadata for convenience
+                    "meta": {
                         "total": total,
-                        "traceId": trace_id,
-                        # Add calculated metadata for convenience
-                        "meta": {
-                            "total": total,
-                            "currentPage": page,
-                            "totalPages": total_pages,
-                            "hasNext": has_next,
-                            "hasPrev": has_prev,
-                            "pageLimit": limit
-                        }
+                        "currentPage": page,
+                        "totalPages": total_pages,
+                        "hasNext": has_next,
+                        "hasPrev": has_prev,
+                        "pageLimit": limit
                     }
-                else:
-                    error_detail = response.text
-                    logger.error(
-                        f"❌ GHL Search API error: {response.status_code} - {error_detail}"
-                    )
-                    return False, {
-                        "error": f"API error: {response.status_code}",
-                        "status_code": response.status_code,
-                        "detail": error_detail
-                    }
+                }
+            else:
+                error_detail = response.text
+                logger.error(
+                    f"❌ GHL Search API error: {response.status_code} - {error_detail}"
+                )
+                return False, {
+                    "error": f"API error: {response.status_code}",
+                    "status_code": response.status_code,
+                    "detail": error_detail
+                }
 
         except httpx.TimeoutException:
             logger.error(f"⏱️ Timeout fetching contacts for location {location_id}")

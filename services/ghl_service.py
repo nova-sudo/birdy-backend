@@ -6,6 +6,7 @@ GoHighLevel service / helper functions extracted from main.py.
 
 import asyncio
 import logging
+import uuid
 from collections import Counter
 from datetime import datetime
 
@@ -496,14 +497,15 @@ async def fetch_and_cache_ghl_data_optimized(
                         f"(ID: {last_known_contact_id})"
                     )
 
+        # FULL LOAD writes into a fresh batch instead of deleting up front, so a
+        # fetch that dies partway through (timeout, GHL error, ...) never leaves
+        # the location with fewer contacts than it had before this run — the old
+        # batch is only removed once the new one is confirmed complete (STEP 4b).
+        sync_batch_id = str(uuid.uuid4()) if is_initial_load else None
+        pagination_failed = False
+
         if is_initial_load:
             logger.info(f"FULL LOAD: Fetching all contacts for {location_name}")
-            # Delete existing contacts for clean slate
-            delete_result = await contacts_collection.delete_many({
-                "user_id": user_id,
-                "location_id": ghl_location_id
-            })
-            logger.info(f"Deleted {delete_result.deleted_count} existing contacts")
 
         # ============================================
         # STEP 2: Fetch contacts using NEW page-based API
@@ -533,6 +535,7 @@ async def fetch_and_cache_ghl_data_optimized(
 
                 if not success:
                     logger.error(f"Failed to fetch page {page}: {result.get('error')}")
+                    pagination_failed = True
                     break
 
                 # Extract from ACTUAL response format
@@ -619,6 +622,7 @@ async def fetch_and_cache_ghl_data_optimized(
                                 # don't need to unwind contact_data. See contact_classifier.py.
                                 "lead_type": classify_contact_type(contact),
                                 "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
+                                "sync_batch_id": sync_batch_id,
                                 "created_at": datetime.now(),
                                 "updated_at": datetime.now()
                             })
@@ -704,7 +708,43 @@ async def fetch_and_cache_ghl_data_optimized(
 
             except Exception as e:
                 logger.error(f"Error on page {page}: {str(e)}", exc_info=True)
+                pagination_failed = True
                 break
+
+        # ============================================
+        # STEP 4b: Commit or roll back the FULL LOAD batch
+        # ============================================
+        # Only now — after the fetch is confirmed complete — do we touch the
+        # location's prior contacts. A failed/partial fetch discards just the
+        # partial batch it wrote and leaves the previous data exactly as it
+        # was; a completed fetch swaps the old batch out for the new one.
+        if is_initial_load:
+            if pagination_failed:
+                rollback = await contacts_collection.delete_many({
+                    "user_id": user_id,
+                    "location_id": ghl_location_id,
+                    "sync_batch_id": sync_batch_id,
+                })
+                logger.error(
+                    f"FULL LOAD for {location_name} did not complete "
+                    f"(stopped at page {page}/{total_pages or '?'}, "
+                    f"{total_new_contacts}/{total_contacts_api or '?'} contacts fetched) — "
+                    f"discarded {rollback.deleted_count} partial contacts, kept prior data"
+                )
+                raise RuntimeError(
+                    f"GHL FULL LOAD incomplete for {location_name}: "
+                    f"stopped at page {page}/{total_pages or '?'}"
+                )
+
+            old_batch = await contacts_collection.delete_many({
+                "user_id": user_id,
+                "location_id": ghl_location_id,
+                "sync_batch_id": {"$ne": sync_batch_id},
+            })
+            logger.info(
+                f"FULL LOAD for {location_name} complete: replaced "
+                f"{old_batch.deleted_count} old contacts with {total_new_contacts} freshly synced"
+            )
 
         # ============================================
         # STEP 5: Update cached tag metrics
