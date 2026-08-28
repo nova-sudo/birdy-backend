@@ -497,10 +497,12 @@ async def fetch_and_cache_ghl_data_optimized(
                         f"(ID: {last_known_contact_id})"
                     )
 
-        # FULL LOAD writes into a fresh batch instead of deleting up front, so a
-        # fetch that dies partway through (timeout, GHL error, ...) never leaves
-        # the location with fewer contacts than it had before this run — the old
-        # batch is only removed once the new one is confirmed complete (STEP 4b).
+        # FULL LOAD no longer deletes up front. Every contact it sees gets
+        # upserted in place and tagged with this run's sync_batch_id (STEP 4);
+        # stale contacts (still tagged with an older/no batch id) are only
+        # pruned once the fetch is confirmed complete (STEP 4b) — so a fetch
+        # that dies partway through (timeout, GHL error, ...) never leaves the
+        # location with fewer contacts than it had before this run.
         sync_batch_id = str(uuid.uuid4()) if is_initial_load else None
         pagination_failed = False
 
@@ -603,89 +605,73 @@ async def fetch_and_cache_ghl_data_optimized(
                 # ============================================
                 # STEP 4: Save contacts to database
                 # ============================================
+                # Always an upsert keyed on (location_id, contact_id) — the pair
+                # `location_contact_unique` enforces as unique — never a raw
+                # insert. FULL LOAD used to insert_many() fresh documents after
+                # wiping the location's contacts up front; now that the wipe
+                # only happens *after* a confirmed-complete fetch (STEP 4b
+                # below), a FULL LOAD page can land on contacts that still have
+                # their old documents in place, and insert_many() would throw
+                # E11000 duplicate key errors on every one of them. Upserting
+                # in place is correct either way: FULL LOAD refreshes each
+                # contact's data and tags it with this run's sync_batch_id;
+                # INCREMENTAL does the same minus the batch tag.
                 if contacts_to_save:
-                    if is_initial_load:
-                        # FULL LOAD: Insert all as new documents
-                        contact_docs = []
-                        for contact in contacts_to_save:
-                            contact_docs.append({
-                                "user_id": user_id,
-                                "location_id": ghl_location_id,
-                                "location_name": location_name,
-                                "location_address": location_address,
-                                "client_group_id": group_id,
-                                "client_group_name": client_group_name,
-                                "contact_id": contact.get("id"),
-                                "contact_data": contact,
-                                # Top-level lead_type, computed from the contact's first-touch
-                                # attribution. Stored so Mongo aggregations / count queries
-                                # don't need to unwind contact_data. See contact_classifier.py.
-                                "lead_type": classify_contact_type(contact),
-                                "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
-                                "sync_batch_id": sync_batch_id,
-                                "created_at": datetime.now(),
-                                "updated_at": datetime.now()
-                            })
+                    from pymongo import UpdateOne
+                    bulk_operations = []
 
-                        if contact_docs:
-                            await contacts_collection.insert_many(contact_docs, ordered=False)
-                            total_new_contacts += len(contact_docs)
-                            logger.info(
-                                f"Page {page}/{total_pages}: Inserted {len(contact_docs)} contacts "
-                                f"(total: {total_new_contacts}/{total_contacts_api})"
+                    for contact in contacts_to_save:
+                        contact_id = contact.get("id")
+
+                        contact_doc = {
+                            "user_id": user_id,
+                            "location_id": ghl_location_id,
+                            "location_name": location_name,
+                            "location_address": location_address,
+                            "client_group_id": group_id,
+                            "client_group_name": client_group_name,
+                            "contact_id": contact_id,
+                            "contact_data": contact,
+                            # Re-classified on every upsert so a GHL workflow that
+                            # later stamps `attributionSource` correctly updates an
+                            # existing contact from "contact" to "lead".
+                            "lead_type": classify_contact_type(contact),
+                            "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
+                            "updated_at": datetime.now()
+                        }
+                        if is_initial_load:
+                            # Marks which contacts this FULL LOAD actually touched,
+                            # so STEP 4b can tell "still in GHL" apart from "GHL
+                            # stopped returning this one" once the fetch completes.
+                            contact_doc["sync_batch_id"] = sync_batch_id
+
+                        bulk_operations.append(
+                            UpdateOne(
+                                {
+                                    "user_id": user_id,
+                                    "location_id": ghl_location_id,
+                                    "contact_id": contact_id
+                                },
+                                {
+                                    "$set": contact_doc,
+                                    "$setOnInsert": {"created_at": datetime.now()}
+                                },
+                                upsert=True
                             )
+                        )
 
-                    else:
-                        # INCREMENTAL: Upsert contacts
-                        from pymongo import UpdateOne
-                        bulk_operations = []
+                    if bulk_operations:
+                        result = await contacts_collection.bulk_write(
+                            bulk_operations, ordered=False
+                        )
+                        total_new_contacts += result.upserted_count
+                        total_updated_contacts += result.modified_count
 
-                        for contact in contacts_to_save:
-                            contact_id = contact.get("id")
-
-                            contact_doc = {
-                                "user_id": user_id,
-                                "location_id": ghl_location_id,
-                                "location_name": location_name,
-                                "location_address": location_address,
-                                "client_group_id": group_id,
-                                "client_group_name": client_group_name,
-                                "contact_id": contact_id,
-                                "contact_data": contact,
-                                # Re-classified on every upsert so a GHL workflow that
-                                # later stamps `attributionSource` correctly updates an
-                                # existing contact from "contact" to "lead".
-                                "lead_type": classify_contact_type(contact),
-                                "match_keys": compute_match_keys(contact.get("email"), contact.get("phone")),
-                                "updated_at": datetime.now()
-                            }
-
-                            bulk_operations.append(
-                                UpdateOne(
-                                    {
-                                        "user_id": user_id,
-                                        "location_id": ghl_location_id,
-                                        "contact_id": contact_id
-                                    },
-                                    {
-                                        "$set": contact_doc,
-                                        "$setOnInsert": {"created_at": datetime.now()}
-                                    },
-                                    upsert=True
-                                )
-                            )
-
-                        if bulk_operations:
-                            result = await contacts_collection.bulk_write(
-                                bulk_operations, ordered=False
-                            )
-                            total_new_contacts += result.upserted_count
-                            total_updated_contacts += result.modified_count
-
-                            logger.info(
-                                f"Page {page}/{total_pages}: {result.upserted_count} new, "
-                                f"{result.modified_count} updated"
-                            )
+                        logger.info(
+                            f"Page {page}/{total_pages}: {result.upserted_count} new, "
+                            f"{result.modified_count} updated "
+                            f"(total: {total_new_contacts + total_updated_contacts}/{total_contacts_api})"
+                        )
 
                 total_contacts_processed += len(contacts_batch)
 
@@ -712,38 +698,38 @@ async def fetch_and_cache_ghl_data_optimized(
                 break
 
         # ============================================
-        # STEP 4b: Commit or roll back the FULL LOAD batch
+        # STEP 4b: Prune stale contacts, or bail out without deleting anything
         # ============================================
-        # Only now — after the fetch is confirmed complete — do we touch the
-        # location's prior contacts. A failed/partial fetch discards just the
-        # partial batch it wrote and leaves the previous data exactly as it
-        # was; a completed fetch swaps the old batch out for the new one.
+        # Every contact this run actually saw was just upserted in place
+        # (STEP 4), so a failed/partial fetch never loses data on its own —
+        # whatever pages did complete are simply fresher than before, and
+        # pages that never ran leave their contacts untouched. The only
+        # destructive step is pruning contacts GHL no longer returns, and that
+        # can only be trusted once every page has been seen: only then does a
+        # missing sync_batch_id genuinely mean "gone from GHL" rather than
+        # "we didn't get that far".
         if is_initial_load:
             if pagination_failed:
-                rollback = await contacts_collection.delete_many({
-                    "user_id": user_id,
-                    "location_id": ghl_location_id,
-                    "sync_batch_id": sync_batch_id,
-                })
                 logger.error(
                     f"FULL LOAD for {location_name} did not complete "
                     f"(stopped at page {page}/{total_pages or '?'}, "
-                    f"{total_new_contacts}/{total_contacts_api or '?'} contacts fetched) — "
-                    f"discarded {rollback.deleted_count} partial contacts, kept prior data"
+                    f"{total_new_contacts + total_updated_contacts}/{total_contacts_api or '?'} "
+                    f"contacts synced this run) — leaving existing contacts as-is, no pruning"
                 )
                 raise RuntimeError(
                     f"GHL FULL LOAD incomplete for {location_name}: "
                     f"stopped at page {page}/{total_pages or '?'}"
                 )
 
-            old_batch = await contacts_collection.delete_many({
+            stale = await contacts_collection.delete_many({
                 "user_id": user_id,
                 "location_id": ghl_location_id,
                 "sync_batch_id": {"$ne": sync_batch_id},
             })
             logger.info(
-                f"FULL LOAD for {location_name} complete: replaced "
-                f"{old_batch.deleted_count} old contacts with {total_new_contacts} freshly synced"
+                f"FULL LOAD for {location_name} complete: "
+                f"{total_new_contacts} new, {total_updated_contacts} updated, "
+                f"pruned {stale.deleted_count} no-longer-in-GHL contacts"
             )
 
         # ============================================
