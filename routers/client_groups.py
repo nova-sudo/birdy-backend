@@ -76,6 +76,14 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Health is derived weekly from the client's monthly closes goal — see
+# services/client_health.py for the rule and jobs/health_jobs.py for the pass
+# that writes it. There is deliberately no endpoint to set it by hand: the
+# Monday run would overwrite any such value, leaving two sources of truth that
+# silently disagree. A client the pass has never reached reads as Healthy.
+CLIENT_HEALTH_VALUES = ("Healthy", "Warning", "Critical")
+DEFAULT_CLIENT_HEALTH = "Healthy"
+
 
 # ---------------------------------------------------------------------------
 # GET /api/client-groups
@@ -231,6 +239,11 @@ async def get_client_groups(
                     "status": 1,
                     "meta_token_error": 1,
                     "client_status": 1,
+                    "health": 1,
+                    "health_detail": 1,
+                    # The Client Detail goals strip measures actuals against
+                    # these, and health is derived from monthly_wins.
+                    "targets": 1,
                 },
             ).to_list(None)
 
@@ -249,6 +262,10 @@ async def get_client_groups(
             result = []
             for group in client_groups:
                 group_data = mongo_to_dict(group)
+                # Health is manually set and most clients have never had one
+                # chosen, so resolve the default here rather than leaving every
+                # consumer to invent its own fallback.
+                group_data["health"] = group_data.get("health") or DEFAULT_CLIENT_HEALTH
                 gid = group_data.get("id") or ""
 
                 # -- GHL: merge lifetime cache + windowed counts + preset opp stats --

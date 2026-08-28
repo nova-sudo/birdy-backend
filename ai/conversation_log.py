@@ -42,6 +42,7 @@ async def log_message(
     page: str | None = None,
     tools_used: list | None = None,
     category: str | None = None,
+    client_group_id: str | None = None,
 ) -> None:
     """Append a single conversation message. Best-effort; never raises."""
     try:
@@ -50,6 +51,11 @@ async def log_message(
             "session_id": session_id,
             "source": source,            # "birdy" | "slack"
             "page": page,
+            # Which client the thread is about, when it was opened from a
+            # client's own page. Without this the Client Detail thread list
+            # would show every conversation the user has ever had, including
+            # other clients'.
+            "client_group_id": client_group_id,
             "role": role,                # "user" | "assistant"
             "content": content,
             "tools_used": tools_used or [],
@@ -76,6 +82,10 @@ async def create_conversation_log_indexes(mongo_client) -> None:
     await db[_COLLECTION].create_index(
         [("created_at", -1)],
         name="idx_convlog_created", background=True,
+    )
+    await db[_COLLECTION].create_index(
+        [("user_id", 1), ("client_group_id", 1), ("created_at", -1)],
+        name="idx_convlog_user_client_created", background=True,
     )
     await db[_COLLECTION].create_index(
         [("category", 1), ("created_at", -1)],

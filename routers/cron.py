@@ -629,6 +629,27 @@ async def suggestions_weekly(authorization: str | None = Header(default=None)):
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
 
 
+@router.get("/health-weekly")
+async def health_weekly(authorization: str | None = Header(default=None)):
+    """Recomputes every client's health band from its monthly closes goal.
+
+    Scheduled Monday 06:00, measured through the previous Sunday. APScheduler
+    runs this in-process off Vercel; on Vercel the platform cron calls here.
+    """
+    _verify_cron_auth(authorization)
+
+    from jobs.health_jobs import run_weekly_health
+
+    tick_start = time.monotonic()
+    result = None
+    try:
+        result = await run_weekly_health()
+    except Exception as e:
+        logger.error(f"[health-weekly] raised: {e}", exc_info=True)
+
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
 @router.get("/suggestions-monthly")
 async def suggestions_monthly(authorization: str | None = Header(default=None)):
     """Runs a monthly (last_30d) Birdy suggestion pass over all users."""

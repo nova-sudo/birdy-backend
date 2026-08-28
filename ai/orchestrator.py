@@ -376,6 +376,7 @@ async def run_chat(
             role="user",
             content=message,
             page=page,
+            client_group_id=client_group_id,
             category=classify_query(message),
         )
 
@@ -494,6 +495,7 @@ async def run_chat(
                     role="assistant",
                     content=reply,
                     page=page,
+                    client_group_id=client_group_id,
                     tools_used=tools_used,
                 )
                 await _debit_credits()
@@ -562,6 +564,7 @@ async def run_chat(
             role="assistant",
             content=reply,
             page=page,
+            client_group_id=client_group_id,
             tools_used=tools_used,
         )
         await _debit_credits()

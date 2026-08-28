@@ -46,6 +46,27 @@ class SaveViewRequest(BaseModel):
     visible_columns: list
 
 
+# ── Named page views ──────────────────────────────────────────────────────
+# Distinct from SaveViewRequest above, which persists the single "where I left
+# off" column layout per page. These are user-named presets capturing the whole
+# page state (columns, filters, sort, tab), stored under users.page_views.
+class CreatePageViewRequest(BaseModel):
+    page: str
+    name: str
+    state: dict
+
+
+class UpdatePageViewRequest(BaseModel):
+    page: str
+    name: Optional[str] = None
+    state: Optional[dict] = None
+
+
+class DefaultPageViewRequest(BaseModel):
+    page: str
+    view_id: Optional[str] = None   # None clears the default
+
+
 class AlertCondition(BaseModel):
     metric: str
     operator: str

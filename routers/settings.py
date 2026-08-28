@@ -1,11 +1,19 @@
+import json
 import logging
+import uuid
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Response
 
 from core.config import COOKIE_DOMAIN, COOKIE_SAMESITE, COOKIE_SECURE
 from core.database import DB_NAME
-from core.models import SaveViewRequest, CapabilitiesRequest
+from core.models import (
+    SaveViewRequest,
+    CapabilitiesRequest,
+    CreatePageViewRequest,
+    UpdatePageViewRequest,
+    DefaultPageViewRequest,
+)
 from dependencies import get_mongo_client, get_current_user
 from services import capabilities_service
 
@@ -223,4 +231,324 @@ async def save_user_view(
             return {"success": True, "page": request.page, "saved_columns": len(request.visible_columns)}
         except Exception as e:
             logger.error(f"Error saving view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Named page views
+#
+# Deliberately separate from `saved_views` above. That field holds one column
+# layout per page — "where I left off" — and the tables keep autosaving into it
+# on drag-reorder. These are named presets capturing the whole page state, and
+# live under `page_views` so neither store can corrupt the other and an old
+# frontend against a new backend keeps working unchanged.
+#
+# Shape:
+#   users.page_views.<page> = {
+#     "views": [ { id, name, state, created_at, updated_at }, ... ],
+#     "default_view_id": "<id>" | None,
+#   }
+# ──────────────────────────────────────────────────────────────────────────
+
+MAX_VIEWS_PER_PAGE = 20
+MAX_VIEW_NAME_LEN = 60
+# A page's state is columns + filters + sort — a few KB at most. The ceiling is
+# here so a runaway client can't inflate the user document; see the 16 MB
+# per-document limit noted in docs/mongodb-schema-audit.md.
+MAX_VIEW_STATE_BYTES = 64 * 1024
+
+
+def _clean_view_name(name: str) -> str:
+    cleaned = (name or "").strip()
+    if not cleaned:
+        raise HTTPException(status_code=400, detail="View name is required")
+    if len(cleaned) > MAX_VIEW_NAME_LEN:
+        raise HTTPException(
+            status_code=400,
+            detail=f"View name must be {MAX_VIEW_NAME_LEN} characters or fewer",
+        )
+    return cleaned
+
+
+def _check_view_state(state: dict) -> dict:
+    if not isinstance(state, dict):
+        raise HTTPException(status_code=400, detail="View state must be an object")
+    size = len(json.dumps(state).encode("utf-8"))
+    if size > MAX_VIEW_STATE_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"View state is too large ({size} bytes, limit {MAX_VIEW_STATE_BYTES})",
+        )
+    return state
+
+
+async def _get_page_bucket(db, current_user: str, page: str) -> dict:
+    """Read one page's view bucket, normalised so callers never see a missing key."""
+    user_doc = await db["users"].find_one(
+        {"user_id": current_user}, {f"page_views.{page}": 1}
+    )
+    bucket = ((user_doc or {}).get("page_views") or {}).get(page) or {}
+    return {
+        "views": bucket.get("views") or [],
+        "default_view_id": bucket.get("default_view_id"),
+    }
+
+
+@router.get("/api/user/page-views")
+async def get_page_views(
+    page: str | None = None,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Named page views for the current user.
+
+    With `?page=clients`, returns that page's bucket:
+        { "views": [...], "default_view_id": "..." | null }
+    Without it, returns every page keyed by page slug.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            if page:
+                return await _get_page_bucket(db, current_user, page)
+
+            user_doc = await db["users"].find_one(
+                {"user_id": current_user}, {"page_views": 1}
+            )
+            return (user_doc or {}).get("page_views") or {}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching page views for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/user/page-views")
+async def create_page_view(
+    request: CreatePageViewRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Create a named view. Body: { page, name, state }.
+    The first view saved for a page becomes that page's default.
+    """
+    name = _clean_view_name(request.name)
+    state = _check_view_state(request.state)
+
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            bucket = await _get_page_bucket(db, current_user, request.page)
+
+            if len(bucket["views"]) >= MAX_VIEWS_PER_PAGE:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"You can save up to {MAX_VIEWS_PER_PAGE} views per page. "
+                           "Delete one to make room.",
+                )
+            if any(v.get("name", "").lower() == name.lower() for v in bucket["views"]):
+                raise HTTPException(
+                    status_code=409, detail=f'A view named "{name}" already exists'
+                )
+
+            now = datetime.now().isoformat()
+            view = {
+                "id": uuid.uuid4().hex[:12],
+                "name": name,
+                "state": state,
+                "created_at": now,
+                "updated_at": now,
+            }
+
+            # $push, never a whole-array $set. Rewriting the array from a value
+            # read moments earlier loses any view saved concurrently — two rapid
+            # saves would both succeed and one would vanish. The name guard in
+            # the filter closes the same race on duplicate names.
+            result = await db["users"].update_one(
+                {
+                    "user_id": current_user,
+                    f"page_views.{request.page}.views.name": {"$ne": name},
+                },
+                {
+                    "$push": {f"page_views.{request.page}.views": view},
+                    "$set": {"updated_at": datetime.now()},
+                },
+                upsert=True,
+            )
+            if result.matched_count == 0 and result.upserted_id is None:
+                raise HTTPException(
+                    status_code=409, detail=f'A view named "{name}" already exists'
+                )
+
+            # First view on a page becomes the default, so the next visit lands
+            # on something rather than on an unsaved layout. Conditional in the
+            # filter so only the first view to land claims it.
+            await db["users"].update_one(
+                {
+                    "user_id": current_user,
+                    "$or": [
+                        {f"page_views.{request.page}.default_view_id": None},
+                        {f"page_views.{request.page}.default_view_id": {"$exists": False}},
+                    ],
+                },
+                {"$set": {f"page_views.{request.page}.default_view_id": view["id"]}},
+            )
+
+            logger.info(
+                f"Created page view '{name}' on '{request.page}' for {current_user}"
+            )
+            return view
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error creating page view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.patch("/api/user/page-views/{view_id}")
+async def update_page_view(
+    view_id: str,
+    request: UpdatePageViewRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Rename a view, overwrite its state, or both. Body: { page, name?, state? }.
+    Omitted fields are left as they are.
+    """
+    if request.name is None and request.state is None:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    name = _clean_view_name(request.name) if request.name is not None else None
+    state = _check_view_state(request.state) if request.state is not None else None
+
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            bucket = await _get_page_bucket(db, current_user, request.page)
+
+            index = next(
+                (i for i, v in enumerate(bucket["views"]) if v.get("id") == view_id),
+                None,
+            )
+            if index is None:
+                raise HTTPException(status_code=404, detail="View not found")
+
+            if name is not None and any(
+                v.get("name", "").lower() == name.lower() and v.get("id") != view_id
+                for v in bucket["views"]
+            ):
+                raise HTTPException(
+                    status_code=409, detail=f'A view named "{name}" already exists'
+                )
+
+            view = {**bucket["views"][index], "updated_at": datetime.now().isoformat()}
+            if name is not None:
+                view["name"] = name
+            if state is not None:
+                view["state"] = state
+
+            # Positional update of just this element — ids are unique, so the
+            # first match is the only match. Writing the whole array back would
+            # clobber any view created or edited in between.
+            fields = {
+                f"page_views.{request.page}.views.$.updated_at": view["updated_at"],
+                "updated_at": datetime.now(),
+            }
+            if name is not None:
+                fields[f"page_views.{request.page}.views.$.name"] = name
+            if state is not None:
+                fields[f"page_views.{request.page}.views.$.state"] = state
+
+            await db["users"].update_one(
+                {
+                    "user_id": current_user,
+                    f"page_views.{request.page}.views.id": view_id,
+                },
+                {"$set": fields},
+            )
+            logger.info(
+                f"Updated page view {view_id} on '{request.page}' for {current_user}"
+            )
+            return view
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating page view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.delete("/api/user/page-views/{view_id}")
+async def delete_page_view(
+    view_id: str,
+    page: str,
+    current_user: str = Depends(get_current_user),
+):
+    """Delete a named view. Clears the page default if it pointed here."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            bucket = await _get_page_bucket(db, current_user, page)
+
+            remaining = [v for v in bucket["views"] if v.get("id") != view_id]
+            if len(remaining) == len(bucket["views"]):
+                raise HTTPException(status_code=404, detail="View not found")
+
+            # $pull the one element rather than writing the survivors back, so a
+            # view saved between the read above and this write is not erased.
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {
+                    "$pull": {f"page_views.{page}.views": {"id": view_id}},
+                    "$set": {"updated_at": datetime.now()},
+                },
+            )
+
+            # Never leave default_view_id pointing at a deleted view — the
+            # frontend would fall back to an unsaved layout with no explanation.
+            if bucket["default_view_id"] == view_id:
+                await db["users"].update_one(
+                    {"user_id": current_user},
+                    {"$set": {
+                        f"page_views.{page}.default_view_id":
+                            remaining[0]["id"] if remaining else None,
+                    }},
+                )
+            logger.info(f"Deleted page view {view_id} on '{page}' for {current_user}")
+            return {"success": True, "id": view_id, "remaining": len(remaining)}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting page view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/user/page-views/default")
+async def set_default_page_view(
+    request: DefaultPageViewRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Set (or clear, with view_id: null) the view a page opens on."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            bucket = await _get_page_bucket(db, current_user, request.page)
+
+            if request.view_id is not None and not any(
+                v.get("id") == request.view_id for v in bucket["views"]
+            ):
+                raise HTTPException(status_code=404, detail="View not found")
+
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {"$set": {
+                    f"page_views.{request.page}.default_view_id": request.view_id,
+                    "updated_at": datetime.now(),
+                }},
+                upsert=True,
+            )
+            return {"success": True, "page": request.page, "default_view_id": request.view_id}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error setting default page view for {current_user}: {e}")
             raise HTTPException(status_code=500, detail=str(e))

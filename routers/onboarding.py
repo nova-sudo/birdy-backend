@@ -75,10 +75,31 @@ class OnboardingStateRequest(BaseModel):
 
 
 class TargetsRequest(BaseModel):
-    cpa: Optional[float] = None
-    monthly_wins: Optional[float] = None
-    conversion_rate: Optional[float] = None
+    """
+    Monthly goals for one client — the six the Client Detail design's Targets
+    tab specifies, plus `cpa`, which the onboarding wizard already collects.
+
+    Every field is optional and only the ones sent are written, so the wizard
+    saving its three cannot blank the three it never asks about. That matters
+    more than it looks: `monthly_wins` drives the health band, and wiping it
+    reads as "no target", which resolves to Healthy — an account would quietly
+    stop being monitored.
+    """
+    cpa: Optional[float] = None                 # cost per acquisition
+    cpl: Optional[float] = None                 # cost per lead
+    monthly_wins: Optional[float] = None        # monthly closes — drives health
+    monthly_revenue: Optional[float] = None
+    monthly_spend: Optional[float] = None
+    conversion_rate: Optional[float] = None     # close rate
+    aov: Optional[float] = None                 # average order value
     save_as_default: bool = False
+
+
+# The goal fields, in the order the design's Targets tab lists them.
+TARGET_FIELDS = (
+    "cpl", "monthly_wins", "monthly_revenue",
+    "conversion_rate", "monthly_spend", "aov", "cpa",
+)
 
 
 class BriefConfigRequest(BaseModel):
@@ -218,28 +239,46 @@ async def set_client_targets(
     current_user: str = Depends(get_current_user),
 ):
     """KPI targets for one client, optionally saved as the agency default that
-    pre-fills every new client."""
-    targets = {
-        "cpa": body.cpa,
-        "monthly_wins": body.monthly_wins,
-        "conversion_rate": body.conversion_rate,
-        "updated_at": datetime.utcnow(),
-    }
+    pre-fills every new client.
+
+    Writes field by field rather than replacing the whole `targets` object: the
+    onboarding wizard collects three of these and the settings modal collects
+    six, and whichever saved last used to blank the other's fields.
+    """
+    sent = {f: getattr(body, f) for f in TARGET_FIELDS if getattr(body, f) is not None}
+    if not sent:
+        raise HTTPException(status_code=400, detail="No targets provided")
+
+    updates = {f"targets.{field}": value for field, value in sent.items()}
+    updates["targets.updated_at"] = datetime.utcnow()
+    updates["updated_at"] = datetime.utcnow()
+
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         result = await db["client_groups"].update_one(
             {"id": group_id, "user_id": current_user},
-            {"$set": {"targets": targets, "updated_at": datetime.utcnow()}},
+            {"$set": updates},
         )
         if result.matched_count == 0:
             raise HTTPException(status_code=404, detail="Client group not found")
 
         if body.save_as_default:
+            # Merged the same way, so saving one field as the agency default
+            # does not drop the others already there.
             await db["users"].update_one(
                 {"user_id": current_user},
-                {"$set": {"default_targets": targets}},
+                {"$set": {f"default_targets.{f}": v for f, v in sent.items()}},
+                upsert=True,
             )
-        return {"ok": True, "targets": targets, "saved_as_default": body.save_as_default}
+
+        stored = await db["client_groups"].find_one(
+            {"id": group_id, "user_id": current_user}, {"targets": 1, "_id": 0}
+        )
+        return {
+            "ok": True,
+            "targets": (stored or {}).get("targets", {}),
+            "saved_as_default": body.save_as_default,
+        }
 
 
 # ---------------------------------------------------------------------------

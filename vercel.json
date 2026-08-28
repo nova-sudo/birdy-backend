@@ -45,6 +45,10 @@
       "schedule": "0 6 * * 1"
     },
     {
+      "path": "/api/cron/health-weekly",
+      "schedule": "0 6 * * 1"
+    },
+    {
       "path": "/api/cron/suggestions-monthly",
       "schedule": "0 6 1 * *"
     },

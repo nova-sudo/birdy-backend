@@ -49,11 +49,39 @@ async def create_session(db, user_id: str) -> str:
     return session_id
 
 
+async def rehydrate_from_archive(db, session_id: str, user_id: str) -> list:
+    """
+    Rebuild working memory for an expired session from the durable archive.
+
+    Working memory expires after an hour, but ai_conversation_log keeps every
+    turn forever. Without this, reopening yesterday's conversation showed the
+    user their old transcript while the model saw an empty history — it would
+    answer follow-ups with no grounding at all, which is the failure mode this
+    module's docstring was written about.
+
+    Only user/assistant prose is archived, so what comes back has no tool_calls
+    and needs no sanitising for orphaned tool groups.
+    """
+    from ai.conversation_log import _COLLECTION as _LOG_COLLECTION
+
+    rows = await db[_LOG_COLLECTION].find(
+        {"session_id": session_id, "user_id": user_id, "role": {"$in": ["user", "assistant"]}},
+        {"role": 1, "content": 1, "_id": 0},
+    ).sort("created_at", -1).limit(MAX_MESSAGES).to_list(length=MAX_MESSAGES)
+
+    # Sorted newest-first above so the limit keeps the most RECENT turns, then
+    # flipped back into chronological order for the model.
+    return [{"role": r["role"], "content": r.get("content") or ""} for r in reversed(rows)]
+
+
 async def get_or_create(db, session_id: str | None, user_id: str) -> tuple[str, list]:
     """
     Return (session_id, messages) for an existing session, or create a new one.
     Validates that the session belongs to the user. Sliding TTL: every read
     pushes expires_at forward another SESSION_TTL_HOURS.
+
+    An expired session is resumed from the archive rather than silently
+    restarted — see rehydrate_from_archive.
     """
     if session_id:
         now = datetime.utcnow()
@@ -63,9 +91,30 @@ async def get_or_create(db, session_id: str | None, user_id: str) -> tuple[str, 
         )
         if doc:
             return session_id, doc.get("messages", [])
-        # Either the id doesn't exist, expired, or belongs to a different
-        # user — indistinguishable from here (TTL deletion looks the same
-        # as "never existed"), so just fall through to a fresh session.
+
+        # Not in working memory: expired, or this worker has never seen it.
+        # The archive is the source of truth for what was actually said, so try
+        # to resume under the SAME id before giving up and starting over.
+        archived = await rehydrate_from_archive(db, session_id, user_id)
+        if archived:
+            await db[_COLLECTION].update_one(
+                {"_id": session_id},
+                {"$set": {
+                    "user_id": user_id,
+                    "messages": archived,
+                    "last_active": now,
+                    "expires_at": _expiry(now),
+                }},
+                upsert=True,
+            )
+            logger.info(
+                "Resumed session %s for %s from archive (%d messages)",
+                session_id, user_id, len(archived),
+            )
+            return session_id, archived
+
+        # Nothing archived either — the id is unknown or belongs to someone
+        # else. Indistinguishable from here, so start fresh.
         logger.info(f"Session {session_id} not found/expired for user {user_id}, creating new")
 
     new_id = await create_session(db, user_id)

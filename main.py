@@ -28,7 +28,7 @@ from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes
 from services.call_logs_service import create_call_logs_indexes
 from services.mcp_token_service import create_mcp_tokens_indexes
 from services.slack_bot_service import create_slack_bot_indexes
@@ -36,6 +36,7 @@ from services.slack_interaction_store import create_slack_ui_interaction_indexes
 from ai.session_store import create_ai_session_indexes
 from ai.suggestions.store import create_suggestion_indexes
 from ai.conversation_log import create_conversation_log_indexes
+from routers.client_notes import create_note_indexes
 from billing import router as billing_router
 from credits import router as credits_router, create_ai_usage_indexes
 
@@ -63,6 +64,7 @@ async def lifespan(app: FastAPI):
         await create_ai_session_indexes(client)
         await create_suggestion_indexes(client)
         await create_conversation_log_indexes(client)
+        await create_note_indexes(client)
         await create_ai_usage_indexes(client)
 
     get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
@@ -138,6 +140,7 @@ app.include_router(slack_interactions.router)
 app.include_router(waitlist.router)
 app.include_router(dashboard.router)
 app.include_router(onboarding.router)
+app.include_router(client_notes.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py

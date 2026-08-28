@@ -72,6 +72,18 @@ def start_background_jobs():
         max_instances=1,
     )
 
+    # Client health: same Monday 06:00 slot, measured through the previous
+    # Sunday. Registered separately from the suggestion passes so a failure in
+    # one cannot stop the other.
+    from jobs.health_jobs import run_weekly_health
+    scheduler.add_job(
+        run_weekly_health,
+        CronTrigger(day_of_week='mon', hour=6, minute=0),
+        id='client_health_weekly',
+        replace_existing=True,
+        max_instances=1,
+    )
+
     scheduler.start()
     logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45), ai_suggestions (weekly Mon 06:00 / monthly 1st 06:00)")
 
