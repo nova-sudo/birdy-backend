@@ -9,6 +9,7 @@ from core.config import COOKIE_DOMAIN, COOKIE_SAMESITE, COOKIE_SECURE
 from core.database import DB_NAME
 from core.models import (
     SaveViewRequest,
+    HiddenMetricRequest,
     CapabilitiesRequest,
     CreatePageViewRequest,
     UpdatePageViewRequest,
@@ -231,6 +232,66 @@ async def save_user_view(
             return {"success": True, "page": request.page, "saved_columns": len(request.visible_columns)}
         except Exception as e:
             logger.error(f"Error saving view for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Hidden metrics
+#
+# The Metrics Hub's show/hide eye. Hiding a metric doesn't delete anything —
+# it takes the metric out of the formula builder's picker so it stops being
+# offered when building new custom metrics. Formulas that already reference a
+# now-hidden metric keep evaluating; hiding is about what you're offered next,
+# not about breaking what exists.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@router.get("/api/user/hidden-metrics")
+async def get_hidden_metrics(current_user: str = Depends(get_current_user)):
+    """Return the metric ids this user has hidden. Response: { "hidden": [...] }"""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            user_doc = await db["users"].find_one(
+                {"user_id": current_user},
+                {"hidden_metrics": 1},
+            )
+            return {"hidden": (user_doc or {}).get("hidden_metrics", [])}
+        except Exception as e:
+            logger.error(f"Error fetching hidden metrics for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.put("/api/user/hidden-metrics")
+async def set_hidden_metric(
+    request: HiddenMetricRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Hide or show one metric. Body: { "metric_id": "meta_spend", "hidden": true }
+
+    $addToSet/$pull rather than writing the whole array back, so a second tab
+    toggling a different row doesn't overwrite this one.
+    """
+    metric_id = request.metric_id.strip()
+    if not metric_id:
+        raise HTTPException(status_code=400, detail="metric_id is required")
+
+    op = "$addToSet" if request.hidden else "$pull"
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {op: {"hidden_metrics": metric_id}, "$set": {"updated_at": datetime.now()}},
+                upsert=True,
+            )
+            user_doc = await db["users"].find_one(
+                {"user_id": current_user},
+                {"hidden_metrics": 1},
+            )
+            return {"hidden": (user_doc or {}).get("hidden_metrics", [])}
+        except Exception as e:
+            logger.error(f"Error setting hidden metric for {current_user}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
 

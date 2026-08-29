@@ -46,6 +46,17 @@ class SaveViewRequest(BaseModel):
     visible_columns: list
 
 
+class HiddenMetricRequest(BaseModel):
+    """One flip of the Metrics Hub show/hide eye.
+
+    Sent per row rather than as a whole list so two tabs toggling different
+    metrics can't clobber each other — the router turns it into $addToSet /
+    $pull, which is atomic.
+    """
+    metric_id: str
+    hidden: bool
+
+
 # ── Named page views ──────────────────────────────────────────────────────
 # Distinct from SaveViewRequest above, which persists the single "where I left
 # off" column layout per page. These are user-named presets capturing the whole
