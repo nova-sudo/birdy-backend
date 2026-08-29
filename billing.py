@@ -41,7 +41,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from whop_sdk import AsyncWhop
+from whop_sdk import APIConnectionError, APIStatusError, AsyncWhop
 
 # Standard Webhooks is only used as a fallback for `whsec_`-style secrets; Whop's
 # dashboard webhooks use their own scheme (see `_verify_webhook_signature`), so
@@ -62,7 +62,13 @@ router = APIRouter()
 WHOP_API_KEY        = os.getenv("WHOP_API_KEY", "")
 WHOP_WEBHOOK_SECRET = os.getenv("WHOP_WEBHOOK_SECRET", "")
 # Only needed for the promo-codes admin surface (list/create/delete); the
-# membership/payment webhook flow above never needs it.
+# membership/payment webhook flow above never needs it, which is why it can be
+# unset or stale for a long time before anyone notices.
+#
+# It is the `biz_...` id of the company WHOP_API_KEY belongs to — the dashboard
+# URL carries it. Whop resolves the key WITHIN the company you name, so a value
+# from a different company answers "This Bot was not found" rather than
+# anything about the id being wrong.
 WHOP_COMPANY_ID     = os.getenv("WHOP_COMPANY_ID", "")
 
 WHOP_PLAN_STARTER      = os.getenv("WHOP_PLAN_STARTER", "")
@@ -101,6 +107,49 @@ def _require_company_id() -> str:
     return WHOP_COMPANY_ID
 
 
+def _whop_reason(e: Exception) -> str:
+    """Whop's own explanation, dug out of the SDK error.
+
+    Whop answers a bad request with a JSON body naming the exact problem —
+    "Actor is missing all required permissions: promo_code:basic:read", or
+    "This Bot was not found" for a company id the key cannot act for. That
+    sentence is the whole diagnosis, so it must not be swallowed.
+    """
+    body = getattr(e, "body", None)
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict) and err.get("message"):
+            return str(err["message"])
+        if isinstance(err, str):
+            return err
+    return str(e)
+
+
+def _whop_http_error(e: Exception, action: str) -> HTTPException:
+    """Turn an SDK exception into the status and message the caller deserves.
+
+    Everything here used to collapse into a bare 502 "Could not reach Whop",
+    which was both unactionable and untrue: we reach Whop fine, and it tells us
+    precisely what is wrong. A 502 now means only what it says — the request
+    never got an answer.
+    """
+    if isinstance(e, APIConnectionError):
+        logger.error(f"Whop {action} could not connect: {e}", exc_info=True)
+        return HTTPException(status_code=502, detail=f"Could not reach Whop to {action}.")
+
+    if isinstance(e, APIStatusError):
+        reason = _whop_reason(e)
+        logger.error(f"Whop {action} failed ({e.status_code}): {reason}")
+        # 401/403 from Whop is about Birdy's own API key, not the admin's
+        # session — passing it through would bounce them to /login, which is
+        # the one place the problem cannot be fixed.
+        status = 502 if e.status_code in (401, 403) else 400
+        return HTTPException(status_code=status, detail=f"Whop rejected the request: {reason}")
+
+    logger.error(f"Whop {action} failed: {e}", exc_info=True)
+    return HTTPException(status_code=502, detail=f"Could not {action}: {e}")
+
+
 def _targetable_plans() -> list[dict]:
     """The admin-facing list of plans a promo code can be scoped to: the
     subscription tiers + extra-client add-on (this module) and the credit
@@ -128,8 +177,7 @@ async def list_promo_codes() -> list:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Whop promo_codes.list failed: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not reach Whop to list promo codes")
+        raise _whop_http_error(e, "list promo codes") from e
 
 
 async def create_promo_code(**kwargs):
@@ -140,8 +188,7 @@ async def create_promo_code(**kwargs):
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Whop promo_codes.create failed: {e}", exc_info=True)
-        raise HTTPException(status_code=400, detail=f"Whop rejected the promo code: {e}")
+        raise _whop_http_error(e, "create the promo code") from e
 
 
 async def delete_promo_code(promo_id: str) -> bool:
@@ -152,8 +199,7 @@ async def delete_promo_code(promo_id: str) -> bool:
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Whop promo_codes.delete failed: {e}", exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not delete the promo code")
+        raise _whop_http_error(e, "delete the promo code") from e
 
 
 def _secret_fingerprint() -> str:
