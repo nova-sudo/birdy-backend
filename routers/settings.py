@@ -3,7 +3,7 @@ import logging
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, HTTPException, Response
+from fastapi import APIRouter, Depends, HTTPException, Request, Response
 
 from core.config import COOKIE_DOMAIN, COOKIE_SAMESITE, COOKIE_SECURE
 from core.database import DB_NAME
@@ -552,3 +552,144 @@ async def set_default_page_view(
         except Exception as e:
             logger.error(f"Error setting default page view for {current_user}: {e}")
             raise HTTPException(status_code=500, detail=str(e))
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# User profile and password
+#
+# The Settings design's General tab edits a name, a currency, a timezone and
+# a password. Only the first two were stored and none of them had a write
+# path, so the tab was a placeholder — the fields existed in the design and
+# nowhere else.
+# ──────────────────────────────────────────────────────────────────────────
+
+MAX_NAME_LENGTH = 120
+MIN_PASSWORD_LENGTH = 8
+
+
+@router.get("/api/user/profile")
+async def get_user_profile(current_user: str = Depends(get_current_user)):
+    """Name, email, currency and timezone for the General tab."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            doc = await db["users"].find_one(
+                {"user_id": current_user},
+                {"name": 1, "default_currency": 1, "timezone": 1, "_id": 0},
+            ) or {}
+            return {
+                "name": doc.get("name") or "",
+                # The user id IS the email; there is no separate field, which
+                # is also why email is not editable here — changing it would
+                # rekey every document that references the account.
+                "email": current_user,
+                "default_currency": doc.get("default_currency") or "USD",
+                "timezone": doc.get("timezone") or "",
+            }
+        except Exception as e:
+            logger.error(f"Error loading profile for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to load profile")
+
+
+@router.patch("/api/user/profile")
+async def update_user_profile(
+    request: Request,
+    current_user: str = Depends(get_current_user),
+):
+    """Update name, currency and/or timezone. Only the fields sent are written."""
+    body = await request.json()
+    updates = {}
+
+    if "name" in body:
+        name = str(body.get("name") or "").strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Name cannot be empty")
+        if len(name) > MAX_NAME_LENGTH:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Name must be {MAX_NAME_LENGTH} characters or fewer",
+            )
+        updates["name"] = name
+
+    if "default_currency" in body:
+        currency = str(body.get("default_currency") or "").strip().upper()
+        # Three letters is the ISO-4217 shape; the picker supplies the list, so
+        # this only guards against a malformed direct call.
+        if len(currency) != 3 or not currency.isalpha():
+            raise HTTPException(status_code=400, detail="Currency must be a 3-letter code")
+        updates["default_currency"] = currency
+
+    if "timezone" in body:
+        updates["timezone"] = str(body.get("timezone") or "").strip()
+
+    if not updates:
+        raise HTTPException(status_code=400, detail="Nothing to update")
+
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            updates["updated_at"] = datetime.now()
+            result = await db["users"].update_one(
+                {"user_id": current_user}, {"$set": updates}
+            )
+            if result.matched_count == 0:
+                raise HTTPException(status_code=404, detail="User not found")
+            logger.info(f"Profile updated for {current_user}: {sorted(updates)}")
+            return {"success": True, "updated": [k for k in updates if k != "updated_at"]}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error updating profile for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to update profile")
+
+
+@router.post("/api/user/password")
+async def change_password(
+    request: Request,
+    current_user: str = Depends(get_current_user),
+):
+    """Change the account password, verifying the current one first."""
+    import bcrypt
+
+    body = await request.json()
+    current_password = body.get("current_password") or ""
+    new_password = body.get("new_password") or ""
+
+    if len(new_password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"New password must be at least {MIN_PASSWORD_LENGTH} characters",
+        )
+    if new_password == current_password:
+        raise HTTPException(
+            status_code=400, detail="New password must differ from the current one"
+        )
+
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            doc = await db["users"].find_one({"user_id": current_user}, {"password": 1})
+            if not doc:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            stored = (doc.get("password") or "").encode("utf-8")
+            if not stored or not bcrypt.checkpw(current_password.encode("utf-8"), stored):
+                # Deliberately 400 rather than 401: a 401 is the app's
+                # session-expired signal and would bounce the user to /login
+                # mid-form (see apiRequest in lib/api.js).
+                raise HTTPException(status_code=400, detail="Current password is incorrect")
+
+            hashed = bcrypt.hashpw(
+                new_password.encode("utf-8"), bcrypt.gensalt()
+            ).decode("utf-8")
+            await db["users"].update_one(
+                {"user_id": current_user},
+                {"$set": {"password": hashed, "updated_at": datetime.now()}},
+            )
+            logger.info(f"Password changed for {current_user}")
+            return {"success": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error changing password for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to change password")
