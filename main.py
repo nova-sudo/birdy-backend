@@ -28,7 +28,7 @@ from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes
 from services.call_logs_service import create_call_logs_indexes
 from services.mcp_token_service import create_mcp_tokens_indexes
 from services.slack_bot_service import create_slack_bot_indexes
@@ -132,6 +132,7 @@ app.include_router(metrics.router)
 app.include_router(cron.router)
 app.include_router(webhooks.router)
 app.include_router(call_logs.router)
+app.include_router(call_analysis.router)
 app.include_router(mcp_tokens.router)
 app.include_router(ai_credentials.router)
 app.include_router(slack.router)

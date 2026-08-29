@@ -44,6 +44,18 @@ MAX_TOOL_ITERATIONS = 12
 MAX_RESULT_CHARS = 8000
 MAX_RESULT_ITEMS = 20
 
+# ── Call analysis (Whisper transcription) ───────────────────────────────────
+# Runs on the account OPENAI_API_KEY regardless of the chat provider — the
+# chat model may be Mistral/Groq/etc., but transcription is always OpenAI.
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+# Cheap model used inside the analyze tool to condense each transcript before
+# it reaches the chat model (raw transcripts would blow MAX_RESULT_CHARS).
+CALL_ANALYSIS_SUMMARY_MODEL = os.getenv("CALL_ANALYSIS_SUMMARY_MODEL", "gpt-4o-mini")
+# Hard cap per analysis run. Analysis is synchronous inside the chat request
+# (Vercel serverless — no long-lived workers), so the batch must stay small;
+# the agent offers a "next batch" instead of one huge run.
+CALL_ANALYSIS_MAX_CALLS = 15
+
 # ── BYOK curated model lists ────────────────────────────────────────────────
 # Only models known to support tool/function calling. Users pick one of
 # these when connecting their own Anthropic/OpenAI key (see

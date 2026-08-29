@@ -78,6 +78,8 @@ _PAGE_TOOLS = {
     "call_center": [
         "get_client_groups",
         "get_call_center_stats",
+        "get_call_recordings_summary",
+        "analyze_call_recordings",
     ],
     "client_detail": [
         "get_client_groups",
@@ -94,8 +96,17 @@ _PAGE_TOOLS = {
         "get_meta_insights_live",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "get_call_recordings_summary",
+        "analyze_call_recordings",
     ],
 }
+
+# Client-scoped pages hard-pin these tools to the page's client server-side:
+# whatever group_id the model passes (or omits) is overwritten with the page's
+# client_group_id, so a client-detail chat can never analyze another client's
+# recordings — the prompt-level "always pass this group" rule is guidance, this
+# is the guarantee.
+_CLIENT_PINNED_GROUP_TOOLS = {"get_call_recordings_summary", "analyze_call_recordings"}
 
 # ── Alerts page system prompt ─────────────────────────────────────────────────
 
@@ -287,11 +298,41 @@ User: "Compare this week vs last week"
 → Call compare_periods with preset="last_7d" vs "prev_7d", highlight biggest changes.
 """
 
+_CALL_CENTER_SYSTEM_PROMPT = """You are Birdy AI, a call-center analyst assistant on the Sales Hub (call center) page of a marketing analytics platform.
+
+You help the user understand call performance — and, uniquely on this page, you can actually LISTEN to call recordings: transcribe them and diagnose what's going wrong (or right) on the calls.
+
+## Your tools
+- `get_client_groups` — list the user's clients (needed for group_id).
+- `get_call_center_stats` — numeric call KPIs per client (totals, connect rate, talk time). Use for "how many / what rate" questions.
+- `get_call_recordings_summary` — Step 1 of recording analysis: counts calls with recordings in a window (per agent, per direction, total minutes). Cheap, touches no audio.
+- `analyze_call_recordings` — Step 2: transcribes recordings with Whisper and returns a condensed summary + outcome per call. Slow and costs credits.
+
+## Recording analysis — MANDATORY confirmation flow
+When the user asks anything that requires listening to calls ("why aren't my calls converting?", "what's wrong with agent X's calls?", "analyze my calls"):
+1. Resolve the client (ask, or use get_client_groups) and call `get_call_recordings_summary` with the relevant window/filters.
+2. Report the scope in one short line (e.g. "38 recorded calls, ~2.1h, across 3 agents in the last 7 days") and ask HOW MANY calls to analyze, with a :::ui radio block. Offer sensible batch sizes (e.g. 5 / 10 / 15 — never more than 15 per run). If the focus is unclear, ask what to look for in the same message.
+3. ONLY after the user explicitly confirms a number, call `analyze_call_recordings` with confirmed=true, limit=their number, and a focus sentence describing what they want diagnosed. Never set confirmed=true without that explicit user confirmation — the tool refuses anyway.
+4. Diagnose from the per-call summaries: lead with the pattern you found (e.g. "6 of 10 calls went to voicemail — this is a contact-timing problem, not an agent problem"), cite 2-3 specific calls as evidence, then give a concrete recommendation. If calls remain in the window, offer to analyze the next batch.
+
+## Rules
+- Stats questions → get_call_center_stats. "Why"/quality questions → the recording flow above.
+- Never claim to know what was said on a call you did not analyze. If a call failed to transcribe or wasn't finished in time, say so.
+- Analysis covers at most 15 calls per run — for bigger windows, work batch by batch and say the diagnosis is based on a sample.
+- Be concise and data-focused. Lead with the finding, then evidence, then the recommendation.
+
+## Example :::ui block (step 2)
+:::ui
+[{"id":"call_count","type":"radio","label":"How many of the 38 recorded calls should I analyze?","options":[{"value":"5","label":"5 calls (quick look)"},{"value":"10","label":"10 calls (recommended)"},{"value":"15","label":"15 calls (deepest single run)"}]}]
+:::
+"""
+
 # ── Per-page system prompts ────────────────────────────────────────────────────
 _PAGE_SYSTEM_PROMPTS = {
     "alerts": _ALERTS_SYSTEM_PROMPT,
     "custom_metrics": _CUSTOM_METRICS_SYSTEM_PROMPT,
     "dashboard": _DASHBOARD_SYSTEM_PROMPT,
+    "call_center": _CALL_CENTER_SYSTEM_PROMPT,
 }
 
 # Surfaces where the optional "media_buying" capability (Settings -> Capabilities)
@@ -316,6 +357,7 @@ If the user asks about a different client, another account, or anything outside 
 - Period comparison: call compare_periods — always pass group_ids=["{client_group_id}"]
 - Active alerts: call get_alerts and filter by this client
 - Live Meta data: call get_meta_insights_live — always pass group_ids=["{client_group_id}"]
+- Call recordings: call get_call_recordings_summary then analyze_call_recordings — always pass group_id="{client_group_id}" (the server enforces this scope regardless). Follow the confirm-first flow: report how many recorded calls/minutes exist, ask how many to analyze with a :::ui radio block (max 15 per run), and only call analyze_call_recordings with confirmed=true after the user explicitly confirms. Never claim to know what was said on a call you did not analyze.
 
 ## Rules
 - ALWAYS pass group_ids=["{client_group_id}"] to every tool call. Never omit it. Never use a different group ID.
@@ -526,6 +568,17 @@ async def run_chat(
                         args = {}
                 except (json.JSONDecodeError, TypeError):
                     args = {}
+
+                # Server-side client pinning: on a client-scoped page the
+                # analysis tools always operate on THAT client, whatever the
+                # model passed. See _CLIENT_PINNED_GROUP_TOOLS.
+                if client_group_id and tc.name in _CLIENT_PINNED_GROUP_TOOLS:
+                    if args.get("group_id") != client_group_id:
+                        logger.info(
+                            f"Pinning {tc.name} group_id to page client {client_group_id} "
+                            f"(model passed {args.get('group_id')!r})"
+                        )
+                    args["group_id"] = client_group_id
 
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
 

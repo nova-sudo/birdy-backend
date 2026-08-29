@@ -24,6 +24,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 
 from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
@@ -177,3 +178,75 @@ async def list_call_logs(
                 "location_id": location_id,
             },
         }
+
+
+# ---------------------------------------------------------------------------
+# POST /api/call_logs/analyze — single-call AI analysis (Sales-Hub button)
+# ---------------------------------------------------------------------------
+
+class AnalyzeCallRequest(BaseModel):
+    """Address the call by Mongo id OR recording URL.
+
+    The Sales-Hub Calls tab is fed by the HotProspector cache and its rows
+    carry no Mongo id — the recording_url is the durable handle there. The
+    optional meta fields only label the ad-hoc path (call not yet synced into
+    call_logs by the HP cron); when a doc exists, its own fields win.
+    """
+    call_id: str | None = None
+    recording_url: str | None = None
+    force: bool = False
+    # Display metadata from the HP cache row (ad-hoc path only).
+    agent_name: str | None = None
+    lead_name: str | None = None
+    direction: str | None = None
+    duration_seconds: int | None = None
+
+
+@router.post("/call_logs/analyze")
+async def analyze_call(
+    request: AnalyzeCallRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Transcribe (Whisper) + AI-analyze one call recording. Synchronous —
+    typically 10-40s for an untranscribed call, instant when cached.
+
+    Returns { call_id?, agent, lead_name, direction, duration_seconds,
+              started_at, analysis, cached }.
+    """
+    from services import call_analysis_service
+    from credits_middleware import check_credits
+
+    if not request.call_id and not request.recording_url:
+        raise HTTPException(status_code=422, detail="Provide call_id or recording_url.")
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        # Same stopper as chat: analysis spends real Whisper/model money.
+        await check_credits(current_user, mongo_client)
+        try:
+            result = await call_analysis_service.analyze_single_call(
+                db,
+                current_user,
+                call_id=request.call_id,
+                recording_url=request.recording_url,
+                extra_meta={
+                    "raw_payload": {
+                        "caller_name": request.agent_name,
+                        "lead_name": request.lead_name,
+                    },
+                    "direction": request.direction,
+                    "duration_seconds": request.duration_seconds,
+                },
+                force=request.force,
+            )
+        except ValueError as e:
+            # Service-level "can't do that" errors (bad id, no recording,
+            # transcription failure) — user-visible, not server faults.
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.error("Single-call analysis failed for %s: %s", current_user, e, exc_info=True)
+            raise HTTPException(status_code=500, detail="Call analysis failed. Please try again.")
+
+    logger.info("analyze_call: user=%s cached=%s", current_user, result.get("cached"))
+    return result

@@ -16,7 +16,7 @@ from ai.tools.registry import registry
 from ai.config import MAX_RESULT_ITEMS
 
 
-async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None):
+async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, **_):
     """Per-client HotProspector call stats for a date-window preset, read from the
     `hotprospector_call_cache` on client_groups. Adds derived connect_rate
     (answered / total calls) and leads_called_rate (leads worked / total leads)."""

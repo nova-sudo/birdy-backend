@@ -44,6 +44,7 @@ router = APIRouter()
 # charge), but the table lets Managed price any supported model.
 MODEL_PRICING = {
     "gpt-4o":                    {"in": 2.50, "out": 10.0, "markup": 4.0},
+    "gpt-4o-mini":               {"in": 0.15, "out": 0.60, "markup": 4.0},
     "gpt-4.1":                   {"in": 2.00, "out": 8.0,  "markup": 4.0},
     "gpt-5":                     {"in": 1.25, "out": 10.0, "markup": 5.0},
     "claude-haiku-4-5-20251001": {"in": 1.00, "out": 5.0,  "markup": 5.0},
@@ -328,30 +329,7 @@ async def record_usage(
         if charge <= 0:
             return 0.0
 
-        # Draw from the plan allowance first, then from purchased top-up credits.
-        # Read-modify-write is acceptable: in practice a user runs one question
-        # at a time, and a lost race only under-charges by a single question.
-        credits, _ = await _load_and_sync(db, user_id)
-        remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
-        from_allowance = min(charge, remaining_allowance)
-        from_topup = charge - from_allowance
-        new_used = round(credits["used"] + from_allowance, 4)
-        new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
-
-        await db["users"].update_one(
-            {"user_id": user_id},
-            {"$set": {
-                "credits.allowance": credits["allowance"],
-                "credits.period_key": credits["period_key"],
-                "credits.used": new_used,
-                "credits.topup_balance": new_topup,
-                "credits.updated_at": datetime.now(timezone.utc),
-            }},
-            upsert=True,
-        )
-
-        await db["ai_usage"].insert_one({
-            "user_id": user_id,
+        await _apply_charge(db, user_id, charge, ledger={
             "session_id": session_id,
             "source": source,
             "feature": feature,
@@ -360,8 +338,6 @@ async def record_usage(
             "prompt_tokens": int(prompt_tokens or 0),
             "completion_tokens": int(completion_tokens or 0),
             "model_calls": int(model_calls or 1),
-            "credits": charge,
-            "created_at": datetime.now(timezone.utc),
         })
 
         logger.info(
@@ -372,6 +348,87 @@ async def record_usage(
     except Exception as e:
         # Metering must never break the AI request.
         logger.error(f"Credit metering failed for {user_id}: {e}", exc_info=True)
+        return 0.0
+
+
+async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> None:
+    """Draw `charge` credits from the user's balance and append a ledger row.
+
+    Draw from the plan allowance first, then from purchased top-up credits.
+    Read-modify-write is acceptable: in practice a user runs one question
+    at a time, and a lost race only under-charges by a single question.
+    """
+    credits, _ = await _load_and_sync(db, user_id)
+    remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
+    from_allowance = min(charge, remaining_allowance)
+    from_topup = charge - from_allowance
+    new_used = round(credits["used"] + from_allowance, 4)
+    new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
+
+    await db["users"].update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "credits.allowance": credits["allowance"],
+            "credits.period_key": credits["period_key"],
+            "credits.used": new_used,
+            "credits.topup_balance": new_topup,
+            "credits.updated_at": datetime.now(timezone.utc),
+        }},
+        upsert=True,
+    )
+
+    await db["ai_usage"].insert_one({
+        "user_id": user_id,
+        **ledger,
+        "credits": charge,
+        "created_at": datetime.now(timezone.utc),
+    })
+
+
+# Whisper is priced per audio minute, not per token (OpenAI: $0.006/min).
+WHISPER_CENTS_PER_MINUTE = 0.6
+
+
+async def record_audio_usage(
+    db,
+    user_id: str,
+    *,
+    audio_seconds: float,
+    model: str = "whisper-1",
+    source: str = "birdy",
+    feature: str = "call_analysis",
+    session_id: Optional[str] = None,
+) -> float:
+    """Charge transcribed audio minutes to the user's balance and append to the
+    ``ai_usage`` ledger. Whisper always runs on Birdy's account key, so the
+    Managed treatment (real cost × markup) applies regardless of rate mode.
+    Best-effort: never raises into the AI request path."""
+    try:
+        seconds = max(0.0, float(audio_seconds or 0))
+        if seconds <= 0:
+            return 0.0
+        settings = await get_credits_settings(db)
+        charge = round((seconds / 60.0) * WHISPER_CENTS_PER_MINUTE * settings["markup"], 2)
+        if charge <= 0:
+            return 0.0
+
+        await _apply_charge(db, user_id, charge, ledger={
+            "session_id": session_id,
+            "source": source,
+            "feature": feature,
+            "model": model,
+            "mode": "managed",
+            "audio_seconds": round(seconds, 1),
+        })
+
+        logger.info(
+            f"💳 Credits: {user_id} -{charge} ({feature}/managed/{model}; "
+            f"{seconds:.0f}s audio)"
+        )
+        return charge
+    except Exception as e:
+        # Metering must never break the AI request.
+        logger.error(f"Audio credit metering failed for {user_id}: {e}", exc_info=True)
         return 0.0
 
 
