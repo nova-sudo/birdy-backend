@@ -15,6 +15,13 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.6-plus:free")
 
+# OpenAI — the account-wide key every user's chat runs on. Birdy supplies the
+# model rather than asking each agency for their own: a user pasting the wrong
+# key, or a key for a model that cannot call tools, silently degrades the
+# product in ways they cannot diagnose.
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
+
 # Mistral
 MISTRAL_API_KEY = os.getenv("MISTRAL_API_KEY")
 MISTRAL_MODEL = os.getenv("MISTRAL_MODEL", "mistral-medium-latest")

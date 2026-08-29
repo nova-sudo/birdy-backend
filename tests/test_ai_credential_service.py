@@ -91,8 +91,26 @@ async def test_save_then_remove_then_status_is_none(mock_db):
 # ── ai/provider_factory.py::get_provider_for_user — no-fallback behavior ────
 
 @pytest.mark.asyncio
-async def test_get_provider_raises_when_not_configured(mock_db):
+async def test_a_user_with_no_credential_gets_the_account_provider(mock_db, monkeypatch):
+    """Users do not bring their own key any more, so chat has to work without
+    one. This used to raise, which is what put an "add your AI key" dead end in
+    front of every user once the settings form was removed."""
+    from ai.provider_factory import get_provider_for_user as _get_provider
+    from ai.providers.openai_provider import OpenAIProvider
+
+    monkeypatch.setattr("ai.config.OPENAI_API_KEY", "sk-test-account-key")
+
+    provider = await _get_provider("nobody@example.com", mock_db)
+    assert isinstance(provider, OpenAIProvider)
+
+
+@pytest.mark.asyncio
+async def test_it_still_raises_when_the_account_key_is_missing(mock_db, monkeypatch):
+    """An operator problem rather than a user one, but the chat route still
+    needs its 412 rather than a 500."""
     from ai.provider_factory import get_provider_for_user as _get_provider, NoAiCredentialError
+
+    monkeypatch.setattr("ai.config.OPENAI_API_KEY", None)
 
     with pytest.raises(NoAiCredentialError):
         await _get_provider("nobody@example.com", mock_db)

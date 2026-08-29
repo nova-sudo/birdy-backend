@@ -9,11 +9,19 @@ DEFAULT_OPENAI_MODEL = "gpt-4o"
 
 
 class OpenAIProvider(BaseLLMProvider):
-    """BYOK-only — there is no Birdy-global OPENAI_API_KEY fallback, api_key is required."""
+    """Runs on Birdy's own account key, falling back to it when none is passed.
 
-    def __init__(self, api_key: str, model: str | None = None):
+    This used to be BYOK-only. Asking each agency for a key meant one wrong
+    paste — or a key for a model that cannot call tools — quietly broke chat in
+    a way the user could not diagnose, so the account key is the default and
+    an explicitly-passed key is the exception.
+    """
+
+    def __init__(self, api_key: str | None = None, model: str | None = None):
+        from ai.config import OPENAI_API_KEY
+        api_key = api_key or OPENAI_API_KEY
         if not api_key:
-            raise ValueError("OpenAI API key is required")
+            raise ValueError("OPENAI_API_KEY environment variable is not set")
         self.client = AsyncOpenAI(api_key=api_key)
         self.model = model or DEFAULT_OPENAI_MODEL
 

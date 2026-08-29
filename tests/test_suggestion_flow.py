@@ -21,6 +21,7 @@ os.environ.setdefault("AI_CREDENTIAL_ENCRYPTION_KEY", Fernet.generate_key().deco
 os.environ.pop("ANTHROPIC_API_KEY", None)  # force the template composer path
 
 import asyncio
+import contextlib
 
 from mongomock_motor import AsyncMongoMockClient
 
@@ -62,10 +63,37 @@ async def _fresh_db_with(ads):
     return client, db
 
 
+@contextlib.contextmanager
+def _no_llm():
+    """Force template composition.
+
+    These tests assert the template wording, and used to get it for free
+    because no user had connected an AI key. Chat now runs on Birdy's own
+    account, so a provider is always available and the composer would reach
+    for the LLM — making the assertion depend on the environment rather than
+    on the behaviour under test.
+    """
+    # Patched on the orchestrator, which imported the name directly — patching
+    # the composer module would leave that bound reference untouched.
+    import ai.suggestions.orchestrator as orchestrator
+
+    original = orchestrator.get_composer_provider
+
+    async def none_available(user_id, db):
+        return None
+
+    orchestrator.get_composer_provider = none_available
+    try:
+        yield
+    finally:
+        orchestrator.get_composer_provider = original
+
+
 async def _create_and_dedupe():
     client, db = await _fresh_db_with(_BAD_ADS)
 
-    s1 = await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
+    with _no_llm():
+        s1 = await run_pass_for_user(db, "u1", "weekly", mongo_client=client)
     open1 = await store.list_open_suggestions(db, "u1")
     # _BAD_ADS has two offending ads → one suggestion per ad.
     assert len(open1) == 2, f"expected 2 (one per ad), got {len(open1)}"

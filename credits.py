@@ -54,7 +54,11 @@ DEFAULT_MODEL = "gpt-4o"
 BYOK_CREDITS_PER_1K = 0.5   # flat, any model
 
 # Default charging mode until the Managed path ships. "byok" | "managed".
-DEFAULT_RATE_MODE = os.getenv("CREDITS_RATE_MODE", "byok")
+# Managed by default: users no longer bring their own key, so every question
+# runs on Birdy's OpenAI account and costs Birdy real tokens. Billing at the
+# own-key rate would charge the flat base for spend we are actually incurring.
+# Set CREDITS_RATE_MODE=byok to revert without a deploy.
+DEFAULT_RATE_MODE = os.getenv("CREDITS_RATE_MODE", "managed")
 
 # Staged rollout: while OFF, usage is metered and the balance is shown, but the
 # stopper never blocks (so shipping metering can't lock existing users out of

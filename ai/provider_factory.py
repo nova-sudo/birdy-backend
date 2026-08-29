@@ -1,3 +1,7 @@
+import logging
+
+logger = logging.getLogger(__name__)
+
 """
 ai/provider_factory.py
 -------------------------
@@ -19,10 +23,40 @@ class NoAiCredentialError(Exception):
 
 
 async def get_provider_for_user(user_id: str, db):
-    """Construct the AI provider from the user's own BYOK credential."""
+    """The provider every chat runs on: Birdy's own OpenAI account.
+
+    Users no longer bring their own key. A wrong paste, or a key for a model
+    that cannot call tools, degraded chat in ways the user could not diagnose,
+    and the failure surfaced as Birdy being unable to answer rather than as a
+    configuration problem.
+
+    A stored credential is still honoured if one exists, so accounts that set
+    one before this change keep working — but nothing writes new ones.
+    """
     cred = await get_decrypted_credential_for_chat(db, user_id)
-    if not cred:
+
+    if cred:
+        if cred["provider"] == "anthropic":
+            from ai.providers.anthropic_provider import AnthropicProvider
+            return AnthropicProvider(api_key=cred["api_key"], model=cred["model"])
+        if cred["provider"] == "openai":
+            from ai.providers.openai_provider import OpenAIProvider
+            return OpenAIProvider(api_key=cred["api_key"], model=cred["model"])
+        # Provider is validated at save time, so an unknown one means the
+        # stored document is bad. Fall through to the account key rather than
+        # locking the user out of chat over it.
+        logger.warning("Unknown stored AI provider %r for %s — using the account key",
+                       cred.get("provider"), user_id)
+
+    from ai.config import OPENAI_API_KEY, OPENAI_MODEL
+    if not OPENAI_API_KEY:
+        # Nothing to run on. Still raises the error the chat route turns into a
+        # 412, but this is now an operator problem, not a user one.
+        logger.error("OPENAI_API_KEY is not set — chat cannot run for any user")
         raise NoAiCredentialError()
+
+    from ai.providers.openai_provider import OpenAIProvider
+    return OpenAIProvider(model=OPENAI_MODEL)
 
     if cred["provider"] == "anthropic":
         from ai.providers.anthropic_provider import AnthropicProvider

@@ -42,13 +42,24 @@ async def list_ai_models():
 
 @router.get("/api/integrations/ai/status", response_model=AiCredentialStatusResponse)
 async def get_ai_status(current_user: str = Depends(get_current_user)):
-    """Current BYOK status — masked key preview only, never the full key."""
+    """Whether chat can run for this user.
+
+    Chat runs on Birdy's own OpenAI account now, so this reports the account
+    key's presence rather than the user's. It gates the chat UI: reporting
+    `configured: false` puts an "add your AI key in Settings" empty state in
+    front of the user, and Settings no longer has that form — a dead end.
+
+    A stored credential is still reported (masked) where one exists, so an
+    account that set one before the change still sees what it is using.
+    """
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
         status = await get_ai_credential_status(db, current_user)
-        if not status:
-            return AiCredentialStatusResponse(configured=False)
-        return AiCredentialStatusResponse(configured=True, **status)
+        if status:
+            return AiCredentialStatusResponse(configured=True, **status)
+
+        from ai.config import OPENAI_API_KEY
+        return AiCredentialStatusResponse(configured=bool(OPENAI_API_KEY))
 
 
 @router.post("/api/integrations/ai/connect", response_model=AiCredentialStatusResponse)

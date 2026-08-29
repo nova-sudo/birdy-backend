@@ -41,10 +41,15 @@ _SYSTEM_PROMPT = (
 
 async def get_composer_provider(user_id: str, db):
     """
-    Resolve the user's own BYOK provider for composing their suggestions — same
-    policy as the Birdy chat agent (no Birdy-global fallback). Returns None when
-    the user hasn't connected a key, so composition uses the template. Never
-    raises.
+    Resolve the provider for composing this user's suggestions — the same one
+    the chat agent uses, which is now Birdy's own OpenAI account rather than a
+    key the user supplied.
+
+    NOTE: that makes LLM composition the norm. It used to be the exception,
+    reached only by the one account that had connected a key; every other user
+    silently got the template. Suggestion passes now cost real tokens for
+    everyone. Returns None only when no provider can be built at all, in which
+    case composition falls back to the template. Never raises.
     """
     try:
         return await get_provider_for_user(user_id, db)
