@@ -76,7 +76,10 @@ async def test_summary_filters_by_agent_and_direction(db):
 
 
 async def test_summary_respects_date_window(db):
-    await _seed(db, [{"days_ago": 1}, {"days_ago": 30}])
+    # 20 (not 30) days back: presets bound by LOCAL calendar days while the
+    # seed uses utcnow(), so an exactly-30-days-old call falls outside
+    # last_30d whenever local midnight has passed but UTC's hasn't.
+    await _seed(db, [{"days_ago": 1}, {"days_ago": 20}])
     out = await call_analysis_service.summarize_analyzable_calls(db, USER, GROUP, preset="last_7d")
     assert out["matching_calls"] == 1
     out = await call_analysis_service.summarize_analyzable_calls(db, USER, GROUP, preset="last_30d")

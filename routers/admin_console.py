@@ -575,17 +575,26 @@ async def credits_accounts(
                 "used_internal": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "birdy"]}]}, "$credits", 0]}},
                 "used_slack": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "slack"]}]}, "$credits", 0]}},
                 "used_cron": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$source", "cron"]}]}, "$credits", 0]}},
+                # Call-recording analysis (Whisper + per-call summaries) — a
+                # feature-level split, orthogonal to the source split above.
+                # audio_seconds only exists on whisper rows; $ifNull covers the rest.
+                "used_call_analysis": {"$sum": {"$cond": [{"$and": [{"$gt": ["$credits", 0]}, {"$eq": ["$feature", "call_analysis"]}]}, "$credits", 0]}},
+                "audio_seconds": {"$sum": {"$ifNull": ["$audio_seconds", 0]}},
                 "purchased_total": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, {"$abs": "$credits"}, 0]}},
                 "granted_total": {"$sum": {"$cond": [{"$eq": ["$feature", "admin_grant"]}, {"$abs": "$credits"}, 0]}},
                 "topups": {"$sum": {"$cond": [{"$eq": ["$feature", "topup"]}, 1, 0]}},
-                "questions": {"$sum": {"$cond": [{"$ne": ["$feature", "topup"]}, 1, 0]}},
+                # Chat questions only — grants aren't questions, and one call
+                # analysis writes up to two ledger rows (whisper + summary), so
+                # counting those here would inflate the number.
+                "questions": {"$sum": {"$cond": [{"$in": ["$feature", ["topup", "admin_grant", "call_analysis"]]}, 0, 1]}},
                 "last_used": {"$max": "$created_at"},
             }},
         ]).to_list(None)}
 
         rows = []
         totals = {"balance": 0.0, "used_total": 0.0, "purchased_total": 0.0, "granted_total": 0.0, "topup_balance": 0.0,
-                  "used_internal": 0.0, "used_slack": 0.0, "used_cron": 0.0}
+                  "used_internal": 0.0, "used_slack": 0.0, "used_cron": 0.0,
+                  "used_call_analysis": 0.0, "audio_minutes": 0.0}
         for u in users:
             uid = u["user_id"]
             credits, _ = _effective_credits(u)  # in-memory period rollover; no write
@@ -605,6 +614,8 @@ async def credits_accounts(
                 "used_internal": round(float(a.get("used_internal", 0.0) or 0.0), 2),
                 "used_slack": round(float(a.get("used_slack", 0.0) or 0.0), 2),
                 "used_cron": round(float(a.get("used_cron", 0.0) or 0.0), 2),
+                "used_call_analysis": round(float(a.get("used_call_analysis", 0.0) or 0.0), 2),
+                "audio_minutes": round(float(a.get("audio_seconds", 0.0) or 0.0) / 60.0, 1),
                 "purchased_total": round(float(a.get("purchased_total", 0.0) or 0.0), 2),
                 "granted_total": round(float(a.get("granted_total", 0.0) or 0.0), 2),
                 "topups": int(a.get("topups", 0) or 0),
@@ -620,6 +631,8 @@ async def credits_accounts(
             totals["used_internal"] += row["used_internal"]
             totals["used_slack"] += row["used_slack"]
             totals["used_cron"] += row["used_cron"]
+            totals["used_call_analysis"] += row["used_call_analysis"]
+            totals["audio_minutes"] += row["audio_minutes"]
 
         # Most-active first (all-time consumption, then purchases).
         rows.sort(key=lambda r: (r["used_total"], r["purchased_total"]), reverse=True)
