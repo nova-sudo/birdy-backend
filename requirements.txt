@@ -9,10 +9,19 @@ bcrypt==4.2.0
 PyJWT[crypto]==2.10.1
 apscheduler==3.10.4
 CurrencyConverter==0.18.15
-# Pinned: an unpinned SDK let a Vercel build silently move to 1.x while this
-# checkout ran 0.0.41, and 1.x dropped the top-level error exports billing.py
-# imported — which failed at module load and took every route down with it.
-whop-sdk[webhooks]==1.0.14
+# Pinned to 0.x deliberately. whop-sdk 1.x is not an upgrade of this library,
+# it is a different one: a Fern-generated client taking `token=` instead of
+# `api_key=`, with different resources, pagination and exception types. Left
+# unpinned, a Vercel rebuild silently moved production onto it, and every call
+# in billing.py — promo codes, and the membership lookup behind the billing
+# portal URL — started raising
+#     AsyncWhop.__init__() got an unexpected keyword argument 'api_key'
+# which the old blanket except swallowed as "Could not reach Whop".
+#
+# Moving to 1.x means rewriting every Whop call in billing.py and re-verifying
+# memberships, promo codes and the webhook path against it. Until that is done
+# deliberately, pin the version this code is written against.
+whop-sdk[webhooks]==0.0.41
 groq
 anthropic
 openai

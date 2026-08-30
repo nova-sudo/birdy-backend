@@ -31,10 +31,6 @@ class FakeStatusError(Exception):
         self.body = {"error": {"type": "bad_request", "message": message}}
 
 
-class FakeConnectionError(billing.APIConnectionError):
-    """The SDK's own connection error, whatever it resolved to."""
-
-
 def test_missing_scope_names_the_scope():
     """The whole diagnosis is in Whop's sentence — surface it verbatim."""
     err = FakeStatusError(
@@ -112,3 +108,36 @@ def test_the_error_types_resolve_to_something_usable():
     assert isinstance(billing.APIStatusError, type)
     assert issubclass(billing.APIStatusError, BaseException)
     assert issubclass(billing.APIConnectionError, BaseException)
+
+
+# ── The client itself ─────────────────────────────────────────────────────
+#
+# These exist because nothing checked that `_whop()` could actually build a
+# client. whop-sdk 1.x takes `token=` rather than `api_key=`, so on the version
+# an unpinned requirements.txt drifted production onto, every call raised
+#     AsyncWhop.__init__() got an unexpected keyword argument 'api_key'
+# and the blanket except reported it as "Could not reach Whop". A test that
+# constructs the client fails loudly on the wrong SDK, at CI time.
+
+
+def test_the_client_can_be_constructed_against_the_installed_sdk(monkeypatch):
+    monkeypatch.setattr(billing, "WHOP_API_KEY", "test-key")
+    monkeypatch.setattr(billing, "WHOP_WEBHOOK_SECRET", "")
+
+    client = billing._whop()
+
+    assert client is not None
+    # Every call site uses it as an async context manager.
+    assert hasattr(client, "__aenter__")
+    assert hasattr(client, "promo_codes")
+    assert hasattr(client, "memberships")
+
+
+def test_an_unconfigured_key_is_reported_as_configuration(monkeypatch):
+    monkeypatch.setattr(billing, "WHOP_API_KEY", "")
+
+    with pytest.raises(HTTPException) as exc:
+        billing._whop()
+
+    assert exc.value.status_code == 500
+    assert "WHOP_API_KEY" in exc.value.detail
