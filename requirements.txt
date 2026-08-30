@@ -9,7 +9,10 @@ bcrypt==4.2.0
 PyJWT[crypto]==2.10.1
 apscheduler==3.10.4
 CurrencyConverter==0.18.15
-whop-sdk[webhooks]
+# Pinned: an unpinned SDK let a Vercel build silently move to 1.x while this
+# checkout ran 0.0.41, and 1.x dropped the top-level error exports billing.py
+# imported — which failed at module load and took every route down with it.
+whop-sdk[webhooks]==1.0.14
 groq
 anthropic
 openai

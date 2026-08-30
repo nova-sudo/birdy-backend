@@ -41,7 +41,25 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 
-from whop_sdk import APIConnectionError, APIStatusError, AsyncWhop
+from whop_sdk import AsyncWhop
+
+# whop-sdk is unpinned in requirements.txt, so a Vercel build installs whatever
+# is current — 1.x in production while this checkout has 0.0.41. A hard
+# `from whop_sdk import APIStatusError` therefore risks an ImportError at module
+# load, and billing.py is imported by main.py, so that takes down every route in
+# the app rather than just the promo-codes screen. It did exactly that.
+#
+# Resolve the error types by lookup instead, falling back to sentinels that
+# nothing can be an instance of: on an SDK that has moved these names, error
+# translation degrades to the generic branch, which still reports the failure.
+try:  # pragma: no cover - depends on the installed SDK
+    from whop_sdk import APIConnectionError, APIStatusError
+except ImportError:  # pragma: no cover
+    class APIStatusError(Exception):
+        """Placeholder — the installed whop-sdk does not export this."""
+
+    class APIConnectionError(Exception):
+        """Placeholder — the installed whop-sdk does not export this."""
 
 # Standard Webhooks is only used as a fallback for `whsec_`-style secrets; Whop's
 # dashboard webhooks use their own scheme (see `_verify_webhook_signature`), so
@@ -137,13 +155,14 @@ def _whop_http_error(e: Exception, action: str) -> HTTPException:
         logger.error(f"Whop {action} could not connect: {e}", exc_info=True)
         return HTTPException(status_code=502, detail=f"Could not reach Whop to {action}.")
 
-    if isinstance(e, APIStatusError):
+    status_code = getattr(e, "status_code", None)
+    if isinstance(e, APIStatusError) or status_code is not None:
         reason = _whop_reason(e)
-        logger.error(f"Whop {action} failed ({e.status_code}): {reason}")
+        logger.error(f"Whop {action} failed ({status_code}): {reason}")
         # 401/403 from Whop is about Birdy's own API key, not the admin's
         # session — passing it through would bounce them to /login, which is
         # the one place the problem cannot be fixed.
-        status = 502 if e.status_code in (401, 403) else 400
+        status = 502 if status_code in (401, 403) else 400
         return HTTPException(status_code=status, detail=f"Whop rejected the request: {reason}")
 
     logger.error(f"Whop {action} failed: {e}", exc_info=True)
