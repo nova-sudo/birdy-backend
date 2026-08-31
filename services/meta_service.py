@@ -134,7 +134,7 @@ async def fetch_meta_data_for_group(
                     response = await client.get(
                         f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                         params={
-                            "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,creative{title,body,image_url},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
+                            "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,creative{title,body,image_url,thumbnail_url,video_id,object_story_spec},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
                             "access_token": token["access_token"],
                         },
                     )
@@ -300,9 +300,7 @@ async def fetch_meta_data_for_group(
                     "cpm": round((ad_spend / ad_impressions * 1000), 2) if ad_impressions > 0 else 0,
                     "cpc": round((ad_spend / ad_clicks), 2) if ad_clicks > 0 else 0,
                     "ctr": round((ad_clicks / ad_impressions * 100), 2) if ad_impressions > 0 else 0,
-                    "creative_title": creative.get("title", ""),
-                    "creative_body": creative.get("body", ""),
-                    "creative_image": creative.get("image_url", ""),
+                    **_creative_fields(creative),
                 })
 
         # Calculate derived metrics
@@ -586,10 +584,35 @@ def _campaigns_fields_for_preset(date_preset: str) -> str:
         "adsets{name,status,"
         f"insights.date_preset({date_preset})"
         "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr}},"
-        "ads{name,adset_id,status,creative{title,body,image_url},"
+        # image_url is only set for image creatives; thumbnail_url covers
+        # videos too (small), and object_story_spec.video_data.image_url is
+        # the full-size video poster. The gallery view needs one of them for
+        # every ad.
+        "ads{name,adset_id,status,creative{title,body,image_url,thumbnail_url,video_id,object_story_spec},"
         f"insights.date_preset({date_preset})"
         "{actions,results,reach,spend,impressions,cpm,inline_link_clicks,cpc,clicks}}"
     )
+
+
+def _creative_fields(creative: dict) -> dict:
+    """The stored creative identity for one ad row.
+
+    image_url only exists for image creatives. For videos the full-size
+    poster lives in object_story_spec.video_data.image_url, with Meta's own
+    small thumbnail_url as the fallback — the gallery view prefers
+    creative_image and falls back to creative_thumbnail, so between the two
+    every ad gets a picture. video_id marks the card as a video.
+    """
+    creative = creative or {}
+    spec = creative.get("object_story_spec") or {}
+    video_data = spec.get("video_data") or {}
+    return {
+        "creative_title": creative.get("title", ""),
+        "creative_body": creative.get("body", ""),
+        "creative_image": creative.get("image_url", ""),
+        "creative_thumbnail": video_data.get("image_url", "") or creative.get("thumbnail_url", ""),
+        "creative_video_id": creative.get("video_id", "") or video_data.get("video_id", ""),
+    }
 
 
 def _classify_meta_error(status_code: int, body: str) -> str | None:
@@ -770,9 +793,7 @@ def _accumulate_campaigns_page(
                 "cpm": round(ad_spend / ad_imp * 1000, 2) if ad_imp > 0 else 0,
                 "cpc": round(ad_spend / ad_clicks, 2) if ad_clicks > 0 else 0,
                 "ctr": round(ad_clicks / ad_imp * 100, 2) if ad_imp > 0 else 0,
-                "creative_title": creative.get("title", ""),
-                "creative_body": creative.get("body", ""),
-                "creative_image": creative.get("image_url", ""),
+                **_creative_fields(creative),
             })
 
 

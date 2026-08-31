@@ -72,6 +72,7 @@ KINDS = ("campaigns", "adsets", "ads")
 IDENTITY_FIELDS = frozenset({
     "id", "name", "campaign_id", "adset_id", "status",
     "creative_title", "creative_body", "creative_image",
+    "creative_thumbnail", "creative_video_id",
 })
 
 
