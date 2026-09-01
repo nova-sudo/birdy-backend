@@ -329,6 +329,63 @@ async def get_facebook_adaccounts(current_user: str = Depends(get_current_user))
 
 
 # ---------------------------------------------------------------------------
+# GET /api/facebook/video/{video_id} — playable source for an ad-preview video
+# ---------------------------------------------------------------------------
+
+@router.get("/api/facebook/video/{video_id}")
+async def get_facebook_video(video_id: str, current_user: str = Depends(get_current_user)):
+    """
+    Fresh, playable `source` URL for a video ad creative (Marketing Hub gallery
+    preview). Ad rows only ever store `creative_video_id` — the video's `source`
+    is a signed CDN link like `creative_image`/`creative_thumbnail`, so like
+    those it must be fetched live rather than cached (see facebook_cache_shape.py).
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            token = await get_facebook_token(current_user, mongo_client)
+            if not token or not token.get("access_token"):
+                raise HTTPException(
+                    status_code=400,
+                    detail="No Meta token available. Please connect Meta in Settings.",
+                )
+
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(
+                    f"https://graph.facebook.com/v25.0/{video_id}",
+                    params={
+                        "fields": "source,permalink_url,picture",
+                        "access_token": token["access_token"],
+                    },
+                )
+
+                if response.status_code != 200:
+                    error_detail = response.json().get("error", {})
+                    logger.error(f"Meta API error fetching video {video_id}: {response.status_code} - {error_detail}")
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=error_detail.get("message", "Failed to fetch video"),
+                    )
+
+                data = response.json()
+                if not data.get("source"):
+                    raise HTTPException(status_code=404, detail="Video has no playable source")
+
+                return {
+                    "source": data.get("source"),
+                    "permalink_url": data.get("permalink_url"),
+                }
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error fetching video {video_id}: {str(e)}", exc_info=True)
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to fetch video: {str(e)}",
+            )
+
+
+# ---------------------------------------------------------------------------
 # GET /api/facebook-leads/paginated
 # ---------------------------------------------------------------------------
 

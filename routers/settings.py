@@ -15,6 +15,7 @@ from core.models import (
     UpdatePageViewRequest,
     DefaultPageViewRequest,
 )
+from billing import ACTIVE_STATUSES
 from dependencies import get_mongo_client, get_current_user
 from services import capabilities_service
 
@@ -702,6 +703,74 @@ async def update_user_profile(
         except Exception as e:
             logger.error(f"Error updating profile for {current_user}: {e}")
             raise HTTPException(status_code=500, detail="Failed to update profile")
+
+
+# Collections holding per-user data keyed by a plain `user_id` field —
+# verified against every writer in routers/services before listing here.
+# (Deliberately excludes admin_audit, promo_codes_meta, waitlist, and the
+# Slack team/channel-scoped caches, none of which are this account's own data.)
+ACCOUNT_DATA_COLLECTIONS = [
+    "client_groups",
+    "ghl_contacts",
+    "hotprospector_leads",
+    "facebook_leads",
+    "facebook_ad_insights",
+    "facebook_adset_insights",
+    "facebook_campaign_insights",
+    "call_logs",
+    "alerts",
+    "alert_notifications",
+    "ai_chat_sessions",
+    "ai_conversation_log",
+    "ai_usage",
+    "mcp_tokens",
+    "meta_refresh_jobs",
+]
+
+
+@router.delete("/api/account")
+async def delete_account(current_user: str = Depends(get_current_user)):
+    """
+    Permanently delete the signed-in account and everything Birdy stored for
+    it. Irreversible — Settings gates this behind a type-to-confirm dialog.
+
+    Blocked while a Whop subscription is still active/trialing/past_due/
+    canceling: Whop plan changes and cancellation only happen through its
+    hosted customer portal (see billing.py) — there's no cancel-by-API here —
+    so deleting first would leave a subscription billing an account that no
+    longer exists.
+    """
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            user = await db["users"].find_one(
+                {"user_id": current_user}, {"subscription": 1}
+            )
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            sub_status = (user.get("subscription") or {}).get("status")
+            if sub_status in ACTIVE_STATUSES:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "You have an active subscription. Cancel it from Manage "
+                        "Billing (Settings → Billing) before deleting your account."
+                    ),
+                )
+
+            for collection in ACCOUNT_DATA_COLLECTIONS:
+                await db[collection].delete_many({"user_id": current_user})
+
+            await db["users"].delete_one({"user_id": current_user})
+
+            logger.info(f"Deleted account and all data for {current_user}")
+            return {"deleted": True}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error deleting account for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to delete account")
 
 
 @router.post("/api/user/password")
