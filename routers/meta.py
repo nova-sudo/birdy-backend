@@ -8,6 +8,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 from datetime import datetime
@@ -329,16 +330,26 @@ async def get_facebook_adaccounts(current_user: str = Depends(get_current_user))
 
 
 # ---------------------------------------------------------------------------
-# GET /api/facebook/video/{video_id} — playable source for an ad-preview video
+# GET /api/facebook/ad-preview/{ad_id} — renderable preview for an ad
 # ---------------------------------------------------------------------------
 
-@router.get("/api/facebook/video/{video_id}")
-async def get_facebook_video(video_id: str, current_user: str = Depends(get_current_user)):
+# A generic feed placement — renders any creative (image or video) with
+# playback controls. Meta's ad_format enum has placement-specific variants
+# (INSTAGRAM_STANDARD, MOBILE_FEED_STANDARD, ...) but this one works for any
+# ad regardless of which placements it's actually running in.
+AD_PREVIEW_FORMAT = "DESKTOP_FEED_STANDARD"
+
+
+@router.get("/api/facebook/ad-preview/{ad_id}")
+async def get_facebook_ad_preview(ad_id: str, current_user: str = Depends(get_current_user)):
     """
-    Fresh, playable `source` URL for a video ad creative (Marketing Hub gallery
-    preview). Ad rows only ever store `creative_video_id` — the video's `source`
-    is a signed CDN link like `creative_image`/`creative_thumbnail`, so like
-    those it must be fetched live rather than cached (see facebook_cache_shape.py).
+    Renderable preview for an ad (Marketing Hub gallery). Uses Meta's own
+    ad-preview renderer (`/{ad_id}/previews`) rather than pulling the video
+    creative's raw `source` URL — Meta blocks `source` for a lot of ad videos
+    (download-protected creatives, ones still processing, music-licensed
+    audio, etc.) even with full ads_read/ads_management access, but the
+    preview iframe always works since it's Meta serving its own render
+    rather than handing back the raw asset.
     """
     async with get_mongo_client() as mongo_client:
         try:
@@ -351,37 +362,45 @@ async def get_facebook_video(video_id: str, current_user: str = Depends(get_curr
 
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.get(
-                    f"https://graph.facebook.com/v25.0/{video_id}",
+                    f"https://graph.facebook.com/v25.0/{ad_id}/previews",
                     params={
-                        "fields": "source,permalink_url,picture",
+                        "ad_format": AD_PREVIEW_FORMAT,
                         "access_token": token["access_token"],
                     },
                 )
 
                 if response.status_code != 200:
                     error_detail = response.json().get("error", {})
-                    logger.error(f"Meta API error fetching video {video_id}: {response.status_code} - {error_detail}")
+                    logger.error(f"Meta API error previewing ad {ad_id}: {response.status_code} - {error_detail}")
                     raise HTTPException(
                         status_code=response.status_code,
-                        detail=error_detail.get("message", "Failed to fetch video"),
+                        detail=error_detail.get("message", "Failed to load ad preview"),
                     )
 
-                data = response.json()
-                if not data.get("source"):
-                    raise HTTPException(status_code=404, detail="Video has no playable source")
+                rows = response.json().get("data") or []
+                body = rows[0].get("body", "") if rows else ""
+                # The API hands back a full <iframe> tag as an HTML string — the
+                # embeddable preview is the iframe's `src`, not the tag itself.
+                src_match = re.search(r'src="([^"]+)"', body)
+                if not src_match:
+                    raise HTTPException(status_code=404, detail="No preview available for this ad")
+
+                width_match = re.search(r'width="(\d+)"', body)
+                height_match = re.search(r'height="(\d+)"', body)
 
                 return {
-                    "source": data.get("source"),
-                    "permalink_url": data.get("permalink_url"),
+                    "preview_url": src_match.group(1).replace("&amp;", "&"),
+                    "width": int(width_match.group(1)) if width_match else None,
+                    "height": int(height_match.group(1)) if height_match else None,
                 }
 
         except HTTPException:
             raise
         except Exception as e:
-            logger.error(f"Error fetching video {video_id}: {str(e)}", exc_info=True)
+            logger.error(f"Error fetching ad preview {ad_id}: {str(e)}", exc_info=True)
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to fetch video: {str(e)}",
+                detail=f"Failed to load ad preview: {str(e)}",
             )
 
 
