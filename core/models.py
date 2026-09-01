@@ -159,6 +159,13 @@ class ChatResponse(BaseModel):
     reply: str
     tools_used: List[str] = []
     session_id: str = ""
+    # Conversation-level scope, derived after every turn: "client" when the
+    # whole thread is about exactly one client, else "global". Lets the UI
+    # badge a thread the moment the first reply lands, and flip a client
+    # thread to global the turn a second client enters it.
+    scope: Optional[str] = None
+    client_group_id: Optional[str] = None
+    client_name: Optional[str] = None
 
 
 # ── Capabilities (per-user agent toggles) ─────────────────────────────────────

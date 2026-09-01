@@ -367,6 +367,57 @@ If the user asks about a different client, another account, or anything outside 
 """
 
 
+_GROUP_ARG_KEYS = ("group_id", "group_ids", "groups", "client_group_id")
+
+
+def _group_ids_in_args(args: dict) -> set:
+    """Every client group id named in one tool call's arguments.
+
+    Tools spell the parameter four ways (group_id string, group_ids array,
+    groups comma-string, client_group_id), so all are read. Values are not
+    validated here — the tagger checks the id belongs to the user before
+    writing anything.
+    """
+    found = set()
+    for key in _GROUP_ARG_KEYS:
+        val = args.get(key)
+        if isinstance(val, str):
+            found.update(v.strip() for v in val.split(",") if v.strip())
+        elif isinstance(val, (list, tuple)):
+            found.update(str(v) for v in val if v)
+    return found
+
+
+async def _conversation_scope(db, user_id: str, session_id: str) -> dict:
+    """
+    Derive a conversation's scope from its archived turns.
+
+    A thread is a CLIENT conversation while every tagged turn in it points at
+    exactly one client; it is GLOBAL otherwise — before anything is tagged,
+    when a question spans several clients, and from the moment a second client
+    enters a thread that started about one. Derived, never stored, so the flip
+    to global happens automatically the turn the second client appears.
+    """
+    try:
+        ids = await db["ai_conversation_log"].distinct(
+            "client_group_id", {"session_id": session_id, "user_id": user_id}
+        )
+        non_null = [i for i in ids if i]
+        if len(non_null) == 1:
+            group = await db["client_groups"].find_one(
+                {"user_id": user_id, "id": non_null[0]}, {"name": 1}
+            )
+            return {
+                "scope": "client",
+                "client_group_id": non_null[0],
+                "client_name": (group or {}).get("name"),
+            }
+        return {"scope": "global", "client_group_id": None, "client_name": None}
+    except Exception:
+        logger.warning("Conversation scope derivation failed", exc_info=True)
+        return {"scope": "global", "client_group_id": None, "client_name": None}
+
+
 async def run_chat(
     provider: BaseLLMProvider,
     tool_registry: ToolRegistry,
@@ -423,6 +474,11 @@ async def run_chat(
         )
 
     tools_used = []
+    # Every distinct group id the model passes to a tool this turn. This is
+    # what scope auto-detection reads: the model already resolves "Aura" to a
+    # group id via get_client_groups before querying, so the ids it filters by
+    # ARE the answer to "which client is this turn about" — no extra AI call.
+    groups_touched: set = set()
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -432,6 +488,27 @@ async def run_chat(
     usage_out = 0
     model_calls = 0
     _model = getattr(provider, "model", None)
+
+    async def _resolve_turn_scope() -> dict:
+        # Tag the archived question with the one client this turn actually
+        # queried, then derive the whole thread's scope. On a client-pinned
+        # page the user turn was already tagged at log time; elsewhere the
+        # single touched id is verified as one of the user's own groups first,
+        # so a junk value the model passed (e.g. "all") never becomes a tag.
+        try:
+            if len(groups_touched) == 1 and not client_group_id:
+                gid = next(iter(groups_touched))
+                group = await db["client_groups"].find_one(
+                    {"user_id": user_id, "id": gid}, {"_id": 1}
+                )
+                if group:
+                    await conversation_log.tag_latest_user_turn(
+                        db, session_id=session_id, user_id=user_id,
+                        client_group_id=gid,
+                    )
+        except Exception:
+            logger.warning("Turn scope tagging failed", exc_info=True)
+        return await _conversation_scope(db, user_id, session_id)
 
     async def _debit_credits():
         try:
@@ -545,6 +622,7 @@ async def run_chat(
                     "reply": reply,
                     "tools_used": tools_used,
                     "session_id": session_id,
+                    **(await _resolve_turn_scope()),
                 }
 
             # Mistral rejects null content — use empty string when model omits it
@@ -581,6 +659,7 @@ async def run_chat(
                     args["group_id"] = client_group_id
 
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
+                groups_touched.update(_group_ids_in_args(args))
 
                 if tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
@@ -625,4 +704,5 @@ async def run_chat(
             "reply": reply,
             "tools_used": tools_used,
             "session_id": session_id,
+            **(await _resolve_turn_scope()),
         }

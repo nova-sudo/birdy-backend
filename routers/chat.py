@@ -131,12 +131,32 @@ async def list_conversations(
                     "user_turns": {"$push": {
                         "$cond": [{"$eq": ["$role", "user"]}, "$content", "$$REMOVE"]
                     }},
+                    # Every distinct client this thread touched. Same rule as
+                    # the orchestrator's _conversation_scope: exactly one →
+                    # a client conversation; zero or several → global.
+                    "group_ids": {"$addToSet": "$client_group_id"},
                 }},
                 {"$sort": {"updated_at": -1}},
                 {"$limit": MAX_CONVERSATIONS},
                 # The title only needs the opening turn; don't ship the rest.
                 {"$set": {"user_turns": {"$slice": ["$user_turns", 3]}}},
             ]).to_list(length=MAX_CONVERSATIONS)
+
+            # One name lookup for every client-scoped thread in the list,
+            # rather than a query per row.
+            scoped_ids = set()
+            for r in rows:
+                gids = [g for g in (r.get("group_ids") or []) if g]
+                r["_scope_gid"] = gids[0] if len(gids) == 1 else None
+                if r["_scope_gid"]:
+                    scoped_ids.add(r["_scope_gid"])
+            names = {}
+            if scoped_ids:
+                async for g in db["client_groups"].find(
+                    {"user_id": current_user, "id": {"$in": list(scoped_ids)}},
+                    {"id": 1, "name": 1},
+                ):
+                    names[g["id"]] = g.get("name")
 
             conversations = []
             for r in rows:
@@ -149,9 +169,15 @@ async def list_conversations(
                 title = (opening or "New Conversation")[:TITLE_LENGTH]
                 if opening and len(opening) > TITLE_LENGTH:
                     title += "…"
+                # A thread whose one tagged client no longer resolves (group
+                # deleted) reads as global rather than wearing a blank badge.
+                gid = r["_scope_gid"] if r.get("_scope_gid") in names else None
                 conversations.append({
                     "session_id": r["_id"],
                     "title": title,
+                    "scope": "client" if gid else "global",
+                    "client_group_id": gid,
+                    "client_name": names.get(gid),
                     "message_count": r.get("message_count", 0),
                     "created_at": (r.get("created_at") or "").isoformat()
                         if hasattr(r.get("created_at"), "isoformat") else r.get("created_at"),

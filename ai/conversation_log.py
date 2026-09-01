@@ -67,6 +67,36 @@ async def log_message(
         logger.warning(f"conversation_log insert failed (non-fatal): {e}")
 
 
+async def tag_latest_user_turn(
+    db,
+    *,
+    session_id: str,
+    user_id: str,
+    client_group_id: str,
+) -> None:
+    """
+    Attach a client to the newest untagged user turn in a session.
+
+    The user turn is archived BEFORE the tool loop runs (so a crash mid-answer
+    still archives the question), but which client the question was about is
+    only known AFTER the loop — it is inferred from the group ids the model
+    actually passed to its tools. Best-effort, like every write here.
+    """
+    try:
+        await db[_COLLECTION].find_one_and_update(
+            {
+                "session_id": session_id,
+                "user_id": user_id,
+                "role": "user",
+                "client_group_id": None,
+            },
+            {"$set": {"client_group_id": client_group_id}},
+            sort=[("created_at", -1)],
+        )
+    except Exception as e:
+        logger.warning(f"conversation_log tag failed (non-fatal): {e}")
+
+
 async def create_conversation_log_indexes(mongo_client) -> None:
     """Register indexes. NOTE: intentionally no TTL index — this is an archive."""
     from core.database import DB_NAME

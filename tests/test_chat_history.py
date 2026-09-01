@@ -336,3 +336,78 @@ async def test_a_scoped_list_still_excludes_other_users(chat_api, mock_db):
 
     out = await chat_router.list_conversations(client_group_id="g1", current_user=USER)
     assert out["conversations"] == []
+
+
+# ── global vs client scope, as the Ask Birdy sidebar reads it ─────────────
+#
+# Scope is DERIVED, never stored on the thread: exactly one tagged client
+# means a client conversation, anything else is global. The rule lives in two
+# places that must agree — the orchestrator (which badges the reply as it
+# lands) and the list endpoint (which badges the sidebar) — so both are
+# tested against the same cases.
+
+
+async def a_client_group(db, group_id, name, user_id=USER):
+    await db["client_groups"].insert_one(
+        {"id": group_id, "user_id": user_id, "name": name}
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_untagged_thread_lists_as_global(chat_api, mock_db):
+    await a_conversation(mock_db, "s1", ["How is the whole account?", "reply"])
+
+    convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
+    assert convo["scope"] == "global"
+    assert convo["client_group_id"] is None
+    assert convo["client_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_single_client_thread_lists_with_that_clients_name(chat_api, mock_db):
+    await a_client_group(mock_db, "g1", "Aura")
+    await a_conversation(mock_db, "s1", ["How is Aura doing?", "reply"],
+                         client_group_id="g1")
+
+    convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
+    assert convo["scope"] == "client"
+    assert convo["client_group_id"] == "g1"
+    assert convo["client_name"] == "Aura"
+
+
+@pytest.mark.asyncio
+async def test_a_thread_that_moves_to_a_second_client_reads_as_global(chat_api, mock_db):
+    """The badge follows the thread, not its opening question: once a second
+    client is in the transcript, no single client's name describes it."""
+    await a_client_group(mock_db, "g1", "Aura")
+    await a_client_group(mock_db, "g2", "Bright Smile")
+    await archive(mock_db, session_id="s1", role="user", content="How is Aura?",
+                  client_group_id="g1", when=datetime(2026, 8, 1, 12, 0))
+    await archive(mock_db, session_id="s1", role="user", content="And Bright Smile?",
+                  client_group_id="g2", when=datetime(2026, 8, 1, 12, 5))
+
+    convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
+    assert convo["scope"] == "global"
+    assert convo["client_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_thread_whose_client_was_deleted_reads_as_global(chat_api, mock_db):
+    """A dangling tag would otherwise badge the row with a blank client name."""
+    await a_conversation(mock_db, "s1", ["About a since-deleted client", "reply"],
+                         client_group_id="gone")
+
+    convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
+    assert convo["scope"] == "global"
+    assert convo["client_name"] is None
+
+
+@pytest.mark.asyncio
+async def test_a_thread_never_borrows_another_users_client_name(chat_api, mock_db):
+    """Group ids are only resolved within the caller's own groups."""
+    await a_client_group(mock_db, "g1", "Their Client", user_id=OTHER)
+    await a_conversation(mock_db, "s1", ["About g1", "reply"], client_group_id="g1")
+
+    convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
+    assert convo["scope"] == "global"
+    assert convo["client_name"] is None
