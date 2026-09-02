@@ -64,6 +64,10 @@ ALLOWED_DATA_KEYS = {
     "slack",                 # {channel_id, channel_name, frequency, time, day, brief_items}
     "wants_sync",
     "skipped",               # step keys the user skipped past (un-set if later completed)
+    "pending_import",        # sub-accounts payload picked in ReviewStep, held here while the
+                             # mandatory billing step runs — an in-memory-only ref doesn't
+                             # survive a checkout redirect or a mid-wait page reload, so this
+                             # is what actually gets imported once the subscription confirms.
 }
 
 BRIEF_ITEM_KEYS = {"spend", "leads", "conversion", "top", "alerts", "underperform"}
