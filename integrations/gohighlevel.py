@@ -476,10 +476,20 @@ class GHLIntegration:
             return False, {"error": str(e)}
 
     def _normalize_locations(self, locations):
-        """Normalize location data structure"""
+        """Normalize location data structure.
+
+        Emits both `id` and `locationId` (same value) — every caller of
+        fetch_locations (subaccount/locations, the onboarding review-prep
+        job, subaccounts-review) reads `loc.get("id") or loc.get("_id")`,
+        which this shape never had before, so every location's id came out
+        None/undefined everywhere downstream. GHL's own field name varies by
+        which upstream endpoint answered (see _loc_id above), hence the same
+        three-way fallback here.
+        """
         return [
             {
-                "locationId": loc.get("_id") or loc.get("id"),
+                "id": loc.get("_id") or loc.get("id") or loc.get("locationId"),
+                "locationId": loc.get("_id") or loc.get("id") or loc.get("locationId"),
                 "name": loc.get("name", "Unknown Location"),
                 "address": loc.get("address"),
                 "isInstalled": loc.get("isInstalled", False),

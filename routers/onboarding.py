@@ -702,6 +702,9 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
             status_default = "active"
             if last_lead is not None:
                 status_default = "active" if now - last_lead <= timedelta(days=30) else "inactive"
+            # Drives ReviewStep's default checkbox state — only sub-accounts
+            # with a lead this recent are pre-selected for import.
+            leads_recent_7 = bool(last_lead and now - last_lead <= timedelta(days=7))
 
             accounts.append({
                 "location_id": location_id,
@@ -710,6 +713,7 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
                 "last_lead_at": last_lead_at,
                 "contact_count": (info or {}).get("contact_count"),
                 "leads_recent_90": leads_recent_90,
+                "leads_recent_7": leads_recent_7,
                 "status_default": status_default,
                 "fb_match": {
                     "id": match["id"],
