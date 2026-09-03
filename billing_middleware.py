@@ -66,6 +66,15 @@ async def check_client_limit(current_user: str, mongo_client):
     """
     sub, count = await _get_subscription_and_count(current_user, mongo_client)
 
+    # A brand-new account's very first client group is free — lets someone
+    # see Birdy actually work before paying. Every client after this one
+    # requires an active subscription, including onboarding's own bulk
+    # import (which is gated by its own mandatory billing step before
+    # import-subaccounts — the other caller of this function — ever runs,
+    # so in practice a real subscription already exists by then).
+    if count == 0:
+        return True
+
     if not sub or sub.get("status") not in ("active", "trialing"):
         raise HTTPException(
             status_code=402,
