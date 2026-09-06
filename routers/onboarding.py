@@ -59,11 +59,20 @@ router = APIRouter()
 # payload is dropped so the scratch dict can't grow unbounded or be abused.
 ALLOWED_DATA_KEYS = {
     "name", "agency", "sales_tool",
+    "currency",              # ISO code chosen on the client_currency step. Used both as the
+                             # new client group's ad_account_currency and as the account-wide
+                             # users.default_currency — the sign-up form no longer asks for it,
+                             # so this step is the only place it now gets set.
     "first_client",          # {group_id, name, ghl_location_id, meta_ad_account_id}
     "kpi",                   # {cpa, wins, conv_rate, save_default}
     "slack",                 # {channel_id, channel_name, frequency, time, day, brief_items}
+    "slack_opt_out",         # True when the user answered "I don't use Slack" — the wizard
+                             # then drops the channel/frequency/brief steps entirely rather
+                             # than leaving them as a dead end for a user with no workspace.
     "wants_sync",
-    "skipped",               # step keys the user skipped past (un-set if later completed)
+    "skipped",               # legacy: step keys the user skipped past, written by the wizard
+                             # back when it had a "Skip for now" affordance. Read-only now —
+                             # kept so accounts mid-wizard when skip was removed still load.
     "pending_import",        # sub-accounts payload picked in ReviewStep, held here while the
                              # mandatory billing step runs — an in-memory-only ref doesn't
                              # survive a checkout redirect or a mid-wait page reload, so this
@@ -71,6 +80,14 @@ ALLOWED_DATA_KEYS = {
 }
 
 BRIEF_ITEM_KEYS = {"spend", "leads", "conversion", "top", "alerts", "underperform"}
+
+# Currencies the wizard's picker offers — the same twelve the old sign-up form
+# listed. Kept here as the server-side guard for data.currency; the frontend
+# list in the wizard is the display copy of it.
+SUPPORTED_CURRENCIES = {
+    "USD", "EUR", "GBP", "CAD", "AUD", "CHF",
+    "CNY", "JPY", "INR", "MXN", "AED", "SAR",
+}
 
 
 class OnboardingStateRequest(BaseModel):
@@ -137,7 +154,13 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
         db = mongo_client[DB_NAME]
         user_doc = await db["users"].find_one(
             {"user_id": current_user},
-            {"onboarding": 1, "integrations.gohighlevel.agency": 1, "name": 1, "agency_name": 1},
+            {
+                "onboarding": 1,
+                "integrations.gohighlevel.agency": 1,
+                "name": 1,
+                "agency_name": 1,
+                "default_currency": 1,
+            },
         )
         if not user_doc:
             raise HTTPException(status_code=404, detail="User not found")
@@ -168,6 +191,10 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
             "data": onboarding.get("data", {}),
             "name": user_doc.get("name"),
             "agency_name": user_doc.get("agency_name"),
+            # Echoed so the wizard can pre-select the currency step for a user
+            # resuming mid-flow, and so the frontend can seed its localStorage
+            # copy without a second round-trip.
+            "default_currency": user_doc.get("default_currency"),
         }
 
 
@@ -181,8 +208,8 @@ async def save_onboarding_state(
     current_user: str = Depends(get_current_user),
 ):
     """Persist wizard progress so an OAuth redirect (or a closed tab) resumes
-    where the user left off. ``data.name`` / ``data.agency`` also update the
-    profile fields the rest of the app reads."""
+    where the user left off. ``data.name`` / ``data.agency`` / ``data.currency``
+    also update the profile fields the rest of the app reads."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         updates: dict[str, Any] = {"updated_at": datetime.utcnow()}
@@ -199,6 +226,15 @@ async def save_onboarding_state(
             updates["name"] = data["name"].strip()
         if isinstance(data.get("agency"), str) and data["agency"].strip():
             updates["agency_name"] = data["agency"].strip()
+        # The sign-up form used to collect this; it now arrives from the
+        # wizard's client_currency step instead. Validated against the list the
+        # picker offers rather than accepted verbatim, because it lands in
+        # users.default_currency, which every money column in the product
+        # formats against — a typo'd code would render "$" everywhere with no
+        # obvious cause.
+        currency = data.get("currency")
+        if isinstance(currency, str) and currency.upper() in SUPPORTED_CURRENCIES:
+            updates["default_currency"] = currency.upper()
 
         result = await db["users"].update_one(
             {"user_id": current_user}, {"$set": updates}
@@ -819,6 +855,20 @@ async def import_subaccounts(
         db = mongo_client[DB_NAME]
         groups = db["client_groups"]
 
+        # Bulk-imported clients inherit the sales-stack answer the user gave in
+        # the wizard, the same way the first client does. Hardcoding "ghl" here
+        # meant an agency that said "I don't currently call my leads" got one
+        # client honestly marked "none" and up to twenty-four claiming a GHL
+        # dialler they don't use — so the Sales Hub would show "not available"
+        # for the first client and a confident 0 for all the others.
+        user_doc = await db["users"].find_one(
+            {"user_id": current_user}, {"onboarding.data.sales_tool": 1, "_id": 0}
+        )
+        sales_tool = (
+            ((user_doc or {}).get("onboarding") or {}).get("data") or {}
+        ).get("sales_tool")
+        provider = {"hp": "hotprospector", "none": "none"}.get(sales_tool, "ghl")
+
         existing = await groups.find(
             {"user_id": current_user, "ghl_location_id": {"$ne": None}},
             {"ghl_location_id": 1, "_id": 0},
@@ -847,7 +897,7 @@ async def import_subaccounts(
                 "ghl_location_id": account.location_id,
                 "meta_ad_account_id": account.meta_ad_account_id,
                 "hotprospector_group_id": None,
-                "call_log_provider": "ghl",
+                "call_log_provider": provider,
                 "notes": "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
