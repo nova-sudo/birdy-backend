@@ -55,6 +55,10 @@ from integrations.hotprospector import (
     save_hotprospector_leads_to_collection,
     HotProspectorIntegration,
 )
+# The one spelling of "this client has no call centre". Imported rather than
+# repeated so the writer here and the reader in call_logs.py cannot drift —
+# a second spelling would silently re-enable everything this value turns off.
+from routers.call_logs import NO_CALL_CENTRE
 
 # Service imports
 from services.meta_service import (
@@ -221,6 +225,14 @@ async def get_client_groups(
                 {
                     "_id": 1, "id": 1, "name": 1,
                     "ghl_location_id": 1, "meta_ad_account_id": 1,
+                    # Which dialler — if any — backs this client's call
+                    # figures. "none" means they told us at onboarding that
+                    # they don't call their leads, and every call-centre
+                    # number on the Sales Hub and the Portfolio Dashboard
+                    # renders as unavailable rather than as a real-looking 0.
+                    # Projected here because that decision is per client and
+                    # every one of those screens reads this list.
+                    "call_log_provider": 1,
                     "ad_account_currency": 1, "notes": 1,
                     "created_at": 1, "updated_at": 1,
                     "gohighlevel_cache": 1,
@@ -559,7 +571,15 @@ async def create_client_group_optimized(
                 "ghl_location_id": request.ghl_location_id,
                 "meta_ad_account_id": request.meta_ad_account_id,
                 "hotprospector_group_id": request.hotprospector_group_id,
-                "call_log_provider": request.call_log_provider or "ghl",
+                # "ghl" is the fallback for a caller that said nothing, not a
+                # floor. "none" — the onboarding wizard's "I don't currently
+                # call my leads" — is a deliberate answer and has to survive
+                # this line intact: coercing it would hand the client a call
+                # centre they explicitly said they don't have, and every
+                # downstream screen would go back to drawing zeroes.
+                # Normalised so a stray "None"/" NONE " still lands on the one
+                # spelling every read path compares against.
+                "call_log_provider": (request.call_log_provider or "ghl").strip().lower(),
                 "notes": request.notes or "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
@@ -1263,6 +1283,16 @@ async def get_client_group_comprehensive(
             async def fetch_hp_data():
                 """Fetch HotProspector data with caching"""
                 if not group.get("ghl_location_id"):
+                    return None
+
+                # A client who told us they don't call their leads has no call
+                # centre to read, and this branch is expensive — it pages every
+                # lead out of HotProspector and then their call logs. Left
+                # alone it would also *invent* the thing the client said they
+                # don't have: HP credentials are account-wide, so any lead of
+                # theirs that happened to exist upstream would come back and be
+                # rendered as this client's call activity.
+                if (group.get("call_log_provider") or "").strip().lower() == NO_CALL_CENTRE:
                     return None
 
                 try:

@@ -11,12 +11,30 @@ Routing rule:
     - provider == "ghl"            → query call_logs collection
                                      (source = "ghl", location_id =
                                       group.ghl_location_id)
-    - provider == "hotprospector"  → empty result set + a `message`
-                                     until HP endpoints are ready
+    - provider == "hotprospector"  → query call_logs collection
+                                     (source = "hotprospector", written by
+                                      the HP cron)
+    - provider == "none"           → the client told us at onboarding that
+                                     they do not call their leads at all.
+                                     Empty result set + a `message`, never
+                                     an error — see below.
 
 The Sales-Hub frontend consumes this endpoint when the selected
 client's `call_log_provider` is "ghl". HP-provider clients short-
 circuit with the empty payload.
+
+Why "none" is a 200 and not a 400
+---------------------------------
+"none" is a *choice*, not a misconfiguration. The Sales Hub asks this
+endpoint for whichever client is selected without first checking what
+that client uses, so a 400 here would surface as an error toast on a
+screen the reader opened deliberately — Birdy shouting that a client is
+broken when the client is exactly as they set it up. The frontend paints
+its "not available" state off `meta.provider`, so what it needs back is
+the ordinary empty payload with the provider echoed in it.
+
+Genuinely unknown values still fail loudly: a stray string in Mongo is a
+config bug, and letting it read as "no calls" would hide it for good.
 """
 
 import logging
@@ -32,6 +50,15 @@ from dependencies import get_mongo_client, get_current_user
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api", tags=["call_logs"])
+
+# The `call_log_provider` value meaning "this client has no call-centre
+# integration at all". One spelling, shared by the onboarding wizard, the
+# client-group writer and every read path — see routers/client_groups.py.
+NO_CALL_CENTRE = "none"
+
+# Providers whose rows actually live in call_logs. NO_CALL_CENTRE is knowingly
+# absent: it is answered before we ever build a query.
+QUERYABLE_PROVIDERS = ("ghl", "hotprospector")
 
 
 # ---------------------------------------------------------------------------
@@ -66,6 +93,37 @@ def _serialize(row: dict) -> dict:
     }
 
 
+def _empty_page(
+    *,
+    provider: str,
+    group_id: str,
+    location_id: str | None,
+    skip: int,
+    limit: int,
+    message: str,
+) -> dict:
+    """The no-rows payload, in the exact shape a populated page has.
+
+    Every "there is nothing to show, and here is why" branch answers through
+    here, so the frontend only ever parses one response shape — what separates
+    those branches is the `message`, not the structure. Inlining the dict per
+    branch is how the two of them drifted apart in the first place.
+    """
+    return {
+        "data": [],
+        "meta": {
+            "total": 0,
+            "returned": 0,
+            "skip": skip,
+            "limit": limit,
+            "provider": provider,
+            "group_id": group_id,
+            "location_id": location_id,
+        },
+        "message": message,
+    }
+
+
 # ---------------------------------------------------------------------------
 # GET /api/call_logs?group_id=...&skip=...&limit=...
 # ---------------------------------------------------------------------------
@@ -87,7 +145,10 @@ async def list_call_logs(
     The group's `call_log_provider` determines which rows we look at:
       - "ghl"           → call_logs where source="ghl" and
                           location_id = group.ghl_location_id
-      - "hotprospector" → empty list (HP integration not yet wired)
+      - "hotprospector" → call_logs where source="hotprospector"
+      - "none"          → empty list, 200. The client does not call their
+                          leads, so there is no source to read — which is a
+                          setting, not a failure. See the module docstring.
 
     Caller can override with ?source=ghl explicitly (used when debugging
     a group whose provider field hasn't been set yet on legacy rows).
@@ -114,31 +175,40 @@ async def list_call_logs(
         if not group:
             raise HTTPException(status_code=404, detail="Client group not found")
 
-        provider = (source or group.get("call_log_provider") or "ghl").lower()
+        provider = (source or group.get("call_log_provider") or "ghl").strip().lower()
         location_id = group.get("ghl_location_id")
+
+        # Answered before the location check and before the allow-list. A
+        # client with no call centre usually still has a GHL location — it is
+        # their CRM — so falling through to "no linked GHL location" would
+        # send the reader off to connect something that is already connected.
+        if provider == NO_CALL_CENTRE:
+            return _empty_page(
+                provider=provider,
+                group_id=group_id,
+                location_id=location_id,
+                skip=skip,
+                limit=limit,
+                message="This client does not use a call centre.",
+            )
 
         # Only known providers are queried; unknown values fail loudly below
         # so config bugs (e.g. a stray value in Mongo) don't silently 200.
-        if provider not in ("ghl", "hotprospector"):
+        if provider not in QUERYABLE_PROVIDERS:
             raise HTTPException(
                 status_code=400,
                 detail=f"Unknown call_log_provider for group {group_id}: {provider!r}",
             )
 
         if not location_id:
-            return {
-                "data": [],
-                "meta": {
-                    "total": 0,
-                    "returned": 0,
-                    "skip": skip,
-                    "limit": limit,
-                    "provider": provider,
-                    "group_id": group_id,
-                    "location_id": None,
-                },
-                "message": "This client group has no linked GHL location.",
-            }
+            return _empty_page(
+                provider=provider,
+                group_id=group_id,
+                location_id=None,
+                skip=skip,
+                limit=limit,
+                message="This client group has no linked GHL location.",
+            )
 
         # Both providers share the same call_logs schema — only the `source`
         # tag differs. GHL rows come from the /webhooks/call_logs handler;
