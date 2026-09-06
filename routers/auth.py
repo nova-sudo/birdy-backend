@@ -73,6 +73,11 @@ async def register_user(request: RegisterRequest, response: Response):
             if existing_user:
                 raise HTTPException(status_code=400, detail="Email already registered")
             hashed_password = bcrypt.hashpw(request.password.encode('utf-8'), bcrypt.gensalt()).decode('utf-8')
+            # `name` and `default_currency` are no longer asked for at sign-up
+            # (the onboarding wizard fills them in), but the keys are still
+            # written — as None — so every user doc has the same shape and the
+            # readers here (get_me, login) don't have to distinguish "never
+            # collected" from "missing field".
             user_doc = {
                 "user_id": request.email,
                 "name": request.name,
@@ -91,7 +96,20 @@ async def register_user(request: RegisterRequest, response: Response):
             set_cookie(response, "refresh_token", refresh_token, JWT_REFRESH_EXPIRY_DAYS * 24 * 60 * 60)
 
             logger.info(f"Set auth_token and refresh_token cookies for user: {request.email}")
-            return {"message": "Registration successful", "user": {"email": request.email, "name": request.name}}
+            # Same `user` shape as /api/login: the frontend drops this straight
+            # into localStorage on both paths, and ProtectedLayout reads
+            # `role` off it to gate /admin — a register response missing that
+            # key left a freshly signed-up session with a different-shaped
+            # user object than a logged-in one.
+            return {
+                "message": "Registration successful",
+                "user": {
+                    "email": request.email,
+                    "name": user_doc.get("name"),
+                    "default_currency": user_doc.get("default_currency"),
+                    "role": user_doc.get("role", "user"),
+                }
+            }
         except HTTPException:
             raise
         except Exception as e:

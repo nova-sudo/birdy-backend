@@ -3,10 +3,16 @@ from typing import Optional, List
 
 
 class RegisterRequest(BaseModel):
-    name: str
+    # Sign-up is deliberately email + password only. Name and currency used to
+    # be required here, which meant three extra decisions before an account
+    # existed; the onboarding wizard now collects both (welcome_name writes
+    # users.name, the currency step writes users.default_currency), so they
+    # stay optional on this payload rather than being dropped from the model —
+    # an older client that still posts them keeps working.
     email: str
     password: str
-    default_currency: str
+    name: Optional[str] = None
+    default_currency: Optional[str] = None
 
 
 class LoginRequest(BaseModel):
