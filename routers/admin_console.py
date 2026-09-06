@@ -45,6 +45,8 @@ from credits import (
     MODEL_PRICING,
 )
 from billing import (
+    ACTIVE_STATUSES,
+    cancel_membership,
     _targetable_plans,
     list_promo_codes,
     create_promo_code,
@@ -241,6 +243,183 @@ async def list_agencies(
         rows.sort(key=lambda r: (r["last_active"] or datetime.min), reverse=True)
         total = len(rows)
         return {"total": total, "agencies": rows[skip: skip + limit]}
+
+
+# Collections holding per-user data keyed by a plain `user_id` field —
+# verified against every writer in routers/services before listing here.
+# (Deliberately excludes admin_audit, promo_codes_meta, waitlist, and the
+# Slack team/channel-scoped caches, none of which are this account's own data.)
+#
+# Lived in routers/settings.py behind a self-service DELETE /api/account until
+# account deletion became an admin-only process; the cascade itself is
+# unchanged, only who is allowed to trigger it.
+ACCOUNT_DATA_COLLECTIONS = [
+    "client_groups",
+    "ghl_contacts",
+    "hotprospector_leads",
+    "facebook_leads",
+    "facebook_ad_insights",
+    "facebook_adset_insights",
+    "facebook_campaign_insights",
+    "call_logs",
+    "alerts",
+    "alert_notifications",
+    "ai_chat_sessions",
+    "ai_conversation_log",
+    "ai_usage",
+    "mcp_tokens",
+    "meta_refresh_jobs",
+]
+
+
+@router.delete("/api/admin/users/{user_id}")
+async def delete_user_account(user_id: str, admin_email: str = Depends(require_admin)):
+    """
+    Permanently delete an account and everything Birdy stored for it. This is
+    the ONLY deletion path — users cannot delete themselves; support does it
+    from the console on request.
+
+    Three refusals, all deliberate:
+
+      * Deleting yourself. An admin nuking their own account through the
+        console is the self-service path wearing a different hat, and it would
+        also destroy the session mid-request. Removing an admin is a
+        database-side job done with intent, not a button.
+      * Deleting another admin. The console has no demote action, so an admin
+        row can only have been made deliberately; requiring the role to be
+        dropped in the database first makes the removal of a colleague's access
+        a two-person-shaped act rather than one misclick in a table.
+    A live Whop subscription used to be a third refusal. It is now handled
+    instead: any active/trialing/past_due/canceling membership is cancelled
+    immediately, through Whop, *before* a single document is deleted. Both
+    memberships are cancelled — the base plan and the extra-client-slot add-on
+    are separate Whop memberships, and cancelling only the first would leave
+    the add-on quietly billing a customer who no longer has an account.
+
+    Ordering is the safety property, and it is deliberate: if Whop refuses the
+    cancellation — most likely because WHOP_API_KEY is missing the
+    `membership:cancel` scope — the request aborts with Whop's own reason and
+    nothing is deleted. Deleting first and cancelling afterwards would risk
+    exactly the orphaned subscription this used to refuse outright: a
+    membership billing an account that no longer exists, with no record left of
+    whose it was.
+
+    Audited to `admin_audit` like every other console mutation, including the
+    per-collection document counts and the memberships cancelled, because after
+    this runs there is nothing left to reconstruct what was removed.
+    """
+    target = user_id.strip().lower()
+    if target == admin_email.lower():
+        raise HTTPException(
+            status_code=400, detail="You cannot delete your own account"
+        )
+
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            user = await db["users"].find_one(
+                {"user_id": target}, {"subscription": 1, "role": 1}
+            )
+            if not user:
+                raise HTTPException(status_code=404, detail="User not found")
+
+            if user.get("role") == "admin":
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        "This is an admin account. Remove the admin role in the "
+                        "database before deleting it."
+                    ),
+                )
+
+            # ── Cancel the subscription before deleting anything ───────────
+            sub = user.get("subscription") or {}
+            sub_status = sub.get("status")
+            cancelled: list[str] = []
+
+            if sub_status in ACTIVE_STATUSES:
+                # The base plan and the extra-client add-on are two separate
+                # Whop memberships against one Birdy account. Both bill.
+                membership_ids = [
+                    mid for mid in (
+                        sub.get("whop_membership_id"),
+                        sub.get("whop_extra_membership_id"),
+                    ) if mid
+                ]
+                if not membership_ids:
+                    # Subscribed according to our mirror, but with nothing to
+                    # cancel against. Refusing beats deleting blind: the
+                    # membership exists at Whop's end and we'd be throwing away
+                    # the only record of whose it is.
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            f"{target} has a {sub_status} subscription but no Whop "
+                            "membership id on file, so it cannot be cancelled "
+                            "automatically. Cancel it in Whop, then delete."
+                        ),
+                    )
+
+                for membership_id in membership_ids:
+                    try:
+                        await cancel_membership(membership_id, immediate=True)
+                    except HTTPException as e:
+                        reason = e.detail if isinstance(e.detail, str) else "Whop rejected the cancellation."
+                        already = (
+                            f" Already cancelled before this failed: {', '.join(cancelled)}."
+                            if cancelled else ""
+                        )
+                        raise HTTPException(
+                            status_code=e.status_code,
+                            detail=(
+                                f"Could not cancel {target}'s Whop membership "
+                                f"{membership_id}, so the account was NOT deleted and "
+                                f"no data was touched. {reason}{already}"
+                            ),
+                        ) from e
+                    cancelled.append(membership_id)
+
+                logger.info(
+                    f"[admin] {admin_email} cancelled Whop memberships {cancelled} "
+                    f"for {target} ahead of deletion"
+                )
+
+            deleted = {}
+            for collection in ACCOUNT_DATA_COLLECTIONS:
+                result = await db[collection].delete_many({"user_id": target})
+                if result.deleted_count:
+                    deleted[collection] = result.deleted_count
+
+            await db["users"].delete_one({"user_id": target})
+
+            await db["admin_audit"].insert_one({
+                "admin": admin_email,
+                "target": target,
+                "action": "account_delete",
+                "deleted": deleted,
+                # Which Whop memberships this cancelled. The only surviving
+                # record: the subscription document went with the user doc.
+                "cancelled_memberships": cancelled,
+                "ts": datetime.utcnow(),
+            })
+
+            logger.info(
+                f"[admin] {admin_email} deleted account {target} and all its data: {deleted}"
+            )
+            return {
+                "deleted": True,
+                "email": target,
+                "collections": deleted,
+                "cancelled_memberships": cancelled,
+            }
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(
+                f"[admin] {admin_email} failed deleting account {target}: {e}",
+                exc_info=True,
+            )
+            raise HTTPException(status_code=500, detail="Failed to delete account")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

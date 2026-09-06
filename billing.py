@@ -221,6 +221,32 @@ async def delete_promo_code(promo_id: str) -> bool:
         raise _whop_http_error(e, "delete the promo code") from e
 
 
+async def cancel_membership(membership_id: str, *, immediate: bool = True):
+    """Cancel one Whop membership.
+
+    ``immediate`` revokes access now; the alternative bills to the end of the
+    current period and stops renewing. Account deletion wants immediate — the
+    account it belongs to is about to stop existing, so "keep access until the
+    period ends" would mean billing nobody for access nobody can use.
+
+    Needs the `membership:cancel` scope on WHOP_API_KEY. If the key is missing
+    it, Whop answers 403 and `_whop_http_error` surfaces its sentence verbatim
+    rather than a generic failure — that distinction matters here, because the
+    caller has to be able to tell "this subscription is now cancelled" from
+    "Birdy is not allowed to cancel it", and only the first makes deletion safe.
+    """
+    try:
+        async with _whop() as whop:
+            return await whop.memberships.cancel(
+                membership_id,
+                cancellation_mode="immediate" if immediate else "at_period_end",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _whop_http_error(e, f"cancel membership {membership_id}") from e
+
+
 def _secret_fingerprint() -> str:
     """A short, non-reversible fingerprint of the configured webhook secret, so
     a config mismatch (wrong value / not redeployed) can be diagnosed from logs
