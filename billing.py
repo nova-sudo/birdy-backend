@@ -247,6 +247,33 @@ async def cancel_membership(membership_id: str, *, immediate: bool = True):
         raise _whop_http_error(e, f"cancel membership {membership_id}") from e
 
 
+async def uncancel_membership(membership_id: str):
+    """Reverse a pending cancellation — the counterpart to cancel_membership
+    with immediate=False. Needs the `member:manage` scope."""
+    try:
+        async with _whop() as whop:
+            return await whop.memberships.uncancel(membership_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise _whop_http_error(e, f"reactivate membership {membership_id}") from e
+
+
+def _membership_ids(sub: dict) -> list[str]:
+    """Every Whop membership backing one Birdy account, base plan first.
+
+    The extra-client-slot add-on is its own membership. Anything that ends a
+    subscription has to end both, or the add-on keeps billing against a plan
+    that no longer exists.
+    """
+    return [
+        mid for mid in (
+            (sub or {}).get("whop_membership_id"),
+            (sub or {}).get("whop_extra_membership_id"),
+        ) if mid
+    ]
+
+
 def _secret_fingerprint() -> str:
     """A short, non-reversible fingerprint of the configured webhook secret, so
     a config mismatch (wrong value / not redeployed) can be diagnosed from logs
@@ -461,6 +488,96 @@ async def portal_url(current_user: str = Depends(get_current_user)):
     if not url:
         raise HTTPException(status_code=500, detail="Manage URL not available yet. Please try again shortly.")
     return {"portal_url": url}
+
+
+# ── POST /api/billing/cancel ──────────────────────────────────────────────────
+
+@router.post("/api/billing/cancel")
+async def cancel_subscription(current_user: str = Depends(get_current_user)):
+    """Cancel the signed-in user's subscription, in place.
+
+    At period end, not immediately: they have already paid for the current
+    period, and revoking access the moment they click cancel would be taking
+    back something they own. `cancel_at_period_end` is what the UI reads to say
+    "Cancels on <date>", and the plan keeps working until then.
+
+    This used to be a trip to Whop's hosted portal, on the belief that Whop had
+    no cancel API. It has one. The portal is still where plan changes and
+    payment methods live — those genuinely need it — but ending a subscription
+    does not, and sending someone to a third-party page to do the one thing
+    they came to Settings for was the worst part of this screen.
+
+    The local mirror is updated here rather than waited on: users.subscription
+    is fed by webhooks and nothing reconciles it, so leaving the flag to arrive
+    on its own would show a customer their cancellation had not registered.
+    """
+    async with get_mongo_client() as mc:
+        sub = await _get_sub(current_user, mc)
+        if not sub or sub.get("status") not in ACTIVE_STATUSES:
+            raise HTTPException(status_code=400, detail="No active subscription to cancel.")
+
+        # Idempotent: asking twice is a double-click or a stale tab, not an error.
+        if sub.get("cancel_at_period_end"):
+            return {
+                "cancelled": True,
+                "cancel_at_period_end": True,
+                "current_period_end": sub.get("current_period_end"),
+            }
+
+        membership_ids = _membership_ids(sub)
+        if not membership_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "We can't find your Whop membership to cancel it. Please contact "
+                    "support and we'll sort it out."
+                ),
+            )
+
+        for membership_id in membership_ids:
+            await cancel_membership(membership_id, immediate=False)
+
+        sub["cancel_at_period_end"] = True
+        await _save_sub(current_user, sub, mc)
+
+    logger.info(f"{current_user} cancelled memberships {membership_ids} at period end")
+    return {
+        "cancelled": True,
+        "cancel_at_period_end": True,
+        "current_period_end": sub.get("current_period_end"),
+    }
+
+
+# ── POST /api/billing/reactivate ──────────────────────────────────────────────
+
+@router.post("/api/billing/reactivate")
+async def reactivate_subscription(current_user: str = Depends(get_current_user)):
+    """Undo a scheduled cancellation, while the plan is still running."""
+    async with get_mongo_client() as mc:
+        sub = await _get_sub(current_user, mc)
+        if not sub or not sub.get("cancel_at_period_end"):
+            raise HTTPException(
+                status_code=400, detail="You don't have a scheduled cancellation to undo."
+            )
+
+        membership_ids = _membership_ids(sub)
+        if not membership_ids:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "We can't find your Whop membership to reactivate it. Please "
+                    "contact support and we'll sort it out."
+                ),
+            )
+
+        for membership_id in membership_ids:
+            await uncancel_membership(membership_id)
+
+        sub["cancel_at_period_end"] = False
+        await _save_sub(current_user, sub, mc)
+
+    logger.info(f"{current_user} reactivated memberships {membership_ids}")
+    return {"cancel_at_period_end": False}
 
 
 # ── POST /api/billing/webhook ─────────────────────────────────────────────────

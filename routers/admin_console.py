@@ -47,6 +47,7 @@ from credits import (
 from billing import (
     ACTIVE_STATUSES,
     cancel_membership,
+    _membership_ids,
     _targetable_plans,
     list_promo_codes,
     create_promo_code,
@@ -340,12 +341,7 @@ async def delete_user_account(user_id: str, admin_email: str = Depends(require_a
             if sub_status in ACTIVE_STATUSES:
                 # The base plan and the extra-client add-on are two separate
                 # Whop memberships against one Birdy account. Both bill.
-                membership_ids = [
-                    mid for mid in (
-                        sub.get("whop_membership_id"),
-                        sub.get("whop_extra_membership_id"),
-                    ) if mid
-                ]
+                membership_ids = _membership_ids(sub)
                 if not membership_ids:
                     # Subscribed according to our mirror, but with nothing to
                     # cancel against. Refusing beats deleting blind: the
