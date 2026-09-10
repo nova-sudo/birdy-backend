@@ -138,6 +138,27 @@ async def meta_tick(authorization: str | None = Header(default=None)):
             limit=20,
         )
 
+        # 1b. Mop up static presets whose monthly sweep missed them.
+        #
+        # meta-static-tick fires once a month, and a group that happens to have
+        # an open job at that moment is skipped — its Last Month / Last Quarter
+        # / Last Year then read £0 for another 28 days, because nothing else
+        # schedules them. Checking here too means a group is at most a few
+        # minutes stale rather than up to a month, and it is what heals the 14
+        # groups that never had these presets written at all.
+        #
+        # This costs one indexed-range query a minute and, because the cutoff
+        # is 28 days, schedules a given group roughly once a month — the same
+        # Meta call volume the monthly cron was always meant to make. The small
+        # limit keeps a tick from filling with static work.
+        scheduled += await schedule_stale_groups(
+            mongo_client,
+            cutoff_hours=META_STATIC_CUTOFF_HOURS,
+            presets=META_STATIC_PRESETS,
+            limit=3,
+            stale_field="last_meta_static_refresh",
+        )
+
         # 2. Claim and work
         jobs = await claim_next_jobs(mongo_client, n=META_GROUPS_PER_TICK)
         if jobs:
@@ -185,13 +206,20 @@ async def meta_static_tick(authorization: str | None = Header(default=None)):
 
     tick_start = time.monotonic()
     async with get_mongo_client() as mongo_client:
-        # Schedule every group that hasn't had a static refresh in ~28 days.
+        # Schedule every group that hasn't had a *static* refresh in ~28 days.
+        #
+        # Read off last_meta_static_refresh, not last_meta_refresh. The latter
+        # is rewritten every minute by meta-tick, so this query used to match
+        # nothing at all and the monthly sweep scheduled zero groups — see
+        # schedule_stale_groups for the measurements.
+        #
         # Higher limit because this only runs once a month.
         scheduled = await schedule_stale_groups(
             mongo_client,
             cutoff_hours=META_STATIC_CUTOFF_HOURS,
             presets=META_STATIC_PRESETS,
             limit=1000,
+            stale_field="last_meta_static_refresh",
         )
 
         # Work on a few right now; meta-tick will mop up the rest over time.

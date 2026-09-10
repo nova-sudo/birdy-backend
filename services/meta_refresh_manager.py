@@ -26,7 +26,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 
-from core.constants import META_CACHE_PRESETS
+from core.constants import META_CACHE_PRESETS, META_STATIC_PRESETS
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
@@ -662,6 +662,31 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
         "meta_refresh_status": group_status,
         "last_meta_refresh": datetime.utcnow(),
     }
+
+    # The static tier gets its own stamp, and this is the whole reason it
+    # exists.
+    #
+    # Both crons decided staleness from `last_meta_refresh`, but only one of
+    # them can keep it fresh: meta-tick runs every minute and writes that field
+    # on every group it touches. So when meta-static-tick fired on the 1st and
+    # asked for groups untouched for 28 days, it found none — every group had
+    # been refreshed minutes earlier by the other tier. It scheduled zero
+    # groups, every month, since the tiers were split.
+    #
+    # Measured on the live collection: 14 of 16 Meta-connected groups had no
+    # `last_month` spend cached at all, and 4 of 274 refresh jobs had ever
+    # included a static preset — all of those from onboarding or a manual
+    # refresh, never from the monthly cron. Last Month / Last Quarter / Last
+    # Year read £0 on every one of those 14 clients.
+    #
+    # Stamped only when a static preset actually landed: an unstamped group is
+    # one whose static windows we still do not have, and next month's tick
+    # should pick it up again rather than skip it for another 28 days.
+    if any(
+        key in META_STATIC_PRESETS and state.get("status") == "success"
+        for key, state in presets.items()
+    ):
+        update_fields["last_meta_static_refresh"] = datetime.utcnow()
     if final_status == "failed":
         error_parts = []
         for k, v in presets.items():
@@ -707,6 +732,7 @@ async def schedule_stale_groups(
     cutoff_hours: float,
     presets: list[str],
     limit: int = 100,
+    stale_field: str = "last_meta_refresh",
 ) -> list[str]:
     """
     Find client groups whose Meta cache is older than `cutoff_hours` and
@@ -720,6 +746,21 @@ async def schedule_stale_groups(
                       the 5h cron, META_STATIC_PRESETS for the monthly one.
         limit:        max number of groups to schedule per tick (caps the
                       growth of meta_refresh_jobs per minute).
+        stale_field:  which timestamp decides staleness. Each tier must read
+                      the stamp its own work writes — see below.
+
+    ── Why `stale_field` is a parameter ──────────────────────────────────────
+
+    Both tiers used to read `last_meta_refresh`, and the every-minute ongoing
+    tick writes that field on every group it refreshes. The monthly static tick
+    therefore asked for groups untouched for 28 days and was told there were
+    none, so it scheduled nothing — month after month, leaving Last Month /
+    Last Quarter / Last Year uncached on 14 of 16 live groups.
+
+    The static tier now reads `last_meta_static_refresh`, which only a
+    successful static refresh writes (see _finalize_job). A tier that cannot
+    starve itself is the point: whichever cron owns a stamp is the only cron
+    that can clear it.
 
     Returns the list of group_ids that were scheduled.
     """
@@ -740,20 +781,23 @@ async def schedule_stale_groups(
             # branch was pure duplication (verified against the live collection —
             # both forms match the same 9 never-refreshed groups, and the whole
             # filter returns identical result sets either way). What is left is
-            # two plain ranges over last_meta_refresh, which is exactly what
+            # two plain ranges over the stamp, which is exactly what
             # idx_cg_meta_stale (partial, see utils/cache_helpers.py) indexes —
             # that index also serves the .sort() below, so this no longer
             # COLLSCANs the collection and sorts it in memory every minute.
+            # The static tier reads a different stamp and runs monthly over a
+            # collection this size, so it is left to scan rather than carrying
+            # a second index for twelve queries a year.
             "$or": [
-                {"last_meta_refresh": {"$lt": cutoff}},
-                {"last_meta_refresh": None},
+                {stale_field: {"$lt": cutoff}},
+                {stale_field: None},
             ],
         },
         {
             "id": 1, "user_id": 1, "name": 1,
             "meta_ad_account_id": 1, "ad_account_currency": 1,
         },
-    ).sort("last_meta_refresh", 1).limit(limit * 2).to_list(None)  # over-fetch in case some are filtered
+    ).sort(stale_field, 1).limit(limit * 2).to_list(None)  # over-fetch in case some are filtered
 
     if not candidates:
         return []
@@ -791,7 +835,7 @@ async def schedule_stale_groups(
     if scheduled:
         logger.info(
             f"[scheduler] Enqueued {len(scheduled)} groups for refresh "
-            f"({len(presets)} presets, cutoff={cutoff_hours}h)"
+            f"({len(presets)} presets, cutoff={cutoff_hours}h on {stale_field})"
         )
     return scheduled
 
