@@ -1,4 +1,5 @@
 {
+  "regions": ["cpt1"],
   "builds": [
     {
       "src": "main.py",
