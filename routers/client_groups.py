@@ -73,6 +73,7 @@ from services.ghl_service import (
     get_ghl_contacts_sorted,
     get_tag_metrics_from_cache,
 )
+from services.ad_leads import fetch_ad_leads
 from services.contact_classifier import classify_contact_type
 from services.facebook_cache_shape import read_preset
 
@@ -267,6 +268,7 @@ async def get_client_groups(
                 "facebook_cache.currency": 1,
                 "facebook_cache.original_currency": 1,
                 "facebook_cache.total_leads": 1,
+                "facebook_cache.lead_source": 1,
                 "facebook_cache.metrics": 1,
                 # facebook_cache.campaigns/.adsets/.ads are deliberately NOT
                 # projected. They are the flat all-time copies kept for
@@ -442,6 +444,11 @@ async def get_client_groups(
                         "name": facebook_cache.get("name", ""),
                         "currency": facebook_cache.get("currency", ""),
                         "total_leads": facebook_cache.get("total_leads", 0),
+                        # Which source those leads came from — instant forms,
+                        # GoHighLevel's own ad attribution, both, or nothing.
+                        # The tables label the count rather than implying every
+                        # lead is a form submission with a contact behind it.
+                        "lead_source": facebook_cache.get("lead_source", "none"),
                         "campaigns": preset_doc.get("campaigns", []),
                         "adsets": preset_doc.get("adsets", []),
                         "ads": preset_doc.get("ads", []),
@@ -463,6 +470,7 @@ async def get_client_groups(
                         "name": facebook_cache.get("name", ""),
                         "currency": facebook_cache.get("currency", ""),
                         "total_leads": facebook_cache.get("total_leads", 0),
+                        "lead_source": facebook_cache.get("lead_source", "none"),
                         "campaigns": [],
                         "adsets": [],
                         "ads": [],
@@ -2097,75 +2105,30 @@ async def get_campaign_opp_rollup(
     Attribute GHL opportunity outcomes (won/lost/open/abandoned) down to the
     campaign/ad set/ad that produced the lead.
 
-    For each Meta lead in the date range, look up its GHL contact via
-    match_keys and classify by the contact's primary opportunity status
-    (priority: won > open > lost > abandoned — same rule the leads tab uses).
-    Counts are then rolled up by campaign_id, adset_id, and ad_id.
+    Counts are rolled up by campaign_id, adset_id and ad_id, and the response
+    shape mirrors /api/campaigns/tag-rollup so the frontend can overlay per-row
+    values onto the campaigns/adsets/ads tables.
 
-    Response shape mirrors /api/campaigns/tag-rollup so the frontend can
-    overlay per-row values onto the campaigns/adsets/ads tables.
+    Leads come from services/ad_leads.py, which resolves both Meta instant forms
+    and the ad id GoHighLevel captures itself. Before that this walked
+    `facebook_leads` alone and matched each row to a contact by match_keys — so
+    a client running their own landing page had no rows to walk and every GHL
+    column on their ads tables was blank. Their leads *are* GHL contacts, so for
+    those the join the old code performed is already done.
+
+    A lead with no opportunity contributes to `contacts` but not to `total`,
+    which is what makes total/contacts a real conversion rate.
     """
     async with get_mongo_client() as mongo_client:
         try:
-            db = mongo_client[DB_NAME]
-            leads_collection = db["facebook_leads"]
-            ghl_col = db["ghl_contacts"]
+            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else None
 
-            group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
-
-            lead_query = {"user_id": current_user}
-            if group_ids:
-                lead_query["client_group_id"] = {"$in": group_ids}
-            if start_date or end_date:
-                date_filter = {}
-                if start_date:
-                    date_filter["$gte"] = start_date
-                if end_date:
-                    try:
-                        date_filter["$lte"] = iso_day_end(end_date)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc)) from exc
-                lead_query["lead_data.created_time"] = date_filter
-
-            lead_docs = await leads_collection.find(
-                lead_query,
-                {
-                    "match_keys": 1,
-                    "lead_data.ad_id": 1,
-                    "lead_data.adset_id": 1,
-                    "lead_data.campaign_id": 1,
-                },
-            ).to_list(None)
-
-            # Build match_key → (primary_status, primary_value) map for GHL contacts
-            all_keys = set()
-            for doc in lead_docs:
-                for key in (doc.get("match_keys") or []):
-                    all_keys.add(key)
-
-            ghl_by_key: dict[str, tuple[str, float]] = {}
-            if all_keys:
-                ghl_docs = await ghl_col.find(
-                    {"user_id": current_user, "match_keys": {"$in": list(all_keys)}},
-                    {"match_keys": 1, "contact_data.opportunities": 1},
-                ).to_list(None)
-                for gd in ghl_docs:
-                    opps = (gd.get("contact_data") or {}).get("opportunities") or []
-                    status, value = "", 0.0
-                    if opps:
-                        for priority in ("won", "open", "lost", "abandoned"):
-                            match = next((o for o in opps if o.get("status") == priority), None)
-                            if match:
-                                status = priority
-                                try:
-                                    value = float(match.get("monetaryValue") or 0)
-                                except (TypeError, ValueError):
-                                    value = 0.0
-                                break
-                    for key in (gd.get("match_keys") or []):
-                        # First contact wins — mirrors the leads tab's primary-match rule
-                        if key not in ghl_by_key:
-                            ghl_by_key[key] = (status, value)
+            try:
+                leads = await fetch_ad_leads(
+                    current_user, group_ids, start_date, end_date, mongo_client
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             def _empty_bucket() -> dict:
                 return {
@@ -2177,27 +2140,17 @@ async def get_campaign_opp_rollup(
             by_adset: dict[str, dict] = {}
             by_ad: dict[str, dict] = {}
 
-            for doc in lead_docs:
-                lead_data = doc.get("lead_data") or {}
-                campaign_id = lead_data.get("campaign_id") or ""
-                adset_id = lead_data.get("adset_id") or ""
-                ad_id = lead_data.get("ad_id") or ""
-
-                # Find first matching GHL contact for this lead
-                ghl_match = None
-                for key in (doc.get("match_keys") or []):
-                    if key in ghl_by_key:
-                        ghl_match = ghl_by_key[key]
-                        break
-                if ghl_match is None:
+            for lead in leads:
+                if not lead["ghl_matched"]:
                     continue  # unmatched lead — contributes nothing to GHL columns
 
-                status, value = ghl_match
+                status = lead["ghl_opportunity_status"]
+                value = lead["ghl_opportunity_value"]
 
                 for bucket_map, key in (
-                    (by_campaign, campaign_id),
-                    (by_adset, adset_id),
-                    (by_ad, ad_id),
+                    (by_campaign, lead["campaign_id"]),
+                    (by_adset, lead["adset_id"]),
+                    (by_ad, lead["ad_id"]),
                 ):
                     if not key:
                         continue
@@ -2215,6 +2168,8 @@ async def get_campaign_opp_rollup(
                 "by_ad": by_ad,
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error computing opp rollup: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=str(e))

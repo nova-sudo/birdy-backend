@@ -19,6 +19,14 @@ from fastapi import HTTPException
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE
 from core.utils import get_result_value, preset_date_bounds
+from services.ad_leads import (
+    LEAD_SOURCE_NONE,
+    LEAD_SOURCE_PIXEL,
+    count_in_window,
+    describe_lead_source,
+    fetch_lead_timeline,
+    pixel_fallback,
+)
 from services.facebook_cache_shape import split_preset_data
 from integrations.facebook_utils.facebook import get_facebook_token
 
@@ -1393,68 +1401,53 @@ async def fetch_meta_all_presets_for_group(
         (acc for acc in facebook_ad_accounts if acc["id"] == meta_ad_account_id), {}
     )
 
-    # -- count leads per preset window from facebook_leads collection --
-    leads_collection = db["facebook_leads"]
-
-    # Lifetime count (preset-agnostic)
-    total_leads_count = await leads_collection.count_documents({
-        "user_id": user_id,
-        "client_group_id": group_id,
-    })
-    logger.info(f"Lifetime lead count for group {group_id}: {total_leads_count}")
-
-    facet_stages = {}
-    for preset_key in preset_data.keys():
-        start_iso, end_iso = preset_date_bounds(preset_key)
-        if start_iso is None:
-            facet_stages[preset_key] = [{"$count": "n"}]
-        else:
-            facet_stages[preset_key] = [
-                {"$match": {"$expr": {"$and": [
-                    {"$gte": [
-                        {"$dateFromString": {
-                            "dateString": "$lead_data.created_time",
-                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                            "onNull": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                        }},
-                        {"$dateFromString": {"dateString": f"{start_iso}T00:00:00Z"}},
-                    ]},
-                    {"$lte": [
-                        {"$dateFromString": {
-                            "dateString": "$lead_data.created_time",
-                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                            "onNull": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                        }},
-                        {"$dateFromString": {"dateString": f"{end_iso}T23:59:59Z"}},
-                    ]},
-                ]}}},
-                {"$count": "n"},
-            ]
-
-    if facet_stages:
-        base_match = {"user_id": user_id, "client_group_id": group_id}
-        pipeline = [{"$match": base_match}, {"$facet": facet_stages}]
-        facet_result = await leads_collection.aggregate(pipeline).to_list(1)
-        facet_doc = facet_result[0] if facet_result else {}
-    else:
-        facet_doc = {}
+    # -- count leads per preset window, from every source that produces one --
+    #
+    # This read `facebook_leads` alone until landing-page clients made the gap
+    # obvious: that collection holds Meta instant-form leads, so a client whose
+    # ads point at their own page had none, and every figure downstream of this
+    # cache reported spend against zero leads. services/ad_leads.py resolves
+    # both sources — instant forms and the ad id GoHighLevel captures itself —
+    # and dedupes anyone who arrived through both.
+    #
+    # Read once, bucketed in memory: thirteen presets across two collections
+    # would otherwise be twenty-six queries on every group's refresh.
+    timeline = await fetch_lead_timeline(user_id, [group_id], mongo_client)
+    total_leads_count = len(timeline)
+    lead_source = describe_lead_source(timeline)
+    logger.info(
+        f"Lifetime lead count for group {group_id}: {total_leads_count} ({lead_source})"
+    )
 
     # -- patch every preset's metrics with its windowed lead count + CPL --
+    pixel_used = False
     for preset_key, data in preset_data.items():
         insights = data.get("metrics", {}).get("insights", {})
         spend = insights.get("spend", 0) or 0
 
-        bucket = facet_doc.get(preset_key, [])
-        preset_leads = bucket[0]["n"] if bucket else 0
+        start_iso, end_iso = preset_date_bounds(preset_key)
+        resolved = count_in_window(timeline, start_iso, end_iso)
+
+        # `results` is Meta's own conversion count for this window, already in
+        # hand: `actions` is requested in _campaigns_fields_for_preset and
+        # core.utils.get_result_value already resolves the pixel action types.
+        # It stands in only when no lead row resolved — see ad_leads.pixel_fallback.
+        preset_leads, override = pixel_fallback(resolved, int(insights.get("results", 0) or 0))
+        if override:
+            pixel_used = True
 
         insights["total_leads"] = preset_leads
         insights["cost_per_result"] = (
             round(spend / preset_leads, 2) if preset_leads > 0 else 0
         )
         logger.info(
-            f"  Preset '{preset_key}': {preset_leads} leads, "
+            f"  Preset '{preset_key}': {preset_leads} leads"
+            f"{' (from Meta pixel conversions)' if override else ''}, "
             f"spend={spend}, CPL={insights['cost_per_result']}"
         )
+
+    if pixel_used and lead_source == LEAD_SOURCE_NONE:
+        lead_source = LEAD_SOURCE_PIXEL
 
     # -- build the facebook_cache document --
     facebook_cache_update = {
@@ -1463,6 +1456,7 @@ async def fetch_meta_all_presets_for_group(
         "facebook_cache.currency": user_currency,
         "facebook_cache.original_currency": ad_account_currency,
         "facebook_cache.total_leads": total_leads_count,
+        "facebook_cache.lead_source": lead_source,
         "last_meta_refresh": datetime.utcnow(),
         "last_meta_refresh_mode": "full_presets" if len(preset_data) >= 10 else "frequent_only",
     }
@@ -1516,50 +1510,29 @@ async def update_preset_lead_counts(
     mongo_client,
     presets: list | None = None,
 ):
+    """
+    Write per-preset lead counts and CPL onto the group's Meta cache.
+
+    Counted through services/ad_leads.py rather than straight off
+    `facebook_leads`, because that collection only ever held Meta instant-form
+    leads. A client running their own landing page has nothing in it, so every
+    figure derived from here — the Marketing Hub, the Client Hub, alerts, Ask
+    Birdy, the suggestion engine — showed them spend against zero leads and a
+    CPL of zero. Their leads were in `ghl_contacts` the whole time, carrying the
+    ad id GoHighLevel captured at submission.
+
+    The timeline is read once and bucketed in memory: thirteen presets against
+    two collections would otherwise be twenty-six queries per group per refresh.
+    """
     if presets is None:
         presets = META_CACHE_PRESETS
 
     db = mongo_client[DB_NAME]
     client_groups_collection = db["client_groups"]
-    leads_collection = db["facebook_leads"]
 
-    total_leads_count = await leads_collection.count_documents({
-        "user_id": user_id,
-        "client_group_id": group_id,
-    })
-
-    facet_stages = {}
-    for preset_key in presets:
-        start_iso, end_iso = preset_date_bounds(preset_key)
-        if start_iso is None:
-            facet_stages[preset_key] = [{"$count": "n"}]
-        else:
-            facet_stages[preset_key] = [
-                {"$match": {"$expr": {"$and": [
-                    {"$gte": [
-                        {"$dateFromString": {
-                            "dateString": "$lead_data.created_time",
-                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                            "onNull": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                        }},
-                        {"$dateFromString": {"dateString": f"{start_iso}T00:00:00Z"}},
-                    ]},
-                    {"$lte": [
-                        {"$dateFromString": {
-                            "dateString": "$lead_data.created_time",
-                            "onError": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                            "onNull": {"$dateFromString": {"dateString": "1970-01-01T00:00:00Z"}},
-                        }},
-                        {"$dateFromString": {"dateString": f"{end_iso}T23:59:59Z"}},
-                    ]},
-                ]}}},
-                {"$count": "n"},
-            ]
-
-    base_match = {"user_id": user_id, "client_group_id": group_id}
-    pipeline = [{"$match": base_match}, {"$facet": facet_stages}]
-    facet_result = await leads_collection.aggregate(pipeline).to_list(1)
-    facet_doc = facet_result[0] if facet_result else {}
+    timeline = await fetch_lead_timeline(user_id, [group_id], mongo_client)
+    total_leads_count = len(timeline)
+    lead_source = describe_lead_source(timeline)
 
     # Fetch all current spend values in one DB read
     group_doc = await client_groups_collection.find_one(
@@ -1570,16 +1543,28 @@ async def update_preset_lead_counts(
 
     update_fields = {
         "facebook_cache.total_leads": total_leads_count,
+        # "instant_form" | "ghl_attribution" | "mixed" | "none" — a pixel-only
+        # or landing-page client must not have their count read as though every
+        # row were a form submission with contact details behind it.
+        "facebook_cache.lead_source": lead_source,
         "updated_at": datetime.utcnow(),
     }
 
+    pixel_used = False
     for preset_key in presets:
-        bucket = facet_doc.get(preset_key, [])
-        preset_leads = bucket[0]["n"] if bucket else 0
+        start_iso, end_iso = preset_date_bounds(preset_key)
+        resolved = count_in_window(timeline, start_iso, end_iso)
 
         _bucket = ((facebook_cache.get("presets") or {}).get(preset_key)
                    or facebook_cache.get(preset_key) or {})
-        spend = ((_bucket.get("metrics") or {}).get("insights") or {}).get("spend", 0) or 0
+        _insights = (_bucket.get("metrics") or {}).get("insights") or {}
+        spend = _insights.get("spend", 0) or 0
+
+        # Meta's own conversion count stands in only when no lead row resolved.
+        # See ad_leads.pixel_fallback for why it is never added to them.
+        preset_leads, override = pixel_fallback(resolved, int(_insights.get("results", 0) or 0))
+        if override:
+            pixel_used = True
 
         cpl = round(spend / preset_leads, 2) if preset_leads > 0 else 0
 
@@ -1592,11 +1577,19 @@ async def update_preset_lead_counts(
         update_fields[f"facebook_cache.presets.{preset_key}.metrics.insights.total_leads"] = preset_leads
         update_fields[f"facebook_cache.presets.{preset_key}.metrics.insights.cost_per_result"] = cpl
 
-        logger.info(f"  Updated preset '{preset_key}': {preset_leads} leads, CPL={cpl}")
+        logger.info(
+            f"  Updated preset '{preset_key}': {preset_leads} leads"
+            f"{' (from Meta pixel conversions)' if override else ''}, CPL={cpl}"
+        )
+
+    # Written after the loop, not with the rest of update_fields above: whether
+    # Meta's conversion count had to stand in is only known once every preset
+    # has been through pixel_fallback.
+    if pixel_used and lead_source == LEAD_SOURCE_NONE:
+        update_fields["facebook_cache.lead_source"] = LEAD_SOURCE_PIXEL
 
     # Also patch the flat legacy path
-    maximum_leads = facet_doc.get("maximum", [{}])
-    maximum_leads_count = maximum_leads[0]["n"] if maximum_leads else total_leads_count
+    maximum_leads_count = total_leads_count
     maximum_spend = (
         facebook_cache.get("maximum", {}).get("metrics", {}).get("insights", {}).get("spend", 0) or 0
     )

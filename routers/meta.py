@@ -29,6 +29,7 @@ from integrations.facebook_utils.facebook_optimized import (
     MetaDataFetcher,
     fetch_all_accounts_parallel,
 )
+from services.ad_leads import ad_leads_series, describe_lead_source, fetch_ad_leads
 from integrations.facebook_utils.facebook_leads import (
     fetch_and_cache_facebook_leads_FIXED,
 )
@@ -779,130 +780,71 @@ async def get_facebook_leads_filtered(
     current_user: str = Depends(get_current_user),
 ):
     """
-    Get Facebook leads filtered by date range and groups.
-    Used by the Marketing Hub for date-based queries.
+    Ad-attributed leads for a date range, whatever produced them.
+
+    This used to read `facebook_leads` alone — Meta instant-form leads. A client
+    running their own landing page has nothing in that collection, so the
+    Marketing Hub showed them an empty Leads tab and a CPL of zero while their
+    leads sat in `ghl_contacts` all along, carrying the ad id GoHighLevel
+    captured at submission. services/ad_leads.py resolves both sources, dedupes
+    the people who came through both, and hands back one shape.
+
+    `lead_source` on each row (and summarised in `meta`) says which source a
+    lead actually came from, so the UI can label it rather than implying every
+    row is a form submission.
     """
     async with get_mongo_client() as mongo_client:
         try:
             start_time = time.time()
 
-            db = mongo_client[DB_NAME]
-            leads_collection = db["facebook_leads"]
+            group_ids = (
+                [g.strip() for g in groups.split(",") if g.strip()] if groups else None
+            )
 
-            # Build query
-            query = {"user_id": current_user}
+            try:
+                rows = await fetch_ad_leads(
+                    current_user, group_ids, start_date, end_date,
+                    mongo_client, limit=limit,
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-            if groups:
-                group_ids = [g.strip() for g in groups.split(",") if g.strip()]
-                if group_ids:
-                    query["client_group_id"] = {"$in": group_ids}
-
-            if start_date or end_date:
-                date_filter = {}
-                if start_date:
-                    date_filter["$gte"] = start_date
-                if end_date:
-                    try:
-                        date_filter["$lte"] = iso_day_end(end_date)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc)) from exc
-                query["lead_data.created_time"] = date_filter
-
-            # Fetch leads (sorted newest first) — include match_keys for GHL enrichment
-            cursor = leads_collection.find(
-                query,
+            # The response keeps the field names the Marketing Hub already
+            # renders, so a landing-page client's Leads tab fills in without a
+            # frontend change. `match_keys` and `client_group_id` are internal to
+            # the resolver and are dropped here.
+            leads = [
                 {
-                    "lead_data": 1,
-                    "match_keys": 1,
-                    "client_group_name": 1,
-                    "ad_account_id": 1,
-                    "client_group_id": 1,
-                },
-            ).sort("lead_data.created_time", -1).limit(limit)
-
-            lead_docs = await cursor.to_list(length=limit)
-
-            # ── GHL enrichment: match Meta leads to GHL contacts ──
-            all_keys = set()
-            for doc in lead_docs:
-                for key in (doc.get("match_keys") or []):
-                    all_keys.add(key)
-
-            ghl_matches = {}
-            if all_keys:
-                ghl_col = db["ghl_contacts"]
-                ghl_docs = await ghl_col.find(
-                    {"user_id": current_user, "match_keys": {"$in": list(all_keys)}},
-                    {"match_keys": 1, "contact_data.tags": 1, "contact_data.opportunities": 1,
-                     "contact_data.firstName": 1, "contact_data.lastName": 1,
-                     "contact_data.dateAdded": 1, "contact_data.source": 1}
-                ).to_list(None)
-                for gd in ghl_docs:
-                    cd = gd.get("contact_data", {})
-                    opps = cd.get("opportunities") or []
-                    # Determine primary opportunity status
-                    opp_status = ""
-                    opp_value = 0
-                    if opps:
-                        # Pick the most relevant: won > open > lost > abandoned
-                        for priority in ["won", "open", "lost", "abandoned"]:
-                            match = next((o for o in opps if o.get("status") == priority), None)
-                            if match:
-                                opp_status = match.get("status", "")
-                                opp_value = match.get("monetaryValue", 0) or 0
-                                break
-                    enrichment = {
-                        "ghl_matched": True,
-                        "ghl_tags": cd.get("tags") or [],
-                        "ghl_opportunity_status": opp_status,
-                        "ghl_opportunity_value": opp_value,
-                        "ghl_date_added": cd.get("dateAdded", ""),
-                    }
-                    for key in (gd.get("match_keys") or []):
-                        ghl_matches[key] = enrichment
-
-            # Format leads with GHL enrichment
-            leads = []
-            for doc in lead_docs:
-                lead_data = doc.get("lead_data", {})
-                doc_keys = doc.get("match_keys") or []
-
-                # Find GHL enrichment
-                ghl_enrich = None
-                for k in doc_keys:
-                    if k in ghl_matches:
-                        ghl_enrich = ghl_matches[k]
-                        break
-
-                lead_entry = {
-                    "lead_id": lead_data.get("id"),
-                    "full_name": lead_data.get("full_name", ""),
-                    "email": lead_data.get("email", ""),
-                    "phone_number": lead_data.get("phone_number", ""),
-                    "ad_id": lead_data.get("ad_id", ""),
-                    "ad_name": lead_data.get("ad_name", ""),
-                    "adset_id": lead_data.get("adset_id", ""),
-                    "adset_name": lead_data.get("adset_name", ""),
-                    "campaign_id": lead_data.get("campaign_id", ""),
-                    "campaign_name": lead_data.get("campaign_name", ""),
-                    "platform": lead_data.get("platform", ""),
-                    "created_time": lead_data.get("created_time", ""),
-                    "group_name": doc.get("client_group_name", "Unknown Group"),
-                    "ad_account_id": doc.get("ad_account_id"),
-                    "field_data": lead_data.get("field_data", {}),
-                    # GHL enrichment
-                    "ghl_matched": ghl_enrich is not None,
-                    "ghl_tags": ghl_enrich["ghl_tags"] if ghl_enrich else [],
-                    "ghl_opportunity_status": ghl_enrich["ghl_opportunity_status"] if ghl_enrich else "",
-                    "ghl_opportunity_value": ghl_enrich["ghl_opportunity_value"] if ghl_enrich else 0,
-                    "ghl_date_added": ghl_enrich["ghl_date_added"] if ghl_enrich else "",
+                    "lead_id": row["lead_id"],
+                    "full_name": row["full_name"],
+                    "email": row["email"],
+                    "phone_number": row["phone_number"],
+                    "ad_id": row["ad_id"],
+                    "ad_name": row["ad_name"],
+                    "adset_id": row["adset_id"],
+                    "adset_name": row["adset_name"],
+                    "campaign_id": row["campaign_id"],
+                    "campaign_name": row["campaign_name"],
+                    "platform": row["platform"],
+                    "created_time": row["created_time"],
+                    "group_name": row["group_name"],
+                    "ad_account_id": row["ad_account_id"],
+                    "field_data": row["field_data"],
+                    "lead_source": row["lead_source"],
+                    "ghl_matched": row["ghl_matched"],
+                    "ghl_tags": row["ghl_tags"],
+                    "ghl_opportunity_status": row["ghl_opportunity_status"],
+                    "ghl_opportunity_value": row["ghl_opportunity_value"],
+                    "ghl_date_added": row["ghl_date_added"],
                 }
-                leads.append(lead_entry)
+                for row in rows
+            ]
 
             elapsed = time.time() - start_time
+            lead_source = describe_lead_source(rows)
 
             logger.info(
-                f"Fetched {len(leads)} filtered leads in {elapsed:.3f}s "
+                f"Fetched {len(leads)} filtered leads ({lead_source}) in {elapsed:.3f}s "
                 f"(date range: {start_date} to {end_date})"
             )
 
@@ -914,6 +856,7 @@ async def get_facebook_leads_filtered(
                     "limit": limit,
                     "start_date": start_date,
                     "end_date": end_date,
+                    "lead_source": lead_source,
                 },
                 "message": f"Retrieved {len(leads)} leads",
                 "performance": {
@@ -921,6 +864,8 @@ async def get_facebook_leads_filtered(
                 },
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error fetching filtered leads: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch leads: {str(e)}")
@@ -946,80 +891,30 @@ async def get_facebook_leads_series(
     missing its early buckets rather than merely under-scaled — "all time"
     drew the last few weeks and called itself all time.
 
-    Counting in Mongo removes the cap and shrinks the payload from thousands of
-    lead records to a few hundred small objects. Callers roll the days up into
-    weeks or months; a day is the finest bucket the chart offers, so nothing is
-    lost by fixing the grain here.
+    Counted rather than listed, so the cap doesn't apply and the payload is a
+    few hundred small objects instead of thousands of lead records. Callers roll
+    the days up into weeks or months; a day is the finest bucket the chart
+    offers, so nothing is lost by fixing the grain here.
 
-    `closes` counts leads whose matched GHL contact holds a won opportunity —
-    the same join /filtered does row by row, done once as a key set.
+    Both lead sources are counted — instant forms and GoHighLevel's own ad
+    attribution — through services/ad_leads.py, so a landing-page client gets a
+    curve instead of a flat zero. `closes` counts leads whose person holds a won
+    opportunity in the CRM.
     """
     async with get_mongo_client() as mongo_client:
         try:
             start_time = time.time()
-            db = mongo_client[DB_NAME]
 
-            query = {"user_id": current_user}
+            group_ids = (
+                [g.strip() for g in groups.split(",") if g.strip()] if groups else None
+            )
 
-            if groups:
-                group_ids = [g.strip() for g in groups.split(",") if g.strip()]
-                if group_ids:
-                    query["client_group_id"] = {"$in": group_ids}
-
-            if start_date or end_date:
-                date_filter = {}
-                if start_date:
-                    date_filter["$gte"] = start_date
-                if end_date:
-                    try:
-                        date_filter["$lte"] = iso_day_end(end_date)
-                    except ValueError as exc:
-                        raise HTTPException(status_code=400, detail=str(exc)) from exc
-                query["lead_data.created_time"] = date_filter
-
-            # created_time is an ISO string, so the day is its first ten
-            # characters — the same slice the date filter above compares on.
-            by_day = [
-                {"$match": query},
-                {"$group": {
-                    "_id": {"$substrBytes": ["$lead_data.created_time", 0, 10]},
-                    "leads": {"$sum": 1},
-                }},
-                {"$sort": {"_id": 1}},
-            ]
-            day_rows = await db["facebook_leads"].aggregate(by_day).to_list(None)
-
-            # Match keys of every contact carrying a won opportunity. Gathered
-            # once so the close count is one extra aggregation rather than a
-            # per-lead lookup.
-            won_keys = set()
-            async for doc in db["ghl_contacts"].find(
-                {"user_id": current_user, "contact_data.opportunities.status": "won"},
-                {"match_keys": 1, "_id": 0},
-            ):
-                won_keys.update(doc.get("match_keys") or [])
-
-            closes_by_day = {}
-            if won_keys:
-                close_pipeline = [
-                    {"$match": {**query, "match_keys": {"$in": list(won_keys)}}},
-                    {"$group": {
-                        "_id": {"$substrBytes": ["$lead_data.created_time", 0, 10]},
-                        "closes": {"$sum": 1},
-                    }},
-                ]
-                async for row in db["facebook_leads"].aggregate(close_pipeline):
-                    closes_by_day[row["_id"]] = row["closes"]
-
-            series = [
-                {
-                    "date": row["_id"],
-                    "leads": row["leads"],
-                    "closes": closes_by_day.get(row["_id"], 0),
-                }
-                for row in day_rows
-                if row.get("_id")
-            ]
+            try:
+                series = await ad_leads_series(
+                    current_user, group_ids, start_date, end_date, mongo_client
+                )
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             elapsed = time.time() - start_time
             logger.info(
@@ -1038,6 +933,8 @@ async def get_facebook_leads_series(
                 "performance": {"response_time_ms": int(elapsed * 1000)},
             }
 
+        except HTTPException:
+            raise
         except Exception as e:
             logger.error(f"Error building lead series: {str(e)}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to build series: {str(e)}")
