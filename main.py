@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core.config import CORS_ORIGINS
+from middleware.etag import ETagMiddleware
 from middleware.token_refresh import TokenRefreshMiddleware
 from jobs.scheduler import start_background_jobs, stop_background_jobs
 from jobs.cache_jobs import populate_cache_for_existing_groups
@@ -114,6 +115,12 @@ app.add_middleware(
     max_age=7200,
 )
 app.add_middleware(TokenRefreshMiddleware)
+
+# Registered last, so it is the outermost: Starlette runs user middleware in
+# reverse of registration order. That is the right place for it — it sees the
+# finished response, cookies and all, after TokenRefreshMiddleware has had its
+# say, and rebuilds the headers without losing any of them.
+app.add_middleware(ETagMiddleware)
 
 # Routers
 app.include_router(auth.router)
