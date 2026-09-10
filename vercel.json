@@ -55,6 +55,14 @@
     {
       "path": "/api/cron/prune-call-payloads",
       "schedule": "40 3 * * *"
+    },
+    {
+      "path": "/api/cron/ensure-indexes",
+      "schedule": "20 2 * * *"
+    },
+    {
+      "path": "/api/cron/attribution-tick",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

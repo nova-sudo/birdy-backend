@@ -20,25 +20,12 @@ from core.config import CORS_ORIGINS
 from middleware.token_refresh import TokenRefreshMiddleware
 from jobs.scheduler import start_background_jobs, stop_background_jobs
 from jobs.cache_jobs import populate_cache_for_existing_groups
-from utils.cache_helpers import create_performance_indexes
-from integrations.facebook_utils.facebook_leads import create_facebook_leads_indexes
-from integrations.facebook_utils.facebook_campaigns import create_campaign_insights_indexes
-from integrations.facebook_utils.facebook_adsets import create_adset_insights_indexes
-from integrations.facebook_utils.facebook_ads import create_ad_insights_indexes
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
 from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes
-from services.call_logs_service import create_call_logs_indexes
-from services.mcp_token_service import create_mcp_tokens_indexes
-from services.slack_bot_service import create_slack_bot_indexes
-from services.slack_interaction_store import create_slack_ui_interaction_indexes
-from ai.session_store import create_ai_session_indexes
-from ai.suggestions.store import create_suggestion_indexes
-from ai.conversation_log import create_conversation_log_indexes
-from routers.client_notes import create_note_indexes
 from billing import router as billing_router
-from credits import router as credits_router, create_ai_usage_indexes
+from credits import router as credits_router
 
 from ai.mcp import mcp_app
 
@@ -50,34 +37,41 @@ logger = logging.getLogger(__name__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: create indexes, start background jobs, warm caches."""
-    async with get_mongo_client() as client:
-        await create_performance_indexes(client)
-        await create_facebook_leads_indexes(client)
-        await create_campaign_insights_indexes(client)
-        await create_adset_insights_indexes(client)
-        await create_ad_insights_indexes(client)
-        await create_call_logs_indexes(client)
-        await create_mcp_tokens_indexes(client)
-        await create_slack_bot_indexes(client)
-        await create_slack_ui_interaction_indexes(client)
-        await create_ai_session_indexes(client)
-        await create_suggestion_indexes(client)
-        await create_conversation_log_indexes(client)
-        await create_note_indexes(client)
-        await create_ai_usage_indexes(client)
+    """
+    Startup.
+
+    On Vercel this runs on every cold container, in front of the request that
+    woke it — so it does as close to nothing as possible. Index creation and
+    the cache backfill both moved out to crons; what's left is warming the
+    Mongo client, which is the one thing the first request genuinely needs.
+    """
+    on_vercel = bool(os.getenv("VERCEL"))
 
     get_shared_mongo_client()  # warm the process-wide client every request shares
 
-    # APScheduler is only suitable for long-lived processes (Azure App Service,
-    # bare VM, Docker, etc.). On Vercel's serverless runtime it's unreliable
-    # because containers are recycled — Vercel cron endpoints in routers/cron.py
-    # take over scheduling there.
-    if os.getenv("VERCEL"):
+    if not on_vercel:
+        # One long-lived process serves everything locally, so the few seconds
+        # this costs are paid once at boot rather than on every cold start,
+        # and it saves remembering to run the script after adding an index.
+        # On Vercel the daily /api/cron/ensure-indexes does it instead.
+        from core.indexes import ensure_indexes
+
+        async with get_mongo_client() as client:
+            await ensure_indexes(client)
+
+        # Fills in groups that have no cache yet. On Vercel the per-minute
+        # meta/ghl/hp ticks already claim them — schedule_stale_groups treats
+        # a missing last_*_refresh as infinitely stale — so running this here
+        # would only duplicate that work inside a container that may be frozen
+        # mid-flight anyway.
+        asyncio.create_task(populate_cache_for_existing_groups())
+    else:
+        # APScheduler is only suitable for long-lived processes (Azure App
+        # Service, bare VM, Docker, etc.). On Vercel's serverless runtime it's
+        # unreliable because containers are recycled — Vercel cron endpoints in
+        # routers/cron.py take over scheduling there.
         logger.info("Detected VERCEL runtime — skipping APScheduler (Vercel crons drive refreshes)")
 
-
-    asyncio.create_task(populate_cache_for_existing_groups())
     logger.info("Server started")
 
     yield

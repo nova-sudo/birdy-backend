@@ -20,6 +20,10 @@ Endpoints (Vercel crons invoke with GET):
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
     GET /api/cron/alerts            — hourly       (alert evaluation)
+    GET /api/cron/ensure-indexes    — daily 02:20  (create newly declared
+                                                    indexes; kept out of app
+                                                    startup so cold starts
+                                                    don't wait on them)
     GET /api/cron/prune-call-payloads — daily 03:40 (strip call_logs raw bodies
                                                      past the retention window)
 """
@@ -589,6 +593,33 @@ async def ghl_tokens(authorization: str | None = Header(default=None)):
 # ---------------------------------------------------------------------------
 # Alert evaluation — hourly
 # ---------------------------------------------------------------------------
+
+@router.get("/ensure-indexes")
+async def ensure_indexes_tick(authorization: str | None = Header(default=None)):
+    """
+    Creates any declared index that doesn't exist yet.
+
+    This used to run in main.py's lifespan, where ~40 createIndex round-trips
+    stood between a cold container and its first request. Here nobody is
+    waiting on it. Daily is enough: adding an index is rare, and the cost of
+    it landing hours late is a slower query, not a broken one — run
+    `python -m scripts.ensure_indexes` after a deploy if that matters.
+    """
+    _verify_cron_auth(authorization)
+
+    from core.indexes import ensure_indexes
+
+    tick_start = time.monotonic()
+    async with get_mongo_client() as mongo_client:
+        result = await ensure_indexes(mongo_client)
+
+    return {
+        "ok": not result["failed"],
+        "index_sets": result["ok"],
+        "failed": result["failed"],
+        "elapsed_seconds": round(time.monotonic() - tick_start, 2),
+    }
+
 
 @router.get("/alerts")
 async def alerts(authorization: str | None = Header(default=None)):
