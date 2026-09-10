@@ -8,12 +8,9 @@ Extracted here to break the circular import:
   billing.py → dependencies.py  ✓
 """
 
-import asyncio
 import logging
-import os
 
 from fastapi import HTTPException, Request
-from motor.motor_asyncio import AsyncIOMotorClient
 from contextlib import asynccontextmanager
 import jwt as pyjwt
 from dotenv import load_dotenv
@@ -24,34 +21,32 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 from core.config import JWT_SECRET, JWT_ALGORITHM, JWT_EXPIRY_MINUTES, JWT_REFRESH_SECRET, JWT_REFRESH_EXPIRY_DAYS
+from core.mongo_client import get_shared_mongo_client
 
 
 @asynccontextmanager
 async def get_mongo_client():
-    """Async context manager that yields a connected AsyncIOMotorClient."""
-    client = None
+    """
+    Yield the process-wide Motor client (see core/mongo_client.py).
+
+    Still an async context manager purely because ~360 call sites are written
+    as `async with get_mongo_client() as client:`. Nothing is opened or closed
+    here any more — the client is a singleton with its own connection pool,
+    closed once at shutdown by main.py's lifespan.
+
+    The yield sits outside the try deliberately. It used to sit inside one
+    whose `except Exception` swallowed anything the *caller's* body raised and
+    re-reported it as "Unexpected error setting up MongoDB client: ...", so a
+    plain KeyError in a route surfaced as a Mongo failure. Only the lookup
+    below can fail here, and only when MONGODB_URI is unset.
+    """
     try:
-        loop = asyncio.get_event_loop()
-        mongo_uri = os.getenv("MONGODB_URI")
-        if not mongo_uri:
-            raise HTTPException(
-                status_code=500,
-                detail="MongoDB configuration error: MONGODB_URI is not set"
-            )
-        client = AsyncIOMotorClient(mongo_uri, io_loop=loop)
-        await client.admin.command("ping")
-        yield client
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in MongoDB client setup: {e}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Unexpected error setting up MongoDB client: {e}"
-        )
-    finally:
-        if client:
-            client.close()
+        client = get_shared_mongo_client()
+    except RuntimeError as e:
+        logger.error(f"MongoDB client unavailable: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    yield client
 
 
 async def generate_tokens(email: str):

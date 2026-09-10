@@ -67,7 +67,7 @@ async def lifespan(app: FastAPI):
         await create_note_indexes(client)
         await create_ai_usage_indexes(client)
 
-    get_shared_mongo_client()  # warm the singleton backing the MCP-hosted tools
+    get_shared_mongo_client()  # warm the process-wide client every request shares
 
     # APScheduler is only suitable for long-lived processes (Azure App Service,
     # bare VM, Docker, etc.). On Vercel's serverless runtime it's unreliable
