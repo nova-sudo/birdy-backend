@@ -90,6 +90,62 @@ DEFAULT_CLIENT_HEALTH = "Healthy"
 
 
 # ---------------------------------------------------------------------------
+# GET /api/client-groups/daily
+# ---------------------------------------------------------------------------
+#
+# Registered ahead of /api/client-groups/{group_id} below, or "daily" would be
+# read as a group id.
+
+@router.get("/api/client-groups/daily")
+async def get_client_groups_daily(current_user: str = Depends(get_current_user)):
+    """
+    The per-day series, on their own.
+
+    These are the trend lines four hubs chart — `gohighlevel.daily_leads`,
+    `facebook.daily_spend`, `hotprospector.daily_calls` — and they were the
+    majority of what /api/client-groups sent: 57% of the response on a measured
+    account, against 2% for the Meta metrics the KPI tiles actually read first.
+    Every tile on those pages therefore waited on hundreds of kilobytes of
+    history before it could show a number.
+
+    Splitting them off lets a hub ask for its figures and its history at the
+    same time and paint whichever lands first. Nothing is aggregated here that
+    wasn't before — the caller merges these back onto the groups and the
+    existing arithmetic runs unchanged.
+
+    No date_preset. The series are stored whole and served whole (each row is a
+    day; how many rows exist is a retention question, not a query one), so the
+    answer is the same for every window. Leaving the parameter off means moving
+    the date picker doesn't refetch them at all.
+    """
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+
+        groups = await db["client_groups"].find(
+            {"user_id": current_user},
+            {"_id": 0, "id": 1, "ghl_daily_leads": 1, "meta_daily_spend": 1, "hp_daily_calls": 1},
+        ).to_list(None)
+
+    def rows(value):
+        # Same tolerance the main endpoint applies: anything that isn't a list
+        # is absent rather than empty, so a chart can tell "no data yet" from
+        # "no activity" instead of drawing a confident flat zero.
+        return value if isinstance(value, list) else None
+
+    series = {
+        group["id"]: {
+            "daily_leads": rows(group.get("ghl_daily_leads")),
+            "daily_spend": rows(group.get("meta_daily_spend")),
+            "daily_calls": rows(group.get("hp_daily_calls")),
+        }
+        for group in groups
+        if group.get("id")
+    }
+
+    return {"series": series}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/client-groups
 # ---------------------------------------------------------------------------
 
