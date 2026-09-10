@@ -47,6 +47,7 @@ import bcrypt
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from core.database import DB_NAME
+from services.facebook_cache_shape import split_preset_data
 from services.meta_service import update_preset_lead_counts
 from utils.phone_normalize import compute_match_keys
 
@@ -177,15 +178,29 @@ def _meta_cache(gid: str, spend: float, results: int) -> dict:
             },
         }
 
+    preset_data = {
+        preset: bucket(preset, share)
+        for preset, share in zip(PRESETS, (1.0, 0.55, 0.18))
+    }
+
+    # Build the split shape with the same helper the real refresh uses, rather
+    # than hand-rolling it. update_preset_lead_counts dual-writes the patched
+    # lead count into facebook_cache.presets.<preset>, and read_preset prefers
+    # that bucket whenever `entities` is present — so a seed that wrote only
+    # the legacy buckets got a presets.<preset> containing nothing but
+    # total_leads and cost_per_result, and every other figure read as zero.
+    entities, split = split_preset_data(preset_data)
+
     cache = {
         "ad_account_id": f"act_{gid}",
         "name": "Demo Ad Account",
         "currency": "GBP",
-        "entities": {"ads": ads, "adsets": adsets, "campaigns": campaigns},
+        "entities": entities,
+        "presets": split,
+        # The legacy flat copies, still written alongside in production.
         "ads": ads, "adsets": adsets, "campaigns": campaigns,
     }
-    for preset, share in zip(PRESETS, (1.0, 0.55, 0.18)):
-        cache[preset] = bucket(preset, share)
+    cache.update(preset_data)
     return cache
 
 
