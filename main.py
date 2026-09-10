@@ -24,7 +24,7 @@ from jobs.cache_jobs import populate_cache_for_existing_groups
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes
+from routers import auth, ghl, meta, hotprospector, client_groups, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution
 from billing import router as billing_router
 from credits import router as credits_router
 
@@ -149,6 +149,10 @@ app.include_router(waitlist.router)
 app.include_router(dashboard.router)
 app.include_router(onboarding.router)
 app.include_router(client_notes.router)
+app.include_router(attribution.router)
+# Public, unauthenticated tracker edge — see routers/tracking.py for why it
+# sits outside the CORS allowlist rather than inside it.
+app.include_router(tracking.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py

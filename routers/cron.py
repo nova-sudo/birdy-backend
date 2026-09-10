@@ -26,6 +26,8 @@ Endpoints (Vercel crons invoke with GET):
                                                     don't wait on them)
     GET /api/cron/prune-call-payloads — daily 03:40 (strip call_logs raw bodies
                                                      past the retention window)
+    GET /api/cron/attribution-tick  — every 5 min  (join identified visitors to
+                                                    GHL contacts)
 """
 
 import asyncio
@@ -39,6 +41,7 @@ from fastapi import APIRouter, Header, HTTPException
 from core.constants import META_ONGOING_PRESETS, META_STATIC_PRESETS
 from core.database import DB_NAME
 from dependencies import get_mongo_client
+from services.attribution_service import run_match_tick
 
 logger = logging.getLogger(__name__)
 
@@ -768,3 +771,46 @@ async def prune_call_payloads(authorization: str | None = Header(default=None)):
         "pruned": modified,
         "elapsed_seconds": round(time.monotonic() - tick_start, 2),
     }
+
+
+# ---------------------------------------------------------------------------
+# Attribution — join identified visitors to their GHL contact
+# ---------------------------------------------------------------------------
+
+# One tick's worth of pending visitors. The queue only holds people who
+# submitted a form and whose contact hasn't synced in yet, so it is normally
+# near-empty; the cap exists for the burst after a client's ad goes live.
+ATTRIBUTION_VISITORS_PER_TICK = int(os.getenv("ATTRIBUTION_VISITORS_PER_TICK", "300"))
+
+
+@router.get("/attribution-tick")
+async def attribution_tick(authorization: str | None = Header(default=None)):
+    """
+    Retry the visitor → GoHighLevel contact join for everyone who has
+    identified themselves but isn't matched yet.
+
+    The retry exists because of an ordering gap, not a failure: someone submits
+    a form and the tracker reports their email within milliseconds, but that
+    contact only reaches ghl_contacts on the hourly GHL sync. Matching once at
+    submission time would therefore miss nearly every lead.
+
+    Driven from attribution_visitors rather than by scanning ghl_contacts, so
+    the cost is proportional to leads waiting — not to how many contacts the
+    account has.
+    """
+    _verify_cron_auth(authorization)
+
+    tick_start = time.monotonic()
+    result = {"scanned": 0, "matched": 0, "gave_up": 0}
+    try:
+        async with get_mongo_client() as mongo_client:
+            result = await run_match_tick(mongo_client, limit=ATTRIBUTION_VISITORS_PER_TICK)
+        if result["matched"] or result["gave_up"]:
+            logger.info(
+                "[attribution-tick] scanned=%d matched=%d gave_up=%d",
+                result["scanned"], result["matched"], result["gave_up"],
+            )
+    except Exception as e:
+        logger.error(f"[attribution-tick] raised: {e}", exc_info=True)
+
+    return {"ok": True, **result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
