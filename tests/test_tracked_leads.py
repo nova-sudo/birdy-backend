@@ -418,3 +418,119 @@ async def test_install_details_never_confirm_an_unknown_site(tracking_db, mock_d
     assert body["known"] is False
     assert body["client_name"] is None
     assert body["snippet"]
+
+
+# ---------------------------------------------------------------------------
+# One person, more than one ad
+# ---------------------------------------------------------------------------
+#
+# A lead can genuinely come from several ads: the winning video in March, then a
+# retargeting ad in June. One person, one lead, two ads that did real work.
+#
+# The rule pinned here is that the ad which *produced* the lead keeps the
+# credit. Not because later clicks don't matter — they are recorded — but
+# because per-ad counts must not restate history. A figure an agency already
+# sent to their client cannot change because somebody resubmitted a form.
+
+@pytest.mark.asyncio
+async def test_the_creating_ad_keeps_the_credit(mock_mongo_client, mock_db):
+    await record_tracked_lead(
+        SITE, _submission(ad_id="ad_march"), SOURCE_WEBHOOK, mock_mongo_client
+    )
+    await record_tracked_lead(
+        SITE, _submission(ad_id="ad_june"), SOURCE_WEBHOOK, mock_mongo_client
+    )
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["ad_id"] == "ad_march", "the ad that produced the lead keeps it"
+    assert lead["latest_ad_id"] == "ad_june", "but we know what brought them back"
+    assert sorted(lead["attributed_ads"]) == ["ad_june", "ad_march"]
+
+
+@pytest.mark.asyncio
+async def test_a_third_visit_adds_a_third_ad(mock_mongo_client, mock_db):
+    for ad in ("ad_1", "ad_2", "ad_3"):
+        await record_tracked_lead(
+            SITE, _submission(ad_id=ad), SOURCE_WEBHOOK, mock_mongo_client
+        )
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["ad_id"] == "ad_1"
+    assert sorted(lead["attributed_ads"]) == ["ad_1", "ad_2", "ad_3"]
+    assert await mock_db[TRACKED_LEADS].count_documents({}) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_same_ad_twice_is_listed_once(mock_mongo_client, mock_db):
+    await record_tracked_lead(SITE, _submission(ad_id="ad_1"), SOURCE_WEBHOOK, mock_mongo_client)
+    await record_tracked_lead(SITE, _submission(ad_id="ad_1"), SOURCE_WEBHOOK, mock_mongo_client)
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["attributed_ads"] == ["ad_1"]
+
+
+@pytest.mark.asyncio
+async def test_the_original_campaign_and_adset_are_frozen_too(mock_mongo_client, mock_db):
+    """Otherwise the ad stays put while its campaign silently moves under it."""
+    await record_tracked_lead(
+        SITE,
+        _submission(ad_id="ad_march", campaign_id="cmp_spring", utm_campaign="Spring"),
+        SOURCE_WEBHOOK, mock_mongo_client,
+    )
+    await record_tracked_lead(
+        SITE,
+        _submission(ad_id="ad_june", campaign_id="cmp_summer", utm_campaign="Summer"),
+        SOURCE_WEBHOOK, mock_mongo_client,
+    )
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["campaign_id"] == "cmp_spring"
+    assert lead["utm_campaign"] == "Spring"
+
+
+@pytest.mark.asyncio
+async def test_an_unattributed_lead_is_filled_in_by_the_first_ad(mock_mongo_client, mock_db):
+    """
+    Someone found the page organically and enquired, then came back through an
+    ad. There was no credit to protect, so the ad takes it rather than being
+    filed as an also-ran.
+    """
+    await record_tracked_lead(SITE, _submission(), SOURCE_WEBHOOK, mock_mongo_client)
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["ad_id"] is None
+
+    await record_tracked_lead(
+        SITE, _submission(ad_id="ad_later"), SOURCE_WEBHOOK, mock_mongo_client
+    )
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["ad_id"] == "ad_later"
+    assert lead["attributed_ads"] == ["ad_later"]
+
+
+@pytest.mark.asyncio
+async def test_a_return_visit_still_refreshes_the_person(mock_mongo_client, mock_db):
+    """Attribution is frozen; the contact details are not."""
+    await record_tracked_lead(
+        SITE, _submission(ad_id="ad_1", name="L Woods", phone=None),
+        SOURCE_WEBHOOK, mock_mongo_client,
+    )
+    await record_tracked_lead(
+        SITE, _submission(ad_id="ad_2", name="Leah Woods", phone="07700 900123"),
+        SOURCE_WEBHOOK, mock_mongo_client,
+    )
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["name"] == "Leah Woods", "a corrected name is an improvement"
+    assert lead["phone"] == "07700 900123"
+    assert lead["ad_id"] == "ad_1"
+
+
+@pytest.mark.asyncio
+async def test_a_lead_that_never_saw_an_ad_has_no_ad_list(mock_mongo_client, mock_db):
+    await record_tracked_lead(SITE, _submission(), SOURCE_WEBHOOK, mock_mongo_client)
+
+    lead = await mock_db[TRACKED_LEADS].find_one({})
+    assert lead["ad_id"] is None
+    assert "attributed_ads" not in lead
+    assert "latest_ad_id" not in lead

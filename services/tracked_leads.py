@@ -90,6 +90,72 @@ def _touch_from_payload(payload: dict) -> dict:
     })
 
 
+def _attribution_update(existing: dict | None, touch: dict, now) -> tuple[dict, dict, dict]:
+    """
+    Decide what this submission does to a lead's attribution.
+
+    Returns `(always_set, only_on_insert, add_to_set)`.
+
+    The rule: **the ad that produced the lead keeps the credit.** A person can
+    genuinely be a lead from more than one ad — they click the winning video in
+    March, enquire, go quiet, then click a retargeting ad in June and enquire
+    again. That is one person and one lead, but two ads did real work, and
+    overwriting the first with the second loses half the story.
+
+    Two things go wrong if the newest click simply wins. An ad inherits credit
+    for a lead a different ad produced. And worse, *last month's report changes*
+    — a per-ad lead count that was right when the agency sent it to their client
+    silently moves when somebody resubmits a form in October. Numbers that
+    restate history are worse than numbers that are merely incomplete.
+
+    So `ad_id` and its campaign/ad set are frozen at creation, every ad that
+    ever brought this person back is collected in `attributed_ads`, and
+    `latest_ad_id` records the most recent. Reporting counts the creating ad, so
+    historical counts never move; the rest is there for anyone asking "what else
+    touched this person?".
+
+    One exception: a lead first captured with no ad at all — someone who found
+    the page organically — is not protecting anything. The first ad that does
+    arrive fills the gap rather than being pushed into the also-ran list.
+    """
+    incoming_ad = touch.get("ad_id")
+    had_ad = bool((existing or {}).get("ad_id"))
+
+    # The attribution block, as it would be written for a brand-new lead.
+    attribution = {
+        "ad_id": incoming_ad,
+        "adset_id": touch.get("adset_id"),
+        "campaign_id": touch.get("campaign_id"),
+        "fbclid": touch.get("fbclid"),
+        "utm_source": touch.get("utm_source"),
+        "utm_medium": touch.get("utm_medium"),
+        "utm_campaign": touch.get("utm_campaign"),
+        "utm_content": touch.get("utm_content"),
+        "landing_page": touch.get("landing_page"),
+    }
+
+    # Every ad that has ever brought this person to a form, creating one
+    # included. A plain list of ids, so $addToSet dedupes it for us.
+    add_to_set = {"attributed_ads": incoming_ad} if incoming_ad else {}
+
+    latest = {}
+    if incoming_ad:
+        latest = {"latest_ad_id": incoming_ad, "latest_ad_at": now}
+
+    if existing is None:
+        # New lead: the attribution is written by the upsert's $set.
+        return {**attribution, **latest}, {}, add_to_set
+
+    if not had_ad:
+        # The lead exists but was never credited to anything. Nothing to
+        # protect, so fill it in.
+        return {**attribution, **latest}, {}, add_to_set
+
+    # Established lead with an ad already on it: only the "latest" pointers and
+    # the ad list move. The original credit stands.
+    return latest, {}, add_to_set
+
+
 async def record_tracked_lead(
     site: dict,
     payload: dict,
@@ -109,6 +175,10 @@ async def record_tracked_lead(
     attribution comes from its touch history via `attributed_touch`, which
     credits the most recent *paid* touch and falls back to the first. A webhook
     with no visitor falls back to whatever identifiers the payload carried.
+
+    Re-submitting refreshes the person's details but never moves the credit —
+    see `_attribution_update` for why a later ad is recorded alongside the
+    original rather than replacing it.
     """
     email = _clip(payload.get("email"))
     phone = _clip(payload.get("phone"))
@@ -124,7 +194,14 @@ async def record_tracked_lead(
         touch = _touch_from_payload(payload)
 
     now = datetime.utcnow()
-    doc = {
+    db = mongo_client[DB_NAME]
+    filter_ = {"client_group_id": site["client_group_id"], "dedupe_key": key}
+    existing = await db[TRACKED_LEADS].find_one(filter_, {"ad_id": 1, "created_at": 1})
+
+    # Details about the person, refreshed every time they come back — a
+    # corrected phone number or a surname they left off first time is an
+    # improvement, not a second lead.
+    changes = {
         "user_id": site["user_id"],
         "client_group_id": site["client_group_id"],
         "client_group_name": site.get("client_group_name"),
@@ -140,31 +217,26 @@ async def record_tracked_lead(
         "email": email,
         "phone": phone,
         "match_keys": compute_match_keys(email, phone),
-        "ad_id": touch.get("ad_id"),
-        "adset_id": touch.get("adset_id"),
-        "campaign_id": touch.get("campaign_id"),
-        "fbclid": touch.get("fbclid"),
-        "utm_source": touch.get("utm_source"),
-        "utm_medium": touch.get("utm_medium"),
-        "utm_campaign": touch.get("utm_campaign"),
-        "utm_content": touch.get("utm_content"),
-        "landing_page": touch.get("landing_page"),
         "submitted_at": now,
     }
 
-    db = mongo_client[DB_NAME]
-    result = await db[TRACKED_LEADS].update_one(
-        {"client_group_id": site["client_group_id"], "dedupe_key": key},
-        {
-            "$set": doc,
-            "$setOnInsert": {
-                "created_at": now,
-                "pushed_to_ghl": False,
-                "ghl_contact_id": None,
-            },
+    # Attribution, which does NOT get refreshed. See _attribution_update.
+    attribution, on_insert, add_to_set = _attribution_update(existing, touch, now)
+    changes.update(attribution)
+
+    update = {
+        "$set": changes,
+        "$setOnInsert": {
+            "created_at": now,
+            "pushed_to_ghl": False,
+            "ghl_contact_id": None,
+            **on_insert,
         },
-        upsert=True,
-    )
+    }
+    if add_to_set:
+        update["$addToSet"] = add_to_set
+
+    result = await db[TRACKED_LEADS].update_one(filter_, update, upsert=True)
 
     inserted = result.upserted_id is not None
     logger.info(
@@ -198,6 +270,11 @@ async def create_tracked_leads_indexes(mongo_client):
         [("client_group_id", 1), ("submitted_at", -1)], name="group_submitted_at"
     )
     await coll.create_index("match_keys", name="idx_match_keys")
+    # "Which leads did this ad ever touch?" — the creating ad is on `ad_id`,
+    # every ad that brought them back is in here.
+    await coll.create_index(
+        [("client_group_id", 1), ("attributed_ads", 1)], name="group_attributed_ads"
+    )
     # The GHL-push worker looks for leads it hasn't pushed yet.
     await coll.create_index(
         [("client_group_id", 1), ("pushed_to_ghl", 1)], name="group_pushed"
