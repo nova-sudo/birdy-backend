@@ -23,6 +23,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
+from core.config import CORS_ORIGINS
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from pydantic import BaseModel
@@ -54,6 +55,25 @@ async def _require_group(group_id: str, user_id: str, mongo_client) -> dict:
     if not group:
         raise HTTPException(status_code=404, detail="Client group not found")
     return group
+
+
+def _app_base() -> str:
+    """
+    Where the *frontend* lives, for links to pages the app renders.
+
+    Distinct from `_tracking_base`, which is the API origin the snippet and the
+    webhook point at. The public install page is a Next route, so building its
+    URL from the API origin produced a link that 404s — and that link is the one
+    thing in this feature designed to be forwarded to someone outside the
+    account, who has no way to work out what went wrong.
+
+    Falls back to the first configured CORS origin, which is the production
+    frontend, so this needs no new configuration to be correct.
+    """
+    configured = os.getenv("APP_BASE_URL")
+    if configured:
+        return configured.rstrip("/")
+    return (CORS_ORIGINS[0] if CORS_ORIGINS else "").rstrip("/")
 
 
 def _tracking_base(request: Request) -> str:
@@ -198,7 +218,7 @@ async def get_portal(
         "meta_url_parameters": META_URL_PARAMETERS,
         "visitor_id_parameter": "birdy_visitor_id",
         "webhook_url": base + "/t/webhook/" + site_id,
-        "install_page_url": base + "/install/" + site_id,
+        "install_page_url": _app_base() + "/install/" + site_id,
         "diagnostics": diagnostics,
         **status,
     }

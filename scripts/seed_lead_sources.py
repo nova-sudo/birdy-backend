@@ -14,6 +14,9 @@ of each in front of you:
     mixed             Both, with the same people arriving twice — the dedupe case.
     pixel             Landing page; only Meta's conversion count. A number, no
                       people, so the Leads tab is empty *and that is correct*.
+    tracker           Their own landing page with our script on it, and a form
+                      that never feeds the CRM — the only leads that exist
+                      nowhere but Birdy.
     none              Spend, and nothing reporting a lead back at all.
 
 The "Both" client is the one worth looking at closely: it is seeded with 40
@@ -47,6 +50,7 @@ import bcrypt
 from motor.motor_asyncio import AsyncIOMotorClient
 
 from core.database import DB_NAME
+from services import lead_collection as lead_collection_service
 from services.facebook_cache_shape import split_preset_data
 from services.meta_service import update_preset_lead_counts
 from utils.phone_normalize import compute_match_keys
@@ -62,7 +66,7 @@ DEMO_PASSWORD = "BirdyDemo123!"
 NOW = datetime.utcnow()
 
 # Collections this script owns. Anything tagged SEED_TAG in them is ours to drop.
-SEEDED_COLLECTIONS = ("client_groups", "ghl_contacts", "facebook_leads")
+SEEDED_COLLECTIONS = ("client_groups", "ghl_contacts", "facebook_leads", "tracked_leads")
 
 
 def _iso(days_ago: int) -> str:
@@ -124,6 +128,19 @@ CLIENTS = [
         "overlap": 0,
         "spend": 210.00,
         "meta_results": 0,
+    },
+    {
+        # The case the tracker exists for: a form that posts somewhere other
+        # than GoHighLevel, so these people are in no other system at all.
+        "name": "Demo - Tracker Only",
+        "expect": "tracker",
+        "instant_form_leads": 0,
+        "ghl_leads": 0,
+        "tracked_leads": 55,
+        "overlap": 0,
+        "spend": 489.20,
+        "meta_results": 61,
+        "lead_collection": {"method": "external_form", "form_provider": "typeform"},
     },
 ]
 
@@ -254,6 +271,39 @@ def _ghl_contact(gid: str, name: str, i: int, ad_id: str, won: bool) -> dict:
     }
 
 
+def _tracked_lead(gid: str, name: str, i: int, ad_id: str) -> dict:
+    """A lead our script or the webhook captured. No CRM copy exists."""
+    first, last, email, phone = _person(gid, i)
+    return {
+        "_seed": SEED_TAG,
+        "user_id": DEMO_EMAIL,
+        "client_group_id": gid,
+        "client_group_name": name,
+        "location_id": f"loc_{gid}",
+        "source": "tracker" if i % 3 else "webhook",
+        "provider": "typeform" if i % 3 == 0 else None,
+        "visitor_id": f"v_{gid[:10]}{i:04d}",
+        "dedupe_key": f"email:{email}",
+        "name": f"{first} {last}",
+        "email": email,
+        "phone": phone,
+        "match_keys": compute_match_keys(email, phone),
+        "ad_id": ad_id,
+        "adset_id": None,
+        "campaign_id": f"cmp_{gid}",
+        "fbclid": None,
+        "utm_source": "facebook",
+        "utm_medium": "paid",
+        "utm_campaign": "Body Sculpting - Lead Gen",
+        "utm_content": "Winning Creative - Evergreen",
+        "landing_page": "https://demo-client.example/offer",
+        "submitted_at": NOW - timedelta(days=i % 28),
+        "created_at": NOW,
+        "pushed_to_ghl": False,
+        "ghl_contact_id": None,
+    }
+
+
 def _instant_form_lead(gid: str, name: str, i: int, ad_id: str) -> dict:
     first, last, email, phone = _person(gid, i)
     lead_id = f"seedl_{uuid.uuid4().hex[:12]}"
@@ -324,7 +374,7 @@ async def seed(db, mongo_client) -> None:
         upsert=True,
     )
 
-    groups, contacts, leads = [], [], []
+    groups, contacts, leads, tracked = [], [], [], []
 
     for spec in CLIENTS:
         gid = f"seed_{uuid.uuid4().hex[:12]}"
@@ -345,6 +395,15 @@ async def seed(db, mongo_client) -> None:
             "client_status": "Active",
             "ad_account_currency": "GBP",
             "facebook_cache": _meta_cache(gid, spec["spend"], spec["meta_results"]),
+            "lead_collection": {
+                **lead_collection_service.DEFAULT,
+                **spec.get("lead_collection", {}),
+                "webhook_secret": (
+                    lead_collection_service.new_webhook_secret()
+                    if spec.get("lead_collection", {}).get("method") == "external_form"
+                    else None
+                ),
+            },
             "gohighlevel_cache": {}, "hotprospector_cache": {},
             "hotprospector_call_cache": {},
             "last_ghl_refresh": NOW, "last_meta_refresh": NOW, "last_hp_refresh": None,
@@ -362,12 +421,17 @@ async def seed(db, mongo_client) -> None:
             i = start + j
             contacts.append(_ghl_contact(gid, name, i, ad_a if i % 2 == 0 else ad_b, won=(j % 8 == 0)))
 
+        for k in range(spec.get("tracked_leads", 0)):
+            tracked.append(_tracked_lead(gid, name, k, ad_a if k % 2 == 0 else ad_b))
+
     if groups:
         await db["client_groups"].insert_many(groups)
     if contacts:
         await db["ghl_contacts"].insert_many(contacts)
     if leads:
         await db["facebook_leads"].insert_many(leads)
+    if tracked:
+        await db["tracked_leads"].insert_many(tracked)
 
     # Run the real cache-patching path rather than writing the answers by hand,
     # so the seed exercises the production code and the numbers on screen are
@@ -376,8 +440,8 @@ async def seed(db, mongo_client) -> None:
         await update_preset_lead_counts(group["id"], DEMO_EMAIL, mongo_client, presets=list(PRESETS))
 
     logger.info(
-        "Seeded %d clients, %d attributed contacts, %d instant-form leads.",
-        len(groups), len(contacts), len(leads),
+        "Seeded %d clients, %d attributed contacts, %d instant-form leads, %d captured leads.",
+        len(groups), len(contacts), len(leads), len(tracked),
     )
     logger.info("Log in as %s / %s", DEMO_EMAIL, DEMO_PASSWORD)
 
