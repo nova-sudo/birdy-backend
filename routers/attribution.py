@@ -176,6 +176,9 @@ class LeadCollectionRequest(BaseModel):
     method: str
     form_provider: str | None = None
     push_to_ghl: bool = False
+    # Hosts this client's form tool lives on, if it isn't one of the providers
+    # every account shares.
+    form_hosts: list[str] | None = None
 
 
 @router.get("/portal/{group_id}")
@@ -243,6 +246,7 @@ async def put_lead_collection(
             group_id, body.method, mongo_client,
             form_provider=body.form_provider,
             push_to_ghl=body.push_to_ghl,
+            form_hosts=body.form_hosts,
         )
     return {"ok": True, "lead_collection": config}
 

@@ -62,6 +62,11 @@ DEFAULT = {
     "form_provider": None,
     "push_to_ghl": False,
     "webhook_secret": None,
+    # Extra hosts this client's form tool lives on, beyond the providers
+    # everyone shares — a white-labelled form on book.theirbrand.com matches
+    # nothing built in, and without this its submissions never carry a visitor
+    # id. See services/tracker_script.render_tracker.
+    "form_hosts": [],
     "configured_at": None,
 }
 
@@ -84,12 +89,39 @@ def new_webhook_secret() -> str:
     return secrets.token_urlsafe(32)
 
 
+def normalize_hosts(value) -> list[str]:
+    """
+    Clean a customer-typed list of form hosts.
+
+    People paste whole URLs, so take the host out of one when they do. Anything
+    that isn't a usable host is dropped rather than stored — a bad entry here
+    would silently never match and be invisible to debug.
+    """
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return []
+
+    hosts = []
+    for raw in value[:10]:
+        if not isinstance(raw, str):
+            continue
+        host = raw.strip().lower()
+        if not host:
+            continue
+        host = host.split("://")[-1].split("/")[0].strip()
+        if host and "." in host or host.startswith("localhost"):
+            hosts.append(host)
+    return hosts
+
+
 async def save(
     group_id: str,
     method: str,
     mongo_client,
     form_provider=None,
     push_to_ghl: bool = False,
+    form_hosts=None,
 ) -> dict:
     """
     Write a client's lead-collection choice, minting a webhook secret if the
@@ -110,6 +142,10 @@ async def save(
         "form_provider": normalize_provider(form_provider),
         "push_to_ghl": bool(push_to_ghl),
         "webhook_secret": current["webhook_secret"],
+        "form_hosts": (
+            normalize_hosts(form_hosts) if form_hosts is not None
+            else current.get("form_hosts") or []
+        ),
         "configured_at": datetime.utcnow(),
     }
     if method in NEEDS_WEBHOOK and not config["webhook_secret"]:

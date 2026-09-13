@@ -90,15 +90,22 @@ async def tracker_script(site_file: str, request: Request):
     """
     Serve the tracker for a site id, e.g. GET /t/abc123XYZ.js
 
-    Not checked against the database on purpose: this runs on every page load
-    of every customer landing page, and serving an inert script for an unknown
-    id costs nothing while a lookup here would cost a round trip per visitor.
-    The id is validated where it matters — on ingest.
+    An unknown id still gets a working script rather than a 404 — it simply has
+    nothing to report to. The id is validated where it matters, on ingest.
+
+    The one lookup here is for this client's extra form hosts, and it is cheap
+    twice over: `resolve_site` memoises for five minutes per process, and the
+    response is browser-cached for an hour, so a busy landing page does not turn
+    into a query per visitor.
     """
     site_id = site_file[:-3] if site_file.endswith(".js") else site_file
     endpoint = str(request.base_url).rstrip("/") + "/t"
+
+    async with get_mongo_client() as mongo_client:
+        site = await resolve_site(site_id, mongo_client)
+
     return Response(
-        content=render_tracker(site_id, endpoint),
+        content=render_tracker(site_id, endpoint, (site or {}).get("form_hosts")),
         media_type="application/javascript; charset=utf-8",
         headers={
             # Long enough that repeat visitors don't re-fetch, short enough

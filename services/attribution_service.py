@@ -144,7 +144,10 @@ async def resolve_site(site_id: str | None, mongo_client) -> dict | None:
 
     group = await mongo_client[DB_NAME]["client_groups"].find_one(
         {"attribution_site_id": site_id},
-        projection={"id": 1, "user_id": 1, "ghl_location_id": 1, "name": 1},
+        projection={
+            "id": 1, "user_id": 1, "ghl_location_id": 1, "name": 1,
+            "lead_collection.form_hosts": 1,
+        },
     )
     site = None
     if group:
@@ -154,6 +157,7 @@ async def resolve_site(site_id: str | None, mongo_client) -> dict | None:
             "client_group_name": group.get("name"),
             "user_id": group.get("user_id"),
             "location_id": group.get("ghl_location_id"),
+            "form_hosts": (group.get("lead_collection") or {}).get("form_hosts") or [],
         }
     _site_cache[site_id] = (now, site)
     return site

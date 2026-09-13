@@ -30,6 +30,8 @@ preflight ever hits the API and the client never needs to read a response —
 the visitor_id is minted in the browser, not handed down by the server.
 """
 
+import json
+
 TRACKER_JS = r"""
 (function () {
   var SITE = "__SITE_ID__";
@@ -43,11 +45,18 @@ TRACKER_JS = r"""
   ];
   // Form/booking providers we hand the visitor id to. Matched as a substring
   // of the URL host, so subdomains (link.msgsndr.com, form.typeform.com) hit.
+  //
+  // An allowlist rather than "every cross-origin frame" on purpose: the visitor
+  // id identifies a person to us, and handing it to every analytics pixel and
+  // embedded video on the page would leak it for nothing. __EXTRA_HOSTS__ is
+  // this client's own additions — a form tool on a white-labelled domain
+  // (book.theirbrand.com) is invisible to the list below and would otherwise
+  // silently never receive the id.
   var FORM_HOSTS = [
     "typeform.com", "roasform.com", "roasform.io",
     "leadconnectorhq.com", "msgsndr.com",
     "jotform.com", "tally.so", "calendly.com", "gohighlevel.com"
-  ];
+  ].concat(__EXTRA_HOSTS__);
 
   function params() {
     try { return new URLSearchParams(location.search); } catch (e) { return null; }
@@ -256,6 +265,23 @@ TRACKER_JS = r"""
 """
 
 
-def render_tracker(site_id: str, endpoint: str) -> str:
-    """Return the tracker source with this account's site id and API base baked in."""
-    return TRACKER_JS.replace("__SITE_ID__", site_id).replace("__ENDPOINT__", endpoint)
+def render_tracker(site_id: str, endpoint: str, extra_form_hosts=None) -> str:
+    """
+    Return the tracker source with this account's details baked in.
+
+    `extra_form_hosts` are host fragments this client's form tool lives on,
+    beyond the providers everyone shares. A white-labelled ROASForm or Typeform
+    on the client's own domain matches nothing in the built-in list, so without
+    this the visitor id is quietly never handed over and every lead from that
+    form falls back to email matching.
+
+    Hosts are serialised as a JSON array of strings, so nothing a customer types
+    into the setting can break out into the script body.
+    """
+    hosts = [h for h in (extra_form_hosts or []) if isinstance(h, str) and h.strip()]
+    return (
+        TRACKER_JS
+        .replace("__SITE_ID__", site_id)
+        .replace("__ENDPOINT__", endpoint)
+        .replace("__EXTRA_HOSTS__", json.dumps([h.strip().lower() for h in hosts]))
+    )
