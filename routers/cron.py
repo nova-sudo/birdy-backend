@@ -42,6 +42,7 @@ from core.constants import META_ONGOING_PRESETS, META_STATIC_PRESETS
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from services.attribution_service import run_match_tick
+from services.ghl_lead_push import push_pending_for_group
 
 logger = logging.getLogger(__name__)
 
@@ -810,6 +811,11 @@ async def prune_call_payloads(authorization: str | None = Header(default=None)):
 # near-empty; the cap exists for the burst after a client's ad goes live.
 ATTRIBUTION_VISITORS_PER_TICK = int(os.getenv("ATTRIBUTION_VISITORS_PER_TICK", "300"))
 
+# Clients whose captured leads get copied into their own GoHighLevel, per tick.
+# Small on purpose: each one is an outbound API call per lead into someone
+# else's CRM, and there is no hurry — the lead is already safe in Birdy.
+ATTRIBUTION_PUSH_GROUPS_PER_TICK = int(os.getenv("ATTRIBUTION_PUSH_GROUPS_PER_TICK", "5"))
+
 
 @router.get("/attribution-tick")
 async def attribution_tick(authorization: str | None = Header(default=None)):
@@ -830,9 +836,11 @@ async def attribution_tick(authorization: str | None = Header(default=None)):
 
     tick_start = time.monotonic()
     result = {"scanned": 0, "matched": 0, "gave_up": 0}
+    pushed = {}
     try:
         async with get_mongo_client() as mongo_client:
             result = await run_match_tick(mongo_client, limit=ATTRIBUTION_VISITORS_PER_TICK)
+            pushed = await _push_landing_page_leads(mongo_client)
         if result["matched"] or result["gave_up"]:
             logger.info(
                 "[attribution-tick] scanned=%d matched=%d gave_up=%d",
@@ -841,4 +849,49 @@ async def attribution_tick(authorization: str | None = Header(default=None)):
     except Exception as e:
         logger.error(f"[attribution-tick] raised: {e}", exc_info=True)
 
-    return {"ok": True, **result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+    return {
+        "ok": True, **result, "ghl_push": pushed,
+        "elapsed_seconds": round(time.monotonic() - tick_start, 2),
+    }
+
+
+async def _push_landing_page_leads(mongo_client) -> dict:
+    """
+    Second slice of the attribution tick: copy captured leads into the clients'
+    own GoHighLevel, for the clients who asked for that.
+
+    Only groups with `lead_collection.push_to_ghl` are even looked at, so an
+    account that never opted in costs one indexed query per tick. Failures are
+    logged and counted rather than raised — this is a best-effort copy, and the
+    lead is already safe in Birdy either way.
+    """
+    db = mongo_client[DB_NAME]
+    groups = await db["client_groups"].find(
+        {"lead_collection.push_to_ghl": True},
+        projection={"id": 1, "user_id": 1, "ghl_location_id": 1,
+                    "lead_collection": 1, "_id": 0},
+        limit=ATTRIBUTION_PUSH_GROUPS_PER_TICK,
+    ).to_list(length=ATTRIBUTION_PUSH_GROUPS_PER_TICK)
+    if not groups:
+        return {}
+
+    totals = {"groups": 0, "pushed": 0, "skipped": 0, "failed": 0}
+    for group in groups:
+        try:
+            summary = await push_pending_for_group(group, mongo_client)
+        except Exception as e:
+            logger.error("[attribution-tick] GHL push failed for %s: %s",
+                         group.get("id"), e, exc_info=True)
+            continue
+        if summary.get("skipped") in ("not_enabled", "no_ghl_location", "no_access_token"):
+            continue
+        totals["groups"] += 1
+        for key in ("pushed", "skipped", "failed"):
+            totals[key] += summary.get(key, 0)
+
+    if totals["pushed"] or totals["failed"]:
+        logger.info(
+            "[attribution-tick] GHL push: groups=%d pushed=%d skipped=%d failed=%d",
+            totals["groups"], totals["pushed"], totals["skipped"], totals["failed"],
+        )
+    return totals

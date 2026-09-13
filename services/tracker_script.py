@@ -148,20 +148,40 @@ TRACKER_JS = r"""
     if (!fields) return;
     var email = fields.email || null;
     var phone = fields.phone || null;
+    // Nothing to identify anyone by, so there is nothing to send. The backend
+    // would drop it anyway; not sending saves a request per abandoned form.
     if (!email && !phone) return;
-    send("/identify", { email: email, phone: phone });
+    send("/identify", { email: email, phone: phone, name: fields.name || null });
+  }
+
+  function looksName(el, val) {
+    var hint = ((el.name || "") + " " + (el.id || "") + " " + (el.placeholder || "")).toLowerCase();
+    if (/name/.test(hint) && !/user-?name|company|business/.test(hint)) return true;
+    return false;
   }
 
   function scrape(form) {
     var out = {};
+    var first = "", last = "", whole = "";
     var els = form.querySelectorAll("input, textarea");
     for (var i = 0; i < els.length; i++) {
       var el = els[i];
       var val = (el.value || "").trim();
       if (!val || el.type === "password" || el.type === "hidden") continue;
-      if (!out.email && looksEmail(el, val) && EMAIL_RE.test(val)) out.email = val;
-      else if (!out.phone && looksPhone(el, val)) out.phone = val;
+      if (!out.email && looksEmail(el, val) && EMAIL_RE.test(val)) { out.email = val; continue; }
+      if (!out.phone && looksPhone(el, val)) { out.phone = val; continue; }
+      if (looksName(el, val)) {
+        var hint = ((el.name || "") + " " + (el.id || "") + " " + (el.placeholder || "")).toLowerCase();
+        if (/first/.test(hint)) first = first || val;
+        else if (/last|sur/.test(hint)) last = last || val;
+        else whole = whole || val;
+      }
     }
+    // A form asks for one full name or for two halves, never reliably either,
+    // so take whichever it gave us. The name is for the agency to recognise and
+    // call the person — it is never used for matching, which is why a wrong
+    // guess here costs a label and nothing more.
+    out.name = whole || (first + " " + last).trim() || null;
     return out;
   }
 

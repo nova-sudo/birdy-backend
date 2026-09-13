@@ -3,15 +3,18 @@ routers/attribution.py
 ----------------------
 The authenticated side of attribution — what the agency sees and installs.
 
-    GET /attribution/setup/{group_id}    site id, snippet, Meta URL parameters
-    GET /attribution/status/{group_id}   is the snippet live, are clicks landing
-    GET /attribution/leads-by-ad/{group_id}
-                                         attributed leads per Meta ad
+    GET /attribution/portal/{group_id}           everything the portal renders
+    PUT /attribution/lead-collection/{group_id}  how this client collects leads
+    GET /attribution/diagnostics/{group_id}      the setup checklist
+    GET /attribution/overview                    every client's tracking status
+    GET /attribution/setup/{group_id}            site id, snippet, parameters
+    GET /attribution/status/{group_id}           is the snippet live
+    GET /attribution/leads-by-ad/{group_id}      attributed leads per Meta ad
 
-The setup endpoint is the one that makes onboarding two steps instead of ten:
-it hands back a ready-to-paste script tag and the exact Meta URL-parameter
-string, and mints the site id on first request so nothing has to be
-provisioned ahead of time.
+`portal` exists so the setup screen is one round trip rather than five: it mints
+the site id on first read, so nothing has to be provisioned ahead of time, and
+returns the snippet, the Meta URL-parameter string, the webhook URL and secret,
+and the verification state together.
 """
 
 import logging
@@ -22,35 +25,31 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
+from pydantic import BaseModel
+
+from services import lead_collection as lead_collection_service
 from services.attribution_service import (
+    META_URL_PARAMETERS,
     ensure_site_id,
     install_status,
     leads_by_ad,
 )
+from services.tracked_leads import TRACKED_LEADS
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/attribution", tags=["attribution"])
 
 
-# Meta's dynamic URL parameters. The names are cosmetic — `ad_id` is what the
-# reports join on, and Birdy already knows what that ad is called, so a client
-# who mistypes a campaign name here costs themselves nothing.
-META_URL_PARAMETERS = (
-    "utm_source=facebook"
-    "&utm_medium=paid"
-    "&utm_campaign={{campaign.name}}"
-    "&utm_content={{ad.name}}"
-    "&campaign_id={{campaign.id}}"
-    "&adset_id={{adset.id}}"
-    "&ad_id={{ad.id}}"
-)
 
 
 async def _require_group(group_id: str, user_id: str, mongo_client) -> dict:
     group = await mongo_client[DB_NAME]["client_groups"].find_one(
         {"id": group_id, "user_id": user_id},
-        projection={"id": 1, "name": 1, "user_id": 1, "attribution_site_id": 1},
+        projection={
+            "id": 1, "name": 1, "user_id": 1,
+            "attribution_site_id": 1, "lead_collection": 1,
+        },
     )
     if not group:
         raise HTTPException(status_code=404, detail="Client group not found")
@@ -147,3 +146,140 @@ async def get_leads_by_ad(
         "ads": rows,
         "attributed_leads": sum(r["leads"] for r in rows),
     }
+
+
+# ---------------------------------------------------------------------------
+# The setup portal
+# ---------------------------------------------------------------------------
+
+class LeadCollectionRequest(BaseModel):
+    method: str
+    form_provider: str | None = None
+    push_to_ghl: bool = False
+
+
+@router.get("/portal/{group_id}")
+async def get_portal(
+    group_id: str,
+    request: Request,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Everything the per-client setup portal renders, in one call.
+
+    Deliberately one round trip: the portal shows the snippet, the Meta
+    parameters, the webhook details and the live checklist on one screen, and
+    five separate fetches would make it flicker through five loading states on a
+    page whose whole job is to feel like a checklist.
+    """
+    async with get_mongo_client() as mongo_client:
+        group = await _require_group(group_id, current_user, mongo_client)
+        site_id = await ensure_site_id(group, mongo_client)
+        config = lead_collection_service.read(group)
+        diagnostics = await lead_collection_service.diagnose(group, mongo_client)
+        status = await install_status(group_id, mongo_client)
+
+    base = _tracking_base(request)
+    src = base + "/t/" + site_id + ".js"
+    return {
+        "group_id": group_id,
+        "group_name": group.get("name"),
+        "site_id": site_id,
+        "lead_collection": {
+            # The webhook secret is returned deliberately: whoever is wiring up
+            # Typeform has to paste it. It grants only the ability to add leads
+            # to this one client, and nothing to read.
+            **config,
+            "needs_script": config["method"] in lead_collection_service.NEEDS_SCRIPT,
+            "needs_webhook": config["method"] in lead_collection_service.NEEDS_WEBHOOK,
+        },
+        "snippet": '<script async src="' + src + '"></script>',
+        "script_url": src,
+        "meta_url_parameters": META_URL_PARAMETERS,
+        "visitor_id_parameter": "birdy_visitor_id",
+        "webhook_url": base + "/t/webhook/" + site_id,
+        "install_page_url": base + "/install/" + site_id,
+        "diagnostics": diagnostics,
+        **status,
+    }
+
+
+@router.put("/lead-collection/{group_id}")
+async def put_lead_collection(
+    group_id: str,
+    body: LeadCollectionRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Record how this client collects their leads."""
+    if body.method not in lead_collection_service.METHODS:
+        raise HTTPException(
+            status_code=400,
+            detail="method must be one of: " + ", ".join(lead_collection_service.METHODS),
+        )
+
+    async with get_mongo_client() as mongo_client:
+        await _require_group(group_id, current_user, mongo_client)
+        config = await lead_collection_service.save(
+            group_id, body.method, mongo_client,
+            form_provider=body.form_provider,
+            push_to_ghl=body.push_to_ghl,
+        )
+    return {"ok": True, "lead_collection": config}
+
+
+@router.get("/diagnostics/{group_id}")
+async def get_diagnostics(
+    group_id: str,
+    current_user: str = Depends(get_current_user),
+):
+    """The setup checklist — what has happened, and the next thing that must."""
+    async with get_mongo_client() as mongo_client:
+        group = await _require_group(group_id, current_user, mongo_client)
+        return await lead_collection_service.diagnose(group, mongo_client)
+
+
+@router.get("/overview")
+async def get_overview(current_user: str = Depends(get_current_user)):
+    """
+    One row per client for the agency-wide Tracking table.
+
+    Onboarding imports sub-accounts in bulk, so an agency finishes the wizard
+    with fourteen clients and needs one screen to see which are live and chase
+    the rest — not fourteen portals opened one at a time. Unconfigured clients
+    sort first, because they are the ones needing attention.
+    """
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        groups = await db["client_groups"].find(
+            {"user_id": current_user},
+            projection={
+                "id": 1, "name": 1, "client_status": 1, "_id": 0,
+                "attribution_site_id": 1, "lead_collection": 1,
+            },
+        ).to_list(None)
+
+        rows = []
+        for group in groups:
+            group_id = group["id"]
+            config = lead_collection_service.read(group)
+            status = await install_status(group_id, mongo_client)
+            leads = await db[TRACKED_LEADS].count_documents({"client_group_id": group_id})
+            rows.append({
+                "group_id": group_id,
+                "group_name": group.get("name"),
+                "client_status": group.get("client_status"),
+                "method": config["method"],
+                "form_provider": config["form_provider"],
+                "site_id": group.get("attribution_site_id"),
+                "installed": status["installed"],
+                "last_seen_at": status["last_seen_at"],
+                "ad_click_seen": status["first_ad_click_seen"],
+                "tracked_leads": leads,
+                "attributed_leads": status["attributed_leads"],
+            })
+
+    rows.sort(key=lambda r: (
+        r["method"] != lead_collection_service.METHOD_UNKNOWN,
+        (r["group_name"] or "").lower(),
+    ))
+    return {"clients": rows}

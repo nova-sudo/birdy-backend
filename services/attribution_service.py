@@ -79,6 +79,20 @@ MAX_MATCH_ATTEMPTS = 24
 # "leads from this ad" can exclude re-engaged existing contacts.
 CLICK_SLACK = timedelta(hours=1)
 
+# Meta's dynamic URL parameters. The names are cosmetic — `ad_id` is what the
+# reports join on, and Birdy already knows what that ad is called, so a client
+# who mistypes a campaign name here costs themselves nothing.
+META_URL_PARAMETERS = (
+    "utm_source=facebook"
+    "&utm_medium=paid"
+    "&utm_campaign={{campaign.name}}"
+    "&utm_content={{ad.name}}"
+    "&campaign_id={{campaign.id}}"
+    "&adset_id={{adset.id}}"
+    "&ad_id={{ad.id}}"
+)
+
+
 _SITE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 _VISITOR_ID_RE = re.compile(r"^[A-Za-z0-9_-]{8,64}$")
 
@@ -210,7 +224,14 @@ async def record_touch(site: dict, visitor_id: str, touch: dict, mongo_client) -
             "match_attempts": 0,
             "created_at": now,
         },
-        "$set": {"last_seen_at": now},
+        "$set": {
+            "last_seen_at": now,
+            # Anonymous browsing ages out; see the TTL in
+            # create_attribution_indexes. record_identity unsets this, because a
+            # person who gave us their email is a lead and has to outlive the
+            # session that produced them.
+            "expires_at": now + timedelta(days=VISITOR_TTL_DAYS),
+        },
         "$inc": {"touch_count": 1},
     }
     if is_paid_touch(touch):
@@ -268,6 +289,10 @@ async def record_identity(
             },
             "$set": changes,
             "$addToSet": {"match_keys": {"$each": keys}},
+            # This visitor is a person now, not browsing history. Dropping the
+            # expiry is what stops a landing-page lead vanishing six months
+            # later with nothing to show it was ever there.
+            "$unset": {"expires_at": ""},
         },
         upsert=True,
     )
@@ -582,11 +607,23 @@ async def create_attribution_indexes(mongo_client):
         [("client_group_id", 1), ("last_seen_at", -1)], name="group_last_seen"
     )
     await visitors.create_index("match_keys", name="idx_match_keys", sparse=True)
-    # Anonymous browsing history ages out; attribution_matches is the record
-    # that has to survive, and it has no TTL.
+    # Anonymous browsing history ages out. The TTL is on `expires_at` rather
+    # than `last_seen_at` because only anonymous rows carry that field —
+    # record_identity unsets it, and a document with no TTL field is never
+    # expired. Putting it on last_seen_at deleted identified people too, which
+    # silently destroyed landing-page leads 180 days after capture.
     await visitors.create_index(
-        "last_seen_at", expireAfterSeconds=VISITOR_TTL_DAYS * 86400, name="visitor_ttl"
+        "expires_at", expireAfterSeconds=0, name="visitor_ttl_anonymous"
     )
+    # The earlier TTL lived on `last_seen_at` and expired every visitor,
+    # identified or not. Creating the replacement above does not remove it, so
+    # it has to go explicitly or it keeps deleting the leads this change exists
+    # to preserve. Absent on a fresh database, hence the swallowed error.
+    try:
+        await visitors.drop_index("visitor_ttl")
+        logger.info("Dropped the old visitor_ttl index (it expired identified visitors)")
+    except Exception:
+        pass
 
     matches = db[MATCHES]
     await matches.create_index(

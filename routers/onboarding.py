@@ -40,6 +40,7 @@ from pydantic import BaseModel
 
 from billing_middleware import check_client_limit
 from core.database import DB_NAME
+from services import lead_collection as lead_collection_service
 from dependencies import get_current_user, get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
 from integrations.gohighlevel import (
@@ -136,6 +137,11 @@ class ImportAccount(BaseModel):
     meta_ad_account_id: Optional[str] = None
     ad_account_currency: Optional[str] = None
     client_status: Optional[str] = "Active"
+    # How this client collects leads, chosen per row in the review step. Left
+    # optional so anything still posting the old shape imports as "unknown"
+    # rather than 422-ing a whole batch of clients.
+    lead_collection_method: Optional[str] = None
+    form_provider: Optional[str] = None
 
 
 class ImportSubaccountsRequest(BaseModel):
@@ -898,6 +904,18 @@ async def import_subaccounts(
                 "meta_ad_account_id": account.meta_ad_account_id,
                 "hotprospector_group_id": None,
                 "call_log_provider": provider,
+                # Declared per client in the review step. An agency's clients do
+                # not all collect leads the same way, and guessing a default
+                # would silently mis-configure every client nobody looked at.
+                "lead_collection": {
+                    **lead_collection_service.DEFAULT,
+                    "method": lead_collection_service.normalize_method(
+                        account.lead_collection_method
+                    ),
+                    "form_provider": lead_collection_service.normalize_provider(
+                        account.form_provider
+                    ),
+                },
                 "notes": "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
@@ -912,6 +930,21 @@ async def import_subaccounts(
                 "last_hp_refresh": None,
                 "client_status": client_status,
             })
+            # A client whose form we can't read from the page needs a webhook to
+            # post submissions to, and that needs a secret. Minted here so the
+            # portal has one to show the moment the import finishes, rather than
+            # making someone come back and press a button to generate it.
+            if lead_collection_service.normalize_method(
+                account.lead_collection_method
+            ) in lead_collection_service.NEEDS_WEBHOOK:
+                await groups.update_one(
+                    {"id": group_id},
+                    {"$set": {
+                        "lead_collection.webhook_secret":
+                            lead_collection_service.new_webhook_secret(),
+                    }},
+                )
+
             seen_this_batch.add(account.location_id)
             imported.append({"group_id": group_id, "location_id": account.location_id})
 

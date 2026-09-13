@@ -38,14 +38,20 @@ client renames things. So the ad/ad set/campaign identity is looked up from the 
 `facebook_cache` by ad id, and GHL's strings are used only as a fallback for ads
 the cache has no row for.
 
-Adding a third source — the attribution tracker's `attribution_matches`, which
-covers contacts GHL itself could not attribute — should be one more `_fetch_*`
-function and one more entry in `SOURCE_PRECEDENCE`. See `docs/attribution-next.md`.
+A third source now sits alongside them: `tracked_leads`, written by our own
+tracking script and by the inbound form webhook. Those are the leads that exist
+*nowhere else* — a form posting to a spreadsheet, a Zap, or the client's own
+backend never reaches GoHighLevel, so without that row the person is invisible
+however the ads performed.
+
+Adding a fourth is the same shape: one `_fetch_*` function and one entry in
+`SOURCE_PRECEDENCE`.
 """
 
 from __future__ import annotations
 
 import logging
+from datetime import datetime
 
 from core.database import DB_NAME
 from core.utils import iso_day_range
@@ -55,12 +61,20 @@ logger = logging.getLogger(__name__)
 
 LEAD_SOURCE_INSTANT_FORM = "instant_form"
 LEAD_SOURCE_GHL_ATTRIBUTION = "ghl_attribution"
+LEAD_SOURCE_TRACKER = "tracker"
 
 # Which row wins when two sources describe the same person. The instant-form row
 # is canonical because it is the only one carrying the form's question answers
 # (`field_data`); the GHL contact still contributes opportunity status and
 # revenue, which the merge folds in.
-SOURCE_PRECEDENCE = (LEAD_SOURCE_INSTANT_FORM, LEAD_SOURCE_GHL_ATTRIBUTION)
+# `tracker` sits last so that nothing changes for a client whose leads already
+# resolve from the first two. It only ever wins where it is the only source —
+# which is exactly the case it was built for: a form that never fed the CRM.
+SOURCE_PRECEDENCE = (
+    LEAD_SOURCE_INSTANT_FORM,
+    LEAD_SOURCE_GHL_ATTRIBUTION,
+    LEAD_SOURCE_TRACKER,
+)
 
 # `lead_source` as reported to callers, describing a whole result set.
 LEAD_SOURCE_MIXED = "mixed"
@@ -135,6 +149,25 @@ def primary_opportunity(opportunities) -> tuple[str, float]:
                 value = 0.0
             return status, value
     return "", 0.0
+
+
+def _as_datetime_range(date_range: dict) -> dict:
+    """
+    Re-type an `iso_day_range` bound for a field that holds a real datetime.
+
+    The other two sources store their timestamps as ISO *strings* — Meta's
+    `created_time` and GHL's `dateAdded` both arrive that way — so the shared
+    helper produces string bounds. `tracked_leads.submitted_at` is a BSON date,
+    and a string compared against a date in Mongo matches nothing at all rather
+    than erroring, so this silently returned zero leads until converted.
+    """
+    out = {}
+    for op, value in date_range.items():
+        if isinstance(value, str):
+            out[op] = datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
+        else:
+            out[op] = value
+    return out
 
 
 def _group_filter(user_id: str, group_ids: list[str] | None) -> dict:
@@ -321,6 +354,75 @@ async def _fetch_ghl_attributed_leads(
 
 
 # ---------------------------------------------------------------------------
+# Source: leads our tracker captured off a landing page (tracked_leads)
+# ---------------------------------------------------------------------------
+
+async def _fetch_tracker_leads(
+    db, user_id: str, group_ids: list[str] | None, date_range: dict, limit: int | None
+) -> list[dict]:
+    """
+    Leads our own script or the inbound webhook captured.
+
+    These are the only leads that exist nowhere else: a form that posts to a
+    spreadsheet, a Zap, or the client's own backend never reaches GoHighLevel,
+    so without this row the person is invisible no matter how the ads performed.
+    """
+    query = _group_filter(user_id, group_ids)
+    if date_range:
+        query["submitted_at"] = _as_datetime_range(date_range)
+
+    cursor = db["tracked_leads"].find(
+        query,
+        {
+            "name": 1, "email": 1, "phone": 1, "match_keys": 1,
+            "source": 1, "provider": 1, "visitor_id": 1,
+            "ad_id": 1, "adset_id": 1, "campaign_id": 1,
+            "utm_campaign": 1, "utm_content": 1, "utm_source": 1,
+            "landing_page": 1, "submitted_at": 1,
+            "client_group_id": 1, "client_group_name": 1,
+            "ghl_contact_id": 1,
+        },
+    ).sort("submitted_at", -1)
+    if limit:
+        cursor = cursor.limit(limit)
+
+    rows = []
+    for doc in await cursor.to_list(length=limit):
+        submitted = doc.get("submitted_at")
+        rows.append({
+            "lead_source": LEAD_SOURCE_TRACKER,
+            "lead_id": str(doc.get("_id")),
+            "full_name": doc.get("name") or "",
+            "email": doc.get("email") or "",
+            "phone_number": doc.get("phone") or "",
+            # Stored as a real datetime here, unlike the other two sources which
+            # carry provider strings. Normalised to ISO so every row sorts and
+            # renders the same way.
+            "created_time": submitted.isoformat() + "Z" if submitted else "",
+            "ad_id": doc.get("ad_id") or "",
+            "ad_name": doc.get("utm_content") or "",
+            "adset_id": doc.get("adset_id") or "",
+            "adset_name": "",
+            "campaign_id": doc.get("campaign_id") or "",
+            "campaign_name": doc.get("utm_campaign") or "",
+            "platform": doc.get("utm_source") or "",
+            "field_data": {},
+            "match_keys": doc.get("match_keys") or [],
+            "client_group_id": doc.get("client_group_id"),
+            "group_name": doc.get("client_group_name") or "Unknown Group",
+            "ad_account_id": None,
+            # Filled in by the CRM enrichment pass when a contact turns up.
+            "ghl_matched": bool(doc.get("ghl_contact_id")),
+            "ghl_contact_id": doc.get("ghl_contact_id"),
+            "ghl_tags": [],
+            "ghl_opportunity_status": "",
+            "ghl_opportunity_value": 0,
+            "ghl_date_added": "",
+        })
+    return rows
+
+
+# ---------------------------------------------------------------------------
 # Enrichment
 # ---------------------------------------------------------------------------
 
@@ -395,11 +497,15 @@ async def _enrich_ghl_contact(db, user_id: str, rows: list[dict]) -> None:
     """
     Attach CRM state to instant-form leads, in place.
 
-    Only instant-form rows need this — a GHL-attributed lead already is the
-    contact. Same match_keys join /api/facebook-leads/filtered has always done,
-    lifted here so both sources come out of the resolver in one shape.
+    A GHL-attributed lead already *is* the contact, so it needs nothing. The
+    other two do: an instant-form lead and a tracker-captured lead are both
+    records of a person who may also exist in the CRM, and without this join
+    neither shows an opportunity status or a penny of revenue.
     """
-    pending = [r for r in rows if r["lead_source"] == LEAD_SOURCE_INSTANT_FORM]
+    pending = [
+        r for r in rows
+        if r["lead_source"] in (LEAD_SOURCE_INSTANT_FORM, LEAD_SOURCE_TRACKER)
+    ]
     if not pending:
         return
 
@@ -511,8 +617,9 @@ async def fetch_ad_leads(
     # row kept.
     instant = await _fetch_instant_form_leads(db, user_id, group_ids, date_range, limit)
     ghl = await _fetch_ghl_attributed_leads(db, user_id, group_ids, date_range, limit)
+    tracker = await _fetch_tracker_leads(db, user_id, group_ids, date_range, limit)
 
-    rows = _dedupe(instant + ghl)
+    rows = _dedupe(instant + ghl + tracker)
     await _enrich_ghl_contact(db, user_id, rows)
     await _enrich_ad_identity(db, user_id, rows)
 
@@ -554,6 +661,19 @@ async def _fetch_count_rows(
             "lead_source": LEAD_SOURCE_GHL_ATTRIBUTION,
             "match_keys": doc.get("match_keys") or [],
             "created_time": (doc.get("contact_data") or {}).get("dateAdded") or "",
+        })
+
+    tracker_query = _group_filter(user_id, group_ids)
+    if date_range:
+        tracker_query["submitted_at"] = _as_datetime_range(date_range)
+    async for doc in db["tracked_leads"].find(
+        tracker_query, {"submitted_at": 1, "match_keys": 1, "_id": 0}
+    ):
+        submitted = doc.get("submitted_at")
+        rows.append({
+            "lead_source": LEAD_SOURCE_TRACKER,
+            "match_keys": doc.get("match_keys") or [],
+            "created_time": submitted.isoformat() + "Z" if submitted else "",
         })
 
     return _dedupe(rows)

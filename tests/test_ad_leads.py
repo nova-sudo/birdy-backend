@@ -520,3 +520,167 @@ def test_the_two_are_never_added_together():
     assert count == 190, "a sum here would be neither figure"
     count, _ = pixel_fallback(257, 251)
     assert count == 257
+
+
+# ---------------------------------------------------------------------------
+# The third source: leads our own tracker captured
+# ---------------------------------------------------------------------------
+#
+# These are the only leads with no second copy anywhere. A form posting to a
+# spreadsheet or a Zap never reaches the CRM, so if the resolver skips them the
+# person is invisible however the ads performed.
+
+from datetime import datetime as _dt  # noqa: E402
+
+from services.ad_leads import LEAD_SOURCE_TRACKER  # noqa: E402
+
+
+async def _tracked_lead(
+    db, *, email="tracked@x.com", phone="07700900501", ad_id="120246113041200118",
+    submitted=None, group=GROUP, name="Leah Woods", ghl_contact_id=None,
+):
+    await db["tracked_leads"].insert_one({
+        "user_id": USER,
+        "client_group_id": group,
+        "client_group_name": "Aura",
+        "source": "tracker",
+        "provider": None,
+        "visitor_id": "v_0123456789abcdef",
+        "dedupe_key": f"email:{email}",
+        "name": name,
+        "email": email,
+        "phone": phone,
+        "match_keys": compute_match_keys(email, phone),
+        "ad_id": ad_id,
+        "adset_id": None,
+        "campaign_id": "120232720006000118",
+        "utm_campaign": "September Lead Gen",
+        "utm_content": "Winning Creative",
+        "utm_source": "facebook",
+        "submitted_at": submitted or _dt(2026, 9, 1, 10, 0, 0),
+        "ghl_contact_id": ghl_contact_id,
+        "pushed_to_ghl": False,
+    })
+
+
+@pytest.mark.asyncio
+async def test_a_tracked_lead_is_a_lead(mock_mongo_client, mock_db):
+    await _tracked_lead(mock_db)
+
+    rows = await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client)
+
+    assert len(rows) == 1
+    lead = rows[0]
+    assert lead["lead_source"] == LEAD_SOURCE_TRACKER
+    assert lead["full_name"] == "Leah Woods"
+    assert lead["email"] == "tracked@x.com"
+    assert lead["ad_id"] == "120246113041200118"
+    assert lead["created_time"].startswith("2026-09-01")
+
+
+@pytest.mark.asyncio
+async def test_meta_still_supplies_a_tracked_leads_adset(mock_mongo_client, mock_db):
+    """The tracker never sees an ad set id either — it comes from the cache."""
+    await _tracked_lead(mock_db)
+    await _meta_entities(mock_db)
+
+    lead = (await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client))[0]
+
+    assert lead["adset_id"] == "120238943811800656"
+    assert lead["ad_name"] == "Lose Belly Fat V2"
+
+
+@pytest.mark.asyncio
+async def test_a_tracked_lead_dedupes_against_the_crm_contact(mock_mongo_client, mock_db):
+    """
+    The form fed GoHighLevel after all, so the same person is in both. One lead,
+    and the GHL row wins because it carries the opportunity.
+    """
+    await _ghl_contact(mock_db, email="both@x.com", phone="07700900601",
+                       opportunities=[{"status": "won", "monetaryValue": 2200}])
+    await _tracked_lead(mock_db, email="both@x.com", phone="07700900601")
+
+    rows = await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client)
+
+    assert len(rows) == 1
+    assert rows[0]["lead_source"] == LEAD_SOURCE_GHL_ATTRIBUTION
+    assert rows[0]["ghl_opportunity_status"] == "won"
+
+
+@pytest.mark.asyncio
+async def test_an_instant_form_lead_outranks_a_tracked_one(mock_mongo_client, mock_db):
+    await _instant_form_lead(mock_db, email="dupe@x.com", phone="07700900701")
+    await _tracked_lead(mock_db, email="dupe@x.com", phone="07700900701")
+
+    rows = await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client)
+
+    assert len(rows) == 1
+    assert rows[0]["lead_source"] == LEAD_SOURCE_INSTANT_FORM
+
+
+@pytest.mark.asyncio
+async def test_a_tracked_lead_picks_up_its_crm_state(mock_mongo_client, mock_db):
+    """
+    The contact has no ad attribution of its own, so it is not a lead in its own
+    right — but it is still this person's CRM record, and the revenue is real.
+    """
+    await _tracked_lead(mock_db, email="later@x.com", phone="07700900801")
+    await mock_db["ghl_contacts"].insert_one({
+        "user_id": USER,
+        "client_group_id": GROUP,
+        "contact_id": "c_later",
+        "match_keys": compute_match_keys("later@x.com", "07700900801"),
+        "contact_data": {
+            "dateAdded": "2026-09-01T11:00:00.000Z",
+            "tags": ["booked"],
+            "opportunities": [{"status": "won", "monetaryValue": 1500}],
+        },
+    })
+
+    lead = (await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client))[0]
+
+    assert lead["lead_source"] == LEAD_SOURCE_TRACKER
+    assert lead["ghl_matched"] is True
+    assert lead["ghl_opportunity_status"] == "won"
+    assert lead["ghl_opportunity_value"] == 1500.0
+
+
+@pytest.mark.asyncio
+async def test_tracked_leads_respect_the_date_window(mock_mongo_client, mock_db):
+    """
+    submitted_at is a real datetime, unlike the ISO strings the other two
+    sources store, so the shared string bounds have to be re-typed or this
+    silently matches nothing.
+    """
+    await _tracked_lead(mock_db, email="in@x.com", phone="07700900901",
+                        submitted=_dt(2026, 9, 2, 23, 30))
+    await _tracked_lead(mock_db, email="out@x.com", phone="07700900902",
+                        submitted=_dt(2026, 9, 3, 0, 30))
+
+    rows = await fetch_ad_leads(USER, [GROUP], "2026-09-01", "2026-09-02", mock_mongo_client)
+
+    assert [r["email"] for r in rows] == ["in@x.com"]
+
+
+@pytest.mark.asyncio
+async def test_tracked_leads_are_counted_and_deduped(mock_mongo_client, mock_db):
+    await _tracked_lead(mock_db, email="a@x.com", phone="07700901001",
+                        submitted=_dt(2026, 9, 1, 9, 0))
+    await _tracked_lead(mock_db, email="b@x.com", phone="07700901002",
+                        submitted=_dt(2026, 9, 1, 10, 0))
+    # Same person as b, also arriving as a GHL-attributed contact.
+    await _ghl_contact(mock_db, contact_id="c_b", email="b@x.com", phone="07700901002",
+                       date_added="2026-09-01T10:05:00.000Z")
+
+    by_day = await count_ad_leads_by_day(USER, [GROUP], None, None, mock_mongo_client)
+
+    assert by_day == {"2026-09-01": 2}
+
+
+@pytest.mark.asyncio
+async def test_a_tracker_only_client_reports_its_source(mock_mongo_client, mock_db):
+    await _tracked_lead(mock_db)
+
+    rows = await fetch_ad_leads(USER, [GROUP], None, None, mock_mongo_client)
+
+    assert describe_lead_source(rows) == LEAD_SOURCE_TRACKER
