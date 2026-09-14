@@ -605,9 +605,13 @@ async def fetch_and_cache_ghl_data_optimized(
                 # ============================================
                 # STEP 4: Save contacts to database
                 # ============================================
-                # Always an upsert keyed on (location_id, contact_id) — the pair
-                # `location_contact_unique` enforces as unique — never a raw
-                # insert. FULL LOAD used to insert_many() fresh documents after
+                # Always an upsert keyed on (user_id, location_id, contact_id) —
+                # the triple `user_location_contact_unique` enforces as unique —
+                # never a raw insert. The index used to be (location_id,
+                # contact_id), one field short of this filter, so a second Birdy
+                # account syncing the same GHL location collided on E11000 and
+                # killed the whole load; see utils/cache_helpers.py for the full
+                # story. FULL LOAD used to insert_many() fresh documents after
                 # wiping the location's contacts up front; now that the wipe
                 # only happens *after* a confirmed-complete fetch (STEP 4b
                 # below), a FULL LOAD page can land on contacts that still have

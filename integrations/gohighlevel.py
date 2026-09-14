@@ -1393,9 +1393,9 @@ async def get_user_contacts_summary(user_id: str, mongo_client):
 #
 # Two of the five indexes it declared were deliberately NOT carried over:
 # a unique (user_id, contact_id) — uniqueness is already enforced by
-# location_contact_unique and a second unique constraint would fail on existing
-# data — and (user_id, client_group_id, location_id), which is a redundant
-# prefix-extension of idx_ghl_date.
+# user_location_contact_unique and a second unique constraint would fail on
+# existing data — and (user_id, client_group_id, location_id), which is a
+# redundant prefix-extension of idx_ghl_date.
 
 
 async def get_location_contacts(

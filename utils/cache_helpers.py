@@ -178,6 +178,23 @@ async def create_performance_indexes(mongo_client: AsyncIOMotorClient):
         # With (user_id, location_id) the plan collapses to a pure COUNT_SCAN and
         # examines ZERO documents.
         ("ghl_contacts.idx_ghl_user_location", db["ghl_contacts"].create_index([("user_id", 1), ("location_id", 1)], name="idx_ghl_user_location", background=True)),
+        # The uniqueness contract for a contact, at the grain the sync actually
+        # writes: services/ghl_service.py upserts on exactly these three fields.
+        #
+        # It used to be (location_id, contact_id), which asserted that a GHL
+        # contact belongs to at most one Birdy account. That was never true — an
+        # agency and a sub-agency can both connect the same location, and ten of
+        # them were on production. When the second account's FULL LOAD reached a
+        # contact only the first had stored, the upsert filter matched nothing
+        # for that user, Mongo attempted an insert, and it collided: E11000,
+        # bulk_write raised, and the whole load aborted with "FULL LOAD
+        # incomplete ... stopped at page 1/7". Nothing was lost (a partial load
+        # skips pruning) but the initial sync could never finish, and the cron
+        # retried the same failure every tick.
+        #
+        # Live databases were migrated by scripts/fix_contact_unique_index.py;
+        # this declaration is what makes it true of a rebuilt one.
+        ("ghl_contacts.user_location_contact_unique", db["ghl_contacts"].create_index([("user_id", 1), ("location_id", 1), ("contact_id", 1)], unique=True, name="user_location_contact_unique", background=True)),
         # client_groups is looked up by bare {"id": ...} in a dozen call paths
         # (meta_refresh_manager, ghl_service, refresh jobs). user_id_1_id_1 above
         # cannot serve those — a compound index is unusable without its leading
