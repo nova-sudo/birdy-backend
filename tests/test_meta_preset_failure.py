@@ -95,3 +95,70 @@ class TestFetch:
 
         assert r.get("_rate_limited") is True
         assert r.get("_failed") is None
+
+
+# ---------------------------------------------------------------------------
+# Creatives are fetched flat and joined by ad id
+# ---------------------------------------------------------------------------
+#
+# The campaigns query used to expand creatives three levels deep —
+# campaign → ads → creative → object_story_spec. Meta answered the whole
+# request with HTTP 500 "Please reduce the amount of data you're asking for",
+# on an account with 5 campaigns and 72 ads, for every date window. Creatives
+# now come from one flat pass over /act_X/ads and join on ad id.
+
+from services.meta_service import _accumulate_campaigns_page
+
+
+def _one_campaign_page(ad_id="ad_1"):
+    return [{
+        "id": "camp_1",
+        "name": "Campaign",
+        "status": "ACTIVE",
+        "insights": {"data": [{"spend": "10", "impressions": "100", "clicks": "5", "reach": "90"}]},
+        "adsets": {"data": []},
+        "ads": {"data": [{"id": ad_id, "name": "Ad", "adset_id": "as_1", "status": "ACTIVE"}]},
+    }]
+
+
+def _accumulate(page, creatives):
+    campaigns, adsets, ads = [], [], []
+    totals = {"spend": 0.0, "impressions": 0, "clicks": 0, "reach": 0, "results": 0}
+    _accumulate_campaigns_page(page, campaigns, adsets, ads, totals, creatives)
+    return ads
+
+
+def test_an_ad_picks_up_its_creative_from_the_flat_map():
+    ads = _accumulate(_one_campaign_page(), {
+        "ad_1": {
+            "creative_title": "Book now",
+            "creative_body": "Limited slots",
+            "creative_image": "https://example.test/a.jpg",
+            "creative_thumbnail": "",
+            "creative_video_id": "",
+        }
+    })
+    assert ads[0]["creative_title"] == "Book now"
+    assert ads[0]["creative_image"] == "https://example.test/a.jpg"
+
+
+def test_an_ad_missing_from_the_creative_map_still_produces_a_row():
+    """The creative fetch is best-effort: losing the pictures must not cost us
+    the spend figures, which are what the report is actually for."""
+    ads = _accumulate(_one_campaign_page(), {})
+    assert ads[0]["id"] == "ad_1"
+    assert ads[0]["spend"] == 0 or "spend" in ads[0]
+    assert ads[0]["creative_title"] == ""
+    assert ads[0]["creative_image"] == ""
+
+
+def test_creatives_are_never_read_off_the_campaign_payload():
+    """A stale nested `creative` in the response must not win over the flat
+    map — otherwise re-introducing the nesting would silently half-work."""
+    page = _one_campaign_page()
+    page[0]["ads"]["data"][0]["creative"] = {"title": "from nesting"}
+    ads = _accumulate(page, {"ad_1": {
+        "creative_title": "from flat map", "creative_body": "",
+        "creative_image": "", "creative_thumbnail": "", "creative_video_id": "",
+    }})
+    assert ads[0]["creative_title"] == "from flat map"

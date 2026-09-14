@@ -592,14 +592,103 @@ def _campaigns_fields_for_preset(date_preset: str) -> str:
         "adsets{name,status,"
         f"insights.date_preset({date_preset})"
         "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr}},"
-        # image_url is only set for image creatives; thumbnail_url covers
-        # videos too (small), and object_story_spec.video_data.image_url is
-        # the full-size video poster. The gallery view needs one of them for
-        # every ad.
-        "ads{name,adset_id,status,creative{title,body,image_url,thumbnail_url,video_id,object_story_spec},"
+        # No `creative{...}` here, deliberately. Expanding creatives three
+        # levels deep — campaign → ads → creative → object_story_spec — blows
+        # Meta's per-response budget and the whole request comes back
+        # HTTP 500 "Please reduce the amount of data you're asking for".
+        # It is the nesting, not the volume: Aura has 5 campaigns and 72 ads
+        # and still failed, on every date_preset, down to campaign limit=5.
+        # Every preset then failed, and because the failure was swallowed the
+        # refresh reported success with an empty cache — the client showed no
+        # Meta data at all while the job said it was fine.
+        #
+        # Creatives don't vary by date window, so they come from a single flat
+        # pass over /act_X/ads instead — see _fetch_ad_creatives — and join
+        # onto these rows by ad id.
+        "ads{name,adset_id,status,"
         f"insights.date_preset({date_preset})"
         "{actions,results,reach,spend,impressions,cpm,inline_link_clicks,cpc,clicks}}"
     )
+
+
+# Meta's response budget tolerates the full creative expansion on the flat
+# /ads edge at 50 per page; 100 already 500s on a 72-ad account.
+_ADS_CREATIVE_PAGE_SIZE = 50
+
+# image_url is only set for image creatives; thumbnail_url covers videos too
+# (small), and object_story_spec.video_data.image_url is the full-size video
+# poster. The gallery view needs one of them for every ad.
+_ADS_CREATIVE_FIELDS = (
+    "creative{title,body,image_url,thumbnail_url,video_id,object_story_spec}"
+)
+
+
+async def _fetch_ad_creatives(
+    ad_account_id: str,
+    access_token: str,
+) -> dict[str, dict]:
+    """
+    {ad_id: creative fields} for every ad on the account, in one flat pass.
+
+    Split out of the per-preset campaigns query, which could not carry it —
+    see _campaigns_fields_for_preset. Creatives have no date dimension, so one
+    pass serves all thirteen presets rather than thirteen identical fetches.
+
+    Best-effort by design: a failure here costs the ad gallery its pictures,
+    which is worth strictly less than the spend and lead figures the caller is
+    really after. Returning {} lets those land with blank creative fields
+    rather than failing the preset.
+    """
+    creatives: dict[str, dict] = {}
+    url = f"https://graph.facebook.com/v25.0/{ad_account_id}/ads"
+    params = {
+        "fields": f"id,{_ADS_CREATIVE_FIELDS}",
+        "access_token": access_token,
+        "limit": _ADS_CREATIVE_PAGE_SIZE,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=120.0) as client:
+            next_url = None
+            page = 0
+            while True:
+                page += 1
+                resp = (
+                    await client.get(url, params=params) if page == 1
+                    else await client.get(next_url)
+                )
+                if resp.status_code != 200:
+                    body = resp.text[:300]
+                    if _classify_meta_error(resp.status_code, body) == "auth":
+                        raise MetaAuthError(
+                            f"Facebook auth/permission error for account "
+                            f"{ad_account_id}: {body[:200]}"
+                        )
+                    logger.warning(
+                        "Ad creatives HTTP %s for account %s — ads will render "
+                        "without images: %s",
+                        resp.status_code, ad_account_id, body,
+                    )
+                    break
+
+                data = resp.json()
+                for ad in data.get("data", []) or []:
+                    if ad.get("id"):
+                        creatives[ad["id"]] = _creative_fields(ad.get("creative"))
+
+                next_url = data.get("paging", {}).get("next")
+                if not next_url:
+                    break
+                await asyncio.sleep(0.15)
+    except MetaAuthError:
+        raise
+    except Exception as e:
+        logger.warning(
+            "Ad creatives failed for account %s (%s) — ads will render "
+            "without images", ad_account_id, e,
+        )
+
+    return creatives
 
 
 def _creative_fields(creative: dict) -> dict:
@@ -704,11 +793,17 @@ def _accumulate_campaigns_page(
     adsets_list: list[dict],
     ads_list: list[dict],
     totals: dict,
+    creatives_by_ad: dict[str, dict] | None = None,
 ) -> None:
     """
     Parse one page of Meta `/campaigns?fields=name,status,insights,adsets,ads`
     into the flat campaigns/adsets/ads lists and running totals. Shared by
     the single-preset fetcher and the batch subresponse parser.
+
+    `creatives_by_ad` comes from _fetch_ad_creatives; the campaigns query no
+    longer carries creatives itself because that nesting made Meta 500 the
+    whole request. Omitting it leaves the creative fields blank, which is what
+    an ad with no creative on record has always looked like.
     """
     for campaign in campaigns:
         c_insights = campaign.get("insights", {}).get("data", [])
@@ -786,7 +881,7 @@ def _accumulate_campaigns_page(
                     ad_results = get_result_value(ad_ins, "lead")
                 except (ValueError, TypeError):
                     pass
-            creative = ad.get("creative", {})
+            creative_row = (creatives_by_ad or {}).get(ad.get("id")) or _creative_fields(None)
             ads_list.append({
                 "id": ad.get("id"),
                 "name": ad.get("name"),
@@ -801,7 +896,7 @@ def _accumulate_campaigns_page(
                 "cpm": round(ad_spend / ad_imp * 1000, 2) if ad_imp > 0 else 0,
                 "cpc": round(ad_spend / ad_clicks, 2) if ad_clicks > 0 else 0,
                 "ctr": round(ad_clicks / ad_imp * 100, 2) if ad_imp > 0 else 0,
-                **_creative_fields(creative),
+                **creative_row,
             })
 
 
@@ -891,14 +986,21 @@ async def _fetch_meta_campaigns_for_preset(
     ad_account_id: str,
     access_token: str,
     date_preset: str,
+    creatives_by_ad: dict[str, dict] | None = None,
 ) -> dict:
     """
     Fetch campaigns + aggregated metrics from Meta for one date_preset.
     Kept as a fallback path when the batched fetcher is unavailable or
     a specific preset needs a one-off fetch.
+
+    `creatives_by_ad` is fetched once per refresh by the caller and passed in;
+    when it is None this function fetches its own, so a one-off call still
+    returns complete rows.
     """
 
     fields = _campaigns_fields_for_preset(date_preset)
+    if creatives_by_ad is None:
+        creatives_by_ad = await _fetch_ad_creatives(ad_account_id, access_token)
 
     campaigns_list: list[dict] = []
     adsets_list: list[dict] = []
@@ -948,6 +1050,7 @@ async def _fetch_meta_campaigns_for_preset(
                 _accumulate_campaigns_page(
                     data.get("data", []) or [],
                     campaigns_list, adsets_list, ads_list, totals,
+                    creatives_by_ad,
                 )
 
                 next_url = data.get("paging", {}).get("next")
@@ -1010,6 +1113,7 @@ async def _fetch_meta_presets_batch(
     ad_account_id: str,
     access_token: str,
     presets: list[str],
+    creatives_by_ad: dict[str, dict] | None = None,
 ) -> dict[str, dict]:
     """
     Fetch all `presets` in ONE HTTP request via Meta's Batch API. Returns
@@ -1176,6 +1280,7 @@ async def _fetch_meta_presets_batch(
         _accumulate_campaigns_page(
             body.get("data", []) or [],
             campaigns_list, adsets_list, ads_list, totals,
+            creatives_by_ad,
         )
 
         # If the ad account has >500 campaigns this preset has a paging.next.
@@ -1188,7 +1293,7 @@ async def _fetch_meta_presets_batch(
                 f"path to avoid truncation."
             )
             out[preset] = await _fetch_meta_campaigns_for_preset(
-                ad_account_id, access_token, preset,
+                ad_account_id, access_token, preset, creatives_by_ad,
             )
             continue
 
@@ -1294,9 +1399,14 @@ async def fetch_meta_all_presets_for_group(
 
     preset_data: dict[str, dict] = {}
 
+    # Once for the whole refresh, not once per preset: ad creatives have no
+    # date dimension, and they can no longer ride along inside the campaigns
+    # query without Meta rejecting it outright. See _fetch_ad_creatives.
+    creatives_by_ad = await _fetch_ad_creatives(meta_ad_account_id, access_token)
+
     try:
         batch_results = await _fetch_meta_presets_batch(
-            meta_ad_account_id, access_token, list(presets)
+            meta_ad_account_id, access_token, list(presets), creatives_by_ad
         )
     except MetaAuthError:
         # Circuit breaker — refresh manager sets meta_token_error=True
@@ -1348,7 +1458,7 @@ async def fetch_meta_all_presets_for_group(
         for attempt in range(3):
             try:
                 result = await _fetch_meta_campaigns_for_preset(
-                    meta_ad_account_id, access_token, preset
+                    meta_ad_account_id, access_token, preset, creatives_by_ad
                 )
                 if result.get("_rate_limited"):
                     wait = 30 * (2 ** attempt)
@@ -1498,6 +1608,23 @@ async def fetch_meta_all_presets_for_group(
     logger.info(
         f"Saved {len(preset_data)} Meta preset buckets for group {group_id}"
     )
+
+    # Everything above is best-effort by design — a preset that fails is left
+    # out of the cache rather than overwriting good data with a zero. But
+    # "left out" was never reported to the caller, so execute_refresh marked
+    # the preset a success and moved on. Aura spent a whole refresh cycle that
+    # way: all thirteen presets failed on a malformed creative query, all
+    # thirteen were recorded as successes, and the client showed no Meta data
+    # while the job claimed to be healthy.
+    #
+    # Raise after the save, not before, so presets that did land are kept and
+    # only the ones that didn't are retried on the next attempt.
+    missing = [p for p in presets if p not in preset_data]
+    if missing:
+        raise RuntimeError(
+            f"Meta preset fetch failed for {group_id}: "
+            f"{', '.join(missing)} returned no data after retries"
+        )
 
 
 # ---------------------------------------------------------------------------
