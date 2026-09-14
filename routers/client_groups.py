@@ -528,9 +528,70 @@ async def get_client_groups(
 # POST /api/client-groups
 # ---------------------------------------------------------------------------
 
+async def _initial_client_data_load(
+    group_id: str,
+    user_id: str,
+    ghl_location_id: str | None,
+    meta_ad_account_id: str | None,
+    ad_account_currency: str | None,
+    name: str,
+) -> None:
+    """
+    First pull of a new client's GHL and Meta data, after the response has gone.
+
+    This used to run inside the create request. On a real client the GHL full
+    load takes over a minute — 3,247 contacts took seventy seconds — which is
+    long enough for a browser or proxy to time out. The request would be
+    cancelled mid-load and the group left at "creating" forever, with its data
+    arriving underneath it moments later. Two separate commits went into making
+    that failure survivable before it was worth admitting that a multi-minute
+    job simply does not belong in an HTTP request. Bulk import has always done
+    this in the background.
+
+    Opens its own Mongo client: the request-scoped one is closed by the time
+    this runs.
+
+    Both fetches are best-effort. On failure last_ghl_refresh and
+    last_meta_refresh stay None, which the cron ticks read as maximally stale,
+    so the group is picked up within the minute either way.
+    """
+    async with get_mongo_client() as mongo_client:
+        if ghl_location_id:
+            try:
+                await fetch_and_cache_ghl_data_optimized(
+                    group_id, ghl_location_id, user_id, mongo_client,
+                    is_initial_load=True,
+                )
+            except Exception as e:
+                logger.error(
+                    "Initial GHL load failed for %s (%s) — the cron will retry: %s",
+                    group_id, name, e, exc_info=True,
+                )
+
+        if meta_ad_account_id:
+            from services.meta_refresh_manager import start_refresh
+
+            try:
+                await start_refresh(
+                    group_id, user_id,
+                    {
+                        "meta_ad_account_id": meta_ad_account_id,
+                        "ad_account_currency": ad_account_currency,
+                        "name": name,
+                    },
+                    mongo_client,
+                )
+            except Exception as e:
+                logger.error(
+                    "Initial Meta refresh failed to start for %s (%s) — the cron will retry: %s",
+                    group_id, name, e, exc_info=True,
+                )
+
+
 @router.post("/api/client-groups")
 async def create_client_group_optimized(
     request: ClientGroupRequest,
+    background_tasks: BackgroundTasks,
     current_user: str = Depends(get_current_user),
 ):
     """
@@ -625,6 +686,15 @@ async def create_client_group_optimized(
 
                 logger.info(f"Generated and saved token for GHL location {request.ghl_location_id}")
 
+            # Checked before the insert, not after: the Meta refresh now runs in
+            # the background, so a currency problem raised later would surface as
+            # a log line against a client that had already been created.
+            if request.meta_ad_account_id and not request.ad_account_currency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ad_account_currency is required when meta_ad_account_id is provided",
+                )
+
             # STEP 2: Create client group
             group_id = f"{current_user}_{int(datetime.now().timestamp())}"
             client_group = {
@@ -647,8 +717,14 @@ async def create_client_group_optimized(
                 "notes": request.notes or "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
-                "status": "creating",
-                "status_message": "Fetching data...",
+                # Settled from the start. The data arrives in the background,
+                # and the Clients table already distinguishes "exists but has no
+                # figures yet" from "still being created" — isAwaitingFirstData
+                # drives the loading row, so nothing here needs to claim the
+                # client is half-made. It also means a "creating" status can no
+                # longer outlive the process that set it.
+                "status": "complete",
+                "status_message": "Created — data is syncing in the background",
                 "gohighlevel_cache": {},
                 "facebook_cache": {},
                 "hotprospector_cache": {},
@@ -665,91 +741,17 @@ async def create_client_group_optimized(
             await client_groups_collection.insert_one(client_group)
             logger.info(f"Created client group {group_id}")
 
-            # Validated before the first fetch, not between them — raising
-            # half-way through would abandon the group mid-creation.
-            if request.meta_ad_account_id and not request.ad_account_currency:
-                raise HTTPException(
-                    status_code=400,
-                    detail="ad_account_currency is required when meta_ad_account_id is provided",
-                )
-
-            # STEP 3: first pull of GHL and Meta data.
-            #
-            # Both are best-effort, and that is the whole point of the try. The
-            # group is inserted as "creating", and the frontend polls for as long
-            # as it stays that way — so anything that escapes this block leaves a
-            # client spinning on screen forever with no way back. It happened:
-            # an E11000 in the GHL full load 500'd this request, the crons later
-            # completed both refreshes perfectly, and the client still showed
-            # "Fetching data..." because nothing revisits `status`.
-            #
-            # Neither fetch is load-bearing for creation. last_ghl_refresh and
-            # last_meta_refresh are left None on failure, which is exactly the
-            # state the cron ticks treat as maximally stale, so they pick the
-            # group up within the minute.
-            warnings = []
-
-            # `finally`, not a plain except, and the reason is the failure that
-            # actually happens most. The GHL full load runs inside this request
-            # and takes over a minute on a real client — long enough for the
-            # browser or a proxy to time out. When the connection drops the
-            # server task is *cancelled*, and CancelledError inherits from
-            # BaseException, so `except Exception` never sees it and the status
-            # transition is skipped. That is indistinguishable, on screen, from
-            # the crash this block was first written to survive: a client stuck
-            # on "Fetching data..." with its data sitting there complete.
-            try:
-                if request.ghl_location_id:
-                    try:
-                        await fetch_and_cache_ghl_data_optimized(
-                            group_id,
-                            request.ghl_location_id,
-                            current_user,
-                            mongo_client,
-                            is_initial_load=True,
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Initial GHL load failed for %s (%s) — the cron will retry: %s",
-                            group_id, request.name, e, exc_info=True,
-                        )
-                        warnings.append("GoHighLevel data is still syncing")
-
-                if request.meta_ad_account_id:
-                    from services.meta_refresh_manager import start_refresh
-
-                    group_for_refresh = {
-                        "meta_ad_account_id": request.meta_ad_account_id,
-                        "ad_account_currency": request.ad_account_currency,
-                        "name": request.name,
-                    }
-                    try:
-                        await start_refresh(group_id, current_user, group_for_refresh, mongo_client)
-                    except Exception as e:
-                        logger.error(
-                            "Initial Meta refresh failed to start for %s (%s) — the cron will retry: %s",
-                            group_id, request.name, e, exc_info=True,
-                        )
-                        warnings.append("Meta data is still syncing")
-            finally:
-                # STEP 4: mark it complete, whatever happened above — including
-                # this task being cancelled mid-fetch. shield() keeps the write
-                # itself from being cancelled in turn, which is the difference
-                # between a group that settles and one that never does.
-                await asyncio.shield(
-                    client_groups_collection.update_one(
-                        {"id": group_id},
-                        {
-                            "$set": {
-                                "status": "complete",
-                                "status_message": (
-                                    "Created — " + ", ".join(warnings)
-                                    if warnings else "Client group created successfully"
-                                ),
-                            }
-                        },
-                    )
-                )
+            # The first data pull happens after the response. See
+            # _initial_client_data_load for why it cannot live in this request.
+            background_tasks.add_task(
+                _initial_client_data_load,
+                group_id,
+                current_user,
+                request.ghl_location_id,
+                request.meta_ad_account_id,
+                request.ad_account_currency,
+                request.name,
+            )
 
             final_group = await client_groups_collection.find_one({"id": group_id})
 
