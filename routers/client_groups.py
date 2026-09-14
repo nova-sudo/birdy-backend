@@ -665,23 +665,47 @@ async def create_client_group_optimized(
             await client_groups_collection.insert_one(client_group)
             logger.info(f"Created client group {group_id}")
 
-            # STEP 3: Fetch GHL data with OPTIMIZED function
-            if request.ghl_location_id:
-                await fetch_and_cache_ghl_data_optimized(
-                    group_id,
-                    request.ghl_location_id,
-                    current_user,
-                    mongo_client,
-                    is_initial_load=True,
+            # Validated before the first fetch, not between them — raising
+            # half-way through would abandon the group mid-creation.
+            if request.meta_ad_account_id and not request.ad_account_currency:
+                raise HTTPException(
+                    status_code=400,
+                    detail="ad_account_currency is required when meta_ad_account_id is provided",
                 )
 
-            # Fetch Meta data via resilient refresh manager
-            if request.meta_ad_account_id:
-                if not request.ad_account_currency:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="ad_account_currency is required when meta_ad_account_id is provided",
+            # STEP 3: first pull of GHL and Meta data.
+            #
+            # Both are best-effort, and that is the whole point of the try. The
+            # group is inserted as "creating", and the frontend polls for as long
+            # as it stays that way — so anything that escapes this block leaves a
+            # client spinning on screen forever with no way back. It happened:
+            # an E11000 in the GHL full load 500'd this request, the crons later
+            # completed both refreshes perfectly, and the client still showed
+            # "Fetching data..." because nothing revisits `status`.
+            #
+            # Neither fetch is load-bearing for creation. last_ghl_refresh and
+            # last_meta_refresh are left None on failure, which is exactly the
+            # state the cron ticks treat as maximally stale, so they pick the
+            # group up within the minute.
+            warnings = []
+
+            if request.ghl_location_id:
+                try:
+                    await fetch_and_cache_ghl_data_optimized(
+                        group_id,
+                        request.ghl_location_id,
+                        current_user,
+                        mongo_client,
+                        is_initial_load=True,
                     )
+                except Exception as e:
+                    logger.error(
+                        "Initial GHL load failed for %s (%s) — the cron will retry: %s",
+                        group_id, request.name, e, exc_info=True,
+                    )
+                    warnings.append("GoHighLevel data is still syncing")
+
+            if request.meta_ad_account_id:
                 from services.meta_refresh_manager import start_refresh
 
                 group_for_refresh = {
@@ -689,15 +713,25 @@ async def create_client_group_optimized(
                     "ad_account_currency": request.ad_account_currency,
                     "name": request.name,
                 }
-                await start_refresh(group_id, current_user, group_for_refresh, mongo_client)
+                try:
+                    await start_refresh(group_id, current_user, group_for_refresh, mongo_client)
+                except Exception as e:
+                    logger.error(
+                        "Initial Meta refresh failed to start for %s (%s) — the cron will retry: %s",
+                        group_id, request.name, e, exc_info=True,
+                    )
+                    warnings.append("Meta data is still syncing")
 
-            # STEP 4: Mark as complete
+            # STEP 4: Mark as complete. Reached whatever the fetches did.
             await client_groups_collection.update_one(
                 {"id": group_id},
                 {
                     "$set": {
                         "status": "complete",
-                        "status_message": "Client group created successfully",
+                        "status_message": (
+                            "Created — " + ", ".join(warnings)
+                            if warnings else "Client group created successfully"
+                        ),
                     }
                 },
             )
