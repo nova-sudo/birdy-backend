@@ -425,6 +425,34 @@ async def fetch_and_cache_multiple_ghl_locations(
 # ------------------------------------------------------------------
 # fetch_and_cache_ghl_data_optimized  (line ~5967)
 # ------------------------------------------------------------------
+def stale_contact_filter(
+    user_id: str,
+    ghl_location_id: str,
+    sync_batch_id: str,
+    run_started_at: datetime,
+) -> dict:
+    """
+    Which of this location's contacts a completed FULL LOAD may delete.
+
+    Pulled out of the prune so it can be tested directly, because getting it
+    wrong is expensive: the previous version — batch tag alone — deleted 1,500
+    of Aura's 3,247 live contacts. Two FULL LOADs of the same location had
+    overlapped, each stamping its own sync_batch_id, and the one that finished
+    first saw the other's freshly-written rows as "not mine, therefore stale".
+
+    So a row survives if *either* this run stamped it, or it was written at or
+    after this run began — the second clause being what makes a concurrent load
+    a harmless duplicate rather than a mutual delete. `$not`/`$gte` rather than
+    `$lt` so a legacy row with no `updated_at` still counts as stale.
+    """
+    return {
+        "user_id": user_id,
+        "location_id": ghl_location_id,
+        "sync_batch_id": {"$ne": sync_batch_id},
+        "updated_at": {"$not": {"$gte": run_started_at}},
+    }
+
+
 async def fetch_and_cache_ghl_data_optimized(
         group_id: str,
         ghl_location_id: str,
@@ -504,6 +532,10 @@ async def fetch_and_cache_ghl_data_optimized(
         # that dies partway through (timeout, GHL error, ...) never leaves the
         # location with fewer contacts than it had before this run.
         sync_batch_id = str(uuid.uuid4()) if is_initial_load else None
+        # Everything this run writes is stamped `updated_at >= run_started_at`,
+        # and so is everything a *concurrently running* load writes. STEP 4b
+        # uses that to tell "stale" from "someone else just refreshed this".
+        run_started_at = datetime.now()
         pagination_failed = False
 
         if is_initial_load:
@@ -725,11 +757,11 @@ async def fetch_and_cache_ghl_data_optimized(
                     f"stopped at page {page}/{total_pages or '?'}"
                 )
 
-            stale = await contacts_collection.delete_many({
-                "user_id": user_id,
-                "location_id": ghl_location_id,
-                "sync_batch_id": {"$ne": sync_batch_id},
-            })
+            stale = await contacts_collection.delete_many(
+                stale_contact_filter(
+                    user_id, ghl_location_id, sync_batch_id, run_started_at
+                )
+            )
             logger.info(
                 f"FULL LOAD for {location_name} complete: "
                 f"{total_new_contacts} new, {total_updated_contacts} updated, "

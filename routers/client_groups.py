@@ -554,18 +554,47 @@ async def _initial_client_data_load(
     Both fetches are best-effort. On failure last_ghl_refresh and
     last_meta_refresh stay None, which the cron ticks read as maximally stale,
     so the group is picked up within the minute either way.
+
+    The GHL load claims the group first. A new group has no last_ghl_refresh,
+    which is exactly what the every-minute ghl-tick treats as maximally stale,
+    so without a claim the tick starts a *second* FULL LOAD of the same location
+    seconds after this one begins — and the two loads' prunes delete each
+    other's contacts. That is how Aura lost 1,500 of 3,247.
     """
     async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
         if ghl_location_id:
             try:
+                await db.client_groups.update_one(
+                    {"id": group_id},
+                    {"$set": {
+                        "ghl_refresh_status": "running",
+                        "_ghl_claimed_at": datetime.utcnow(),
+                    }},
+                )
                 await fetch_and_cache_ghl_data_optimized(
                     group_id, ghl_location_id, user_id, mongo_client,
                     is_initial_load=True,
+                )
+                await db.client_groups.update_one(
+                    {"id": group_id},
+                    {"$set": {
+                        "ghl_refresh_status": "complete",
+                        "last_ghl_refresh": datetime.utcnow(),
+                    },
+                     "$unset": {"_ghl_claimed_at": ""}},
                 )
             except Exception as e:
                 logger.error(
                     "Initial GHL load failed for %s (%s) — the cron will retry: %s",
                     group_id, name, e, exc_info=True,
+                )
+                # Release the claim so the retry can happen within the minute
+                # rather than waiting out the stale window.
+                await db.client_groups.update_one(
+                    {"id": group_id},
+                    {"$set": {"ghl_refresh_status": "error"},
+                     "$unset": {"_ghl_claimed_at": ""}},
                 )
 
         if meta_ad_account_id:
@@ -2675,10 +2704,15 @@ async def refresh_integration_data(
             raise HTTPException(status_code=404, detail="Client group not found")
 
         status_field = f"{integration}_refresh_status"
-        await db.client_groups.update_one(
-            {"id": group_id},
-            {"$set": {status_field: "running"}},
-        )
+        # The claim timestamp goes with the status. The ghl-tick decides whether
+        # a running group is held or merely stuck by looking at the claim time,
+        # so a manual refresh that set the status alone stayed claimable — and
+        # the tick would run a second FULL LOAD of the same location alongside
+        # this one, each prune deleting contacts the other had just written.
+        claim = {status_field: "running"}
+        if integration == "ghl":
+            claim["_ghl_claimed_at"] = datetime.utcnow()
+        await db.client_groups.update_one({"id": group_id}, {"$set": claim})
 
     background_tasks.add_task(_run_refresh, group_id, integration, current_user, group)
     return {"status": "started", "integration": integration}
@@ -2700,7 +2734,9 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
                 if not ad_account_id:
                     logger.warning(f"No Meta ad account for group {group_id}")
                     await db.client_groups.update_one(
-                        {"id": group_id}, {"$set": {status_field: "error"}}
+                        {"id": group_id},
+                        {"$set": {status_field: "error"},
+                         "$unset": {"_ghl_claimed_at": ""}},
                     )
                     return
 
@@ -2713,7 +2749,9 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
                 if not location_id:
                     logger.warning(f"No GHL location for group {group_id}")
                     await db.client_groups.update_one(
-                        {"id": group_id}, {"$set": {status_field: "error"}}
+                        {"id": group_id},
+                        {"$set": {status_field: "error"},
+                         "$unset": {"_ghl_claimed_at": ""}},
                     )
                     return
 
@@ -2731,7 +2769,8 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
                 {"$set": {
                     status_field: "complete",
                     refresh_field: datetime.utcnow(),
-                }},
+                },
+                 "$unset": {"_ghl_claimed_at": ""}},
             )
             logger.info(f"Refresh complete: {integration} for group {group_id}")
 
@@ -2745,7 +2784,8 @@ async def _run_refresh(group_id: str, integration: str, user_id: str, group: dic
                     {"$set": {
                         status_field: "error",
                         f"{integration}_refresh_error": error_msg,
-                    }},
+                    },
+                     "$unset": {"_ghl_claimed_at": ""}},
                 )
         except Exception:
             pass

@@ -283,6 +283,16 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
         cutoff = now - timedelta(hours=GHL_CUTOFF_HOURS)
         stale_lock_before = now - timedelta(minutes=GHL_STALE_CLAIM_MINUTES)
 
+        # A lock is only a lock because it expires, and the claim time is what
+        # expires it. Any group left running without one — written by an older
+        # build, or by a caller that has since been fixed — would now be held
+        # forever by the claim filter below. Give it a claim time as of now so
+        # it releases itself in GHL_STALE_CLAIM_MINUTES instead.
+        await client_groups.update_many(
+            {"ghl_refresh_status": "running", "_ghl_claimed_at": {"$exists": False}},
+            {"$set": {"_ghl_claimed_at": now}},
+        )
+
         # Atomically claim up to N groups
         claimed: list[dict] = []
         for _ in range(GHL_GROUPS_PER_TICK):
@@ -294,13 +304,28 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                         {"last_ghl_refresh": {"$exists": False}},
                         {"last_ghl_refresh": None},
                     ],
-                    # Either not running, or running-but-stuck
+                    # Either not running, or running-but-stuck.
+                    #
+                    # Note what is NOT here: a `_ghl_claimed_at does not exist`
+                    # arm. It used to be, and it made the whole clause a no-op —
+                    # every caller that marks a group running without stamping a
+                    # claim time (refresh_all_job, and until recently the create
+                    # and manual-refresh paths, which stamped nothing at all)
+                    # stayed claimable, so the tick would start a second FULL
+                    # LOAD of a location that was already mid-load. Two loads,
+                    # two sync_batch_ids, and the prune in ghl_service STEP 4b
+                    # deleting rows the other one had just written.
+                    #
+                    # A running group with no claim time is now treated as held,
+                    # not stuck. The claim time is what expires a lock, so every
+                    # caller that sets the status sets it too, and a caller that
+                    # dies without clearing either is released by
+                    # GHL_STALE_CLAIM_MINUTES like any other.
                     "$and": [
                         {
                             "$or": [
                                 {"ghl_refresh_status": {"$ne": "running"}},
                                 {"_ghl_claimed_at": {"$lt": stale_lock_before}},
-                                {"_ghl_claimed_at": {"$exists": False}},
                             ]
                         }
                     ],

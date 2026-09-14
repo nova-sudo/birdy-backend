@@ -88,7 +88,10 @@ async def _refresh_single_group(group: dict, user_id: str, mongo_client):
         try:
             await db.client_groups.update_one(
                 {"id": group_id},
-                {"$set": {"ghl_refresh_status": "running"}},
+                # _ghl_claimed_at as well as the status: the ghl-tick's claim
+                # filter reads the claim time to decide whether a running group
+                # is held or stuck, and a group running without one is now held.
+                {"$set": {"ghl_refresh_status": "running", "_ghl_claimed_at": datetime.utcnow()}},
             )
             await fetch_and_cache_ghl_data_optimized(
                 group_id=group_id,
@@ -102,14 +105,18 @@ async def _refresh_single_group(group: dict, user_id: str, mongo_client):
                 {"$set": {
                     "ghl_refresh_status": "complete",
                     "last_ghl_refresh": datetime.utcnow(),
-                }},
+                },
+                 "$unset": {"_ghl_claimed_at": ""}},
             )
             logger.info(f"[refresh-all] GHL OK for '{group_name}'")
         except Exception as e:
             logger.error(f"[refresh-all] GHL FAIL for '{group_name}': {e}")
             await db.client_groups.update_one(
                 {"id": group_id},
-                {"$set": {"ghl_refresh_status": "error"}},
+                # Release the lock on the way out, or this group stays held
+                # until the stale window expires it.
+                {"$set": {"ghl_refresh_status": "error"},
+                 "$unset": {"_ghl_claimed_at": ""}},
             )
 
 
