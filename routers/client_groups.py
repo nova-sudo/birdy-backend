@@ -74,6 +74,7 @@ from services.ghl_service import (
     get_tag_metrics_from_cache,
 )
 from services.ad_leads import fetch_ad_leads
+from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
 from services.facebook_cache_shape import read_preset
 
@@ -743,6 +744,22 @@ async def create_client_group_optimized(
                 # Normalised so a stray "None"/" NONE " still lands on the one
                 # spelling every read path compares against.
                 "call_log_provider": (request.call_log_provider or "ghl").strip().lower(),
+                # Same question the bulk-import review step asks per row. A
+                # client added one at a time used to skip it entirely and land
+                # on "unknown", so the tracking portal opened at step one for a
+                # client whose answer the person had already had in mind.
+                # normalize_method maps anything unrecognised (including None,
+                # from an older caller) back to "unknown", which changes
+                # nothing about how the client behaves.
+                "lead_collection": {
+                    **lead_collection_service.DEFAULT,
+                    "method": lead_collection_service.normalize_method(
+                        request.lead_collection_method
+                    ),
+                    "form_provider": lead_collection_service.normalize_provider(
+                        request.form_provider
+                    ),
+                },
                 "notes": request.notes or "",
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
@@ -766,6 +783,17 @@ async def create_client_group_optimized(
                 "last_hp_refresh": None,
                 "client_status": "Active"
             }
+
+            # A form we can't read off the page needs somewhere to post to, and
+            # that needs a secret. Minted now so the tracking portal has one to
+            # show as soon as the client exists, rather than making someone come
+            # back and press a button for it. Mirrors the bulk-import path.
+            if lead_collection_service.normalize_method(
+                request.lead_collection_method
+            ) in lead_collection_service.NEEDS_WEBHOOK:
+                client_group["lead_collection"]["webhook_secret"] = (
+                    lead_collection_service.new_webhook_secret()
+                )
 
             await client_groups_collection.insert_one(client_group)
             logger.info(f"Created client group {group_id}")

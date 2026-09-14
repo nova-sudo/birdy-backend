@@ -45,6 +45,13 @@ class ClientGroupRequest(BaseModel):
     # webhook). "hotprospector" reserves the choice; HP data wiring comes once
     # their endpoints are ready. Default mirrors the working path today.
     call_log_provider: str | None = "ghl"
+    # How this client collects leads — Meta instant forms, their own landing
+    # page, or an external form tool. The bulk-import path has taken this per
+    # row since the review step gained its column; a client added one at a
+    # time had no way to say, and silently became "unknown". Optional so an
+    # older client posting the previous shape still creates the group.
+    lead_collection_method: str | None = None
+    form_provider: str | None = None
 
 
 class SaveViewRequest(BaseModel):
