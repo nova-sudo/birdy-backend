@@ -105,6 +105,56 @@ Two other honesty guards:
   organic revisit can't take credit from the ad that paid for it. `first_touch`
   is kept on every row, so a first-click view stays available later.
 
+## The landing-page funnel
+
+Attribution answers *which ad produced this lead*. For a client whose ads point
+at a page of their own, the question after that one is where everybody else
+went — and that is a step no other report in Birdy can see.
+
+```
+ad clicks  →  landing views  →  form started  →  opted in
+                    └──────── left without opting in ────────┘
+                         before the form  │  inside the form
+```
+
+Counted in `landing_page_daily`, one row per (client group, day), incremented
+on the way past by the same `/t/*` ingest that records a touch. Each counter is
+deduplicated at the source, so the stages can be compared with each other:
+
+| counter | counted | once per |
+|---|---|---|
+| `pageviews` | every `/t/collect` hit | — |
+| `visitors` | browsers never seen before | ever |
+| `views` | a visit — the funnel's cohort | browser-day |
+| `ad_views` | visits carrying ad identifiers | browser-day |
+| `form_starts` | a cursor in a field, or focus into an embedded form | browser-day |
+| `opt_ins` | the visit became a lead | browser, ever |
+
+**Why a rollup and not an aggregation over `attribution_visitors`.** Anonymous
+visitors carry a TTL; identified ones have theirs unset. Counting a funnel off
+that collection therefore *improves as it ages* — six months on, everyone who
+bounced has been deleted and everyone who converted is still there, so an old
+window reports a 100% opt-in rate. A rollup row is immune to that.
+
+**Why the drop-off is two numbers.** "Left before touching the form" is a page
+problem — offer, headline, load speed, an ad promising something the page
+doesn't deliver. "Started the form and abandoned it" is a form problem — too
+long, asking too much, broken on a phone. They need opposite fixes, and a
+single conversion rate hides which one you have. That split is the only reason
+the tracker reports a form start at all.
+
+`GET /attribution/funnel/{group_id}` returns `applicable: false` for clients on
+Meta Instant Forms (no page of ours to measure) and for clients who have
+declared nothing and reported nothing. The Marketing Hub and the client
+workspace's Overview both draw the card, and both draw nothing when it says
+false — four zeroes under "Landing page" read as a page that is failing rather
+than one that was never there.
+
+Existing clients start with an empty funnel; `python -m scripts.backfill_landing_funnel`
+reconstructs what it honestly can from the visitors already on file, marks the
+rows `backfilled: true`, and under-reports return visits and over-reports the
+opt-in rate for exactly the reason above.
+
 ## Endpoints
 
 | | |
@@ -112,9 +162,11 @@ Two other honesty guards:
 | `GET /t/{site_id}.js` | the snippet, account baked in, no DB lookup |
 | `POST /t/collect` | a landing |
 | `POST /t/identify` | an email/phone |
+| `POST /t/event` | an engagement signal (today: `form_start`) |
 | `GET /attribution/setup/{group_id}` | snippet + Meta parameters + status |
 | `GET /attribution/status/{group_id}` | onboarding ticks |
 | `GET /attribution/leads-by-ad/{group_id}` | attributed leads per ad |
+| `GET /attribution/funnel/{group_id}` | the landing-page funnel for a window |
 | `GET /api/cron/attribution-tick` | the match queue |
 
 The `/t/*` endpoints are public and unauthenticated by design. They answer 204

@@ -35,7 +35,7 @@ import logging
 from datetime import datetime
 
 from core.database import DB_NAME
-from services.attribution_service import attributed_touch, clean_touch
+from services.attribution_service import attributed_touch, clean_touch, record_opt_in
 from utils.phone_normalize import compute_match_keys, normalize_email, normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -237,6 +237,14 @@ async def record_tracked_lead(
         update["$addToSet"] = add_to_set
 
     result = await db[TRACKED_LEADS].update_one(filter_, update, upsert=True)
+
+    # The bottom of the landing-page funnel, recorded here rather than in the
+    # two callers because this is the one place both of them pass through — a
+    # form read off the page and a form that could only reach us as a webhook
+    # are the same event to anyone reading the funnel. It is a no-op when the
+    # submission carried no visitor (a webhook from a page with no script),
+    # and idempotent on the visitor, so a resubmission never counts twice.
+    await record_opt_in(site, (visitor or {}).get("_id"), mongo_client)
 
     inserted = result.upserted_id is not None
     logger.info(

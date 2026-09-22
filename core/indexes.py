@@ -49,6 +49,7 @@ def _load_creators():
     from services.ad_leads import create_ad_leads_indexes
     from services.attribution_service import create_attribution_indexes
     from services.call_logs_service import create_call_logs_indexes
+    from services.landing_funnel import create_landing_funnel_indexes
     from services.tracked_leads import create_tracked_leads_indexes
     from services.mcp_token_service import create_mcp_tokens_indexes
     from services.slack_bot_service import create_slack_bot_indexes
@@ -65,6 +66,7 @@ def _load_creators():
         create_attribution_indexes,
         create_ad_leads_indexes,
         create_tracked_leads_indexes,
+        create_landing_funnel_indexes,
         create_mcp_tokens_indexes,
         create_slack_bot_indexes,
         create_slack_ui_interaction_indexes,

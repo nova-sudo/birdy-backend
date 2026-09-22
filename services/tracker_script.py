@@ -23,6 +23,11 @@ What the script does, in the order it matters:
      scrapes the email/phone and reports them, which is what lets the backend
      join the visitor to the GoHighLevel contact even when the form provider
      strips everything we sent it.
+  5. Reports the first time the visitor engages with a form at all — a cursor
+     in a field, a click through to the booking link, or focus moving into an
+     embedded form's iframe. That single signal is what splits the people who
+     never opt in into the two groups worth telling apart: the ones the page
+     lost before they ever tried, and the ones the form itself lost.
 
 Everything is fire-and-forget (`sendBeacon`, falling back to a keepalive
 `fetch` with a text/plain body). Both are CORS "simple requests", so no
@@ -162,6 +167,55 @@ TRACKER_JS = r"""
     if (!email && !phone) return;
     send("/identify", { email: email, phone: phone, name: fields.name || null });
   }
+
+  // -- form engagement ------------------------------------------------------
+  // One report per page, deduplicated again per visitor-day on the server. The
+  // browser cannot know whether the person already started a form on another
+  // page this morning, so it does not try — it says what it saw and lets the
+  // backend decide whether that is news.
+  var startedForm = false;
+  function formStart() {
+    if (startedForm) return;
+    startedForm = true;
+    send("/event", { event: "form_start" });
+  }
+
+  // A cursor in a field of a form on our own page. Capture phase, because a
+  // page builder's own handlers often stop propagation on the way up.
+  document.addEventListener("focusin", function (e) {
+    var el = e.target;
+    if (!el || !el.tagName) return;
+    var tag = el.tagName.toLowerCase();
+    if (tag !== "input" && tag !== "textarea" && tag !== "select") return;
+    if (el.type === "hidden" || el.type === "submit" || el.type === "button") return;
+    formStart();
+  }, true);
+
+  // Clicking through to a form or booking page hosted somewhere else. Same
+  // allowlist the visitor id is handed to, so "engaged with the form" means
+  // the same thing whichever shape the form takes.
+  document.addEventListener("click", function (e) {
+    try {
+      var link = e.target && e.target.closest && e.target.closest("a[href]");
+      if (!link) return;
+      if (isFormHost(new URL(link.getAttribute("href"), location.href))) formStart();
+    } catch (err) {}
+  }, true);
+
+  // An embedded form is cross-origin, so nothing inside it is visible to us —
+  // but the browser still moves focus to the iframe element when someone
+  // clicks into it, and the page loses focus at the same moment. Checking what
+  // holds focus on blur is the only read we get, which is why the funnel calls
+  // this stage a floor rather than a count for embedded forms.
+  window.addEventListener("blur", function () {
+    setTimeout(function () {
+      try {
+        var el = document.activeElement;
+        if (!el || el.tagName !== "IFRAME" || !el.src) return;
+        if (isFormHost(new URL(el.src, location.href))) formStart();
+      } catch (err) {}
+    }, 0);
+  });
 
   function looksName(el, val) {
     var hint = ((el.name || "") + " " + (el.id || "") + " " + (el.placeholder || "")).toLowerCase();

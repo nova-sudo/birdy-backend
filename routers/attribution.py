@@ -10,6 +10,7 @@ The authenticated side of attribution — what the agency sees and installs.
     GET /attribution/setup/{group_id}            site id, snippet, parameters
     GET /attribution/status/{group_id}           is the snippet live
     GET /attribution/leads-by-ad/{group_id}      attributed leads per Meta ad
+    GET /attribution/funnel/{group_id}           the landing-page funnel
 
 `portal` exists so the setup screen is one round trip rather than five: it mints
 the site id on first read, so nothing has to be provisioned ahead of time, and
@@ -28,6 +29,7 @@ from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from pydantic import BaseModel
 
+from services import landing_funnel as landing_funnel_service
 from services import lead_collection as lead_collection_service
 from services.attribution_service import (
     META_URL_PARAMETERS,
@@ -165,6 +167,84 @@ async def get_leads_by_ad(
         "end": end,
         "ads": rows,
         "attributed_leads": sum(r["leads"] for r in rows),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The landing-page funnel
+# ---------------------------------------------------------------------------
+
+def _parse_day(value: str | None, field: str) -> str | None:
+    """An ISO date off the query string, as the day key the rollup stores."""
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(status_code=400, detail=f"Invalid {field} date: {value}")
+
+
+@router.get("/funnel/{group_id}")
+async def get_landing_funnel(
+    group_id: str,
+    start: str | None = Query(default=None, description="ISO date, inclusive"),
+    end: str | None = Query(default=None, description="ISO date, inclusive"),
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Landing views → form starts → opt-ins for one client, with the drop-off.
+
+    `applicable` is the field the hubs read before drawing anything. A client on
+    Meta Instant Forms has no landing page of ours to measure and gets a hard
+    false — four zeroes on a screen imply a page that is failing, when the truth
+    is that there is no page. A client who has not said how they collect leads
+    yet gets the funnel only once their pages have actually reported something,
+    so declaring the method stays a convenience rather than a prerequisite.
+    """
+    if not start or not end:
+        raise HTTPException(status_code=400, detail="start and end are required")
+    start_day = _parse_day(start, "start")
+    end_day = _parse_day(end, "end")
+    if start_day > end_day:
+        raise HTTPException(status_code=400, detail="start must not be after end")
+
+    async with get_mongo_client() as mongo_client:
+        group = await _require_group(group_id, current_user, mongo_client)
+        config = lead_collection_service.read(group)
+        method = config["method"]
+
+        applicable = method in lead_collection_service.NEEDS_SCRIPT
+        if method == lead_collection_service.METHOD_UNKNOWN:
+            applicable = await landing_funnel_service.has_any_data(group_id, mongo_client)
+
+        if not applicable:
+            return {
+                "group_id": group_id,
+                "group_name": group.get("name"),
+                "method": method,
+                "applicable": False,
+                "reason": (
+                    "This client's leads come from Meta Instant Forms, which never "
+                    "send anyone to a page of their own."
+                    if method == lead_collection_service.METHOD_INSTANT_FORM else
+                    "No landing page activity has reached Birdy for this client yet."
+                ),
+            }
+
+        funnel = await landing_funnel_service.funnel(
+            group_id, start_day, end_day, mongo_client,
+            embedded_form=(method == lead_collection_service.METHOD_EXTERNAL_FORM),
+        )
+        status = await install_status(group_id, mongo_client)
+
+    return {
+        "group_id": group_id,
+        "group_name": group.get("name"),
+        "method": method,
+        "applicable": True,
+        "installed": status["installed"],
+        "last_seen_at": status["last_seen_at"],
+        **funnel,
     }
 
 

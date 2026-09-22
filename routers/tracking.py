@@ -6,6 +6,7 @@ stranger's browser talks to.
 
     GET  /t/{site_id}.js       the tracking snippet, with the account baked in
     POST /t/collect            a landing (Meta/UTM identifiers off the URL)
+    POST /t/event              an engagement signal short of a submission
     POST /t/identify           a form submitted on the page
     POST /t/webhook/{site_id}  a form submitted somewhere we cannot read
     GET  /t/install/{site_id}  what the forwardable install page renders
@@ -44,6 +45,7 @@ from services.attribution_service import (
     VISITORS,
     clean_touch,
     install_status,
+    record_form_start,
     record_identity,
     record_touch,
     resolve_site,
@@ -138,6 +140,52 @@ async def collect(request: Request):
         if not site:
             return _ok()
         await record_touch(site, visitor_id, touch, mongo_client)
+
+    return _ok()
+
+
+# ---------------------------------------------------------------------------
+# POST /t/event
+# ---------------------------------------------------------------------------
+
+# What the tracker is allowed to report here, and nothing else. An open event
+# name on a public endpoint is a free write into our storage for anyone who
+# reads the snippet; an allowlist means a scraped site_id can at worst inflate
+# a number that already exists.
+TRACKED_EVENTS = {"form_start"}
+
+
+@router.post("/event", status_code=204)
+async def event(request: Request):
+    """
+    Record an engagement signal from the page: today, a form being started.
+
+    Separate from /collect because it is not a landing and must not create a
+    visitor — a "started the form" with no page view above it would be a funnel
+    stage counting people the stage before it never saw. `record_form_start`
+    enforces that by only updating a visitor that already exists.
+    """
+    payload = await _read_json(request)
+    if not payload:
+        return _ok()
+
+    visitor_id = payload.get("visitor_id")
+    if not valid_visitor_id(visitor_id):
+        return _ok()
+
+    if payload.get("event") not in TRACKED_EVENTS:
+        return _ok()
+
+    async with get_mongo_client() as mongo_client:
+        site = await resolve_site(payload.get("site_id"), mongo_client)
+        if not site:
+            return _ok()
+        try:
+            await record_form_start(site, visitor_id, mongo_client)
+        except Exception as e:
+            # Same rule as the rest of this router: never a red error in a
+            # customer's console over a number nobody is waiting on.
+            logger.error("form_start failed for visitor %s: %s", visitor_id, e, exc_info=True)
 
     return _ok()
 

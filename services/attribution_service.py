@@ -41,7 +41,10 @@ import secrets
 import time
 from datetime import datetime, timedelta
 
+from pymongo import ReturnDocument
+
 from core.database import DB_NAME
+from services import landing_funnel
 from utils.phone_normalize import compute_match_keys, normalize_email, normalize_phone
 
 logger = logging.getLogger(__name__)
@@ -215,7 +218,16 @@ def attributed_touch(visitor: dict) -> dict | None:
 
 
 async def record_touch(site: dict, visitor_id: str, touch: dict, mongo_client) -> None:
-    """Upsert a visitor and fold in this landing."""
+    """
+    Upsert a visitor and fold in this landing.
+
+    Written as find_one_and_update rather than update_one so the visitor's
+    *previous* state comes back in the same round trip. That pre-image is what
+    the landing funnel counts off: whether this browser had ever been seen, and
+    whether it had been seen today. Deriving that from a separate read would
+    cost a second query on the busiest endpoint in the system, and deriving it
+    from `touch_count` would call every page of a four-page session a new visit.
+    """
     now = datetime.utcnow()
     update = {
         "$setOnInsert": {
@@ -238,10 +250,75 @@ async def record_touch(site: dict, visitor_id: str, touch: dict, mongo_client) -
         },
         "$inc": {"touch_count": 1},
     }
-    if is_paid_touch(touch):
+    paid = is_paid_touch(touch)
+    if paid:
         update["$set"]["last_paid_touch"] = {**touch, "ts": now}
 
-    await mongo_client[DB_NAME][VISITORS].update_one({"_id": visitor_id}, update, upsert=True)
+    before = await mongo_client[DB_NAME][VISITORS].find_one_and_update(
+        {"_id": visitor_id},
+        update,
+        upsert=True,
+        projection={"last_seen_at": 1},
+        return_document=ReturnDocument.BEFORE,
+    )
+    await landing_funnel.record_view(site, before, mongo_client, now=now, paid=paid)
+
+
+async def record_form_start(site: dict, visitor_id: str, mongo_client) -> bool:
+    """
+    Note that this visitor started filling a form today.
+
+    Once per browser per day, which is what makes it a funnel stage rather than
+    an event count: a person tabbing between four fields is one start, and the
+    same person returning tomorrow is a second visit with a second start.
+
+    Returns whether this was the day's first — the caller needs no more than
+    that, and the tests assert on it.
+    """
+    now = datetime.utcnow()
+    day = landing_funnel.day_of(now)
+
+    # The filter carries the deduplication, so two beacons racing each other
+    # can only have one of them match. A visitor we have never seen collect a
+    # pageview for is skipped rather than created: a form start with no landing
+    # behind it would be a stage counting people the stage above never saw.
+    result = await mongo_client[DB_NAME][VISITORS].update_one(
+        {"_id": visitor_id, "form_started_day": {"$ne": day}},
+        {"$set": {"form_started_day": day, "last_seen_at": now}, "$inc": {"form_starts": 1}},
+    )
+    if not result.modified_count:
+        return False
+
+    await landing_funnel.bump(site, mongo_client, day=day, form_starts=1)
+    return True
+
+
+async def record_opt_in(site: dict, visitor_id: str | None, mongo_client) -> bool:
+    """
+    Note that this visitor became a lead.
+
+    Counted once per visitor *ever*, not once per day: `tracked_leads` dedupes
+    the same person's second submission into the same lead, and a funnel whose
+    bottom stage counts submissions while its top counts people would report an
+    opt-in rate above 100% for any client whose form gets resubmitted.
+
+    Returns whether this was the first time.
+    """
+    if not visitor_id:
+        # A webhook lead from a page with no script. It has no view either, so
+        # leaving it out is what keeps the stages consistent with each other.
+        return False
+
+    now = datetime.utcnow()
+    result = await mongo_client[DB_NAME][VISITORS].update_one(
+        {"_id": visitor_id, "opted_in_at": {"$exists": False}},
+        {"$set": {"opted_in_at": now}},
+    )
+    if not result.modified_count:
+        return False
+
+    await landing_funnel.bump(site, mongo_client, day=landing_funnel.day_of(now), opt_ins=1)
+    return True
 
 
 async def record_identity(
