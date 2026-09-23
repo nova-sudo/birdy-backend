@@ -26,6 +26,7 @@ then backfill data because ``last_*_refresh`` is None — the same contract the
 single-client path relies on for HP.
 """
 
+import asyncio
 import difflib
 import json
 import logging
@@ -386,6 +387,17 @@ async def set_slack_brief(
 REVIEW_PREP_STALE_MINUTES = 10
 AI_MATCH_MODEL = "gpt-4o"
 
+# How many sub-accounts the prep job and the bulk import work on at once.
+#
+# The ceiling is GoHighLevel's, not ours: its v2 API allows 100 requests per
+# 10 seconds per resource, and each sub-account costs up to three of them. At
+# eight in flight a burst stays comfortably inside that while turning what was
+# a serial walk of every sub-account into something an agency can sit through.
+# Raising it buys progressively less and risks a 429 that the user experiences
+# as a sub-account that simply failed to load.
+GHL_FANOUT = 8
+REVIEW_PREP_CONCURRENCY = GHL_FANOUT
+
 
 # How many of a location's newest contacts the activity probe reads. The page
 # is only ever used to count how many landed in the last 30 days, and an
@@ -559,38 +571,53 @@ async def _prepare_review_job(user_id: str):
             )
 
             existing_tokens = await get_subaccount_tokens(user_id, mongo_client) or {}
+            gate = asyncio.Semaphore(REVIEW_PREP_CONCURRENCY)
 
-            for i, target in enumerate(targets):
+            async def probe(target: dict):
                 location_id = target["location_id"]
                 entry: dict[str, Any] = {
                     "last_lead_at": None, "contact_count": 0,
                     "leads_30d": 0, "leads_30d_capped": False, "error": None,
                 }
-                try:
-                    token = (existing_tokens.get(location_id) or {}).get("access_token")
-                    if not token:
-                        ok, loc_tokens = await ghl_integration.generate_location_token(
-                            company_id, location_id, access_token
-                        )
-                        if not ok:
-                            raise RuntimeError(loc_tokens.get("error", "token generation failed"))
-                        token = loc_tokens.get("access_token")
-                        location_details = await fetch_location_details(location_id, token)
-                        await save_subaccount_token(
-                            user_id, location_id, loc_tokens, mongo_client, location_details,
-                        )
-                    entry.update(await _latest_contact(location_id, token))
-                except Exception as e:
-                    entry["error"] = str(e)
-                    logger.warning(f"review prep failed for location {location_id}: {e}")
+                async with gate:
+                    try:
+                        token = (existing_tokens.get(location_id) or {}).get("access_token")
+                        if not token:
+                            ok, loc_tokens = await ghl_integration.generate_location_token(
+                                company_id, location_id, access_token
+                            )
+                            if not ok:
+                                raise RuntimeError(loc_tokens.get("error", "token generation failed"))
+                            token = loc_tokens.get("access_token")
+                            location_details = await fetch_location_details(location_id, token)
+                            await save_subaccount_token(
+                                user_id, location_id, loc_tokens, mongo_client, location_details,
+                            )
+                        entry.update(await _latest_contact(location_id, token))
+                    except Exception as e:
+                        entry["error"] = str(e)
+                        logger.warning(f"review prep failed for location {location_id}: {e}")
 
+                # $inc, not a running index: the locations no longer finish in
+                # the order they were started, so a positional counter would
+                # make the wizard's progress bar jump backwards.
                 await users.update_one(
                     {"user_id": user_id},
-                    {"$set": {
-                        f"{prep_key}.accounts.{location_id}": entry,
-                        f"{prep_key}.done": i + 1,
-                    }},
+                    {
+                        "$set": {f"{prep_key}.accounts.{location_id}": entry},
+                        "$inc": {f"{prep_key}.done": 1},
+                    },
                 )
+
+            # One location at a time meant a large agency waited on 174 round
+            # trips in series — a token mint, a location fetch and a contact
+            # search each — while a progress bar crawled. They do not depend on
+            # each other, so they run together, bounded so an agency with two
+            # hundred sub-accounts cannot open two hundred sockets at GHL and
+            # earn itself a rate limit. Every probe handles its own failure, so
+            # gather never sees an exception and one dead location cannot take
+            # the batch down.
+            await asyncio.gather(*(probe(t) for t in targets))
 
             # Facebook matching: similarity first, AI (house key) for leftovers.
             fb_accounts = await _fetch_fb_accounts(user_id, mongo_client)
@@ -1050,47 +1077,56 @@ async def _mint_location_tokens(user_id: str, imports: list[dict]):
         access_token = agency_token.get("access_token")
         existing_tokens = await get_subaccount_tokens(user_id, mongo_client) or {}
 
-        for item in imports:
+        gate = asyncio.Semaphore(GHL_FANOUT)
+
+        async def mint(item: dict):
             group_id, location_id = item["group_id"], item["location_id"]
-            try:
-                # The review-prep job usually minted this token already.
-                existing = existing_tokens.get(location_id) or {}
-                expires_at = existing.get("expires_at")
-                token_fresh = bool(existing.get("access_token")) and (
-                    expires_at is None or expires_at > datetime.now()
-                )
-                if not token_fresh:
-                    success, loc_tokens = await ghl_integration.generate_location_token(
-                        company_id, location_id, access_token
+            async with gate:
+                try:
+                    # The review-prep job usually minted this token already.
+                    existing = existing_tokens.get(location_id) or {}
+                    expires_at = existing.get("expires_at")
+                    token_fresh = bool(existing.get("access_token")) and (
+                        expires_at is None or expires_at > datetime.now()
                     )
-                    if not success:
-                        raise RuntimeError(loc_tokens.get("error", "token generation failed"))
-                    location_details = await fetch_location_details(
-                        location_id, loc_tokens.get("access_token")
+                    if not token_fresh:
+                        success, loc_tokens = await ghl_integration.generate_location_token(
+                            company_id, location_id, access_token
+                        )
+                        if not success:
+                            raise RuntimeError(loc_tokens.get("error", "token generation failed"))
+                        location_details = await fetch_location_details(
+                            location_id, loc_tokens.get("access_token")
+                        )
+                        contact_count = await get_contact_count_from_ghl(
+                            location_id, loc_tokens.get("access_token")
+                        )
+                        await save_subaccount_token(
+                            user_id, location_id, loc_tokens, mongo_client,
+                            location_details, contact_count=contact_count,
+                        )
+                    await db["client_groups"].update_one(
+                        {"id": group_id},
+                        {"$set": {
+                            "status": "complete",
+                            "status_message": "Imported — historical data syncing in the background",
+                        }},
                     )
-                    contact_count = await get_contact_count_from_ghl(
-                        location_id, loc_tokens.get("access_token")
+                except Exception as e:
+                    logger.error(f"bulk import failed for location {location_id}: {e}")
+                    await db["client_groups"].update_one(
+                        {"id": group_id},
+                        {"$set": {
+                            "status": "complete",
+                            "status_message": f"Imported, but GHL access failed: {e}",
+                        }},
                     )
-                    await save_subaccount_token(
-                        user_id, location_id, loc_tokens, mongo_client,
-                        location_details, contact_count=contact_count,
-                    )
-                await db["client_groups"].update_one(
-                    {"id": group_id},
-                    {"$set": {
-                        "status": "complete",
-                        "status_message": "Imported — historical data syncing in the background",
-                    }},
-                )
-            except Exception as e:
-                logger.error(f"bulk import failed for location {location_id}: {e}")
-                await db["client_groups"].update_one(
-                    {"id": group_id},
-                    {"$set": {
-                        "status": "complete",
-                        "status_message": f"Imported, but GHL access failed: {e}",
-                    }},
-                )
+
+        # The wait after "import these" — every client sat in "Queued for
+        # import..." until the one before it had finished minting. Same bound
+        # as the prep job, and for the same reason. Each group settles its own
+        # status either way, so one failure leaves the rest untouched.
+        await asyncio.gather(*(mint(item) for item in imports))
 
 
 @router.post("/api/onboarding/import-subaccounts")
