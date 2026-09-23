@@ -74,6 +74,7 @@ from services.ghl_service import (
     get_tag_metrics_from_cache,
 )
 from services.ad_leads import fetch_ad_leads
+from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
 from services.facebook_cache_shape import read_preset
@@ -761,6 +762,15 @@ async def create_client_group_optimized(
                     ),
                 },
                 "notes": request.notes or "",
+                # Pre-filled from the agency's saved defaults, which is what
+                # the wizard's "Save these as your defaults?" step promises.
+                # Nothing read them before, so every client after the first
+                # arrived with no targets — and a client with no target has no
+                # expectation to miss, which the weekly health pass resolves
+                # to Healthy. They were silently unmonitored.
+                "targets": await client_targets_service.defaults_for(
+                    current_user, db
+                ),
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
                 # Settled from the start. The data arrives in the background,
