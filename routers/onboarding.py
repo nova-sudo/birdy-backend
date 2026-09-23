@@ -40,6 +40,7 @@ from pydantic import BaseModel
 
 from billing_middleware import check_client_limit
 from core.database import DB_NAME
+from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from dependencies import get_current_user, get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
@@ -117,11 +118,10 @@ class TargetsRequest(BaseModel):
     save_as_default: bool = False
 
 
-# The goal fields, in the order the design's Targets tab lists them.
-TARGET_FIELDS = (
-    "cpl", "monthly_wins", "monthly_revenue",
-    "conversion_rate", "monthly_spend", "aov", "cpa",
-)
+# The goal fields, in the order the design's Targets tab lists them. Defined
+# in the service so the wizard, the Targets tab and the default-seeding on a
+# new client group all read one list.
+TARGET_FIELDS = client_targets_service.TARGET_FIELDS
 
 
 class BriefConfigRequest(BaseModel):
@@ -371,12 +371,15 @@ async def set_slack_brief(
 #
 # Kicked off when the user accepts background sync ("Yes, add all my clients").
 # For every sub-account not yet imported it mints a GHL location token and asks
-# GHL for the most-recent contact, so by the time the user reaches the review
-# step the table can apply the real activity rules:
+# GHL for its recent contacts, so by the time the user reaches the review step
+# the table can apply the real activity rules:
 #   - a lead in the last 90 days  -> the sub-account appears in the list
 #   - a lead in the last 30 days  -> defaults to Active, else Inactive
-# It also resolves Facebook ad-account matches: name similarity first, then a
-# single Anthropic call (Birdy's own key — free to the user) for the leftovers.
+#   - how many arrived in those 30 days -> shown per row, the quickest read on
+#     whether a client is actually live
+# It also resolves Facebook ad-account pairings: name similarity across the
+# whole table first, then a single OpenAI call (Birdy's own key — free to the
+# user) for the sub-accounts similarity could not confidently place.
 # Progress is written incrementally to users.onboarding.review_prep so the
 # review endpoint can serve partial results while the job runs.
 
@@ -384,16 +387,44 @@ REVIEW_PREP_STALE_MINUTES = 10
 AI_MATCH_MODEL = "gpt-4o"
 
 
-async def _latest_contact(location_id: str, access_token: str) -> tuple[Optional[str], int]:
-    """(most recent contact's dateAdded ISO string, total contacts) for a
-    location — one /contacts/search call sorted newest-first, pageLimit 1."""
+# How many of a location's newest contacts the activity probe reads. The page
+# is only ever used to count how many landed in the last 30 days, and an
+# account with more than this many new leads in a month is emphatically live —
+# so the count saturates here and is reported as "50+" rather than paging on
+# to a precise number nobody needs. One page per location either way.
+RECENT_PAGE_LIMIT = 50
+
+
+async def _latest_contact(location_id: str, access_token: str) -> dict:
+    """A location's recent lead activity from one /contacts/search call,
+    sorted newest-first:
+
+        last_lead_at      most recent contact's dateAdded (ISO), or None
+        contact_count     total contacts on the location, all time
+        leads_30d         how many of them arrived in the last 30 days
+        leads_30d_capped  True when leads_30d hit RECENT_PAGE_LIMIT and the
+                          real number is higher
+
+    The 30-day count is done here, over one newest-first page, rather than
+    with a server-side date filter: nothing else in the codebase filters GHL
+    search by date (see gohighlevel._in_window, which also counts in-window
+    client-side), and a filter this endpoint quietly ignored would return the
+    all-time total dressed up as a 30-day one — which is the number that
+    decides whether a client is shown as Active, so being wrong is worse than
+    being coarse.
+
+    Errors degrade to "no activity known" (last_lead_at None) rather than
+    "no activity": the caller distinguishes the two by whether it recorded an
+    error for the location.
+    """
+    empty = {"last_lead_at": None, "contact_count": 0, "leads_30d": 0, "leads_30d_capped": False}
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(
                 "https://services.leadconnectorhq.com/contacts/search",
                 json={
                     "locationId": location_id,
-                    "pageLimit": 1,
+                    "pageLimit": RECENT_PAGE_LIMIT,
                     "page": 1,
                     "sort": [{"field": "dateAdded", "direction": "desc"}],
                 },
@@ -406,15 +437,34 @@ async def _latest_contact(location_id: str, access_token: str) -> tuple[Optional
             )
             if response.status_code != 200:
                 logger.warning(f"latest-contact search failed for {location_id}: {response.status_code}")
-                return None, 0
+                return empty
             data = response.json()
             contacts = data.get("contacts", [])
             total = data.get("total", len(contacts))
             last = contacts[0].get("dateAdded") if contacts else None
-            return last, total
+
+            cutoff = datetime.utcnow() - timedelta(days=30)
+            leads_30d = 0
+            for contact in contacts:
+                added = _parse_ghl_date(contact.get("dateAdded"))
+                # Newest-first, so the first contact older than the cutoff ends
+                # the window — but only trust that ordering to stop early, not
+                # to skip an undated row.
+                if added is None:
+                    continue
+                if added < cutoff:
+                    break
+                leads_30d += 1
+
+            return {
+                "last_lead_at": last,
+                "contact_count": total,
+                "leads_30d": leads_30d,
+                "leads_30d_capped": leads_30d >= RECENT_PAGE_LIMIT,
+            }
     except Exception as e:
         logger.warning(f"latest-contact search failed for {location_id}: {e}")
-        return None, 0
+        return empty
 
 
 async def _ai_match_accounts(unmatched: list[dict], fb_accounts: list[dict]) -> dict[str, str]:
@@ -512,7 +562,10 @@ async def _prepare_review_job(user_id: str):
 
             for i, target in enumerate(targets):
                 location_id = target["location_id"]
-                entry: dict[str, Any] = {"last_lead_at": None, "contact_count": 0, "error": None}
+                entry: dict[str, Any] = {
+                    "last_lead_at": None, "contact_count": 0,
+                    "leads_30d": 0, "leads_30d_capped": False, "error": None,
+                }
                 try:
                     token = (existing_tokens.get(location_id) or {}).get("access_token")
                     if not token:
@@ -526,9 +579,7 @@ async def _prepare_review_job(user_id: str):
                         await save_subaccount_token(
                             user_id, location_id, loc_tokens, mongo_client, location_details,
                         )
-                    last_lead_at, contact_count = await _latest_contact(location_id, token)
-                    entry["last_lead_at"] = last_lead_at
-                    entry["contact_count"] = contact_count
+                    entry.update(await _latest_contact(location_id, token))
                 except Exception as e:
                     entry["error"] = str(e)
                     logger.warning(f"review prep failed for location {location_id}: {e}")
@@ -547,7 +598,15 @@ async def _prepare_review_job(user_id: str):
                 {"user_id": user_id}, {"meta_ad_account_id": 1, "_id": 0}
             ).to_list(length=None) if g.get("meta_ad_account_id")}
             free_fb = [a for a in fb_accounts if a.get("id") not in used_ad_accounts]
-            unmatched = [t for t in targets if not _best_fb_match(t["name"], free_fb)]
+            # The AI pass exists to place sub-accounts similarity could not, so
+            # it is asked about the ones with no *confident* similarity match —
+            # a 0.6-0.8 near-miss is still an open question, and letting the
+            # model weigh in on it is the cheaper half of this call.
+            similarity = _assign_fb_matches(targets, free_fb)
+            unmatched = [
+                t for t in targets
+                if not (similarity.get(t["location_id"]) or {}).get("confident")
+            ]
             ai_matches = await _ai_match_accounts(unmatched, free_fb)
 
             await users.update_one(
@@ -610,40 +669,178 @@ def _first_distinctive_word(name: str) -> Optional[str]:
     return None
 
 
-def _best_fb_match(location_name: str, fb_accounts: list[dict]) -> Optional[dict]:
-    """Best name-similarity match between a GHL sub-account and a Meta ad
-    account. Conservative threshold — a wrong match is worse than no match,
-    since the user can pick from the dropdown (and the AI pass catches the
-    rest)."""
-    loc = _normalise(location_name)
-    if not loc:
-        return None
-    loc_word = _first_distinctive_word(location_name)
-    # A shared distinctive leading word ("Aura" in "Aura Aesthetics" /
-    # "Aura — Primary") only counts if exactly one ad account carries it —
-    # two accounts starting with the same word is ambiguity, not a match.
-    word_counts: dict[str, int] = {}
+# A pair below the floor is not a candidate at all; a candidate below
+# MATCH_CONFIDENT is offered as a suggestion but never pre-filled.
+#
+# Pre-filling a wrong ad account is the expensive mistake: the row looks
+# answered, so nobody reads it, and the client is imported reporting another
+# client's spend. An empty dropdown is visibly unanswered and costs one click.
+# So the bar for filling the box in is higher than the bar for having an
+# opinion. Containment ("Aura" in "Aura — Primary") clears it; a shared
+# distinctive word on its own does not.
+MATCH_FLOOR = 0.6
+MATCH_CONFIDENT = 0.8
+
+
+def _match_word_counts(fb_accounts: list[dict]) -> dict[str, int]:
+    """How many ad accounts lead with each distinctive word. Computed once per
+    assignment rather than per location — it is a property of the ad-account
+    list, and it was previously rebuilt for every sub-account."""
+    counts: dict[str, int] = {}
     for account in fb_accounts:
         word = _first_distinctive_word(account.get("name", ""))
         if word:
-            word_counts[word] = word_counts.get(word, 0) + 1
+            counts[word] = counts.get(word, 0) + 1
+    return counts
 
-    best, best_score = None, 0.0
-    for account in fb_accounts:
-        acc = _normalise(account.get("name", ""))
-        if not acc:
+
+def _score_fb_match(location_name: str, account: dict, word_counts: dict[str, int]) -> float:
+    """Name-similarity score in 0..1 between one GHL sub-account and one Meta
+    ad account."""
+    loc = _normalise(location_name)
+    acc = _normalise(account.get("name", ""))
+    if not loc or not acc:
+        return 0.0
+
+    score = difflib.SequenceMatcher(None, loc, acc).ratio()
+    # Containment either way is a strong signal fuzzy ratio underrates
+    # ("Aura" vs "Aura — Primary").
+    if loc in acc or acc in loc:
+        score = max(score, 0.85)
+    # A shared distinctive leading word ("Aura" in "Aura Aesthetics" /
+    # "Aura — Primary") only counts if exactly one ad account carries it —
+    # two accounts starting with the same word is ambiguity, not a match.
+    loc_word = _first_distinctive_word(location_name)
+    acc_word = _first_distinctive_word(account.get("name", ""))
+    if loc_word and acc_word == loc_word and word_counts.get(loc_word, 0) == 1:
+        score = max(score, 0.68)
+    return score
+
+
+def _assign_fb_matches(
+    locations: list[dict],
+    fb_accounts: list[dict],
+    active_location_ids: Optional[set] = None,
+) -> dict[str, dict]:
+    """Match sub-accounts to ad accounts as one assignment over the whole
+    list, rather than per sub-account independently.
+
+    Scoring each sub-account against the full ad-account list on its own —
+    which is what this used to do — lets the same ad account be handed to
+    several sub-accounts at once. Every one of those rows but one is wrong by
+    construction, and the duplicates showed up on exactly the agencies this
+    matters to: "Aura — Primary" is the best fuzzy match for "Aura Aesthetics"
+    and for "Aura Body", so both got it, and whichever the user didn't notice
+    was imported pointing at another client's spend.
+
+    So candidate pairs are ranked globally and consumed one-to-one: the
+    strongest pair in the whole grid is settled first, and both sides drop
+    out. Scores are bucketed to two decimals before ranking so that a
+    genuinely live sub-account wins a contested ad account over a dormant one
+    at effectively the same score — the dormant row is the one nobody is
+    waiting on, and it stays available in the dropdown either way.
+
+    @param locations            [{location_id, name}]
+    @param fb_accounts          ad accounts still free to be assigned
+    @param active_location_ids  sub-accounts with recent leads, used only to
+                                break ties; None treats them all as equal
+    @returns {location_id: {"account": <ad account>, "score": float,
+                            "confident": bool}}
+    """
+    if not locations or not fb_accounts:
+        return {}
+    active = active_location_ids or set()
+    word_counts = _match_word_counts(fb_accounts)
+
+    candidates = []
+    for target in locations:
+        location_id = target.get("location_id")
+        if not location_id:
             continue
-        score = difflib.SequenceMatcher(None, loc, acc).ratio()
-        # Containment either way is a strong signal fuzzy ratio underrates
-        # ("Aura" vs "Aura — Primary").
-        if loc in acc or acc in loc:
-            score = max(score, 0.85)
-        acc_word = _first_distinctive_word(account.get("name", ""))
-        if loc_word and acc_word == loc_word and word_counts.get(loc_word, 0) == 1:
-            score = max(score, 0.68)
-        if score > best_score:
-            best, best_score = account, score
-    return best if best_score >= 0.6 else None
+        for account in fb_accounts:
+            account_id = account.get("id")
+            if not account_id:
+                continue
+            score = _score_fb_match(target.get("name", ""), account, word_counts)
+            if score >= MATCH_FLOOR:
+                candidates.append((score, location_id, account_id, account))
+
+    candidates.sort(
+        key=lambda c: (
+            -round(c[0], 2),
+            0 if c[1] in active else 1,
+            c[1],  # stable across runs for equal pairs, so the table doesn't
+                   # reshuffle between two polls of the same data
+        )
+    )
+
+    matches: dict[str, dict] = {}
+    used_accounts: set = set()
+    for score, location_id, account_id, account in candidates:
+        if location_id in matches or account_id in used_accounts:
+            continue
+        matches[location_id] = {
+            "account": account,
+            "score": score,
+            "confident": score >= MATCH_CONFIDENT,
+        }
+        used_accounts.add(account_id)
+    return matches
+
+
+def _fb_payload(account: dict, score: Optional[float]) -> dict:
+    return {
+        "id": account.get("id"),
+        "name": account.get("name", ""),
+        "currency": account.get("currency"),
+        "score": round(score, 3) if score is not None else None,
+    }
+
+
+def _resolve_pairings(
+    matches: dict[str, dict],
+    ai_matches: dict[str, str],
+    fb_by_id: dict[str, dict],
+) -> dict[str, tuple[Optional[dict], Optional[dict]]]:
+    """Fold the two sources of a pairing — name similarity and the prep job's
+    AI pass — into one (fb_match, fb_suggestion) per sub-account.
+
+    Confident similarity settles first and holds its ad account; the AI pass
+    then fills what is left. They are resolved against one shared `taken` set
+    rather than independently, because they were computed at different moments
+    against different free-account lists: the prep job asked the model about
+    the leftovers *it* could not place, and by the time the review endpoint
+    runs, similarity may have placed one of them. Letting both write would put
+    the same ad account on two rows, which is the thing the assignment exists
+    to prevent.
+
+    A near-miss becomes a suggestion, and is withheld once its ad account has
+    gone to a row that was sure of it — accepting it would only duplicate.
+    """
+    resolved: dict[str, dict] = {}
+    taken: set = set()
+
+    for location_id, match in matches.items():
+        if match["confident"]:
+            resolved[location_id] = _fb_payload(match["account"], match["score"])
+            taken.add(match["account"].get("id"))
+
+    for location_id, account_id in ai_matches.items():
+        account = fb_by_id.get(account_id)
+        if not account or location_id in resolved or account_id in taken:
+            continue
+        resolved[location_id] = _fb_payload(account, None)
+        taken.add(account_id)
+
+    pairings: dict[str, tuple[Optional[dict], Optional[dict]]] = {}
+    for location_id in set(matches) | set(resolved):
+        fb_match = resolved.get(location_id)
+        suggestion = None
+        match = matches.get(location_id)
+        if not fb_match and match and match["account"].get("id") not in taken:
+            suggestion = _fb_payload(match["account"], match["score"])
+        pairings[location_id] = (fb_match, suggestion)
+    return pairings
 
 
 async def _fetch_fb_accounts(current_user: str, mongo_client) -> list[dict]:
@@ -682,12 +879,25 @@ def _parse_ghl_date(value: Optional[str]) -> Optional[datetime]:
 @router.get("/api/onboarding/subaccounts-review")
 async def subaccounts_review(current_user: str = Depends(get_current_user)):
     """Everything the review table needs: all GHL sub-accounts, which are
-    already imported, a Meta ad-account match per sub-account (name similarity
-    + the prep job's AI matches), and — once the prep job has run — real
-    activity flags: ``leads_recent_90`` (whether the sub-account belongs in
-    the list at all) and ``status_default`` (Active on a lead in the last 30
-    days, Inactive otherwise). ``prep`` reports the job's progress so the
-    wizard can poll while it finishes."""
+    already imported, a Meta ad-account pairing per sub-account, and — once
+    the prep job has run — real activity.
+
+    Pairing comes back in two fields, and the difference between them is the
+    point: ``fb_match`` is confident enough to pre-fill the row's dropdown,
+    ``fb_suggestion`` is a near-miss offered to the user without being chosen
+    for them. Both carry the similarity ``score`` that decided which is which
+    (AI matches have no score). Each ad account appears in at most one row —
+    the pairing is one assignment over the whole table, not a per-row lookup.
+
+    Activity, per sub-account: ``leads_30d`` (with ``leads_30d_capped`` when
+    the real number is higher than the probe counts), ``leads_recent_90``
+    (whether the sub-account belongs in the list at all), ``leads_recent_7``
+    (pre-ticked for import) and ``status_default`` (Active on a lead in the
+    last 30 days; Inactive once the prep job has looked and found none;
+    Active while it has not looked yet).
+
+    ``prep`` reports the job's progress so the wizard can poll while it
+    finishes."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
 
@@ -725,43 +935,81 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
         fb_by_id = {a.get("id"): a for a in fb_accounts}
 
         now = datetime.utcnow()
+
+        # Pass 1 — what the prep job learned about each sub-account. Activity is
+        # resolved before matching because it decides which sub-accounts are
+        # even in the running for an ad account.
+        activity: dict[str, dict] = {}
+        for loc in locations:
+            location_id = loc.get("id") or loc.get("_id")
+            info = prep_accounts.get(location_id) or {}
+            answered = bool(info) and not info.get("error")
+            last_lead_at = info.get("last_lead_at")
+            last_lead = _parse_ghl_date(last_lead_at)
+            # None = prep hasn't answered for this location; True/False = real.
+            leads_recent_90 = (now - last_lead <= timedelta(days=90)) if last_lead else (
+                False if answered else None
+            )
+            # A sub-account the prep job successfully read and found no recent
+            # lead in is Inactive, not Active. It defaulted to Active whenever
+            # `last_lead` was missing, which covered both "we have not looked
+            # yet" and "we looked and there is nothing" — so a dormant client
+            # arrived pre-labelled Active and pre-ticked for import, which is
+            # the opposite of what the status column is for. Unknown still
+            # defaults to Active: guessing Inactive over a failed lookup would
+            # quietly drop a live client out of the import.
+            if last_lead is not None:
+                status_default = "active" if now - last_lead <= timedelta(days=30) else "inactive"
+            else:
+                status_default = "inactive" if answered else "active"
+            activity[location_id] = {
+                "last_lead_at": last_lead_at,
+                "contact_count": info.get("contact_count"),
+                "leads_30d": info.get("leads_30d"),
+                "leads_30d_capped": bool(info.get("leads_30d_capped")),
+                "leads_recent_90": leads_recent_90,
+                # Drives ReviewStep's default checkbox state — only sub-accounts
+                # with a lead this recent are pre-selected for import.
+                "leads_recent_7": bool(last_lead and now - last_lead <= timedelta(days=7)),
+                "status_default": status_default,
+            }
+
+        # Pass 2 — one assignment across every sub-account still up for import.
+        # Already-imported ones are left out on both sides: their ad account is
+        # already in `used_ad_accounts`, and letting the row itself compete
+        # would consume a free ad account on behalf of a client nobody is
+        # looking at on this screen.
+        pending = [
+            {"location_id": loc.get("id") or loc.get("_id"), "name": loc.get("name", "Unknown")}
+            for loc in locations
+            if (loc.get("id") or loc.get("_id")) not in imported_locations
+        ]
+        active_ids = {
+            location_id for location_id, a in activity.items()
+            if a["status_default"] == "active"
+        }
+        matches = _assign_fb_matches(pending, free_fb_accounts, active_ids)
+
+        pairings = _resolve_pairings(matches, ai_matches, fb_by_id)
+
+        # Pass 3 — the rows themselves.
         accounts = []
         for loc in locations:
             location_id = loc.get("id") or loc.get("_id")
             name = loc.get("name", "Unknown")
-
-            match = _best_fb_match(name, free_fb_accounts)
-            if not match and location_id in ai_matches:
-                match = fb_by_id.get(ai_matches[location_id])
-
-            info = prep_accounts.get(location_id)
-            last_lead_at = (info or {}).get("last_lead_at")
-            last_lead = _parse_ghl_date(last_lead_at)
-            # None = prep hasn't answered for this location; True/False = real.
-            leads_recent_90 = (now - last_lead <= timedelta(days=90)) if last_lead else (
-                False if info and not (info or {}).get("error") else None
-            )
-            status_default = "active"
-            if last_lead is not None:
-                status_default = "active" if now - last_lead <= timedelta(days=30) else "inactive"
-            # Drives ReviewStep's default checkbox state — only sub-accounts
-            # with a lead this recent are pre-selected for import.
-            leads_recent_7 = bool(last_lead and now - last_lead <= timedelta(days=7))
+            info = activity[location_id]
+            fb_match, fb_suggestion = pairings.get(location_id, (None, None))
 
             accounts.append({
                 "location_id": location_id,
                 "name": name,
                 "already_imported": location_id in imported_locations,
-                "last_lead_at": last_lead_at,
-                "contact_count": (info or {}).get("contact_count"),
-                "leads_recent_90": leads_recent_90,
-                "leads_recent_7": leads_recent_7,
-                "status_default": status_default,
-                "fb_match": {
-                    "id": match["id"],
-                    "name": match.get("name", ""),
-                    "currency": match.get("currency"),
-                } if match else None,
+                **{k: info[k] for k in (
+                    "last_lead_at", "contact_count", "leads_30d", "leads_30d_capped",
+                    "leads_recent_90", "leads_recent_7", "status_default",
+                )},
+                "fb_match": fb_match,
+                "fb_suggestion": fb_suggestion,
             })
 
         return {
@@ -779,6 +1027,7 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
                 "accounts_found": len(accounts),
                 "already_imported": len([a for a in accounts if a["already_imported"]]),
                 "matched": len([a for a in accounts if a["fb_match"]]),
+                "suggested": len([a for a in accounts if a["fb_suggestion"]]),
             },
         }
 
@@ -881,6 +1130,13 @@ async def import_subaccounts(
         ).to_list(length=None)
         already = {g["ghl_location_id"] for g in existing}
 
+        # Read once for the batch, not per client. This is the path that made
+        # the unread defaults expensive: the wizard collects targets for the
+        # first client, offers to save them as the agency default, and then
+        # imports up to twenty-four more clients here — none of which used to
+        # get them.
+        default_targets = await client_targets_service.defaults_for(current_user, db)
+
         imported, skipped_existing, skipped_limit = [], [], []
         seen_this_batch = set()
         for account in body.accounts:
@@ -917,6 +1173,7 @@ async def import_subaccounts(
                     ),
                 },
                 "notes": "",
+                "targets": dict(default_targets),
                 "created_at": datetime.now(),
                 "updated_at": datetime.now(),
                 "status": "creating",
