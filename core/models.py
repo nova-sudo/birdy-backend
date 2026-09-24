@@ -232,6 +232,12 @@ class SlackBotStatusResponse(BaseModel):
     installed_at: Optional[str] = None
     notify_channel_id: Optional[str] = None
     notify_channel_name: Optional[str] = None
+    # `installed` only ever meant "a row exists", and a caller reading it as
+    # "Slack works" is how a wizard came to announce "Slack connected" about
+    # an install Slack was answering invalid_auth to — then wall the user on
+    # the next step, which was the first thing to actually try the token.
+    needs_reconnect: bool = False
+    reconnect_reason: Optional[str] = None
 
 
 class SlackChannel(BaseModel):

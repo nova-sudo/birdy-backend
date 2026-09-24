@@ -35,6 +35,8 @@ from services.slack_bot_service import (
     remove_slack_bot_installation,
     get_decrypted_bot_token_for_user,
     set_notify_channel,
+    DEAD_TOKEN_ERRORS,
+    mark_needs_reconnect,
     SlackTeamAlreadyLinkedError,
 )
 
@@ -215,10 +217,37 @@ async def slack_channels(current_user: str = Depends(get_current_user)):
                 if not cursor:
                     break
         except Exception as e:
-            logger.warning(f"Slack conversations_list failed for {current_user}: {e}")
+            # Every failure used to come back as "reconnect Slack to grant
+            # channel access", which named the one cause it usually was not.
+            # The account that surfaced this had a token Slack was answering
+            # `invalid_auth` to — nothing to do with scopes — so the screen
+            # sent someone to re-grant a permission they already had, and the
+            # step stayed broken afterwards.
+            slack_error = getattr(getattr(e, "response", None), "data", {}) or {}
+            code = slack_error.get("error") if isinstance(slack_error, dict) else None
+            logger.warning(
+                f"Slack conversations_list failed for {current_user}: {code or e}"
+            )
+
+            if code in DEAD_TOKEN_ERRORS:
+                # Remembered, so /status stops calling this install healthy and
+                # the UI can offer the one action that actually helps.
+                await mark_needs_reconnect(db, current_user, code)
+                raise HTTPException(
+                    status_code=409,
+                    detail="Slack has disconnected Birdy from your workspace. Reconnect Slack to continue.",
+                )
+            if code == "missing_scope":
+                await mark_needs_reconnect(db, current_user, code)
+                raise HTTPException(
+                    status_code=409,
+                    detail="Birdy can't read your channel list yet — reconnect Slack to grant channel access.",
+                )
+            # Transient, or something we have not seen. Not the user's to fix,
+            # and not worth flagging the install over.
             raise HTTPException(
                 status_code=502,
-                detail="Couldn't list Slack channels — reconnect Slack to grant channel access.",
+                detail="Couldn't reach Slack just now. Try again in a moment.",
             )
 
         channels.sort(key=lambda c: c.name.lower())

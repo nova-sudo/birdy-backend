@@ -60,6 +60,19 @@ async def save_slack_bot_installation(
         "installed_at": now,
         "updated_at": now,
     }
+
+    # Carry the chosen channel across a reinstall of the same workspace. This
+    # write replaces the whole sub-document, so reconnecting used to silently
+    # clear where Birdy posts — and the briefs would simply stop arriving,
+    # with the integration still showing as connected. That was survivable
+    # while reconnecting was rare; it stopped being rare the moment a refused
+    # token started telling people to do it.
+    previous = await get_slack_bot_status(db, user_id)
+    if previous and previous.get("team_id") == team_id:
+        if previous.get("notify_channel_id"):
+            doc["notify_channel_id"] = previous["notify_channel_id"]
+            doc["notify_channel_name"] = previous.get("notify_channel_name")
+
     await db["users"].update_one(
         {"user_id": user_id},
         {"$set": {"integrations.slack_bot": doc, "updated_at": now}},
@@ -90,7 +103,42 @@ async def get_slack_bot_status(db, user_id: str) -> dict | None:
         "installed_at": installed_at.isoformat() if installed_at else None,
         "notify_channel_id": slack_bot.get("notify_channel_id"),
         "notify_channel_name": slack_bot.get("notify_channel_name"),
+        # "There is a row" and "the token in it works" are different claims,
+        # and reporting the first as the second is how an account ends up
+        # being told Slack is connected by a screen that then cannot do
+        # anything with it. Set the first time Slack refuses the token.
+        "needs_reconnect": bool(slack_bot.get("needs_reconnect")),
+        "reconnect_reason": slack_bot.get("reconnect_reason"),
     }
+
+
+# Slack errors that mean the stored token will never work again, however many
+# times it is retried. Anything else — a rate limit, a network blip, a Slack
+# outage — is transient and must not be recorded as a broken install, because
+# the badge it raises asks the user to redo an OAuth hop they do not need.
+DEAD_TOKEN_ERRORS = {
+    "invalid_auth", "token_revoked", "account_inactive",
+    "token_expired", "not_authed",
+}
+
+
+async def mark_needs_reconnect(db, user_id: str, reason: str) -> None:
+    """Record that Slack has refused this installation's token.
+
+    The install is left in place rather than deleted: it still holds the team,
+    the channel the user picked and the thread sessions, and throwing those
+    away would mean reconnecting cost them their configuration on top of the
+    OAuth hop.
+    """
+    await db["users"].update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "integrations.slack_bot.needs_reconnect": True,
+            "integrations.slack_bot.reconnect_reason": reason,
+            "integrations.slack_bot.reconnect_flagged_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }},
+    )
 
 
 async def remove_slack_bot_installation(db, user_id: str) -> bool:
