@@ -307,3 +307,87 @@ async def test_recompute_counts_every_band(mock_db):
     assert out["scanned"] == 3
     assert out["counts"][CRITICAL] == 1
     assert out["counts"][HEALTHY] == 2       # on-pace client + the untargeted one
+
+
+# ── counting closes over the same window as expected closes ─────────────
+
+
+def test_health_window_bounds_start_at_the_first_of_the_sundays_month():
+    assert ch.health_window_bounds(date(2026, 9, 28)) == (date(2026, 9, 1), date(2026, 9, 27))
+    # Monday the 1st: the window is the whole previous month, not the new one.
+    assert ch.health_window_bounds(date(2027, 2, 1)) == (date(2027, 1, 1), date(2027, 1, 31))
+
+
+def test_health_prefers_closes_counted_through_the_same_sunday():
+    """Month-to-date includes closes made after Sunday; the health window does not."""
+    group = {
+        "targets": {"monthly_wins": 13},
+        "ghl_opp_cache": {
+            "this_month": {"won": 12},
+            "health_window": {"through": "2026-09-27", "won": 8},
+            "updated_at": "2026-09-30T10:00:00",
+        },
+    }
+    r = ch.health_for_group(group, through=date(2026, 9, 27))
+    assert r["actual"] == 8
+    assert r["closes_source"] == "health_window"
+    assert r["health"] == CRITICAL
+
+
+def test_health_ignores_a_health_window_for_a_different_sunday():
+    group = {
+        "targets": {"monthly_wins": 20},
+        "ghl_opp_cache": {
+            "this_month": {"won": 10},
+            "health_window": {"through": "2026-08-09", "won": 1},
+            "updated_at": "2026-08-17T01:00:00",
+        },
+    }
+    r = ch.health_for_group(group, through=date(2026, 8, 16))
+    assert r["actual"] == 10
+    assert r["closes_source"] == "this_month"
+
+
+def test_monday_the_first_does_not_judge_last_month_on_this_months_closes():
+    """Through Jan 31, a February month-to-date cache counts the wrong month.
+    It used to read ~0 closes against a full month's target: everyone Critical."""
+    group = {
+        "health": WARNING,
+        "targets": {"monthly_wins": 20},
+        "ghl_opp_cache": {"this_month": {"won": 0}, "updated_at": "2027-02-01T05:00:00"},
+    }
+    r = ch.health_for_group(group, through=date(2027, 1, 31))
+    assert r["health"] is None
+
+
+@pytest.mark.asyncio
+async def test_recompute_keeps_the_band_when_no_figure_measures_the_window(mock_db):
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": "u", "health": WARNING,
+        "targets": {"monthly_wins": 20},
+        "ghl_opp_cache": {"this_month": {"won": 0}, "updated_at": "2027-02-01T05:00:00"},
+    })
+
+    out = await ch.recompute_all(mock_db, through=date(2027, 1, 31))
+
+    stored = await mock_db["client_groups"].find_one({"id": "g1"})
+    assert stored["health"] == WARNING
+    assert out["skipped"] == 1 and out["changed"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recompute_uses_the_health_window_on_monday_the_first(mock_db):
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": "u",
+        "targets": {"monthly_wins": 20},
+        "ghl_opp_cache": {
+            "this_month": {"won": 0},
+            "health_window": {"through": "2027-01-31", "won": 19},
+            "updated_at": "2027-02-01T05:00:00",
+        },
+    })
+
+    await ch.recompute_all(mock_db, through=date(2027, 1, 31))
+
+    stored = await mock_db["client_groups"].find_one({"id": "g1"})
+    assert stored["health"] == HEALTHY

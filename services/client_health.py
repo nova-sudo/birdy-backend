@@ -50,6 +50,20 @@ def previous_sunday(today: date) -> date:
     return today - timedelta(days=today.weekday() + 1)
 
 
+def health_window_bounds(today: date) -> tuple[date, date]:
+    """
+    (first day of the month, through) for the window the health rule measures.
+
+    `through` is previous_sunday(today); the start is the first of *that*
+    Sunday's month. The GHL refresh stores won closes for exactly this window
+    (ghl_opp_cache.health_window) so actual closes are counted over the same
+    days the expected closes are, rather than up to whenever the cache last
+    refreshed.
+    """
+    through = previous_sunday(today)
+    return through.replace(day=1), through
+
+
 def month_progress(through: date) -> tuple[int, int]:
     """(days elapsed, days in month) for the month `through` falls in."""
     days_in_month = calendar.monthrange(through.year, through.month)[1]
@@ -120,33 +134,67 @@ def compute_health(
     }
 
 
+def _won_through(group: dict, through: date) -> tuple[float | None, str]:
+    """
+    Won closes from the first of `through`'s month up to and including
+    `through`, plus where the figure came from. Returns (None, reason) when no
+    cached figure measures that window.
+
+    Preference order:
+      1. ghl_opp_cache.health_window — written by the GHL refresh for exactly
+         [first of month, previous Sunday]. Exact.
+      2. ghl_opp_cache.this_month — month-to-date as of the last refresh. Used
+         only when that refresh happened in `through`'s month; it may include a
+         few closes made after `through`, which errs towards Healthy.
+         A this_month cache from a *later* month (e.g. the Monday that is the
+         1st: through is the last day of the previous month) counts a
+         different month entirely and would mark everyone Critical — refused.
+      3. The legacy gohighlevel_cache location, for groups whose cache predates
+         ghl_opp_cache.
+    """
+    opp_cache = group.get("ghl_opp_cache") or {}
+
+    window = opp_cache.get("health_window") or {}
+    if window.get("through") == through.isoformat():
+        return window.get("won", 0), "health_window"
+
+    month_to_date = opp_cache.get("this_month")
+    if month_to_date:
+        refreshed = str(opp_cache.get("updated_at") or "")[:7]  # "YYYY-MM"
+        if refreshed and refreshed != through.strftime("%Y-%m"):
+            return None, f"no closes figure for {through:%B %Y} (cache is from {refreshed})"
+        return month_to_date.get("won", 0), "this_month"
+
+    legacy = (
+        (group.get("gohighlevel_cache") or {})
+        .get("metrics", {})
+        .get("opportunity_stats", {})
+    )
+    return (legacy or {}).get("won", 0), "legacy"
+
+
 def health_for_group(group: dict, through: date | None = None) -> dict:
     """
     Evaluate a client_groups document.
 
-    `actual closes` is the won-opportunity count for the current month, read
-    from the cached GHL opportunity stats rather than recounted here — the
-    cache is what every other surface reports, so health agrees with the
-    numbers the user can see.
+    `actual closes` is the won-opportunity count for `through`'s month up to
+    `through`, read from the cached GHL opportunity stats rather than recounted
+    here — see _won_through for which cached figure is used.
+
+    When no cached figure measures that window the result has health None and
+    the caller keeps the previous band rather than guessing.
     """
     through = through or previous_sunday(date.today())
     days_elapsed, days_in_month = month_progress(through)
 
     target = ((group.get("targets") or {}).get("monthly_wins"))
+    actual, source = _won_through(group, through)
 
-    # "this_month" is the preset whose window matches the rule's month-to-date
-    # arithmetic; fall back to the legacy location if the cache predates it.
-    opp_cache = group.get("ghl_opp_cache") or {}
-    stats = opp_cache.get("this_month")
-    if not stats:
-        stats = (
-            (group.get("gohighlevel_cache") or {})
-            .get("metrics", {})
-            .get("opportunity_stats", {})
-        )
-    actual = (stats or {}).get("won", 0)
-
-    result = compute_health(target, actual, days_elapsed, days_in_month)
+    if actual is None:
+        result = {"health": None, "reason": source}
+    else:
+        result = compute_health(target, actual, days_elapsed, days_in_month)
+        result["closes_source"] = source
     result["through"] = through.isoformat()
     result["days_elapsed"] = days_elapsed
     result["days_in_month"] = days_in_month
@@ -164,16 +212,22 @@ async def recompute_all(db, through: date | None = None) -> dict:
     through = through or previous_sunday(date.today())
     cursor = db["client_groups"].find(
         {}, {"id": 1, "user_id": 1, "targets": 1, "ghl_opp_cache.this_month": 1,
+             "ghl_opp_cache.health_window": 1, "ghl_opp_cache.updated_at": 1,
              "gohighlevel_cache.metrics.opportunity_stats": 1, "health": 1, "_id": 0},
     )
 
     counts = {HEALTHY: 0, WARNING: 0, CRITICAL: 0}
     changed = 0
     scanned = 0
+    skipped = 0
 
     async for group in cursor:
         scanned += 1
         result = health_for_group(group, through)
+        if result["health"] is None:
+            # Nothing measures this window — keep the band it already has.
+            skipped += 1
+            continue
         counts[result["health"]] += 1
 
         if group.get("health") == result["health"]:
@@ -190,8 +244,8 @@ async def recompute_all(db, through: date | None = None) -> dict:
         changed += 1
 
     logger.info(
-        "Client health recomputed through %s: %d scanned, %d changed, %s",
-        through.isoformat(), scanned, changed, counts,
+        "Client health recomputed through %s: %d scanned, %d changed, %d skipped, %s",
+        through.isoformat(), scanned, changed, skipped, counts,
     )
-    return {"scanned": scanned, "changed": changed, "counts": counts,
-            "through": through.isoformat()}
+    return {"scanned": scanned, "changed": changed, "skipped": skipped,
+            "counts": counts, "through": through.isoformat()}

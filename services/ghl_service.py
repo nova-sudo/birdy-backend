@@ -8,7 +8,7 @@ import asyncio
 import logging
 import uuid
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime
 
 from utils.phone_normalize import compute_match_keys
 from typing import Dict, List, Tuple
@@ -80,6 +80,16 @@ async def cache_ghl_opp_stats_all_presets(
     # wouldn't clobber the whole subdocument — belt-and-braces.
     update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
     update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
+
+    # Closes over exactly the window the weekly health rule measures (first of
+    # the month → previous Sunday), so health does not compare expected closes
+    # through Sunday with actual closes through "now".
+    from services.client_health import health_window_bounds
+    hw_start, hw_through = health_window_bounds(date.today())
+    update_fields["ghl_opp_cache.health_window"] = {
+        "through": hw_through.isoformat(),
+        **compute_opp_stats(opps, hw_start.isoformat(), hw_through.isoformat()),
+    }
 
     await groups_col.update_one(
         {"id": group_id},
