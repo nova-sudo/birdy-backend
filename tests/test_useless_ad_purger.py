@@ -89,6 +89,28 @@ def test_flags_zero_lead_and_over_baseline():
     print("PASS test_flags_zero_lead_and_over_baseline")
 
 
+def test_account_median_is_the_median_not_the_flag_threshold():
+    """The baseline target is median × 1.75. Labelling it "Acct median" made
+    the copy (and the LLM) overstate the median by 75%."""
+    from ai.suggestions.composer import _facts_block
+
+    ads = [
+        _ad("ad_exp", "Expensive Ad", "ACTIVE", 96, 2),     # cpl 48
+        _ad("ad_good1", "Good Ad 1", "ACTIVE", 100, 10),    # cpl 10
+        _ad("ad_good2", "Good Ad 2", "ACTIVE", 120, 10),    # cpl 12
+    ]
+    [finding] = _run([], _group(ads))
+    stats = {s.label: s.value for s in finding.evidence.stats}
+    assert stats["Acct median"].endswith("12.00"), stats   # median([10, 12, 48])
+    assert "21" not in stats["Acct median"]                # not the 21.00 threshold
+    assert finding.evidence.raw["account_median"] == 12.0
+    assert "12.00 median" in finding.description, finding.description
+
+    facts = _facts_block(finding)
+    assert "account_median: 12.0" in facts
+    assert "flag_threshold (not the median" in facts and "21.0" in facts
+
+
 def test_uses_alert_threshold_as_target():
     """An existing cost_per_result ceiling alert becomes the target."""
     alert = {

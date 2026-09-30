@@ -81,9 +81,17 @@ def _facts_block(finding: Finding) -> str:
     ]
     for s in finding.evidence.stats:
         lines.append(f"stat {s.label}: {s.value}")
-    for key in ("total_spend", "total_leads", "worst_cpl", "worst_ad", "target", "target_source"):
+    for key in ("total_spend", "total_leads", "worst_cpl", "worst_ad", "account_median"):
         if raw.get(key) is not None:
             lines.append(f"{key}: {raw[key]}")
+    # Name the target for what it is. A baseline target is the account median
+    # times a strictness multiplier; passed as a bare "target" the model called
+    # it the median, overstating the median in the copy.
+    if raw.get("target") is not None:
+        if raw.get("target_source") == "alert":
+            lines.append(f"cpl_target_set_by_agency: {raw['target']}")
+        else:
+            lines.append(f"flag_threshold (not the median; ads above it are flagged): {raw['target']}")
     offenders = raw.get("offenders") or []
     if offenders:
         lines.append(f"ad_count: {len(offenders)}")

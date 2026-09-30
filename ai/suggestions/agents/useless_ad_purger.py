@@ -179,8 +179,10 @@ class UselessAdPurger:
             if _is_active(r.get("status")) and r["_leads"] > 0 and r["_cpl"] and r["_spend"] >= min_spend
         ]
         baseline = None
+        account_median = None
         if len(converting_cpls) >= 2:
-            baseline = round(statistics.median(converting_cpls) * profile["baseline_multiplier"], 2)
+            account_median = round(statistics.median(converting_cpls), 2)
+            baseline = round(account_median * profile["baseline_multiplier"], 2)
 
         # Target: alert ceiling first, else baseline.
         target, target_source = await _resolve_target_cpl(ctx, client_group_id)
@@ -228,6 +230,7 @@ class UselessAdPurger:
                 symbol=symbol,
                 target=target,
                 target_source=target_source,
+                account_median=account_median,
                 high_multiplier=profile["high_multiplier"],
                 offender=off,
             )
@@ -235,7 +238,8 @@ class UselessAdPurger:
         ]
 
     def _build_ad_finding(self, *, client_group_id, client_name, window, preset, symbol,
-                          target, target_source, high_multiplier, offender) -> Finding:
+                          target, target_source, high_multiplier, offender,
+                          account_median=None) -> Finding:
         """Build one suggestion for a single underperforming ad."""
         cpl = offender["cpl"]
         spend = offender["spend"]
@@ -251,9 +255,15 @@ class UselessAdPurger:
         stats = []
         if cpl is not None:
             stats.append(Stat("CPL", f"{symbol}{cpl:.2f}", bad=True))
-        if target is not None:
-            target_label = "Target" if target_source == "alert" else "Acct median"
-            stats.append(Stat(target_label, f"{symbol}{target:.2f}"))
+        # The baseline target is the account median SCALED by the strictness
+        # multiplier — a flagging threshold, not the median itself. Label them
+        # separately; the composer rewrites copy from these labels, and calling
+        # the threshold "Acct median" made it tell users the median was higher
+        # than it is.
+        if target is not None and target_source == "alert":
+            stats.append(Stat("Target", f"{symbol}{target:.2f}"))
+        elif target is not None and account_median is not None:
+            stats.append(Stat("Acct median", f"{symbol}{account_median:.2f}"))
         stats.append(Stat(f"Spent ({window_label})", f"{symbol}{spend:.0f}"))
         stats.append(Stat("Leads", str(leads), bad=(leads == 0)))
 
@@ -262,8 +272,8 @@ class UselessAdPurger:
             basis = f"spent {symbol}{spend:.0f} over the last {window_label} with 0 leads"
         elif target_source == "alert" and target is not None:
             basis = f"is at {symbol}{cpl:.2f} cost-per-lead over the last {window_label}, above your {symbol}{target:.0f} target"
-        elif target_source == "baseline" and target is not None:
-            basis = f"is at {symbol}{cpl:.2f} cost-per-lead over the last {window_label}, well above this account's {symbol}{target:.0f} median"
+        elif target_source == "baseline" and target is not None and account_median is not None:
+            basis = f"is at {symbol}{cpl:.2f} cost-per-lead over the last {window_label}, well above this account's {symbol}{account_median:.2f} median"
         else:
             basis = f"spent {symbol}{spend:.0f} over the last {window_label} with poor return"
         title = f"Pause underperforming ad — {name}"
@@ -281,6 +291,7 @@ class UselessAdPurger:
                 "preset": preset,
                 "target": target,
                 "target_source": target_source,
+                "account_median": account_median,
                 "ad": name,
                 "ad_id": offender["object_id"],
                 "spend": spend,
