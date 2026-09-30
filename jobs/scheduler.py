@@ -84,8 +84,18 @@ def start_background_jobs():
         max_instances=1,
     )
 
+    # Scheduled Slack briefs: hourly at :00 (brief times are whole hours).
+    from jobs.brief_jobs import run_slack_briefs
+    scheduler.add_job(
+        run_slack_briefs,
+        CronTrigger(minute=0),
+        id='slack_briefs',
+        replace_existing=True,
+        max_instances=1,
+    )
+
     scheduler.start()
-    logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45), ai_suggestions (weekly Mon 06:00 / monthly 1st 06:00)")
+    logger.info("Background jobs scheduler started — token_refresh (*/45), meta_refresh (:10), ghl_refresh (:30), alert_eval (:45), ai_suggestions (weekly Mon 06:00 / monthly 1st 06:00), slack_briefs (:00)")
 
  
 def stop_background_jobs():

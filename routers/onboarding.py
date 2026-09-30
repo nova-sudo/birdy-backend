@@ -13,8 +13,8 @@ durable state it needs:
 - ``client_groups.targets`` / ``users.default_targets`` — KPI targets
   (cost-per-acquisition, monthly wins, conversion rate).
 - ``users.integrations.slack_bot.brief`` — brief frequency/time/day and which
-  sections the morning brief should contain. (The suggestion crons do not read
-  this yet — storing it here is the contract for when they do.)
+  sections the morning brief should contain. Sent by the hourly
+  /api/cron/slack-briefs tick — see services/slack_brief.py.
 
 Existing users never see the wizard: a user with no ``onboarding`` field who
 already has client groups or a GHL connection is grandfathered as completed on

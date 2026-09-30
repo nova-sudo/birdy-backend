@@ -738,6 +738,22 @@ async def health_weekly(authorization: str | None = Header(default=None)):
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
 
 
+@router.get("/slack-briefs")
+async def slack_briefs(authorization: str | None = Header(default=None)):
+    """Posts every scheduled Slack brief that is due. Hourly at :00.
+
+    Each account chooses a daily or weekly brief and a time in onboarding or
+    Settings; see services/slack_brief.py for when one counts as due.
+    """
+    _verify_cron_auth(authorization)
+
+    from jobs.brief_jobs import run_slack_briefs
+
+    tick_start = time.monotonic()
+    result = await run_slack_briefs()
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
 @router.get("/suggestions-monthly")
 async def suggestions_monthly(authorization: str | None = Header(default=None)):
     """Runs a monthly (last_30d) Birdy suggestion pass over all users."""

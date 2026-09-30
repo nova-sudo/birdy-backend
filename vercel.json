@@ -64,6 +64,10 @@
     {
       "path": "/api/cron/attribution-tick",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/slack-briefs",
+      "schedule": "0 * * * *"
     }
   ]
 }
