@@ -143,11 +143,17 @@ async def _undo_flow():
         actions_mod.set_object_status = original
 
 
-async def _undo_requires_applied():
+async def _undo_of_unapplied_is_noop():
+    """Undo on a suggestion that was never applied is a quiet success (#32):
+    nothing to reverse, so no ad is touched and the suggestion stays open —
+    Slack's Undo button must not surface a "couldn't undo" error for it."""
     db = AsyncMongoMockClient()[DB_NAME]
     await _seed(db, action={"type": "pause_ads", "targets": [{"object_id": "ad_1", "object_type": "ad"}]})
-    res = await actions.undo_suggestion(db, None, "u1", "sug_x")
-    assert res["ok"] is False and res["outcome"] == "not_applied", res
+    res = await actions.undo_suggestion(db, None, "u1", "sug_x", source="slack")
+    assert res["ok"] is True and res["outcome"] == "noop", res
+    assert res["succeeded"] == []
+    doc = await db["ai_suggestions"].find_one({"_id": "sug_x"})
+    assert doc["status"] == "open"
 
 
 def test_undo_reenables_and_reopens():
@@ -155,9 +161,9 @@ def test_undo_reenables_and_reopens():
     print("PASS test_undo_reenables_and_reopens")
 
 
-def test_undo_requires_applied():
-    asyncio.run(_undo_requires_applied())
-    print("PASS test_undo_requires_applied")
+def test_undo_of_unapplied_is_noop():
+    asyncio.run(_undo_of_unapplied_is_noop())
+    print("PASS test_undo_of_unapplied_is_noop")
 
 
 def test_actions_dismiss():
@@ -182,5 +188,5 @@ if __name__ == "__main__":
     test_actions_apply()
     test_actions_apply_not_found()
     test_undo_reenables_and_reopens()
-    test_undo_requires_applied()
+    test_undo_of_unapplied_is_noop()
     print("\nAll slack-suggestion tests passed.")
