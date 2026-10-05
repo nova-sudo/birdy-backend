@@ -18,6 +18,7 @@ no ODM). Index creation mirrors ai/session_store.py and is wired into main.py's
 lifespan.
 """
 
+import hashlib
 import logging
 import uuid
 from datetime import datetime, timedelta
@@ -65,9 +66,25 @@ def _now() -> datetime:
 # Suggestions
 # ---------------------------------------------------------------------------
 
+def suggestion_key(user_id: str, finding: Finding) -> str:
+    """
+    The suggestion's _id: the finding's own identity, scoped to the account.
+
+    Finding.compute_dedup_key() identifies the *ad(s)* — deliberately, so one
+    ad shared by several client groups is one suggestion. But _id is global,
+    and an ad's account can change hands: when an agency's clients moved from
+    one Birdy login to another, every ad Birdy had ever flagged already had a
+    suggestion under the old login. A new finding for the same ad then found
+    that document — reopening it on the old account where nobody would see it,
+    or suppressing it outright because it had been applied or declined there.
+    """
+    base = finding.compute_dedup_key()
+    return "sug_" + hashlib.sha1(f"{user_id}|{base}".encode("utf-8")).hexdigest()[:20]
+
+
 def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "template") -> dict:
     """Turn a Finding (+ its already-composed copy) into a persistable document."""
-    key = finding.compute_dedup_key()
+    key = suggestion_key(user_id, finding)
     now = _now()
     return {
         "_id": key,
@@ -112,9 +129,18 @@ async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = 
     content. This stops the same suggestion flipping between the weekly and
     monthly view (and diverging from what was posted to Slack).
     """
-    key = finding.compute_dedup_key()
+    key = suggestion_key(user_id, finding)
     now = _now()
     existing = await db[SUGGESTIONS].find_one({"_id": key})
+    if existing is None:
+        # Suggestions written before ids were scoped to the account carry the
+        # bare finding key. The same account's history — applied, declined —
+        # still counts; another account's never does.
+        existing = await db[SUGGESTIONS].find_one(
+            {"_id": finding.compute_dedup_key(), "user_id": user_id}
+        )
+    if existing:
+        key = existing["_id"]
 
     if existing:
         status = existing.get("status")
