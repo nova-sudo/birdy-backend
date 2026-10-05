@@ -15,14 +15,26 @@ setup screens actually need: what is the next thing that has to happen?
 
     instant_form    Meta Instant Forms. Nothing to install — Meta hands us the
                     rows. This is the case that always worked.
-    landing_page    Their own page, our script on it. Needs the snippet and the
-                    Meta URL parameters.
-    external_form   Their own page with a form we can't read — Typeform, ROASForm,
-                    an iframe on someone else's domain. Needs the snippet, the
-                    parameters, and a webhook.
+    form_to_ghl     A form tool that sends its leads, with the ad they came from,
+                    to GoHighLevel — ROAS Forms on its own landing pages or
+                    embedded in the client's site, GHL's own forms and funnels.
+                    Nothing to install in Birdy: the tool writes the ad's
+                    attribution onto the GHL contact, and Birdy attributes from
+                    GHL (services/ad_leads.py). The only checks are whether
+                    contacts are arriving and whether they carry an ad id.
+    landing_page    The client's own landing page, with leads going to their own
+                    records or database rather than GHL. Our script on the page
+                    is the only way Birdy sees those leads, so it needs the
+                    snippet and the Meta URL parameters.
     unknown         Nobody has said. The default, and it must never block
                     anything: an unconfigured client keeps behaving exactly as it
                     did before any of this existed.
+
+"external_form" — a form tool on the client's page, wired to Birdy by webhook —
+was the third option before form_to_ghl. Those tools can all send to GHL, which
+is where attribution already lives, so the webhook route is retired and the
+stored value reads as form_to_ghl. Webhook secrets already issued keep working
+(routers/tracking.py checks whichever secret a client has).
 
 `push_to_ghl` is opt-in per client. We hold `contacts.write`, so we *can* create
 the contact in the client's CRM, but writing into someone's live CRM fires their
@@ -44,18 +56,22 @@ logger = logging.getLogger(__name__)
 
 
 METHOD_INSTANT_FORM = "instant_form"
+METHOD_FORM_TO_GHL = "form_to_ghl"
 METHOD_LANDING_PAGE = "landing_page"
-METHOD_EXTERNAL_FORM = "external_form"
 METHOD_UNKNOWN = "unknown"
+# Retired; read as METHOD_FORM_TO_GHL. See the module docstring.
+METHOD_EXTERNAL_FORM = "external_form"
+_LEGACY_METHODS = {METHOD_EXTERNAL_FORM: METHOD_FORM_TO_GHL}
 
-METHODS = (METHOD_INSTANT_FORM, METHOD_LANDING_PAGE, METHOD_EXTERNAL_FORM, METHOD_UNKNOWN)
+METHODS = (METHOD_INSTANT_FORM, METHOD_FORM_TO_GHL, METHOD_LANDING_PAGE, METHOD_UNKNOWN)
 
 # Which methods need our script on the page at all.
-NEEDS_SCRIPT = (METHOD_LANDING_PAGE, METHOD_EXTERNAL_FORM)
-# Which need a server-side webhook because the form can't be read in the browser.
-NEEDS_WEBHOOK = (METHOD_EXTERNAL_FORM,)
+NEEDS_SCRIPT = (METHOD_LANDING_PAGE,)
+# Which need a server-side webhook because the form can't be read in the
+# browser. None any more: a form tool sends to GHL instead.
+NEEDS_WEBHOOK = ()
 
-FORM_PROVIDERS = ("ghl", "typeform", "roasform", "jotform", "custom", "other")
+FORM_PROVIDERS = ("roasform", "ghl", "typeform", "jotform", "custom", "other")
 
 DEFAULT = {
     "method": METHOD_UNKNOWN,
@@ -74,10 +90,13 @@ DEFAULT = {
 def read(group: dict) -> dict:
     """The client's lead_collection, with every key present."""
     stored = (group or {}).get("lead_collection") or {}
-    return {**DEFAULT, **{k: v for k, v in stored.items() if k in DEFAULT}}
+    config = {**DEFAULT, **{k: v for k, v in stored.items() if k in DEFAULT}}
+    config["method"] = normalize_method(config["method"])
+    return config
 
 
 def normalize_method(value) -> str:
+    value = _LEGACY_METHODS.get(value, value)
     return value if value in METHODS else METHOD_UNKNOWN
 
 
@@ -183,6 +202,20 @@ async def diagnose(group: dict, mongo_client) -> dict:
     config = read(group)
     since = datetime.utcnow() - timedelta(days=LOOKBACK_DAYS)
 
+    # Instant-form clients need none of this, and showing them five red crosses
+    # for a setup they were never asked to do would be simply wrong.
+    if config["method"] == METHOD_INSTANT_FORM:
+        return {
+            "method": config["method"],
+            "applicable": False,
+            "complete": True,
+            "stages": [],
+            "next_step": None,
+        }
+
+    if config["method"] == METHOD_FORM_TO_GHL:
+        return await _diagnose_form_to_ghl(db, group_id, config, since)
+
     script_seen = await db[VISITORS].count_documents(
         {"client_group_id": group_id, "last_seen_at": {"$gte": since}}, limit=1
     )
@@ -228,13 +261,11 @@ async def diagnose(group: dict, mongo_client) -> dict:
             "label": "Form submissions captured",
             "done": bool(submissions),
             "hint": (
-                "Visits are tracked but no form submission has reached us. If the "
-                "form is an embed on another domain we cannot read it from the "
-                "page — point its webhook at Birdy instead."
-                if config["method"] == METHOD_EXTERNAL_FORM else
                 "Visits are tracked but no form submission has reached us. Check "
-                "the form is on the same page as the snippet; if it is inside an "
-                "iframe, use the webhook instead."
+                "the form is on the same page as the snippet. A form embedded "
+                "from another site (an iframe) can't be read from the page — if "
+                "that form tool sends its leads to GoHighLevel, choose that "
+                "option instead."
             ),
         },
         {
@@ -260,17 +291,6 @@ async def diagnose(group: dict, mongo_client) -> dict:
         },
     ]
 
-    # Instant-form clients need none of this, and showing them five red crosses
-    # for a setup they were never asked to do would be simply wrong.
-    if config["method"] == METHOD_INSTANT_FORM:
-        return {
-            "method": config["method"],
-            "applicable": False,
-            "complete": True,
-            "stages": [],
-            "next_step": None,
-        }
-
     blocking = [s for s in stages if not s.get("optional")]
     next_step = next((s for s in blocking if not s["done"]), None)
     return {
@@ -279,4 +299,52 @@ async def diagnose(group: dict, mongo_client) -> dict:
         "complete": all(s["done"] for s in blocking),
         "stages": stages,
         "next_step": next_step["key"] if next_step else None,
+    }
+
+
+async def _diagnose_form_to_ghl(db, group_id: str, config: dict, since: datetime) -> dict:
+    """
+    Nothing is installed for a form tool that sends to GoHighLevel, so the
+    checklist only answers whether it is doing its half: are contacts reaching
+    GHL, and do they carry the ad they came from? The second is the one that
+    matters — a contact without an ad id is a lead Birdy can count but not
+    credit to any ad, and the fix is on the form tool's side, not Birdy's.
+    """
+    recent = {"client_group_id": group_id, "contact_data.dateAdded": {"$gte": since.isoformat()}}
+    contacts = await db["ghl_contacts"].count_documents(recent, limit=1)
+    attributed = await db["ghl_contacts"].count_documents(
+        {**recent, "contact_data.attributionSource.adId": {"$gt": ""}}, limit=1
+    )
+    tool = "ROAS Forms" if config.get("form_provider") == "roasform" else "the form tool"
+
+    stages = [
+        {
+            "key": "ghl_contacts_arriving",
+            "label": "Leads arriving in GoHighLevel",
+            "done": bool(contacts),
+            "hint": (
+                f"No new contacts have reached this client's GoHighLevel in the "
+                f"last {LOOKBACK_DAYS} days. Check {tool} is connected to the "
+                "right GHL sub-account."
+            ),
+        },
+        {
+            "key": "ghl_contacts_attributed",
+            "label": "Leads carry the ad they came from",
+            "done": bool(attributed),
+            "hint": (
+                f"Contacts are arriving in GoHighLevel but none carries an ad id, "
+                f"so they can't be credited to an ad. Turn on sending attribution "
+                f"(UTM parameters and the ad id) to GoHighLevel in {tool}, and add "
+                "the tracking parameters to the Meta ads so there is an ad id to send."
+            ),
+        },
+    ]
+    next_step = next((s["key"] for s in stages if not s["done"]), None)
+    return {
+        "method": config["method"],
+        "applicable": True,
+        "complete": next_step is None,
+        "stages": stages,
+        "next_step": next_step,
     }

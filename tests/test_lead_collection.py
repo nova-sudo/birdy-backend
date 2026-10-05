@@ -10,9 +10,10 @@ is the tag, the ads, or the form. So what is pinned here is that the *right*
 stage is reported as the blocker, and that a client who was never asked to
 install anything is never shown a wall of crosses.
 
-Also pinned: the webhook secret survives a re-save. Regenerating it would
-silently break a webhook the customer had already wired into Typeform, and they
-would find out from an empty leads table days later.
+Also pinned: a webhook secret already issued survives a re-save. Regenerating
+it would silently break a webhook the customer had already wired into a form
+tool, and they would find out from an empty leads table days later. New ones
+are no longer issued: the form-tool option now means "sends to GoHighLevel".
 """
 
 from datetime import datetime, timedelta
@@ -56,16 +57,33 @@ def test_unknown_values_are_refused_rather_than_stored():
     assert lc.normalize_provider("typeform") == "typeform"
 
 
+def test_the_retired_external_form_reads_as_a_form_tool_sending_to_ghl():
+    assert lc.normalize_method("external_form") == lc.METHOD_FORM_TO_GHL
+    stored = {"lead_collection": {"method": "external_form", "form_provider": "roasform"}}
+    assert lc.read(stored)["method"] == lc.METHOD_FORM_TO_GHL
+
+
 @pytest.mark.asyncio
-async def test_an_external_form_gets_a_webhook_secret(mock_mongo_client, mock_db):
+async def test_a_form_tool_sending_to_ghl_needs_no_script_or_secret(mock_mongo_client, mock_db):
     await _group(mock_db, method=lc.METHOD_UNKNOWN)
 
-    config = await lc.save(GROUP, lc.METHOD_EXTERNAL_FORM, mock_mongo_client,
-                           form_provider="typeform")
+    config = await lc.save(GROUP, lc.METHOD_FORM_TO_GHL, mock_mongo_client,
+                           form_provider="roasform")
 
-    assert config["webhook_secret"]
-    assert config["form_provider"] == "typeform"
+    assert config["method"] == lc.METHOD_FORM_TO_GHL
+    assert config["form_provider"] == "roasform"
+    assert config["webhook_secret"] is None
+    assert lc.METHOD_FORM_TO_GHL not in lc.NEEDS_SCRIPT
     assert config["configured_at"] is not None
+
+
+@pytest.mark.asyncio
+async def test_saving_the_retired_name_stores_the_new_one(mock_mongo_client, mock_db):
+    await _group(mock_db, method=lc.METHOD_UNKNOWN)
+
+    config = await lc.save(GROUP, lc.METHOD_EXTERNAL_FORM, mock_mongo_client)
+
+    assert config["method"] == lc.METHOD_FORM_TO_GHL
 
 
 @pytest.mark.asyncio
@@ -83,13 +101,13 @@ async def test_the_secret_survives_a_re_save(mock_mongo_client, mock_db):
     Rotating it here would break a webhook already wired into the form tool, and
     the customer would find out from an empty leads table days later.
     """
-    await _group(mock_db, method=lc.METHOD_UNKNOWN)
-    first = await lc.save(GROUP, lc.METHOD_EXTERNAL_FORM, mock_mongo_client)
+    await _group(mock_db, method=lc.METHOD_EXTERNAL_FORM, webhook_secret="already-wired")
 
-    second = await lc.save(GROUP, lc.METHOD_EXTERNAL_FORM, mock_mongo_client,
+    first = await lc.save(GROUP, lc.METHOD_FORM_TO_GHL, mock_mongo_client)
+    second = await lc.save(GROUP, lc.METHOD_FORM_TO_GHL, mock_mongo_client,
                            form_provider="jotform")
 
-    assert second["webhook_secret"] == first["webhook_secret"]
+    assert first["webhook_secret"] == second["webhook_secret"] == "already-wired"
 
 
 @pytest.mark.asyncio
@@ -139,7 +157,7 @@ async def test_a_script_with_no_ad_clicks_blames_the_meta_parameters(mock_mongo_
 
 @pytest.mark.asyncio
 async def test_ad_clicks_with_no_submissions_points_at_the_form(mock_mongo_client, mock_db):
-    group = await _group(mock_db, method=lc.METHOD_EXTERNAL_FORM)
+    group = await _group(mock_db)
     await mock_db[VISITORS].insert_one({
         "_id": "v_clicked", "client_group_id": GROUP,
         "last_seen_at": datetime.utcnow(),
@@ -149,9 +167,10 @@ async def test_ad_clicks_with_no_submissions_points_at_the_form(mock_mongo_clien
     result = await lc.diagnose(group, mock_mongo_client)
 
     assert result["next_step"] == "form_submissions"
-    # An external-form client gets told about the webhook specifically; that is
-    # the one thing that will actually fix it for them.
-    assert "webhook" in _stage(result, "form_submissions")["hint"]
+    # The likely cause is a form embedded from another site, which our script
+    # can't read — and the fix is the GoHighLevel option, not a webhook.
+    hint = _stage(result, "form_submissions")["hint"]
+    assert "iframe" in hint and "GoHighLevel" in hint
 
 
 @pytest.mark.asyncio
@@ -231,3 +250,60 @@ async def test_a_long_dead_install_reads_as_not_installed(mock_mongo_client, moc
     result = await lc.diagnose(group, mock_mongo_client)
 
     assert _stage(result, "script_installed")["done"] is False
+
+
+# ---------------------------------------------------------------------------
+# A form tool that sends to GoHighLevel
+# ---------------------------------------------------------------------------
+
+def _contact(days_ago=1, ad_id=None):
+    added = (datetime.utcnow() - timedelta(days=days_ago)).isoformat()
+    data = {"dateAdded": added}
+    if ad_id:
+        data["attributionSource"] = {"adId": ad_id, "utmSource": "facebook"}
+    return {"client_group_id": GROUP, "contact_data": data}
+
+
+@pytest.mark.asyncio
+async def test_a_form_tool_client_is_never_asked_to_install_anything(mock_mongo_client, mock_db):
+    group = await _group(mock_db, method=lc.METHOD_FORM_TO_GHL)
+
+    result = await lc.diagnose(group, mock_mongo_client)
+
+    keys = [s["key"] for s in result["stages"]]
+    assert keys == ["ghl_contacts_arriving", "ghl_contacts_attributed"]
+    assert "script_installed" not in keys
+    assert result["next_step"] == "ghl_contacts_arriving"
+
+
+@pytest.mark.asyncio
+async def test_contacts_without_an_ad_id_point_at_the_form_tool(mock_mongo_client, mock_db):
+    group = await _group(mock_db, method=lc.METHOD_FORM_TO_GHL, form_provider="roasform")
+    await mock_db["ghl_contacts"].insert_one(_contact())
+
+    result = await lc.diagnose(group, mock_mongo_client)
+
+    assert _stage(result, "ghl_contacts_arriving")["done"] is True
+    assert result["next_step"] == "ghl_contacts_attributed"
+    hint = _stage(result, "ghl_contacts_attributed")["hint"]
+    assert "ROAS Forms" in hint and "ad id" in hint
+
+
+@pytest.mark.asyncio
+async def test_attributed_contacts_complete_the_form_tool_checklist(mock_mongo_client, mock_db):
+    group = await _group(mock_db, method=lc.METHOD_FORM_TO_GHL)
+    await mock_db["ghl_contacts"].insert_one(_contact(ad_id="120246113041200118"))
+
+    result = await lc.diagnose(group, mock_mongo_client)
+
+    assert result["complete"] is True and result["next_step"] is None
+
+
+@pytest.mark.asyncio
+async def test_old_contacts_do_not_count_as_working_now(mock_mongo_client, mock_db):
+    group = await _group(mock_db, method=lc.METHOD_FORM_TO_GHL)
+    await mock_db["ghl_contacts"].insert_one(_contact(days_ago=lc.LOOKBACK_DAYS + 5, ad_id="1"))
+
+    result = await lc.diagnose(group, mock_mongo_client)
+
+    assert result["next_step"] == "ghl_contacts_arriving"

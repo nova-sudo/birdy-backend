@@ -140,7 +140,7 @@ CLIENTS = [
         "overlap": 0,
         "spend": 489.20,
         "meta_results": 61,
-        "lead_collection": {"method": "external_form", "form_provider": "typeform"},
+        "lead_collection": {"method": "landing_page"},
     },
 ]
 
@@ -398,11 +398,6 @@ async def seed(db, mongo_client) -> None:
             "lead_collection": {
                 **lead_collection_service.DEFAULT,
                 **spec.get("lead_collection", {}),
-                "webhook_secret": (
-                    lead_collection_service.new_webhook_secret()
-                    if spec.get("lead_collection", {}).get("method") == "external_form"
-                    else None
-                ),
             },
             "gohighlevel_cache": {}, "hotprospector_cache": {},
             "hotprospector_call_cache": {},

@@ -227,13 +227,16 @@ async def get_landing_funnel(
                     "This client's leads come from Meta Instant Forms, which never "
                     "send anyone to a page of their own."
                     if method == lead_collection_service.METHOD_INSTANT_FORM else
+                    "This client's form tool sends leads to GoHighLevel, so its "
+                    "pages carry no Birdy script to measure. Leads are attributed "
+                    "from GoHighLevel."
+                    if method == lead_collection_service.METHOD_FORM_TO_GHL else
                     "No landing page activity has reached Birdy for this client yet."
                 ),
             }
 
         funnel = await landing_funnel_service.funnel(
             group_id, start_day, end_day, mongo_client,
-            embedded_form=(method == lead_collection_service.METHOD_EXTERNAL_FORM),
         )
         status = await install_status(group_id, mongo_client)
 
@@ -314,7 +317,10 @@ async def put_lead_collection(
     current_user: str = Depends(get_current_user),
 ):
     """Record how this client collects their leads."""
-    if body.method not in lead_collection_service.METHODS:
+    # An older page may still send the retired "external_form"; it means the
+    # same client, so it is accepted and stored under its new name.
+    if body.method not in (*lead_collection_service.METHODS,
+                           lead_collection_service.METHOD_EXTERNAL_FORM):
         raise HTTPException(
             status_code=400,
             detail="method must be one of: " + ", ".join(lead_collection_service.METHODS),
