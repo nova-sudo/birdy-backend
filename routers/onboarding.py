@@ -156,12 +156,20 @@ class ImportSubaccountsRequest(BaseModel):
 @router.get("/api/onboarding/status")
 async def onboarding_status(current_user: str = Depends(get_current_user)):
     """The wizard gate. Users created before onboarding existed are
-    grandfathered as completed the first time this is read."""
+    grandfathered as completed the first time this is read.
+
+    An admin is never onboarded: their only place in the app is the admin
+    console, and the wizard would have them connect integrations and import
+    clients into an account that should hold none. While impersonating,
+    `current_user` is the agency being viewed — admins cannot impersonate
+    admins — so this only ever answers for the admin's own session.
+    """
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         user_doc = await db["users"].find_one(
             {"user_id": current_user},
             {
+                "role": 1,
                 "onboarding": 1,
                 "integrations.gohighlevel.agency": 1,
                 "name": 1,
@@ -171,6 +179,9 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
         )
         if not user_doc:
             raise HTTPException(status_code=404, detail="User not found")
+
+        if user_doc.get("role") == "admin":
+            return {"completed": True, "admin": True}
 
         onboarding = user_doc.get("onboarding")
         if onboarding is None:
