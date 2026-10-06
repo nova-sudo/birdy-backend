@@ -5,6 +5,7 @@ HotProspector helper / service functions extracted from main.py.
 """
 
 import hashlib
+import os
 import logging
 from collections import Counter
 from datetime import datetime, date, timedelta
@@ -441,6 +442,8 @@ async def fetch_and_cache_hp_call_center(
         client_group_name: str = None,
         mode: str = "backfill",
         recent_days: int = 3,
+        resume: dict | None = None,
+        time_budget: float | None = None,
 ):
     """
     Fetch + cache the full call-center dataset for ONE GHL location: leads
@@ -456,9 +459,32 @@ async def fetch_and_cache_hp_call_center(
     This is the single canonical sync path shared by the endpoint and the cron — it
     replaces the old per-lead (N+1) call-log fetch.
 
+    A sync can be cut short — HotProspector rate-limits hard (~5 requests a
+    minute per method) — so it is resumable and never destructive:
+
+      * `resume` = {"leads_offset": int, "windows_done": [window keys]} picks up
+        a previous partial run: lead pages from that offset, call windows not
+        yet done (see HotProspectorIntegration.call_windows).
+      * Calls fetched this run are MERGED into the ones already stored, and
+        matched against stored leads as well as the ones fetched this run, so a
+        partial run adds to the cache and never replaces it with less.
+      * `last_hp_refresh` is only stamped when the sync is complete. A partial
+        run reports `complete: False` and its `progress` for the next run; it
+        used to stamp the client refreshed with half the leads and no calls,
+        and nothing retried for 24 hours.
+      * `time_budget` (seconds, default 100) stops requesting more before the
+        function timeout and saves what it has. A single rate-limited request
+        can itself back off for up to HP_MAX_TOTAL_BACKOFF (180s), so the
+        budget plus that stays under Vercel's 300s.
+
     Returns:
-        {ghl_location_id, total_leads, total_calls, inbound, outbound, success[, error]}
+        {ghl_location_id, total_leads, total_calls, inbound, outbound, success,
+         complete, progress[, error]}
     """
+    import time as _time
+    budget = time_budget if time_budget is not None else float(os.getenv("HP_SYNC_BUDGET_SECONDS", "100"))
+    deadline = _time.monotonic() + budget
+    resume = resume or {}
     db = mongo_client[DB_NAME]
     client_groups_collection = db["client_groups"]
 
@@ -467,6 +493,7 @@ async def fetch_and_cache_hp_call_center(
             "ghl_location_id": ghl_location_id,
             "total_leads": 0, "total_calls": 0, "inbound": 0, "outbound": 0,
             "success": False, "error": error,
+            "complete": False, "progress": dict(resume),
         }
 
     # Resolve credentials / integration if the caller didn't supply one.
@@ -488,13 +515,11 @@ async def fetch_and_cache_hp_call_center(
         mapping = await get_client_group_mapping(user_id, mongo_client)
         client_group_name = mapping.get(ghl_location_id)
 
-    # 1. Leads for this location — now paginates every page of SearchByUserInput
-    #    up to MAX_PAGES (see integrations/hotprospector.py). `truncated` is
-    #    True when the loop stopped short (page-N failure or MAX_PAGES hit) —
-    #    log-only for visibility; the save function is already safe against
-    #    partial data by default (upsert, never delete missing).
+    # 1. Leads — resuming from where a previous partial run stopped. The save
+    #    is an upsert that never deletes, so pages fetched in earlier runs stay.
     success, leads_info = await integration.fetch_all_leads_from_ghl_location(
-        ghl_location_id, with_meta=True
+        ghl_location_id, with_meta=True,
+        start_offset=int(resume.get("leads_offset") or 0), deadline=deadline,
     )
     if not success:
         logger.warning(f"HP leads fetch failed for {ghl_location_id}: {leads_info}")
@@ -503,35 +528,61 @@ async def fetch_and_cache_hp_call_center(
     hp_leads = leads_info["leads"]
     total_lead_count = leads_info["total_count"]
     leads_truncated = bool(leads_info.get("truncated"))
+    leads_next_offset = leads_info.get("next_offset")
     if leads_truncated:
         logger.warning(
             f"HP leads pagination truncated for {ghl_location_id}: "
-            f"got {len(hp_leads)} of {total_lead_count} — existing leads left in place."
+            f"got {len(hp_leads)} of {total_lead_count}, next run resumes at {leads_next_offset}."
         )
 
-    normalized_leads = [
+    fresh_leads = [
         integration.normalize_lead(lead, ghl_location_id, location_name, client_group_name)
         for lead in hp_leads
     ]
 
-    # 2. Call logs for this location (date-windowed; FetchUserCallLog needs dates).
-    #    - backfill: pull the full history once.
-    #    - incremental: keep the stored history and only re-pull the last few days,
-    #      merging by call identity — so the daily run stops re-fetching ~400 days.
+    # Every lead stored for this location, with fresh copies replacing stale
+    # ones. Calls are matched against all of them: a call for a lead fetched in
+    # an earlier run must not fall into "Unmatched calls" because this run's
+    # pages happened not to include it.
+    db_leads = db["hotprospector_leads"]
+    leads_by_id = {}
+    async for doc in db_leads.find(
+        {"user_id": user_id, "ghl_location_id": ghl_location_id}, {"lead_data": 1}
+    ):
+        lead = doc.get("lead_data") or {}
+        if lead.get("_is_unmatched_bucket") or lead.get("id") is None:
+            continue
+        leads_by_id[str(lead["id"])] = lead
+    for lead in fresh_leads:
+        if lead.get("id") is not None:
+            leads_by_id[str(lead["id"])] = lead
+    normalized_leads = list(leads_by_id.values())
+
+    # 2. Call logs, merged into what is already stored — never replacing it.
+    existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
+    windows_done = set(resume.get("windows_done") or [])
     if mode == "incremental":
-        existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
         rec_ok, recent_raw = await integration.fetch_call_logs_for_location(
             ghl_location_id, lookback_days=recent_days
         )
         if not rec_ok:
             logger.warning(f"HP incremental call fetch failed for {ghl_location_id}")
-        recent_norm = [integration.normalize_user_call_log(raw, location_name) for raw in (recent_raw or [])]
-        normalized_calls = _merge_calls(existing, recent_norm)
+        calls_complete = bool(rec_ok)
+        fetched_raw = recent_raw or []
     else:
-        calls_ok, raw_calls = await integration.fetch_call_logs_for_location(ghl_location_id)
-        if not calls_ok:
-            logger.warning(f"HP call-log fetch failed for {ghl_location_id}")
-        normalized_calls = [integration.normalize_user_call_log(raw, location_name) for raw in (raw_calls or [])]
+        _ok, fetched_raw, call_meta = await integration.fetch_call_logs_for_location(
+            ghl_location_id, skip_windows=windows_done, deadline=deadline, with_meta=True,
+        )
+        windows_done |= set(call_meta["done"])
+        calls_complete = call_meta["complete"]
+    fetched_norm = [integration.normalize_user_call_log(raw, location_name) for raw in fetched_raw]
+    normalized_calls = _merge_calls(existing, fetched_norm)
+
+    complete = calls_complete and not leads_truncated
+    progress = {} if complete else {
+        "leads_offset": leads_next_offset if leads_truncated else int(resume.get("leads_offset") or 0),
+        "windows_done": sorted(windows_done),
+    }
 
     # 3. Nest each call under its lead, matched by phone (then email, then leadId).
     #    Leads with no calls keep an empty list. Calls that match no lead are still
@@ -551,6 +602,7 @@ async def fetch_and_cache_hp_call_center(
             lead_by_key.setdefault(f"lead:{lid}", lead)
 
     for call in normalized_calls:
+        call.pop("matched_lead_id", None)
         match = None
         # Phone match on either leg of the call (the lead's number is one of them).
         for num in (call.get("from_number"), call.get("to_number")):
@@ -642,8 +694,11 @@ async def fetch_and_cache_hp_call_center(
         "hotprospector_cache.metrics.outbound_count": outbound,
         "hotprospector_cache.metrics.answered_calls": answered,
         "hotprospector_cache.metrics.total_talk_min": talk_min,
-        "last_hp_refresh": datetime.utcnow(),
     }
+    # Only a complete sync counts as a refresh. Stamping a partial one made it
+    # look done, so hp-tick waited 24 hours and then fetched only recent days.
+    if complete:
+        set_fields["last_hp_refresh"] = datetime.utcnow()
     for preset, stats in call_cache.items():
         set_fields[f"hotprospector_call_cache.{preset}"] = stats
     set_fields["hotprospector_call_cache.updated_at"] = datetime.utcnow().isoformat()
@@ -666,4 +721,6 @@ async def fetch_and_cache_hp_call_center(
         "inbound": inbound,
         "outbound": outbound,
         "success": True,
+        "complete": complete,
+        "progress": progress,
     }

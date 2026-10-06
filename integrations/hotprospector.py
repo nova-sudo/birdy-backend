@@ -551,7 +551,13 @@ class HotProspectorIntegration:
 
         return False, {"error": "Unexpected response format or no results"}
 
-    async def fetch_all_leads_from_ghl_location(self, ghl_location_id: str, with_meta: bool = False):
+    async def fetch_all_leads_from_ghl_location(
+            self,
+            ghl_location_id: str,
+            with_meta: bool = False,
+            start_offset: int = 0,
+            deadline: float | None = None,
+    ):
         """
         Fetch ALL leads for a GHL location by paginating SearchByUserInput.
 
@@ -583,8 +589,14 @@ class HotProspectorIntegration:
         truncated = False
         first_call_failed = False
 
-        for page_idx in range(MAX_PAGES):
+        first_page = max(0, int(start_offset or 0)) // PAGE_SIZE
+        next_offset = None
+        for page_idx in range(first_page, MAX_PAGES):
             offset = page_idx * PAGE_SIZE
+            if deadline is not None and page_idx > first_page and time.monotonic() > deadline:
+                truncated = True
+                next_offset = offset
+                break
             success, data = await self.search_leads_by_ghl_location(
                 ghl_location_id=ghl_location_id,
                 search_field="",
@@ -595,7 +607,7 @@ class HotProspectorIntegration:
             if not success:
                 # First-page failure → this location is unreachable this run.
                 # Later-page failure → return what we have so far, flagged truncated.
-                if page_idx == 0:
+                if page_idx == first_page:
                     logger.error(f"Failed to fetch leads for location {ghl_location_id}: {data}")
                     first_call_failed = True
                     break
@@ -603,6 +615,7 @@ class HotProspectorIntegration:
                     f"Pagination interrupted at offset={offset} for {ghl_location_id}: {data}"
                 )
                 truncated = True
+                next_offset = offset
                 break
 
             page_leads = data.get("leads", []) if isinstance(data, dict) else []
@@ -619,8 +632,9 @@ class HotProspectorIntegration:
                 new_this_page += 1
 
             # Done when we've collected the full reported total, or when a page
-            # comes back shorter than a full page (last page).
-            if total_count and len(by_id) >= total_count:
+            # comes back shorter than a full page (last page). A resumed run
+            # starts part-way, so the leads before its first page count too.
+            if total_count and first_page * PAGE_SIZE + len(by_id) >= total_count:
                 break
             if len(page_leads) < PAGE_SIZE:
                 break
@@ -631,6 +645,7 @@ class HotProspectorIntegration:
                     f"Pagination at offset={offset} added 0 new leads for {ghl_location_id}; stopping"
                 )
                 truncated = True
+                next_offset = offset + PAGE_SIZE
                 break
         else:
             # Hit MAX_PAGES without finishing — flag truncated so we don't prune.
@@ -645,8 +660,11 @@ class HotProspectorIntegration:
             # get an error dict, not an empty payload masquerading as success.
             return False, {"error": "Failed to fetch leads on first page"}
 
-        if total_count and len(by_id) < total_count:
+        covered = first_page * PAGE_SIZE + len(by_id)
+        if total_count and covered < total_count:
             truncated = True
+            if next_offset is None:
+                next_offset = covered
 
         deduplicated_leads = list(by_id.values())
         logger.info(
@@ -659,6 +677,8 @@ class HotProspectorIntegration:
                 "leads": deduplicated_leads,
                 "total_count": total_count or len(deduplicated_leads),
                 "truncated": truncated,
+                # Where the next run should pick up; None when nothing is left.
+                "next_offset": next_offset if truncated else None,
             }
         return True, deduplicated_leads
 
@@ -773,6 +793,7 @@ class HotProspectorIntegration:
             call_type: str = "",
             page_size: int = 500,
             max_records: int = 100000,
+            deadline: float | None = None,
     ):
         """
         Bulk-fetch ALL call logs for a GHL location via FetchUserCallLog.
@@ -787,17 +808,26 @@ class HotProspectorIntegration:
             page_size: records per request (HP default is 100; we ask for more).
             max_records: hard safety cap so a misbehaving has_more can't loop forever.
 
+            deadline: time.monotonic() after which no further page is requested.
+
         Returns:
             (True, {"call_logs": [...raw...], "inbound_count", "outbound_count",
-                    "total_records"}) on success, else (False, {"error": ...}).
+                    "total_records", "complete"}) on success, else (False, {"error": ...}).
+            `complete` is False when paging stopped early — a failed page after
+            the first, or the deadline — so a caller never mistakes part of a
+            window for all of it.
         """
         all_logs = []
+        complete = True
         offset = 0
         inbound_count = 0
         outbound_count = 0
         total_records = 0
 
         while True:
+            if deadline is not None and all_logs and time.monotonic() > deadline:
+                complete = False
+                break
             payload = {
                 "api_uId": self.api_uid,
                 "api_key": self.api_key,
@@ -819,8 +849,10 @@ class HotProspectorIntegration:
 
             success, result = await self._make_request(payload, use_dedup=False)
             if not success:
-                # If we already pulled some pages, return what we have so far.
+                # If we already pulled some pages, return what we have so far —
+                # flagged incomplete, so the caller retries this window.
                 if all_logs:
+                    complete = False
                     break
                 return False, result
 
@@ -828,6 +860,7 @@ class HotProspectorIntegration:
             body = result[0] if isinstance(result, list) and result else result
             if not isinstance(body, dict) or body.get("response") != "true":
                 if all_logs:
+                    complete = False
                     break
                 return False, {"error": "Unexpected FetchUserCallLog response format"}
 
@@ -854,46 +887,85 @@ class HotProspectorIntegration:
             "inbound_count": inbound_count,
             "outbound_count": outbound_count,
             "total_records": total_records or len(all_logs),
+            "complete": complete,
         }
+
+    # Call-log windows are aligned to a fixed date, so the same window has the
+    # same key on every run and a resumed backfill can skip the ones it has.
+    # (They used to start at today-400, which moved every day.)
+    CALL_WINDOW_ANCHOR = date(2020, 1, 1)
+
+    @classmethod
+    def call_windows(cls, lookback_days: int = 400, window_days: int = 30, today: date | None = None):
+        """[(key, from_date, to_date)] covering the lookback, newest first."""
+        today = today or date.today()
+        oldest = today - timedelta(days=lookback_days)
+        k = (today - cls.CALL_WINDOW_ANCHOR).days // window_days
+        out = []
+        while True:
+            start = cls.CALL_WINDOW_ANCHOR + timedelta(days=k * window_days)
+            end = min(start + timedelta(days=window_days - 1), today)
+            if end < oldest:
+                break
+            out.append((start.isoformat(), max(start, oldest).isoformat(), end.isoformat()))
+            k -= 1
+        return out
 
     async def fetch_call_logs_for_location(
             self,
             ghl_location_id: str,
             lookback_days: int = 400,
             window_days: int = 30,
+            skip_windows=None,
+            deadline: float | None = None,
+            with_meta: bool = False,
     ):
         """
-        Fetch ALL of a location's call logs over the past `lookback_days` by walking
-        <= `window_days` date windows.
+        Fetch a location's call logs over the past `lookback_days`, one
+        <= `window_days` date window at a time.
 
         FetchUserCallLog caps from_date/to_date at a 30-day range, AND with no dates
         it returns only a small default (recent) window — so to get the real history
         we must page through explicit date windows. locationId filtering works fine
         once a date range is supplied.
 
-        Returns (ok, [raw call dicts]).
+        Newest window first, so a run cut short by the rate limit or the
+        deadline has the calls that matter most. `skip_windows` (keys from
+        call_windows) are left out, except the newest, which is always
+        refetched because it is still filling up. A window that fails, or
+        pages only partly, is not reported done — HotProspector's rate limit
+        used to make windows fail silently, and the run still counted as a
+        complete sync.
+
+        Returns (ok, [raw call dicts]), or with with_meta=True
+        (ok, [raw call dicts], {"done": [keys], "failed": [keys], "complete": bool}).
         """
-        end = date.today()
-        start = end - timedelta(days=lookback_days)
-        all_calls = []
+        skip = set(skip_windows or ())
+        windows = self.call_windows(lookback_days, window_days)
+        all_calls, done, failed = [], [], []
         any_ok = False
-        cur = start
-        while cur <= end:
-            win_end = min(cur + timedelta(days=window_days - 1), end)
+        for i, (key, from_d, to_d) in enumerate(windows):
+            if i > 0 and key in skip:
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                failed.append(key)
+                continue
             ok, payload = await self.fetch_user_call_logs(
-                ghl_location_id,
-                from_date=cur.isoformat(),
-                to_date=win_end.isoformat(),
+                ghl_location_id, from_date=from_d, to_date=to_d, deadline=deadline,
             )
             if ok and isinstance(payload, dict):
                 any_ok = True
                 all_calls.extend(payload.get("call_logs", []) or [])
-            cur = win_end + timedelta(days=1)
+                (done if payload.get("complete", True) else failed).append(key)
+            else:
+                failed.append(key)
 
         logger.info(
-            f"Fetched {len(all_calls)} call logs for location {ghl_location_id} "
-            f"over last {lookback_days}d ({window_days}d windows)"
+            f"Fetched {len(all_calls)} call logs for location {ghl_location_id}: "
+            f"{len(done)} windows done, {len(failed)} not, {len(skip)} skipped as already done"
         )
+        if with_meta:
+            return any_ok or not failed, all_calls, {"done": done, "failed": failed, "complete": not failed}
         return any_ok, all_calls
 
     def normalize_call_log(self, call_log: dict):

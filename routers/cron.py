@@ -441,11 +441,21 @@ async def hp_tick(authorization: str | None = Header(default=None)):
         cutoff = now - timedelta(hours=HP_CUTOFF_HOURS)
         stale_lock_before = now - timedelta(minutes=HP_STALE_CLAIM_MINUTES)
 
-        # Atomically claim up to N stale HP-provider groups.
+        # One sync per account at a time. HotProspector rate-limits per API
+        # key (~5 requests a minute per method), and every client of an agency
+        # shares the agency's key: three of its clients syncing at once
+        # throttled each other until every one gave up with partial data.
+        busy_users = set(await client_groups.distinct(
+            "user_id",
+            {"hp_refresh_status": "running", "_hp_claimed_at": {"$gte": stale_lock_before}},
+        ))
+
+        # Atomically claim up to N stale HP-provider groups, from different accounts.
         claimed: list[dict] = []
         for _ in range(HP_GROUPS_PER_TICK):
             doc = await client_groups.find_one_and_update(
                 {
+                    "user_id": {"$nin": list(busy_users)},
                     "call_log_provider": "hotprospector",
                     "ghl_location_id": {"$exists": True, "$ne": None},
                     "$or": [
@@ -472,12 +482,13 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                 sort=[("last_hp_refresh", 1)],  # oldest first
                 projection={
                     "id": 1, "user_id": 1, "name": 1,
-                    "ghl_location_id": 1, "hp_backfill_status": 1,
+                    "ghl_location_id": 1, "hp_backfill_status": 1, "hp_sync_progress": 1,
                 },
             )
             if not doc:
                 break
             claimed.append(doc)
+            busy_users.add(doc["user_id"])
 
         async def _refresh_one(group: dict):
             group_id = group["id"]
@@ -487,19 +498,32 @@ async def hp_tick(authorization: str | None = Header(default=None)):
             mode = "incremental" if group.get("hp_backfill_status") == "complete" else "backfill"
             try:
                 result = await fetch_and_cache_hp_call_center(
-                    user_id, group["ghl_location_id"], mongo_client, mode=mode
+                    user_id, group["ghl_location_id"], mongo_client, mode=mode,
+                    resume=group.get("hp_sync_progress") or None,
                 )
                 if not result.get("success"):
                     raise RuntimeError(result.get("error", "fetch_failed"))
-                set_fields = {"hp_refresh_status": "complete"}
-                if mode == "backfill":
-                    set_fields["hp_backfill_status"] = "complete"
-                await client_groups.update_one(
-                    {"id": group_id},
-                    {"$set": set_fields, "$unset": {"_hp_claimed_at": ""}},
+                if result.get("complete", True):
+                    set_fields = {"hp_refresh_status": "complete"}
+                    if mode == "backfill":
+                        set_fields["hp_backfill_status"] = "complete"
+                    unset = {"_hp_claimed_at": "", "hp_sync_progress": "", "hp_refresh_error": ""}
+                    state = "OK"
+                else:
+                    # Cut short — rate limit or time budget. Not a refresh: the
+                    # group stays stale, so a following tick resumes it from here.
+                    set_fields = {
+                        "hp_refresh_status": "partial",
+                        "hp_sync_progress": result.get("progress") or {},
+                    }
+                    unset = {"_hp_claimed_at": ""}
+                    state = "PARTIAL"
+                await client_groups.update_many(
+                    {"user_id": user_id, "ghl_location_id": group["ghl_location_id"]},
+                    {"$set": set_fields, "$unset": unset},
                 )
                 logger.info(
-                    f"[hp-tick] OK '{name}' ({mode}): {result['total_leads']} leads, "
+                    f"[hp-tick] {state} '{name}' ({mode}): {result['total_leads']} leads, "
                     f"{result['total_calls']} calls"
                 )
                 return True
