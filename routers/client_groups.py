@@ -2968,6 +2968,68 @@ async def update_client_status(
             raise HTTPException(status_code=500, detail=f"Failed to update client status: {str(e)}")
 
 # ---------------------------------------------------------------------------
+# PATCH /api/client-groups/call-log-provider
+# ---------------------------------------------------------------------------
+
+CALL_LOG_PROVIDERS = ("ghl", "hotprospector", NO_CALL_CENTRE)
+
+
+@router.patch("/api/client-groups/call-log-provider")
+async def update_call_log_provider(
+    request: Request,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Set which call centre one or more clients use: "hotprospector", "ghl" or
+    "none".
+
+    The choice was only ever asked when a client was created, so a client set
+    to "none" during onboarding stayed "none" after the agency connected
+    HotProspector — the Sales Hub kept saying "call centre not available" with
+    no way to change it. Body: {"group_ids": [...], "provider": "..."}.
+
+    Switching to HotProspector requires the account to have it connected, and
+    clears the client's HotProspector refresh stamp so the next hp-tick (every
+    minute) pulls its call history straight away.
+    """
+    body = await request.json()
+    provider = str(body.get("provider") or "").strip().lower()
+    group_ids = body.get("group_ids") or []
+
+    if provider not in CALL_LOG_PROVIDERS:
+        raise HTTPException(
+            status_code=400,
+            detail="provider must be one of: " + ", ".join(CALL_LOG_PROVIDERS),
+        )
+    if not isinstance(group_ids, list) or not group_ids or not all(isinstance(g, str) for g in group_ids):
+        raise HTTPException(status_code=400, detail="group_ids must be a non-empty list of client ids")
+
+    async with get_mongo_client() as mongo_client:
+        if provider == "hotprospector":
+            if not await get_hotprospector_credentials(current_user, mongo_client):
+                raise HTTPException(
+                    status_code=400,
+                    detail="Connect HotProspector in Settings → Integrations first.",
+                )
+
+        update = {"call_log_provider": provider, "updated_at": datetime.now()}
+        if provider == "hotprospector":
+            update.update({"last_hp_refresh": None, "hp_refresh_status": None})
+
+        db = mongo_client[DB_NAME]
+        result = await db["client_groups"].update_many(
+            {"id": {"$in": group_ids[:500]}, "user_id": current_user},
+            {"$set": update},
+        )
+
+    logger.info(
+        "call_log_provider=%s for %d of %d groups (%s)",
+        provider, result.matched_count, len(group_ids), current_user,
+    )
+    return {"provider": provider, "updated": result.matched_count}
+
+
+# ---------------------------------------------------------------------------
 # GET /api/leads/filter-options
 # ---------------------------------------------------------------------------
 
