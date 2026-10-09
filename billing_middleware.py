@@ -24,6 +24,33 @@ PLAN_LIMITS = {
 # Only Scale plan users can purchase extra client slots
 EXTRA_CLIENTS_ALLOWED_PLANS = {"scale"}
 
+# The most clients an admin override may grant. A typo of 1000 for 100 is
+# the failure this guards against, not anyone's real need.
+MAX_CLIENT_LIMIT_OVERRIDE = 1000
+
+
+def plan_client_limit(sub: dict | None) -> int:
+    """What the subscription alone allows: the plan's base, plus paid extra
+    slots on plans that sell them. 0 with no active/trialing subscription."""
+    if not sub or sub.get("status") not in ("active", "trialing"):
+        return 0
+    plan_id = sub.get("plan_id", "starter")
+    extra = sub.get("extra_clients_paid", 0) if plan_id in EXTRA_CLIENTS_ALLOWED_PLANS else 0
+    return PLAN_LIMITS.get(plan_id, 0) + extra
+
+
+def override_limit(user: dict | None) -> int | None:
+    """
+    An admin's override of the client limit, or None.
+
+    Kept on users.client_limit_override rather than inside `subscription`: the
+    Whop webhook rewrites the whole subscription document on every event, and
+    would silently erase anything an admin had put there.
+    """
+    o = (user or {}).get("client_limit_override") or {}
+    limit = o.get("limit")
+    return int(limit) if isinstance(limit, (int, float)) and limit >= 0 else None
+
 
 async def _get_subscription_and_count(current_user: str, mongo_client):
     """Return (subscription_doc, current_client_count)."""
@@ -31,11 +58,11 @@ async def _get_subscription_and_count(current_user: str, mongo_client):
 
     user = await db["users"].find_one(
         {"user_id": current_user},
-        projection={"subscription": 1, "_id": 0}
+        projection={"subscription": 1, "client_limit_override": 1, "_id": 0}
     )
     sub   = user.get("subscription") if user else None
     count = await db["client_groups"].count_documents({"user_id": current_user})
-    return sub, count
+    return sub, count, user
 
 
 async def require_active_subscription(current_user: str, mongo_client) -> dict:
@@ -43,7 +70,7 @@ async def require_active_subscription(current_user: str, mongo_client) -> dict:
     Raise 402 if the user has no active/trialing subscription.
     Returns the subscription dict if valid.
     """
-    sub, _ = await _get_subscription_and_count(current_user, mongo_client)
+    sub, _, _user = await _get_subscription_and_count(current_user, mongo_client)
 
     if not sub or sub.get("status") not in ("active", "trialing"):
         raise HTTPException(
@@ -61,10 +88,32 @@ async def check_client_limit(current_user: str, mongo_client):
     Raise 402 if the user is at or over their client group limit.
 
     Limit logic:
+      - Admin override (users.client_limit_override): that number, whatever
+        the subscription says — including no subscription at all.
       - Starter / Growth: base limit only — extra_clients_paid is ignored
       - Scale: base limit (25) + extra_clients_paid purchased slots
     """
-    sub, count = await _get_subscription_and_count(current_user, mongo_client)
+    sub, count, user = await _get_subscription_and_count(current_user, mongo_client)
+
+    override = override_limit(user)
+    if override is not None:
+        if count >= override:
+            raise HTTPException(
+                status_code=402,
+                detail={
+                    "code": "CLIENT_LIMIT_REACHED",
+                    "message": (
+                        f"You've reached your account's limit of {override} clients. "
+                        f"Contact Birdy support to change it."
+                    ),
+                    "current_count": count,
+                    "limit": override,
+                    "plan": (sub or {}).get("plan_id"),
+                    "can_add_extra_slots": False,
+                    "limit_override": True,
+                },
+            )
+        return True
 
     # A brand-new account's very first client group is free — lets someone
     # see Birdy actually work before paying. Every client after this one

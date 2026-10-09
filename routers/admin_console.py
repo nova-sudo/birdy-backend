@@ -44,6 +44,7 @@ from credits import (
     DEFAULT_MODEL,
     MODEL_PRICING,
 )
+from billing_middleware import MAX_CLIENT_LIMIT_OVERRIDE, override_limit, plan_client_limit
 from billing import (
     ACTIVE_STATUSES,
     cancel_membership,
@@ -201,7 +202,8 @@ async def list_agencies(
             ]}
         users = await db["users"].find(
             user_query,
-            {"user_id": 1, "name": 1, "subscription": 1, "created_at": 1, "updated_at": 1, "role": 1},
+            {"user_id": 1, "name": 1, "subscription": 1, "created_at": 1, "updated_at": 1, "role": 1,
+             "client_limit_override": 1},
         ).to_list(None)
 
         # Three aggregations (not per-user) then joined in Python — cheap at
@@ -236,6 +238,15 @@ async def list_agencies(
                 "role": u.get("role", "user"),
                 "plan": _resolve_plan(u.get("subscription")),
                 "sub_accounts": subs.get(uid, 0),
+                # What the subscription allows, the admin override if any, and
+                # the one that applies — check_client_limit enforces the last.
+                "plan_client_limit": plan_client_limit(u.get("subscription")),
+                "client_limit_override": override_limit(u),
+                "client_limit_override_note": (u.get("client_limit_override") or {}).get("note"),
+                "client_limit": (
+                    override_limit(u) if override_limit(u) is not None
+                    else plan_client_limit(u.get("subscription"))
+                ),
                 "leads": leads.get(uid, 0),
                 "ai_queries": q.get("n", 0),
                 "last_active": q.get("last") or u.get("updated_at") or u.get("created_at"),
@@ -244,6 +255,80 @@ async def list_agencies(
         rows.sort(key=lambda r: (r["last_active"] or datetime.min), reverse=True)
         total = len(rows)
         return {"total": total, "agencies": rows[skip: skip + limit]}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Client limit override
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ClientLimitOverride(BaseModel):
+    # None removes the override and puts the account back on its plan's limit.
+    limit: int | None = None
+    note: str | None = None
+
+
+@router.put("/api/admin/agencies/{email}/client-limit")
+async def set_client_limit(
+    email: str,
+    body: ClientLimitOverride,
+    admin_email: str = Depends(require_admin),
+):
+    """
+    Give an account a different number of clients than its plan allows — a
+    pilot, a partner deal, a plan Whop does not sell.
+
+    The override replaces the plan's limit outright and applies with or
+    without a subscription; billing_middleware.check_client_limit enforces it
+    and /api/billing/status reports it. Setting `limit` to null removes it.
+    Lowering it below the account's current client count deletes nothing — it
+    only stops new clients being added. Audited to admin_audit.
+    """
+    target = email.strip().lower()
+    if body.limit is not None and not (0 <= body.limit <= MAX_CLIENT_LIMIT_OVERRIDE):
+        raise HTTPException(
+            status_code=400,
+            detail=f"limit must be between 0 and {MAX_CLIENT_LIMIT_OVERRIDE}, or null to remove it",
+        )
+    note = (body.note or "").strip()[:280] or None
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        user = await db["users"].find_one(
+            {"user_id": target}, {"role": 1, "subscription": 1, "client_limit_override": 1}
+        )
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        if user.get("role") == "admin":
+            raise HTTPException(status_code=400, detail="Admin accounts don't hold clients")
+
+        previous = override_limit(user)
+        if body.limit is None:
+            await db["users"].update_one({"user_id": target}, {"$unset": {"client_limit_override": ""}})
+        else:
+            await db["users"].update_one({"user_id": target}, {"$set": {"client_limit_override": {
+                "limit": body.limit, "note": note, "set_by": admin_email, "set_at": datetime.utcnow(),
+            }}})
+
+        await db["admin_audit"].insert_one({
+            "admin": admin_email,
+            "target": target,
+            "action": "client_limit_override" if body.limit is not None else "client_limit_override_removed",
+            "previous": previous,
+            "limit": body.limit,
+            "note": note,
+            "ts": datetime.utcnow(),
+        })
+        client_count = await db["client_groups"].count_documents({"user_id": target})
+
+    logger.info(f"[admin] {admin_email} set client limit for {target}: {previous} -> {body.limit}")
+    plan_limit = plan_client_limit(user.get("subscription"))
+    return {
+        "email": target,
+        "client_limit_override": body.limit,
+        "plan_client_limit": plan_limit,
+        "client_limit": body.limit if body.limit is not None else plan_limit,
+        "client_count": client_count,
+    }
 
 
 # Collections holding per-user data keyed by a plain `user_id` field —

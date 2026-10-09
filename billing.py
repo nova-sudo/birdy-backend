@@ -70,6 +70,7 @@ except ImportError:  # pragma: no cover
     StandardWebhook = None
 
 from dependencies import get_mongo_client, get_current_user
+from billing_middleware import override_limit
 
 logger = logging.getLogger(__name__)
 
@@ -421,6 +422,11 @@ async def billing_status(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mc:
         sub   = await _get_sub(user_id, mc)
         count = await _client_count(user_id, mc)
+        # An admin override replaces the plan's client limit (see
+        # billing_middleware.check_client_limit, which enforces the same number).
+        override = override_limit(await mc[os.getenv("MONGODB_DB", "birdyaidev")]["users"].find_one(
+            {"user_id": user_id}, {"client_limit_override": 1, "_id": 0}
+        ))
 
         if not sub or sub.get("status") not in ACTIVE_STATUSES:
             return {
@@ -428,7 +434,8 @@ async def billing_status(current_user: str = Depends(get_current_user)):
                 "plan": {"id": "free", "name": "Free", "max_clients": 0},
                 "status": "inactive",
                 "client_count": count,
-                "client_limit": 0,
+                "client_limit": override if override is not None else 0,
+                "client_limit_override": override,
                 "extra_clients_paid": 0,
                 "can_add_extra_slots": False,
                 "current_period_end": None,
@@ -449,7 +456,8 @@ async def billing_status(current_user: str = Depends(get_current_user)):
             "plan": plan,
             "status": sub.get("status"),
             "client_count": count,
-            "client_limit": plan["max_clients"] + extra_paid,
+            "client_limit": override if override is not None else plan["max_clients"] + extra_paid,
+            "client_limit_override": override,
             "extra_clients_paid": extra_paid,
             "can_add_extra_slots": plan["id"] in EXTRA_CLIENTS_ALLOWED_PLANS,
             "current_period_end": sub.get("current_period_end"),
