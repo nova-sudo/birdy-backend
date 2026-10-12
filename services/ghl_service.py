@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import date, datetime
 
 from utils.phone_normalize import compute_match_keys
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from core.database import DB_NAME
 from dependencies import get_mongo_client
@@ -468,8 +468,9 @@ async def fetch_and_cache_ghl_data_optimized(
         ghl_location_id: str,
         user_id: str,
         mongo_client,
-        is_initial_load: bool = True
-):
+        is_initial_load: bool = True,
+        updated_since: Optional[datetime] = None,
+) -> dict:
     """
     CORRECTED: Fetch GHL contacts using NEW /contacts/search endpoint
 
@@ -488,11 +489,26 @@ async def fetch_and_cache_ghl_data_optimized(
         user_id: User ID
         mongo_client: MongoDB client
         is_initial_load: If True, fetch all. If False, incremental update
+        updated_since: Incremental only. Ask GHL for just the contacts whose
+            `dateUpdated` is at or after this instant (new ones *and* edited
+            ones — retagged, attributed, opportunity attached), instead of
+            walking newest-first until a known contact appears. The walk only
+            ever caught new contacts, which is why the hourly tick used to
+            FULL LOAD every location: that was the only way an edit reached
+            Birdy. It also cost the whole cluster — every contact re-upserted
+            every hour, then re-read three times to rebuild the caches.
+
+    Returns a summary: {"mode", "new", "updated", "pruned", "changed"}.
+    `changed` is False when GHL had nothing for us, in which case the derived
+    caches (cohort funnel, daily leads, tag breakdown) are left alone — they
+    are pure functions of the contacts, and the contacts didn't move.
     """
     try:
         db = mongo_client[DB_NAME]
         contacts_collection = db["ghl_contacts"]
         client_groups_collection = db["client_groups"]
+        if is_initial_load:
+            updated_since = None
 
         # Get location info
         subaccount_tokens = await get_subaccount_tokens(user_id, mongo_client)
@@ -516,7 +532,11 @@ async def fetch_and_cache_ghl_data_optimized(
         last_known_contact_date = None
         last_known_contact_id = None
 
-        if not is_initial_load:
+        # With an `updated_since` bound the API already returns only what
+        # changed, so there is no "last known contact" to stop at — and
+        # stopping there would be wrong, since an edited contact can be years
+        # old by dateAdded and still be the first row back.
+        if not is_initial_load and updated_since is None:
             last_contact = await contacts_collection.find_one(
                 {
                     "user_id": user_id,
@@ -574,7 +594,8 @@ async def fetch_and_cache_ghl_data_optimized(
                     ghl_location_id,
                     access_token,
                     page=page,
-                    limit=500
+                    limit=500,
+                    updated_since=updated_since,
                 )
 
                 if not success:
@@ -754,6 +775,7 @@ async def fetch_and_cache_ghl_data_optimized(
         # can only be trusted once every page has been seen: only then does a
         # missing sync_batch_id genuinely mean "gone from GHL" rather than
         # "we didn't get that far".
+        pruned_count = 0
         if is_initial_load:
             if pagination_failed:
                 logger.error(
@@ -772,11 +794,19 @@ async def fetch_and_cache_ghl_data_optimized(
                     user_id, ghl_location_id, sync_batch_id, run_started_at
                 )
             )
+            pruned_count = stale.deleted_count
             logger.info(
                 f"FULL LOAD for {location_name} complete: "
                 f"{total_new_contacts} new, {total_updated_contacts} updated, "
                 f"pruned {stale.deleted_count} no-longer-in-GHL contacts"
             )
+
+        # An incremental run that GHL answered with nothing changes nothing
+        # downstream. A FULL LOAD always counts as a change: it is the only
+        # run that prunes, and its upserts touch every row either way.
+        changed = bool(
+            is_initial_load or total_new_contacts or total_updated_contacts or pruned_count
+        )
 
         # ============================================
         # STEP 5: Update cached tag metrics
@@ -815,35 +845,54 @@ async def fetch_and_cache_ghl_data_optimized(
         except Exception as e:
             logger.warning(f"Failed to cache opp stats presets for {ghl_location_id}: {e}")
 
-        # The dashboard funnel is derived from contacts rather than the
-        # opportunity feed, so it gets its own pass over the same refresh.
-        try:
-            await cache_ghl_cohort_funnel_all_presets(
-                group_id, user_id, ghl_location_id, mongo_client
-            )
-        except Exception as e:
-            logger.warning(f"Failed to cache cohort funnel for {ghl_location_id}: {e}")
+        # The three caches below are each a full pass over this location's
+        # contacts (one find, one find, one $unwind aggregate). They only run
+        # when the contacts changed: on an idle hour they would re-read ~7,000
+        # rows three times to arrive at the numbers already stored.
+        if changed:
+            # The dashboard funnel is derived from contacts rather than the
+            # opportunity feed, so it gets its own pass over the same refresh.
+            try:
+                await cache_ghl_cohort_funnel_all_presets(
+                    group_id, user_id, ghl_location_id, mongo_client
+                )
+            except Exception as e:
+                logger.warning(f"Failed to cache cohort funnel for {ghl_location_id}: {e}")
 
-        # Daily lead counts for the Leads page chart — see ghl_daily_leads.py.
-        # A local count over the contacts just synced above, not a fetch, so
-        # it's cheap enough to run on every refresh alongside the others.
-        try:
-            from services.ghl_daily_leads import cache_ghl_daily_leads
-            await cache_ghl_daily_leads(
-                group_id, user_id, ghl_location_id, mongo_client
-            )
-        except Exception as e:
-            logger.warning(f"Failed to cache daily leads for {ghl_location_id}: {e}")
+            # Daily lead counts for the Leads page chart — see ghl_daily_leads.py.
+            # A local count over the contacts just synced above, not a fetch.
+            try:
+                from services.ghl_daily_leads import cache_ghl_daily_leads
+                await cache_ghl_daily_leads(
+                    group_id, user_id, ghl_location_id, mongo_client
+                )
+            except Exception as e:
+                logger.warning(f"Failed to cache daily leads for {ghl_location_id}: {e}")
 
-        # Windowed tag counts for the Clients-page tag columns. Same
-        # fire-and-forget shape as the daily-leads cache above: a failure
-        # leaves the previous rows in place and costs a stale tag column,
-        # never a failed refresh.
+            # Windowed tag counts for the Clients-page tag columns. Same
+            # fire-and-forget shape as the daily-leads cache above: a failure
+            # leaves the previous rows in place and costs a stale tag column,
+            # never a failed refresh.
+            try:
+                from services.ghl_tag_cache import cache_group_tag_breakdown
+                await cache_group_tag_breakdown(user_id, group_id, mongo_client)
+            except Exception as e:
+                logger.warning(f"Failed to cache tag breakdown for {group_id}: {e}")
+
+        # The lifetime tag counts on the group doc are the "maximum" row of
+        # the tag cache just rebuilt — counted from the database, so an
+        # incremental run that re-saw an existing contact's tags does not add
+        # them a second time. The merge of the run's counter with the stored
+        # counts above is only the fallback for a group without a cache row.
         try:
-            from services.ghl_tag_cache import cache_group_tag_breakdown
-            await cache_group_tag_breakdown(user_id, group_id, mongo_client)
+            from services.ghl_tag_cache import COLLECTION as TAG_CACHE
+            cached_max = await db[TAG_CACHE].find_one(
+                {"group_id": group_id, "preset": "maximum"}, {"tags": 1}
+            )
+            if cached_max and isinstance(cached_max.get("tags"), dict):
+                tag_metrics = cached_max["tags"]
         except Exception as e:
-            logger.warning(f"Failed to cache tag breakdown for {group_id}: {e}")
+            logger.warning(f"Could not read cached tag totals for {group_id}: {e}")
 
         # Read back opp stats — prefer fresh "maximum" from ghl_opp_cache, fall back to existing
         opp_stats = {"won": 0, "lost": 0, "open": 0, "abandoned": 0,
@@ -899,6 +948,14 @@ async def fetch_and_cache_ghl_data_optimized(
         if tag_metrics:
             top_tags = list(tag_metrics.items())[:5]
             logger.info(f"Top tags: {top_tags}")
+
+        return {
+            "mode": mode,
+            "new": total_new_contacts,
+            "updated": total_updated_contacts,
+            "pruned": pruned_count,
+            "changed": changed,
+        }
 
     except Exception as e:
         logger.error(f"Error in fetch_and_cache_ghl_data_optimized: {e}", exc_info=True)

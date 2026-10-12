@@ -1,13 +1,25 @@
 import httpx
 import json
 import urllib.parse
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import logging
 import os
 from dotenv import load_dotenv
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from typing import Optional, Dict, Tuple, List
+
+
+def _ghl_iso_utc(moment: datetime) -> str:
+    """
+    Render a datetime the way GHL's search filters expect it:
+    `2026-10-12T17:00:00.000Z`. Naive values are taken as UTC, which is what
+    every timestamp the sync stores is.
+    """
+    if moment.tzinfo is not None:
+        moment = moment.astimezone(timezone.utc).replace(tzinfo=None)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
 
 # Load environment variables
 load_dotenv()
@@ -680,10 +692,17 @@ class GHLIntegration:
             location_id: str,
             access_token: str,
             page: int = 1,
-            limit: int = 500
+            limit: int = 500,
+            updated_since: Optional[datetime] = None,
     ) -> Tuple[bool, Dict]:
         """
         NEW METHOD: Fetch contacts using the /contacts/search endpoint
+
+        `updated_since` narrows the search to contacts whose `dateUpdated` is
+        at or after that instant, newest-updated first. That is what makes an
+        hourly refresh cheap: a 7,000-contact location has a few dozen
+        contacts touched in the last hour, and only those come back. Without
+        it the endpoint returns every contact in the location.
 
         ACTUAL API RESPONSE FORMAT:
         {
@@ -730,6 +749,16 @@ class GHLIntegration:
                 "pageLimit": limit,
                 "page": page
             }
+            if updated_since is not None:
+                # Verified against the live endpoint: date fields accept only
+                # the `range` operator (a bare `gte` is rejected with 422), and
+                # the bound is an ISO-8601 UTC string with milliseconds.
+                payload["filters"] = [{
+                    "field": "dateUpdated",
+                    "operator": "range",
+                    "value": {"gte": _ghl_iso_utc(updated_since)},
+                }]
+                payload["sort"] = [{"field": "dateUpdated", "direction": "desc"}]
 
             # Retry a timed-out/dropped request a couple of times before giving
             # up — a single slow page used to kill the whole FULL LOAD (see

@@ -15,7 +15,9 @@ max_seconds parameter).
 
 Endpoints (Vercel crons invoke with GET):
     GET /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
-    GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence)
+    GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence:
+                                                    incremental, with one FULL
+                                                    LOAD per group per day)
     GET /api/cron/hp-tick           — every 1 min  (HotProspector data, daily cadence)
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
@@ -56,7 +58,10 @@ router = APIRouter(prefix="/api/cron", tags=["cron"])
 # How many groups to claim per tick (parallel within one Vercel invocation).
 # Bounded by 300s function timeout / worst-case single-group runtime.
 META_GROUPS_PER_TICK = 5
-GHL_GROUPS_PER_TICK = 5
+# Two, not five. Five full-location syncs at once was most of a CPU alert on
+# the dev cluster; now that the hourly run is incremental the tick is short
+# enough that two per minute still clears every group well inside an hour.
+GHL_GROUPS_PER_TICK = 2
 
 # Wall-clock budget passed to execute_refresh per claimed Meta job.
 # Leaves headroom for the function's own startup/shutdown overhead.
@@ -66,6 +71,16 @@ META_BUDGET_PER_JOB_SECONDS = 250
 META_ONGOING_CUTOFF_HOURS = 5
 META_STATIC_CUTOFF_HOURS = 24 * 28  # ~monthly; static presets only change at period boundaries
 GHL_CUTOFF_HOURS = 1
+# How often a group gets a FULL LOAD instead of the hourly incremental pass.
+# The incremental pass asks GHL only for contacts updated since the last run,
+# which catches new and edited contacts but not deleted ones — only a full
+# walk can notice that GHL stopped returning a contact and prune it.
+GHL_FULL_RELOAD_HOURS = 24
+# The incremental window starts this long before the previous run's stamp,
+# so a contact edited while that run was in flight, or a clock a little
+# behind GHL's, is picked up on the next pass rather than lost until the
+# daily full load. Re-seeing a contact is an idempotent upsert.
+GHL_INCREMENTAL_OVERLAP_MINUTES = 15
 
 # Stale-claim recovery — a group stuck in "running" for longer than this is
 # considered crashed and may be retried.
@@ -251,10 +266,36 @@ async def meta_static_tick(authorization: str | None = Header(default=None)):
 # GHL data refresh — 1-hour cadence (matches the legacy APScheduler)
 # ---------------------------------------------------------------------------
 
+def ghl_refresh_plan(group: dict, now: datetime) -> tuple[bool, datetime | None]:
+    """
+    Decide how the tick refreshes one claimed group.
+
+    Returns (full_load, updated_since). A FULL LOAD when the group has never
+    had one or its last one is older than GHL_FULL_RELOAD_HOURS; otherwise an
+    incremental pass bounded at the previous refresh minus the overlap. A
+    group that was never refreshed at all has nothing to bound by and gets a
+    FULL LOAD too, which is also what the create path would have done.
+    """
+    last_full = group.get("last_ghl_full_refresh")
+    last_any = group.get("last_ghl_refresh")
+    if last_full is None or last_any is None:
+        return True, None
+    if now - last_full >= timedelta(hours=GHL_FULL_RELOAD_HOURS):
+        return True, None
+    return False, last_any - timedelta(minutes=GHL_INCREMENTAL_OVERLAP_MINUTES)
+
+
 @router.get("/ghl-tick")
 async def ghl_tick(authorization: str | None = Header(default=None)):
     """
     Refreshes GHL data for the stalest groups. Runs every minute.
+
+    Hourly runs are incremental — GHL is asked only for contacts updated since
+    the previous run — and each group gets one FULL LOAD a day for the prune
+    (see ghl_refresh_plan). Before this every run was a FULL LOAD: 213k
+    contacts re-upserted every hour and the derived caches rebuilt from three
+    more passes over them, which is what kept tripping Atlas's query-targeting
+    and CPU alerts.
 
     GHL doesn't have a separate job state machine (it's faster per group
     than Meta), so this uses an inline claim via a status flag on the
@@ -340,6 +381,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                 projection={
                     "id": 1, "user_id": 1, "name": 1,
                     "ghl_location_id": 1,
+                    "last_ghl_refresh": 1, "last_ghl_full_refresh": 1,
                 },
             )
             if not doc:
@@ -350,25 +392,33 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
             group_id = group["id"]
             user_id = group["user_id"]
             name = group.get("name", group_id)
+            full_load, updated_since = ghl_refresh_plan(group, now)
             try:
-                await fetch_and_cache_ghl_data_optimized(
+                summary = await fetch_and_cache_ghl_data_optimized(
                     group_id=group_id,
                     ghl_location_id=group["ghl_location_id"],
                     user_id=user_id,
                     mongo_client=mongo_client,
-                    is_initial_load=True,
+                    is_initial_load=full_load,
+                    updated_since=updated_since,
                 )
+                finished = datetime.utcnow()
+                stamps = {
+                    "ghl_refresh_status": "complete",
+                    "last_ghl_refresh": finished,
+                }
+                if full_load:
+                    stamps["last_ghl_full_refresh"] = finished
                 await client_groups.update_one(
                     {"id": group_id},
-                    {
-                        "$set": {
-                            "ghl_refresh_status": "complete",
-                            "last_ghl_refresh": datetime.utcnow(),
-                        },
-                        "$unset": {"_ghl_claimed_at": ""},
-                    },
+                    {"$set": stamps, "$unset": {"_ghl_claimed_at": ""}},
                 )
-                logger.info(f"[ghl-tick] OK '{name}'")
+                logger.info(
+                    "[ghl-tick] OK '%s' (%s: %s new, %s updated, %s pruned)",
+                    name, (summary or {}).get("mode", "FULL LOAD" if full_load else "INCREMENTAL"),
+                    (summary or {}).get("new", "?"), (summary or {}).get("updated", "?"),
+                    (summary or {}).get("pruned", "?"),
+                )
                 return True
             except Exception as e:
                 err = str(e)[:200]
