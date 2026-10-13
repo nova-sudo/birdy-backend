@@ -316,3 +316,27 @@ def test_small_slips_are_fitted():
     assert t["blocks"][0]["caption"] == "Clients"
     assert t["blocks"][1]["birdy_data"]["metrics"] == ["spend", "leads", "cpl"]
     assert notes == ["Client cards fit 3 numbers each, so they show the first three you picked."]
+
+
+async def test_empty_placeholders_leave_no_stubs(mock_db):
+    await _seed(mock_db, [_group("g1", "Glow Clinic", 120, 12), _group("g2", "Bright Smiles", 60, 3)])
+    blocks, _ = await rendered(mock_db, {"type": "section", "text":
+        "• *Spend:* {{spend}} (Change: {{spend show=change}})\n• *Leads:* {{leads}} · {{leads show=change}}\n"
+        "• *Top:*\n  {{ranking metric=cpl order=best limit=2}}\nKeep (this) one"})
+    assert blocks[0]["text"]["text"] == ("• *Spend:* £180\n• *Leads:* 15\n• *Top:*\n"
+                                         "1. Glow Clinic · £10.00\n2. Bright Smiles · £20.00\nKeep (this) one")
+
+
+async def test_take_with_a_quoted_focus_is_written(mock_db, monkeypatch):
+    import services.report_template as core
+    seen = {}
+
+    async def fake_core_take(db, user_id, template, report_text):
+        seen["has_take"] = core.has_take(template) is not None
+        seen["focus"] = core.has_take(template)["opts"].get("focus")
+        return "x"
+
+    monkeypatch.setattr(core, "write_take", fake_core_take)
+    t = V({"type": "section", "text": '*Take:* {{birdy_take focus="ad performance and sales"}}'})
+    assert await rb.write_take(mock_db, USER, t, "report") == "x"
+    assert seen == {"has_take": True, "focus": "ad performance and sales"}

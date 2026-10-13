@@ -804,12 +804,19 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
         for tok in core.parse_tokens(s):
             out.append(core._escape(s[last:tok["start"]]) if md else s[last:tok["start"]])
             value = (take or "") if tok["name"] == "birdy_take" else core._resolve(tok, ctx)
-            if value.startswith("\n") and "".join(out).endswith("\n"):
-                value = value[1:]
+            if value.startswith("\n") and "".join(out).rstrip(" \t").endswith("\n"):
+                value = value[1:]  # a list already on its own line: no extra break, no stray indent
+                if out:
+                    out[-1] = out[-1].rstrip(" \t")
             out.append(core._escape(value) if md else value)
             last = tok["end"]
         out.append(core._escape(s[last:]) if md else s[last:])
-        text = re.sub(r"[ \t]+(\n|$)", r"\1", "".join(out))
+        text = "".join(out)
+        # A placeholder with nothing to say yet (a change on the first report, a
+        # missing target) leaves its wrapper behind: "(Change: )", "()", "· ".
+        text = re.sub(r"[ \t]*\((?:[^()\n:]{0,30}:)?[ \t]*\)", "", text)
+        text = re.sub(r"[ \t]*[·|][ \t]*(?=\n|$)", "", text)
+        text = re.sub(r"[ \t]+(\n|$)", r"\1", text)
         return re.sub(r"\n{3,}", "\n\n", text).strip() or " "
 
     blocks = []
@@ -877,9 +884,10 @@ async def write_take(db, user_id: str, template: dict, report_text: str) -> str 
     tok = has_take(template)
     if not tok:
         return None
-    return await core.write_take(db, user_id, {"frequency": template["frequency"],
-                                               "body": json.dumps(template.get("blocks"), ensure_ascii=False)},
-                                 report_text)
+    # The raw strings, not a JSON dump: JSON escapes the quotes in
+    # {{birdy_take focus="..."}}, and the placeholder then no longer parses.
+    body = "\n".join(text for _, text in _strings(template.get("blocks") or []))
+    return await core.write_take(db, user_id, {"frequency": template["frequency"], "body": body}, report_text)
 
 
 # ── For the copilot ───────────────────────────────────────────────────────────
