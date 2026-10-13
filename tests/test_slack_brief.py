@@ -105,6 +105,12 @@ async def _seed(db, *, slack=True, brief=DAILY_9AM, groups=None, tz="Europe/Lond
         await db["client_groups"].insert_many(groups)
 
 
+async def _render(db, brief, now):
+    template = rt.normalize(brief)
+    ctx = await rt.build_context(db, "agency@x.com", template, now)
+    return ctx, rt.render(template, ctx)[1]
+
+
 async def test_legacy_brief_renders_the_chosen_sections_with_real_figures(mock_db):
     await _seed(mock_db)
     await mock_db["alert_notifications"].insert_many([
@@ -115,16 +121,14 @@ async def test_legacy_brief_renders_the_chosen_sections_with_real_figures(mock_d
         "user_id": "agency@x.com", "status": "open", "action": {"type": "pause_ads"},
         "title": "Pause underperforming ad — Summer Promo", "client_name": "Glow Clinic"})
 
-    template = rt.normalize(DAILY_9AM)
-    data = await rt.gather(mock_db, "agency@x.com", template, utc(2026, 9, 30, 8, 0))
-    _, text = rt.render(template, data)
+    ctx, text = await _render(mock_db, DAILY_9AM, utc(2026, 9, 30, 8, 0))
 
-    assert data["clients"] == 2                       # the inactive client is left out
-    assert "Birdy daily brief · Yesterday" in text
+    assert len(ctx.groups) == 2                        # the inactive client is left out
+    assert "Birdy brief · Yesterday" in text
     assert "*Ad spend:* £180" in text
     assert "*Leads:* 15" in text and "*Cost per lead:* £12.00" in text
-    assert "*Close rate:* 20.0%" in text              # 3 won of 15 opportunities
-    assert "Glow Clinic (12)" in text                  # top performer by leads
+    assert "*Close rate:* 20.0%" in text               # 3 won of 15 opportunities
+    assert "Glow Clinic (12)" in text                   # top performer by leads
     assert "1 triggered · [Glow Clinic] CPL above £10" in text
     assert "1 flagged · Summer Promo" in text
 
@@ -135,24 +139,17 @@ async def test_never_reports_lifetime_closes_as_yesterdays(mock_db):
     g["ghl_opp_cache"] = {"maximum": {"won": 999, "total_opportunities": 9999}}
     await _seed(mock_db, groups=[g])
 
-    template = rt.normalize(DAILY_9AM)
-    data = await rt.gather(mock_db, "agency@x.com", template, utc(2026, 9, 30, 8, 0))
-    _, text = rt.render(template, data)
+    _, text = await _render(mock_db, DAILY_9AM, utc(2026, 9, 30, 8, 0))
 
-    assert "*Close rate:* no data for this period" in text
+    assert "*Close rate:* no data" in text
     assert "999" not in text
 
 
-def test_empty_sections_say_so():
-    template = {**rt.normalize({**DAILY_9AM, "frequency": "weekly"})}
-    data = {"label": "Last 7 days", "prev_label": "the week before", "currency": "USD", "clients": 1,
-            "sections": [
-                {"type": "ranking", "metric": "leads", "direction": "best", "limit": 1, "rows": []},
-                {"type": "alerts", "alerts": []},
-                {"type": "underperforming_ads", "flagged": []},
-            ]}
-    _, text = rt.render(template, data)
-    assert "Birdy weekly brief · Last 7 days" in text
+async def test_empty_sections_say_so(mock_db):
+    await _seed(mock_db, groups=[_group("g1", "Quiet", 0, 0)])
+    brief = {"frequency": "weekly", "time": "9:00 AM", "items": {"top": True, "alerts": True, "underperform": True}}
+    _, text = await _render(mock_db, brief, utc(2026, 9, 28, 8, 0))
+    assert "Birdy brief · Last 7 days" in text
     assert "no client has data for this period" in text
     assert "none triggered" in text
     assert "none flagged" in text

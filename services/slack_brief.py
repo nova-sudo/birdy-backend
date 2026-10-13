@@ -5,9 +5,9 @@ The scheduled Slack brief: the daily or weekly summary each account chooses in
 onboarding / Settings (users.integrations.slack_bot.brief) and receives in the
 channel Birdy posts suggestions to.
 
-What the brief contains is a template (services/report_template.py): the
-report copilot designs it with the user, older six-checkbox briefs are
-converted on read, and one renderer turns either into Slack blocks.
+What the brief says is a Block Kit message with live placeholders and data
+blocks (services/report_blocks.py), written by the user or the report
+copilot; older briefs are converted on read, and one renderer fills them all.
 
 A cron tick (hourly) calls send_due_briefs(). A brief is due when the user's
 local clock has passed the chosen time on a matching day and that period has
@@ -35,7 +35,7 @@ import logging
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from services import report_template as rt
+from services import report_blocks as rt
 
 logger = logging.getLogger(__name__)
 
@@ -114,16 +114,16 @@ async def send_brief(db, user_id: str, brief: dict, now_utc: datetime,
     if not bot_token or not channel_id:
         return SKIPPED
 
-    data = await rt.gather(db, user_id, template, now_utc)
-    if not data["clients"]:
-        logger.info("slack brief: %s has no active clients — skipping", user_id)
-        return SKIPPED
-
     frequency = template["frequency"]
     period_key = period_key or now_utc.date().isoformat()
     previous = rt.previous_for(last_figures, period_key, frequency)
-    take = await rt.write_take(db, user_id, template, rt.section_lines(data, previous))
-    blocks, fallback = rt.render(template, data, previous, take=take)
+    ctx = await rt.build_context(db, user_id, template, now_utc, previous=previous)
+    if not ctx.groups:
+        logger.info("slack brief: %s has no active clients — skipping", user_id)
+        return SKIPPED
+
+    take = await rt.write_take(db, user_id, template, rt.render(template, ctx)[1])
+    blocks, fallback = rt.render(template, ctx, take=take)
 
     from slack_sdk.web.async_client import AsyncWebClient
     try:
@@ -136,7 +136,7 @@ async def send_brief(db, user_id: str, brief: dict, now_utc: datetime,
 
     await db["users"].update_one(
         {"user_id": user_id},
-        {"$set": {"integrations.slack_bot.brief_last_figures": rt.snapshot(data, period_key, frequency)}},
+        {"$set": {"integrations.slack_bot.brief_last_figures": rt.snapshot(ctx, period_key)}},
     )
     return SENT
 

@@ -353,11 +353,11 @@ async def set_slack_brief(
     """
     Three shapes, newest first:
 
-      · {template}                — what the report copilot designed; stored whole.
-      · {frequency, time, day}    — a schedule change (Settings); keeps the sections.
-      · {frequency, ..., items}   — the old six checkboxes; converted to a template.
+      · {template}                — the report (Block Kit blocks + schedule); stored whole.
+      · {frequency, time, day}    — a schedule change (Settings); keeps the blocks.
+      · {frequency, ..., items}   — the old six checkboxes; converted to blocks.
     """
-    from services import report_template as rt
+    from services import report_blocks as rt
 
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
@@ -375,18 +375,16 @@ async def set_slack_brief(
                 raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
             if body.items is not None:
                 items = {key: bool(body.items.get(key, key != "underperform")) for key in BRIEF_ITEM_KEYS}
-                sections = rt.from_legacy({"items": items})["sections"]
+                blocks = rt.normalize({"frequency": body.frequency, "items": items})["blocks"]
             else:
                 current = rt.normalize(slack_bot.get("brief"))
-                sections = (current or {}).get("sections") or rt.default_template()["sections"]
-            current_title = (rt.normalize(slack_bot.get("brief")) or {}).get("title")
-            raw = {"frequency": body.frequency, "time": body.time, "day": body.day,
-                   "title": current_title, "sections": sections}
+                blocks = (current or {}).get("blocks") or rt.default_template()["blocks"]
+            raw = {"frequency": body.frequency, "time": body.time, "day": body.day, "blocks": blocks}
 
-        client_ids = {g["id"] async for g in db["client_groups"].find(
-            {"user_id": current_user}, {"_id": 0, "id": 1}) if g.get("id")}
+        names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
+            {"user_id": current_user}, {"_id": 0, "id": 1, "name": 1}) if g.get("id")}
         try:
-            brief = rt.validate(raw, client_ids)
+            brief = rt.validate(raw, names)
         except rt.TemplateError as e:
             raise HTTPException(status_code=400, detail={"errors": e.errors})
         brief["updated_at"] = datetime.utcnow()

@@ -114,7 +114,7 @@ async def get_slack_bot_status(db, user_id: str) -> dict | None:
 
 
 def _brief_for_status(brief: dict | None) -> dict | None:
-    from services.report_template import has_content, normalize
+    from services.report_blocks import has_content, normalize
     template = normalize(brief)
     if not has_content(template):
         return None

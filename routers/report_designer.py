@@ -22,7 +22,7 @@ from pydantic import BaseModel
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
-from services import report_template as rt
+from services import report_blocks as rt
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +48,14 @@ async def _clients(db, user_id: str) -> list[dict]:
     ).to_list(length=1000)
 
 
+async def client_names(db, user_id: str) -> dict[str, str]:
+    return {c["id"]: c.get("name") or "" for c in await _clients(db, user_id) if c.get("id")}
+
+
 async def load_draft(db, user_id: str) -> Optional[dict]:
     doc = await db[DRAFTS].find_one({"user_id": user_id}, {"_id": 0, "template": 1})
-    return (doc or {}).get("template")
+    template = rt.normalize((doc or {}).get("template"))
+    return template if rt.has_content(template) else None
 
 
 async def save_draft(db, user_id: str, template: dict) -> None:
@@ -65,32 +70,30 @@ async def saved_brief(db, user_id: str) -> Optional[dict]:
     user = await db["users"].find_one({"user_id": user_id}, {"integrations.slack_bot.brief": 1}) or {}
     brief = ((user.get("integrations") or {}).get("slack_bot") or {}).get("brief")
     template = rt.normalize(brief)
+    if template:
+        template.pop("updated_at", None)
     return template if rt.has_content(template) else None
 
 
 async def preview_payload(db, user_id: str, template: dict) -> dict:
     """The rendered message, with real figures when there are any to show."""
-    now = datetime.now(timezone.utc)
-    data = await rt.gather(db, user_id, template, now)
-    has_figures = any(
-        (s["type"] == "metric" and s.get("value") is not None) or (s["type"] == "ranking" and s.get("rows"))
-        for s in data["sections"]
-    )
-    sample = False
-    if not has_figures:
-        clients = await _clients(db, user_id)
-        user = await db["users"].find_one({"user_id": user_id}, {"default_currency": 1}) or {}
-        data = rt.sample_data(template, user.get("default_currency") or "GBP",
-                              {c["id"]: c.get("name") or "Client" for c in clients})
-        sample = True
-
+    ctx = await rt.build_context(db, user_id, template, datetime.now(timezone.utc),
+                                  allow_sample=True, preview=True)
     take = rt.has_take(template)
     placeholder = None
     if take:
+        focus = take["opts"].get("focus")
         placeholder = ("Birdy writes two or three sentences here each time the report goes out"
-                       + (f", focused on {take['focus']}." if take.get("focus") else "."))
-    blocks, text = rt.render(template, data, previous=None, take_placeholder=placeholder)
-    return {"blocks": blocks, "text": text, "sample": sample, "template": template}
+                       + (f", focused on {focus}." if focus else "."))
+    blocks, text = rt.render(template, ctx, take=placeholder)
+    return {"blocks": blocks, "text": text, "sample": ctx.sample, "template": template}
+
+
+def _validate(template: dict, names: dict[str, str]) -> dict:
+    try:
+        return rt.validate(template, names)
+    except rt.TemplateError as e:
+        raise HTTPException(status_code=400, detail={"errors": e.errors})
 
 
 @router.get("/api/report-designer/state")
@@ -102,6 +105,8 @@ async def state(current_user: str = Depends(get_current_user)):
             "brief": await saved_brief(db, current_user),
             "draft": await load_draft(db, current_user),
             "catalog": rt.catalog_for(rt.sources_connected(clients)),
+            "periods": rt.periods_for_ui(),
+            "daily_metrics": [{"id": k, "label": v["label"]} for k, v in rt.DAILY_METRICS.items()],
             "clients": [{"id": c["id"], "name": c.get("name")} for c in clients],
         }
 
@@ -113,11 +118,7 @@ async def put_draft(body: DraftBody, current_user: str = Depends(get_current_use
         if body.template is None:
             template = await saved_brief(db, current_user) or rt.default_template()
         else:
-            clients = await _clients(db, current_user)
-            try:
-                template = rt.validate(body.template, {c["id"] for c in clients})
-            except rt.TemplateError as e:
-                raise HTTPException(status_code=400, detail={"errors": e.errors})
+            template = _validate(body.template, await client_names(db, current_user))
         await save_draft(db, current_user, template)
         return {"draft": template}
 
@@ -134,9 +135,5 @@ async def preview(body: PreviewBody, current_user: str = Depends(get_current_use
                     return {"blocks": [], "text": "", "sample": False, "template": None}
                 template = rt.default_template()
         else:
-            clients = await _clients(db, current_user)
-            try:
-                template = rt.validate(body.template, {c["id"] for c in clients})
-            except rt.TemplateError as e:
-                raise HTTPException(status_code=400, detail={"errors": e.errors})
+            template = _validate(body.template, await client_names(db, current_user))
         return await preview_payload(db, current_user, template)

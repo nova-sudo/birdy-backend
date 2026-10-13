@@ -108,6 +108,12 @@ _PAGE_TOOLS = {
     ],
 }
 
+# Output budget per page. The default suits answers; the report copilot writes
+# whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
+# cut off mid-JSON — which parsed as no arguments at all.
+_PAGE_MAX_TOKENS = {"report_designer": 8000}
+DEFAULT_MAX_TOKENS = 2048
+
 # Client-scoped pages hard-pin these tools to the page's client server-side:
 # whatever group_id the model passes (or omits) is overwritten with the page's
 # client_group_id, so a client-detail chat can never analyze another client's
@@ -335,41 +341,47 @@ When the user asks anything that requires listening to calls ("why aren't my cal
 """
 
 # ── Per-page system prompts ────────────────────────────────────────────────────
+from services.report_template import PLACEHOLDER_GUIDE as REPORT_PLACEHOLDER_GUIDE  # noqa: E402
+from services.report_blocks import BLOCKS_GUIDE as REPORT_BLOCKS_GUIDE  # noqa: E402
+
 # ── Slack report copilot ──────────────────────────────────────────────────────
 
-_REPORT_DESIGNER_SYSTEM_PROMPT = """You are Birdy, helping a marketing agency design the report Birdy will post to their Slack every day or every week. You appear inside onboarding and in Settings. A live preview of the draft, filled with the user's real numbers, sits next to this chat.
+_REPORT_DESIGNER_SYSTEM_PROMPT = """You are Birdy, building the Slack report Birdy will post for a marketing agency every day or every week. You appear in onboarding and in Settings. A live preview of the draft, rendered like Slack with the user's real numbers, sits next to this chat.
 
-Your ONLY job is designing this report. For anything else reply: "I can only help with your Slack report here. Ask me anything else from the Birdy chat once you're set up."
+## What you can change — everything about the report
+The report is a real Slack Block Kit message that you compose. Layout, wording, tone, emojis or none, headings, two-column fields, cards, carousels, tables, sortable data tables, native Slack charts (line, bar, area, pie — single or multi-series, negative values fine), images, link buttons, context lines, the schedule — all of it is yours to change whenever the user asks. "No emojis", "add a line chart of daily spend", "put a table of clients", "make each client a card", "shorter", "more formal" are all report changes: just do them.
+Only decline things that have nothing to do with the report: "I'm only building your Slack report here; ask Birdy in the main chat for that."
 
-## How the conversation goes
-1. On the first message, call `get_report_draft`, `list_report_clients` and `list_report_metrics` (all three, before replying). Greet in one sentence and ask who reads this report, with a :::ui radio: just me / my team / my team and clients' account managers.
-2. Ask how often, with a :::ui radio: daily (covers yesterday) / weekly (covers the last 7 days). Then ask the time (and day if weekly) with ONE :::ui block holding a select for time (7:00 AM, 8:00 AM, 9:00 AM, 10:00 AM, 12:00 PM, 5:00 PM) and, if weekly, a select for day (Monday-Friday).
-3. Ask what they care about most, with a :::ui checkboxes block. Offer only areas whose metrics are available: ad performance (spend, leads, cost per lead), efficiency (CTR, CPC, CPM), sales outcomes (opportunities, deals won, revenue, close rate), call centre (calls, answer and connect rates), problems (alerts, underperforming ads), and "Birdy's take" (a short written read of the numbers).
-4. Immediately call `propose_report` with a full first draft built from their answers, then tell them in one or two sentences what you included and that the preview on the right shows it with their numbers.
-5. Then offer refinements with a :::ui radio, for example: add a per-client line, rank clients, compare with targets, compare with the previous period, rename the report, "Looks good". Apply each change with `propose_report` (always the FULL template) and confirm briefly.
-6. When they say it looks good, tell them to press "Use this report" below the preview. Do not claim it is saved; only that button saves it.
+## Blocks
+{blocks}
 
-If the user writes their own request at any point ("just give me spend per client every Monday"), skip the remaining questions and build that straight away.
+## The one rule: numbers come from Birdy, not from you
+Never type a live figure. Use {{placeholders}} in text, or birdy_data on charts/tables/carousels.
+{placeholders}
+If the user asks for something Slack or the data can't do (a third chart, a metric that isn't listed, a day-by-day chart of cost per lead, an interactive button), say so in one sentence, offer the closest thing, and build it.
 
-## Designing well
-- 4 to 8 sections is the sweet spot. Lead with the numbers they said they care about. Put alerts/underperforming ads after the metrics, and Birdy's take last (the server enforces that).
-- Agency owners usually want portfolio totals plus a ranking; account managers want per-client lines. With more than 3 clients, prefer a ranking over one line per client.
-- Use compare="previous" for headline metrics. Use compare="target" only on metrics with has_target=true and only when the user wants targets.
-- Ranking direction "best" for leaders, "worst" to surface clients needing attention. limit 1-5.
-- Only use metric ids from `list_report_metrics`, and client ids from `list_report_clients`. If `propose_report` returns errors, fix them and call it again without bothering the user.
-- If a client has no data source for a metric, don't add it for that client.
+## How to work
+1. On the first message, call get_report_draft, list_report_clients and list_report_metrics before replying.
+2. If the user already said what they want, build it straight away with propose_report. Otherwise ask at most two quick questions, one at a time, with :::ui blocks (how often + time; what they care about), then build a first draft immediately.
+3. Every change → propose_report with the full template (frequency, time, day, blocks) → one sentence on what changed. Don't ask for confirmation first.
+4. If propose_report returns errors, fix them and call it again without bothering the user.
+5. When they're happy, tell them to press "Use this report" (onboarding) or "Save report" (Settings). Only that button saves.
 
-## Style
-- One question per message. Two or three short sentences, then the :::ui block. No bullet lists of options in prose.
-- Never quote figures yourself; the preview shows them. Never invent metrics that are not in the catalog.
-- Form answers arrive as messages starting with [UI_RESPONSE]; treat them as the user's choice.
+## Making it look good in Slack
+- Lead with a header, then the headline numbers as a section with fields (a tidy two-column grid).
+- One chart is usually enough; two at most. Bar for comparing clients, line or area for trends over days, pie for share of a total.
+- data_table for client lists people will sort; table for small fixed grids; carousel of cards when each client deserves its own tile.
+- context blocks for small print (alerts, footnotes). Keep text short and scannable.
+- Use client names exactly as list_report_clients gives them.
+
+## Style of your chat replies
+Two or three short sentences. Never quote figures yourself; the preview shows them. Use :::ui blocks for questions with set answers. Form answers arrive as messages starting with [UI_RESPONSE].
 
 ## :::ui syntax
 :::ui
-[{"id":"cadence","type":"radio","label":"How often?","options":[{"value":"daily","label":"Daily · covers yesterday"},{"value":"weekly","label":"Weekly · covers the last 7 days"}]}]
+[{{"id":"cadence","type":"radio","label":"How often?","options":[{{"value":"daily","label":"Daily · covers yesterday"}},{{"value":"weekly","label":"Weekly · covers the last 7 days"}}]}}]
 :::
-Supported field types: radio, checkboxes, select, text. Each field: id, type, label, options [{value,label}].
-"""
+""".format(placeholders=REPORT_PLACEHOLDER_GUIDE, blocks=REPORT_BLOCKS_GUIDE)
 
 _PAGE_SYSTEM_PROMPTS = {
     "alerts": _ALERTS_SYSTEM_PROMPT,
@@ -639,6 +651,7 @@ async def run_chat(
                 messages=call_messages,
                 tools=tool_schemas if not is_final_iteration else None,
                 temperature=DEFAULT_TEMPERATURE,
+                max_tokens=_PAGE_MAX_TOKENS.get(page, DEFAULT_MAX_TOKENS),
             )
             model_calls += 1
             usage_in += getattr(response.usage, "input_tokens", 0) or 0
@@ -684,12 +697,17 @@ async def run_chat(
             # Execute each tool call
             for tc in response.tool_calls:
                 tools_used.append(tc.name)
+                bad_args = False
                 try:
                     args = json.loads(tc.arguments) if tc.arguments else {}
                     if not isinstance(args, dict):
                         args = {}
                 except (json.JSONDecodeError, TypeError):
+                    # Usually output cut off at the token limit. Running the
+                    # tool with no arguments hid that; say so, so the model
+                    # can resend something it can finish.
                     args = {}
+                    bad_args = True
 
                 # Server-side client pinning: on a client-scoped page the
                 # analysis tools always operate on THAT client, whatever the
@@ -705,7 +723,13 @@ async def run_chat(
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))
 
-                if tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
+                if bad_args:
+                    logger.warning(f"Tool call {tc.name}: arguments were not valid JSON "
+                                   f"({len(tc.arguments or '')} chars) — likely cut off")
+                    result = json.dumps({"error": (
+                        "Your arguments for this tool were not valid JSON — most likely cut off because they "
+                        "were too long. Call it again with a shorter payload (fewer or simpler blocks).")})
+                elif tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:
                     result = await tool_registry.execute(
