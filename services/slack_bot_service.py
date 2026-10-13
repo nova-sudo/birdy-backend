@@ -109,7 +109,19 @@ async def get_slack_bot_status(db, user_id: str) -> dict | None:
         # anything with it. Set the first time Slack refuses the token.
         "needs_reconnect": bool(slack_bot.get("needs_reconnect")),
         "reconnect_reason": slack_bot.get("reconnect_reason"),
+        "brief": _brief_for_status(slack_bot.get("brief")),
     }
+
+
+def _brief_for_status(brief: dict | None) -> dict | None:
+    from services.report_template import has_content, normalize
+    template = normalize(brief)
+    if not has_content(template):
+        return None
+    out = dict(template)
+    if isinstance(out.get("updated_at"), datetime):
+        out["updated_at"] = out["updated_at"].isoformat()
+    return out
 
 
 # Slack errors that mean the stored token will never work again, however many

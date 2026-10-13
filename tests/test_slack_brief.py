@@ -8,6 +8,7 @@ import pytest
 
 from core.crypto import encrypt
 import services.slack_brief as sb
+import services.report_template as rt
 
 ALL_ITEMS = {k: True for k in sb.ITEM_KEYS}
 DAILY_9AM = {"frequency": "daily", "time": "9:00 AM", "day": None, "items": ALL_ITEMS}
@@ -104,7 +105,7 @@ async def _seed(db, *, slack=True, brief=DAILY_9AM, groups=None, tz="Europe/Lond
         await db["client_groups"].insert_many(groups)
 
 
-async def test_gather_uses_the_period_and_active_clients_only(mock_db):
+async def test_legacy_brief_renders_the_chosen_sections_with_real_figures(mock_db):
     await _seed(mock_db)
     await mock_db["alert_notifications"].insert_many([
         {"user_id": "agency@x.com", "message": "[Glow Clinic] CPL above £10", "triggered_at": datetime(2026, 9, 29, 15)},
@@ -114,53 +115,47 @@ async def test_gather_uses_the_period_and_active_clients_only(mock_db):
         "user_id": "agency@x.com", "status": "open", "action": {"type": "pause_ads"},
         "title": "Pause underperforming ad — Summer Promo", "client_name": "Glow Clinic"})
 
-    data = await sb.gather_brief(mock_db, "agency@x.com", "daily", utc(2026, 9, 30, 8, 0))
+    template = rt.normalize(DAILY_9AM)
+    data = await rt.gather(mock_db, "agency@x.com", template, utc(2026, 9, 30, 8, 0))
+    _, text = rt.render(template, data)
 
     assert data["clients"] == 2                       # the inactive client is left out
-    assert data["spend"] == 180 and data["leads"] == 15
-    assert data["won"] == 3 and data["opportunities"] == 15
-    assert data["top"]["name"] == "Glow Clinic"
-    assert [a["message"] for a in data["alerts"]] == ["[Glow Clinic] CPL above £10"]
-    assert len(data["underperforming"]) == 1
+    assert "Birdy daily brief · Yesterday" in text
+    assert "*Ad spend:* £180" in text
+    assert "*Leads:* 15" in text and "*Cost per lead:* £12.00" in text
+    assert "*Close rate:* 20.0%" in text              # 3 won of 15 opportunities
+    assert "Glow Clinic (12)" in text                  # top performer by leads
+    assert "1 triggered · [Glow Clinic] CPL above £10" in text
+    assert "1 flagged · Summer Promo" in text
 
 
-async def test_gather_never_reports_lifetime_closes_as_yesterdays(mock_db):
+async def test_never_reports_lifetime_closes_as_yesterdays(mock_db):
     """The metric reader falls back to 'maximum' when a preset is missing."""
     g = _group("g1", "Glow Clinic", 120, 12)
     g["ghl_opp_cache"] = {"maximum": {"won": 999, "total_opportunities": 9999}}
     await _seed(mock_db, groups=[g])
 
-    data = await sb.gather_brief(mock_db, "agency@x.com", "daily", utc(2026, 9, 30, 8, 0))
+    template = rt.normalize(DAILY_9AM)
+    data = await rt.gather(mock_db, "agency@x.com", template, utc(2026, 9, 30, 8, 0))
+    _, text = rt.render(template, data)
 
-    assert data["won"] == 0 and data["opportunities"] == 0
-
-
-def test_blocks_show_only_the_chosen_sections():
-    data = {"label": "Yesterday", "currency": "GBP", "clients": 2, "spending_clients": 2,
-            "spend": 180.0, "leads": 15.0, "won": 3.0, "opportunities": 15.0,
-            "top": {"name": "Glow Clinic", "leads": 12.0, "cpl": 10.0},
-            "alerts": [{"message": "[Glow Clinic] CPL above £10"}], "underperforming": []}
-
-    blocks, text = sb.build_brief_blocks(data, {"spend": True, "leads": True, "conversion": True}, "daily")
-
-    assert "Birdy daily brief · Yesterday" in text
-    assert "£180 across 2 clients" in text
-    assert "15 at £12.00 per lead" in text
-    assert "20.0% (3 won of 15 opportunities)" in text
-    assert "Top performer" not in text and "Alerts" not in text
-    assert blocks[0]["type"] == "header"
+    assert "*Close rate:* no data for this period" in text
+    assert "999" not in text
 
 
-def test_blocks_say_so_when_a_section_is_empty():
-    data = {"label": "Last 7 days", "currency": "USD", "clients": 1, "spending_clients": 0,
-            "spend": 0.0, "leads": 0.0, "won": 0.0, "opportunities": 0.0,
-            "top": None, "alerts": [], "underperforming": []}
-    _, text = sb.build_brief_blocks(data, ALL_ITEMS, "weekly")
+def test_empty_sections_say_so():
+    template = {**rt.normalize({**DAILY_9AM, "frequency": "weekly"})}
+    data = {"label": "Last 7 days", "prev_label": "the week before", "currency": "USD", "clients": 1,
+            "sections": [
+                {"type": "ranking", "metric": "leads", "direction": "best", "limit": 1, "rows": []},
+                {"type": "alerts", "alerts": []},
+                {"type": "underperforming_ads", "flagged": []},
+            ]}
+    _, text = rt.render(template, data)
     assert "Birdy weekly brief · Last 7 days" in text
-    assert "$0" in text
-    assert "no client generated leads" in text
+    assert "no client has data for this period" in text
     assert "none triggered" in text
-    assert "no ads flagged" in text
+    assert "none flagged" in text
 
 
 # ── sending ───────────────────────────────────────────────────────────────────

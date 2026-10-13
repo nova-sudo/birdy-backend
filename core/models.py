@@ -238,6 +238,10 @@ class SlackBotStatusResponse(BaseModel):
     # the next step, which was the first thing to actually try the token.
     needs_reconnect: bool = False
     reconnect_reason: Optional[str] = None
+    # The scheduled report (services/report_template.py, v2 shape). Settings
+    # reads its schedule from here; without it the schedule controls showed
+    # the defaults and saving them overwrote whatever the user had chosen.
+    brief: Optional[dict] = None
 
 
 class SlackChannel(BaseModel):

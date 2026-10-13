@@ -68,7 +68,8 @@ ALLOWED_DATA_KEYS = {
                              # so this step is the only place it now gets set.
     "first_client",          # {group_id, name, ghl_location_id, meta_ad_account_id}
     "kpi",                   # {cpa, wins, conv_rate, save_default}
-    "slack",                 # {channel_id, channel_name, frequency, time, day, brief_items}
+    "slack",                 # {channel_id, channel_name, frequency, time, day, sections}
+    "steps_version",         # which STEPS list `step` indexes (the wizard translates older ones)
     "slack_opt_out",         # True when the user answered "I don't use Slack" — the wizard
                              # then drops the channel/frequency/brief steps entirely rather
                              # than leaving them as a dead end for a user with no workspace.
@@ -126,10 +127,11 @@ TARGET_FIELDS = client_targets_service.TARGET_FIELDS
 
 
 class BriefConfigRequest(BaseModel):
-    frequency: str                      # "daily" | "weekly"
+    frequency: Optional[str] = None     # "daily" | "weekly"
     time: Optional[str] = None          # e.g. "9:00 AM"
     day: Optional[str] = None           # e.g. "Monday" (weekly only)
-    items: Optional[dict] = None        # {spend: bool, leads: bool, ...}
+    items: Optional[dict] = None        # legacy {spend: bool, leads: bool, ...}
+    template: Optional[dict] = None     # a full report template (services/report_template.py)
 
 
 class ImportAccount(BaseModel):
@@ -348,27 +350,46 @@ async def set_slack_brief(
     body: BriefConfigRequest,
     current_user: str = Depends(get_current_user),
 ):
-    if body.frequency not in ("daily", "weekly"):
-        raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+    """
+    Three shapes, newest first:
 
-    items = {
-        key: bool((body.items or {}).get(key, key != "underperform"))
-        for key in BRIEF_ITEM_KEYS
-    }
-    brief = {
-        "frequency": body.frequency,
-        "time": body.time or "9:00 AM",
-        "day": (body.day or "Monday") if body.frequency == "weekly" else None,
-        "items": items,
-        "updated_at": datetime.utcnow(),
-    }
+      · {template}                — what the report copilot designed; stored whole.
+      · {frequency, time, day}    — a schedule change (Settings); keeps the sections.
+      · {frequency, ..., items}   — the old six checkboxes; converted to a template.
+    """
+    from services import report_template as rt
+
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         user_doc = await db["users"].find_one(
             {"user_id": current_user}, {"integrations.slack_bot": 1}
         )
-        if not user_doc or not ((user_doc.get("integrations") or {}).get("slack_bot")):
+        slack_bot = ((user_doc or {}).get("integrations") or {}).get("slack_bot")
+        if not slack_bot:
             raise HTTPException(status_code=404, detail="Slack bot not connected")
+
+        if body.template is not None:
+            raw = body.template
+        else:
+            if body.frequency not in ("daily", "weekly"):
+                raise HTTPException(status_code=400, detail="frequency must be 'daily' or 'weekly'")
+            if body.items is not None:
+                items = {key: bool(body.items.get(key, key != "underperform")) for key in BRIEF_ITEM_KEYS}
+                sections = rt.from_legacy({"items": items})["sections"]
+            else:
+                current = rt.normalize(slack_bot.get("brief"))
+                sections = (current or {}).get("sections") or rt.default_template()["sections"]
+            current_title = (rt.normalize(slack_bot.get("brief")) or {}).get("title")
+            raw = {"frequency": body.frequency, "time": body.time, "day": body.day,
+                   "title": current_title, "sections": sections}
+
+        client_ids = {g["id"] async for g in db["client_groups"].find(
+            {"user_id": current_user}, {"_id": 0, "id": 1}) if g.get("id")}
+        try:
+            brief = rt.validate(raw, client_ids)
+        except rt.TemplateError as e:
+            raise HTTPException(status_code=400, detail={"errors": e.errors})
+        brief["updated_at"] = datetime.utcnow()
 
         await db["users"].update_one(
             {"user_id": current_user},

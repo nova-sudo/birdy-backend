@@ -21,6 +21,7 @@ from ai.tools.unified_leads_tools import register_unified_leads_tools
 from ai.tools.multi_window_tools import register_multi_window_tools
 from ai.tools.hp_tools import register_hp_tools
 from ai.tools.call_analysis_tools import register_call_analysis_tools
+from ai.tools.report_designer_tools import register_report_designer_tools
 from ai.orchestrator import run_chat
 
 logger = logging.getLogger(__name__)
@@ -40,6 +41,12 @@ register_unified_leads_tools()
 register_multi_window_tools()
 register_hp_tools()
 register_call_analysis_tools()
+register_report_designer_tools()
+
+
+async def _onboarding_complete(db, user_id: str) -> bool:
+    user = await db["users"].find_one({"user_id": user_id}, {"onboarding.completed": 1}) or {}
+    return bool((user.get("onboarding") or {}).get("completed"))
 
 
 @router.post("/api/chat", response_model=ChatResponse)
@@ -52,7 +59,11 @@ async def chat(
             db = get_db(mongo_client)
             # Stopper: block when the user is out of Birdy Credits (raises 402
             # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
-            await check_credits(current_user, mongo_client)
+            # Except the report copilot during onboarding: it runs before
+            # billing, and a new account must be able to finish setting up.
+            if not (request.page == "report_designer"
+                    and not await _onboarding_complete(db, current_user)):
+                await check_credits(current_user, mongo_client)
             provider = await get_provider_for_user(current_user, db)
             result = await run_chat(
                 provider=provider,
