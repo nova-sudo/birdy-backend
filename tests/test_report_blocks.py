@@ -287,3 +287,32 @@ async def test_slack_status_carries_the_report_for_settings(mock_db):
                 team_id="T1", bot_user_id="U1")
     status = await get_slack_bot_status(mock_db, USER)
     assert status["brief"]["version"] == 4 and status["brief"]["day"] == "Friday"
+
+
+async def test_too_many_charts_are_fitted_not_refused(mock_db):
+    await _seed(mock_db, [_group("g1", "Glow Clinic", 100, 10)])
+    chart = lambda t, by="client": {"type": "data_visualization", "title": t,
+                                    "birdy_data": {"chart": "bar" if by == "client" else "line", "by": by, "metrics": ["spend"]}}
+    out = await tools.propose_report(mock_db, USER, template={"frequency": "daily", "time": "9:00 AM", "blocks": [
+        chart("One"), chart("Two", "day"), chart("Three"), chart("Four", "day")]})
+    assert out["ok"] is True
+    kinds = [b["type"] for b in out["draft"]["blocks"]]
+    assert kinds == ["data_visualization", "data_visualization", "data_table"]
+    assert any("“Three” became a sortable table" in n for n in out["adjusted"])
+    assert any("“Four” was left out" in n for n in out["adjusted"])
+
+
+async def test_a_failed_proposal_says_nothing_was_saved(mock_db):
+    await _seed(mock_db, [_group("g1", "Glow Clinic", 100, 10)])
+    out = await tools.propose_report(mock_db, USER, template={"frequency": "daily", "time": "9:00 AM",
+        "blocks": [{"type": "data_visualization", "title": "x", "birdy_data": {"chart": "line", "by": "day", "metrics": ["leads"]}}]})
+    assert out["ok"] is False and out["note"].startswith("NOT saved")
+
+
+def test_small_slips_are_fitted():
+    t, notes = rb.fit_to_slack({"blocks": [
+        {"type": "data_table", "birdy_data": {"metrics": ["spend"]}},
+        {"type": "carousel", "birdy_data": {"metrics": ["spend", "leads", "cpl", "ctr"]}}]})
+    assert t["blocks"][0]["caption"] == "Clients"
+    assert t["blocks"][1]["birdy_data"]["metrics"] == ["spend", "leads", "cpl"]
+    assert notes == ["Client cards fit 3 numbers each, so they show the first three you picked."]

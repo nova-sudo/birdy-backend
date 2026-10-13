@@ -65,13 +65,19 @@ async def propose_report(db, user_id, template=None, **_):
     if not isinstance(template, dict):
         return {"ok": False, "errors": ["template is required"]}
     clients = await _clients(db, user_id)
+    template, adjusted = rt.fit_to_slack(template)
     try:
         clean = rt.validate(template, {c["id"]: c.get("name") or "" for c in clients if c.get("id")})
     except rt.TemplateError as e:
-        return {"ok": False, "errors": e.errors}
+        return {"ok": False, "errors": e.errors,
+                "note": "NOT saved — the draft and preview are unchanged. Fix these and call propose_report again."}
     await save_draft(db, user_id, clean)
-    return {"ok": True, "draft": clean,
-            "note": "Saved. The live preview beside the chat now shows this draft with the user's real numbers."}
+    out = {"ok": True, "draft": clean,
+           "note": "Saved. The preview now shows it and scrolls to what changed."}
+    if adjusted:
+        out["adjusted"] = adjusted
+        out["note"] += " Tell the user about each 'adjusted' item in plain words."
+    return out
 
 
 def register_report_designer_tools():

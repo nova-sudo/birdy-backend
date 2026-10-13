@@ -495,6 +495,51 @@ def _check_block(b, i, errs, clients, counters):
     return out
 
 
+def fit_to_slack(raw: dict) -> tuple[dict, list[str]]:
+    """
+    Adjust a template that asks for more than Slack allows, instead of refusing it.
+    Charts past Slack's two become a data table (when they compare clients) or
+    are left out (day-by-day trends have no table form); blocks past 50 are cut.
+    Returns the adjusted template and a note for each change, for the copilot to
+    pass on. Anything else wrong is left for `validate` to report.
+    """
+    notes: list[str] = []
+    blocks = raw.get("blocks")
+    if isinstance(blocks, str):
+        try:
+            blocks = json.loads(blocks)
+        except ValueError:
+            return raw, notes
+    if not isinstance(blocks, list):
+        return raw, notes
+    out, charts = [], 0
+    for b in blocks:
+        if isinstance(b, dict) and b.get("type") == "data_table" and not b.get("caption"):
+            b = {**b, "caption": "Clients"}
+        if isinstance(b, dict) and b.get("type") == "carousel" and isinstance(b.get("birdy_data"), dict):
+            metrics = b["birdy_data"].get("metrics") or []
+            if isinstance(metrics, list) and len(metrics) > 3:
+                b = {**b, "birdy_data": {**b["birdy_data"], "metrics": metrics[:3]}}
+                notes.append("Client cards fit 3 numbers each, so they show the first three you picked.")
+        if isinstance(b, dict) and b.get("type") == "data_visualization":
+            charts += 1
+            if charts > MAX_CHARTS:
+                bd = b.get("birdy_data") or {}
+                title = b.get("title") if isinstance(b.get("title"), str) else "Chart"
+                if bd.get("by", "client") == "client" and bd.get("metrics"):
+                    out.append({"type": "data_table", "caption": title[:150],
+                                "birdy_data": {"metrics": bd["metrics"][:19], "limit": bd.get("limit") or 10}})
+                    notes.append(f"Slack allows {MAX_CHARTS} charts per message, so “{title}” became a sortable table.")
+                else:
+                    notes.append(f"Slack allows {MAX_CHARTS} charts per message, so “{title}” was left out.")
+                continue
+        out.append(b)
+    if len(out) > MAX_BLOCKS:
+        notes.append(f"Slack allows {MAX_BLOCKS} blocks per message, so the last {len(out) - MAX_BLOCKS} were left out.")
+        out = out[:MAX_BLOCKS]
+    return {**raw, "blocks": out}, notes
+
+
 def validate(raw: dict, clients: dict[str, str] | None = None) -> dict:
     """
     A clean v4 template, or TemplateError listing everything wrong with it.
