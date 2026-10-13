@@ -419,10 +419,12 @@ def _check_block(b, i, errs, clients, counters):
             if bd is None:
                 return None
             out["birdy_data"] = bd
-        elif isinstance(b.get("chart"), dict) and b["chart"].get("type") in CHART_KINDS:
-            out["chart"] = b["chart"]  # a static chart, written by hand: Slack validates its shape
+        elif isinstance(b.get("chart"), dict) and b["chart"].get("type") in CHART_KINDS and (
+                b["chart"].get("series") or b["chart"].get("segments")):
+            out["chart"] = b["chart"]  # a static chart, written by hand with its own series
         else:
-            errs.append(f"{where}: a chart needs birdy_data (live) or a chart object")
+            errs.append(f"{where}: a chart needs live data — add \"birdy_data\": {{\"chart\": \"line\", "
+                        f"\"by\": \"day\", \"metrics\": [\"spend\"]}} (see the examples)")
             return None
 
     elif kind in ("table", "data_table"):
@@ -443,7 +445,11 @@ def _check_block(b, i, errs, clients, counters):
             out["birdy_data"] = bd
         elif isinstance(b.get("rows"), list) and b["rows"]:
             rows = b["rows"]
-            if len(rows) > (100 if kind == "table" else 201) or any(not isinstance(r, list) or len(r) > 20 for r in rows):
+            if any(not isinstance(r, list) for r in rows):
+                errs.append(f"{where}: rows must be a list of rows, each a list of cells like "
+                            f"{{\"type\": \"raw_text\", \"text\": \"...\"}} — or use birdy_data for a live client table")
+                return None
+            if len(rows) > (100 if kind == "table" else 201) or any(len(r) > 20 for r in rows):
                 errs.append(f"{where}: too many rows or columns for a {kind}")
                 return None
             out["rows"] = rows
@@ -495,6 +501,57 @@ def _check_block(b, i, errs, clients, counters):
     return out
 
 
+_BINDING_KEYS = ("chart", "by", "metrics", "metric", "days", "limit", "split", "clients", "period",
+                 "sort", "order", "total_row")
+
+
+def _binding_from(d: dict, keys=_BINDING_KEYS) -> dict:
+    return {k: d[k] for k in keys if k in d and d[k] is not None}
+
+
+def _repair(b):
+    """
+    Turn the shapes models most often write into the ones Slack and Birdy use:
+      · a chart whose live-data settings went into `chart` or onto the block
+        ({"chart": {"type": "line", "by": "day", "metrics": [...]}}) → birdy_data
+      · table rows written as {"cells": [...]}, or cells typed plain_text → raw_text
+      · a table/data_table given metrics but no real rows → birdy_data
+      · carousel cards missing their "type"
+    """
+    if not isinstance(b, dict):
+        return b
+    kind = b.get("type")
+    if kind == "data_visualization" and not b.get("birdy_data"):
+        chart = b.get("chart")
+        has_series = isinstance(chart, dict) and (chart.get("series") or chart.get("segments"))
+        if not has_series:
+            bd = _binding_from(chart) if isinstance(chart, dict) else {}
+            if isinstance(chart, dict) and chart.get("type") in CHART_KINDS:
+                bd["chart"] = chart["type"]
+            elif isinstance(chart, str):
+                bd["chart"] = chart
+            bd.update(_binding_from(b, ("by", "metrics", "metric", "days", "limit", "split", "clients", "period")))
+            if bd.get("metrics") or bd.get("metric"):
+                b = {k: v for k, v in b.items() if k not in _BINDING_KEYS}
+                b["birdy_data"] = bd
+    elif kind in ("table", "data_table"):
+        rows = b.get("rows")
+        if isinstance(rows, list) and rows and all(isinstance(r, dict) and isinstance(r.get("cells"), list) for r in rows):
+            rows = [r["cells"] for r in rows]
+        if isinstance(rows, list):
+            rows = [[({**c, "type": "raw_text"} if isinstance(c, dict) and c.get("type") in ("plain_text", "mrkdwn", "text") else c)
+                     for c in r] if isinstance(r, list) else r for r in rows]
+            b = {**b, "rows": rows}
+        live = b.get("birdy_data") or _binding_from(b, ("metrics", "sort", "order", "limit", "total_row", "clients", "period"))
+        rows_ok = isinstance(rows, list) and len(rows) >= 2 and all(isinstance(r, list) and r for r in rows)
+        if not b.get("birdy_data") and live.get("metrics") and not rows_ok:
+            b = {k: v for k, v in b.items() if k not in ("rows", "metrics", "sort", "order", "limit", "total_row", "clients", "period")}
+            b["birdy_data"] = live
+    elif kind == "carousel" and isinstance(b.get("elements"), list):
+        b = {**b, "elements": [({**c, "type": "card"} if isinstance(c, dict) and not c.get("type") else c) for c in b["elements"]]}
+    return b
+
+
 def fit_to_slack(raw: dict) -> tuple[dict, list[str]]:
     """
     Adjust a template that asks for more than Slack allows, instead of refusing it.
@@ -514,6 +571,7 @@ def fit_to_slack(raw: dict) -> tuple[dict, list[str]]:
         return raw, notes
     out, charts = [], 0
     for b in blocks:
+        b = _repair(b)
         if isinstance(b, dict) and b.get("type") == "data_table" and not b.get("caption"):
             b = {**b, "caption": "Clients"}
         if isinstance(b, dict) and b.get("type") == "carousel" and isinstance(b.get("birdy_data"), dict):
@@ -892,6 +950,23 @@ async def write_take(db, user_id: str, template: dict, report_text: str) -> str 
 
 # ── For the copilot ───────────────────────────────────────────────────────────
 
+
+def describe(template: dict) -> list[str]:
+    """One line per saved block, so the copilot reports what was actually saved."""
+    out = []
+    for b in template.get("blocks") or []:
+        bd = b.get("birdy_data") or {}
+        if b["type"] == "data_visualization":
+            what = f"{bd.get('chart', (b.get('chart') or {}).get('type'))} chart “{b.get('title')}”"
+            if bd:
+                what += f" of {', '.join(bd.get('metrics', []))} by {bd.get('by', 'client')}"
+            out.append(what)
+        elif b["type"] in ("table", "data_table", "carousel") and bd:
+            out.append(f"{b['type']} of clients ({', '.join(bd.get('metrics', []))})")
+        else:
+            out.append(b["type"])
+    return out
+
 BLOCKS_GUIDE = """The report is a Slack Block Kit message: a JSON array of blocks. Allowed in channel messages:
 header {text plain ≤150} · section {text mrkdwn ≤3000 | fields: 1-10 mrkdwn ≤2000 (two-column grid), accessory: image or link button}
 divider · image {image_url https, alt_text, title?} · context {elements: 1-10 mrkdwn text or images — small grey print}
@@ -910,4 +985,12 @@ Live data — two ways, never type a figure yourself:
      Pie = exactly one metric. Up to 12 series, up to 20 categories; negative values are fine.
    table / data_table: {"metrics": [...], "sort": metric, "order": "best"|"worst", "limit": n, "total_row": true, "clients": [...], "period": window}
    carousel: {"metrics": [1-3], "sort", "order", "limit": 1-10, "period"} → one card per client.
+
+Exact shapes that work (copy them):
+{"type": "data_visualization", "title": "Daily ad spend", "birdy_data": {"chart": "line", "by": "day", "metrics": ["spend"], "days": 14}}
+{"type": "data_visualization", "title": "Spend and leads by client", "birdy_data": {"chart": "bar", "by": "client", "metrics": ["spend", "leads"], "limit": 8}}
+{"type": "data_table", "caption": "Clients", "page_size": 10, "birdy_data": {"metrics": ["spend", "leads", "cpl"], "sort": "spend", "total_row": true}}
+{"type": "carousel", "birdy_data": {"metrics": ["spend", "leads", "cpl"], "limit": 5}}
+{"type": "section", "fields": [{"type": "mrkdwn", "text": "*Ad spend*\n{{spend}}"}, {"type": "mrkdwn", "text": "*Leads*\n{{leads}}"}]}
+Never put metrics inside "chart" — live charts take birdy_data and no "chart" key.
 """

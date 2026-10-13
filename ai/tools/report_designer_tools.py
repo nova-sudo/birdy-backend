@@ -72,8 +72,9 @@ async def propose_report(db, user_id, template=None, **_):
         return {"ok": False, "errors": e.errors,
                 "note": "NOT saved — the draft and preview are unchanged. Fix these and call propose_report again."}
     await save_draft(db, user_id, clean)
-    out = {"ok": True, "draft": clean,
-           "note": "Saved. The preview now shows it and scrolls to what changed."}
+    out = {"ok": True, "saved_blocks": rt.describe(clean),
+           "note": ("Saved. The preview now shows it and scrolls to what changed. Describe the change ONLY from "
+                    "saved_blocks — if something the user asked for is not in that list, it was not added.")}
     if adjusted:
         out["adjusted"] = adjusted
         out["note"] += " Tell the user about each 'adjusted' item in plain words."

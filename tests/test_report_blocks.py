@@ -296,8 +296,8 @@ async def test_too_many_charts_are_fitted_not_refused(mock_db):
     out = await tools.propose_report(mock_db, USER, template={"frequency": "daily", "time": "9:00 AM", "blocks": [
         chart("One"), chart("Two", "day"), chart("Three"), chart("Four", "day")]})
     assert out["ok"] is True
-    kinds = [b["type"] for b in out["draft"]["blocks"]]
-    assert kinds == ["data_visualization", "data_visualization", "data_table"]
+    assert out["saved_blocks"] == ["bar chart “One” of spend by client", "line chart “Two” of spend by day",
+                                   "data_table of clients (spend)"]
     assert any("“Three” became a sortable table" in n for n in out["adjusted"])
     assert any("“Four” was left out" in n for n in out["adjusted"])
 
@@ -340,3 +340,34 @@ async def test_take_with_a_quoted_focus_is_written(mock_db, monkeypatch):
     t = V({"type": "section", "text": '*Take:* {{birdy_take focus="ad performance and sales"}}'})
     assert await rb.write_take(mock_db, USER, t, "report") == "x"
     assert seen == {"has_take": True, "focus": "ad performance and sales"}
+
+
+def test_model_shapes_are_repaired_into_live_blocks():
+    t, _ = rb.fit_to_slack({"blocks": [
+        {"type": "data_visualization", "title": "Daily", "chart": {"type": "line", "by": "day", "metrics": ["spend"], "days": 7}},
+        {"type": "data_visualization", "title": "Clients", "chart": "bar", "by": "client", "metrics": ["spend", "leads"]},
+        {"type": "data_table", "caption": "C", "rows": [{"cells": [{"type": "plain_text", "text": "Client"}]}], "metrics": ["spend"]},
+        {"type": "table", "rows": [{"cells": [{"type": "plain_text", "text": "A"}, {"type": "plain_text", "text": "B"}]},
+                                   {"cells": [{"type": "plain_text", "text": "1"}, {"type": "plain_text", "text": "2"}]}]},
+        {"type": "carousel", "elements": [{"title": "Glow"}]},
+    ]})
+    b = t["blocks"]
+    assert b[0] == {"type": "data_visualization", "title": "Daily", "birdy_data": {"by": "day", "metrics": ["spend"], "days": 7, "chart": "line"}}
+    assert b[1]["birdy_data"] == {"chart": "bar", "by": "client", "metrics": ["spend", "leads"]} and "chart" not in b[1]
+    assert b[2]["birdy_data"] == {"metrics": ["spend"]} and "rows" not in b[2]
+    assert b[3]["rows"] == [[{"type": "raw_text", "text": "A"}, {"type": "raw_text", "text": "B"}],
+                            [{"type": "raw_text", "text": "1"}, {"type": "raw_text", "text": "2"}]]
+    assert b[4]["elements"][0]["type"] == "card"
+    rb.validate({"frequency": "daily", "time": "9am", **t}, NAMES)
+
+
+def test_a_chart_without_data_is_refused():
+    assert "a chart needs live data" in errors_of({"type": "data_visualization", "title": "x", "chart": {"type": "line"}})
+
+
+async def test_saved_blocks_are_described_for_the_copilot(mock_db):
+    await _seed(mock_db, [_group("g1", "Glow Clinic", 100, 10)])
+    out = await tools.propose_report(mock_db, USER, template={"frequency": "daily", "time": "9:00 AM", "blocks": [
+        {"type": "header", "text": "Hi"},
+        {"type": "data_visualization", "title": "Daily", "chart": {"type": "line", "by": "day", "metrics": ["spend"]}}]})
+    assert out["saved_blocks"] == ["header", "line chart “Daily” of spend by day"]
