@@ -52,6 +52,15 @@ class ClientGroupRequest(BaseModel):
     # older client posting the previous shape still creates the group.
     lead_collection_method: str | None = None
     form_provider: str | None = None
+    # Campaigns this group owns on a shared Meta ad account. None = all of
+    # them (the only valid choice while the account is not shared).
+    meta_campaign_ids: Optional[list[str]] = None
+
+
+class MetaCampaignsRequest(BaseModel):
+    """PATCH body for a group's Meta campaign selection. The key is required;
+    null means "all campaigns" and is only allowed on an unshared account."""
+    campaign_ids: Optional[list[str]]
 
 
 class SaveViewRequest(BaseModel):

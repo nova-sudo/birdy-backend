@@ -19,7 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE, ghl_date_bounds
-from core.models import ClientGroupRequest
+from core.models import ClientGroupRequest, MetaCampaignsRequest
 from core.utils import mongo_to_dict, get_result_value, iso_day_end, iso_day_range
 from dependencies import get_current_user, get_mongo_client
 from billing_middleware import check_client_limit
@@ -78,6 +78,8 @@ from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
 from services.facebook_cache_shape import read_preset
+# Called through the module so tests can swap the live Graph listing.
+from services import meta_campaign_scope as meta_scope_svc
 
 logger = logging.getLogger(__name__)
 
@@ -293,6 +295,10 @@ async def get_client_groups(
                     # Projected here because that decision is per client and
                     # every one of those screens reads this list.
                     "call_log_provider": 1,
+                    # Campaign scoping on a shared Meta ad account. The cached
+                    # account campaign list feeds meta_scope and is dropped
+                    # from the payload below.
+                    "meta_campaign_ids": 1, "meta_account_campaigns": 1,
                     "ad_account_currency": 1, "notes": 1,
                     "created_at": 1, "updated_at": 1,
                     "gohighlevel_cache": 1,
@@ -331,9 +337,22 @@ async def get_client_groups(
                     "message": "No client groups found",
                 }
 
+            # Siblings per Meta ad account, from the groups already loaded —
+            # one pass here instead of a query per group.
+            groups_by_account: dict = {}
+            for g in client_groups:
+                if g.get("meta_ad_account_id"):
+                    groups_by_account.setdefault(g["meta_ad_account_id"], []).append(g)
+
             result = []
             for group in client_groups:
                 group_data = mongo_to_dict(group)
+                group_data["meta_campaign_ids"] = group.get("meta_campaign_ids")
+                group_data["meta_scope"] = meta_scope_svc.scope_summary(group, [
+                    g for g in groups_by_account.get(group.get("meta_ad_account_id"), [])
+                    if g.get("id") != group.get("id")
+                ])
+                group_data.pop("meta_account_campaigns", None)
                 # Health is manually set and most clients have never had one
                 # chosen, so resolve the default here rather than leaving every
                 # consumer to invent its own fallback.
@@ -619,6 +638,47 @@ async def _initial_client_data_load(
                 )
 
 
+async def _live_account_campaigns(user_id: str, ad_account_id: str, mongo_client) -> list:
+    """The account's campaigns straight from Graph, or an HTTP error."""
+    token = await get_facebook_token(user_id, mongo_client)
+    if not token or not token.get("access_token"):
+        raise HTTPException(
+            status_code=400,
+            detail="No Meta token available. Please connect Meta in Settings.",
+        )
+    campaigns = await meta_scope_svc.fetch_account_campaigns(ad_account_id, token["access_token"])
+    if campaigns is None:
+        raise HTTPException(
+            status_code=502,
+            detail="Couldn't load this ad account's campaigns from Meta. Please try again.",
+        )
+    return campaigns
+
+
+async def _store_account_campaigns(db, user_id: str, ad_account_id: str, campaigns: list) -> None:
+    """Cache a just-fetched campaign list on every group using the account,
+    so meta_scope is current without waiting for the next refresh."""
+    await db.client_groups.update_many(
+        {"user_id": user_id, "meta_ad_account_id": ad_account_id},
+        {"$set": {
+            "meta_account_campaigns": campaigns,
+            "meta_account_campaigns_at": datetime.utcnow().isoformat(),
+        }},
+    )
+
+
+async def _schedule_meta_refreshes(db, background_tasks: BackgroundTasks, user_id: str,
+                                   group_ids: list) -> None:
+    """Claim and start a Meta refresh for each group, as the manual refresh does."""
+    for gid in group_ids:
+        await db.client_groups.update_one(
+            {"id": gid, "user_id": user_id}, {"$set": {"meta_refresh_status": "running"}}
+        )
+        doc = await db.client_groups.find_one({"id": gid, "user_id": user_id})
+        if doc:
+            background_tasks.add_task(_run_refresh, gid, "meta", user_id, doc)
+
+
 @router.post("/api/client-groups")
 async def create_client_group_optimized(
     request: ClientGroupRequest,
@@ -643,6 +703,9 @@ async def create_client_group_optimized(
                 raise HTTPException(status_code=400, detail="Client group name is required")
 
             # DUPLICATE CHECK
+            # A Meta ad account on its own is no longer exclusive: several
+            # groups may share one, each owning chosen campaigns. That rule is
+            # checked below against the live campaign list.
             duplicate_filter = {"user_id": current_user}
 
             if request.ghl_location_id and request.meta_ad_account_id:
@@ -652,8 +715,6 @@ async def create_client_group_optimized(
                 ]
             elif request.ghl_location_id:
                 duplicate_filter["ghl_location_id"] = request.ghl_location_id
-            elif request.meta_ad_account_id:
-                duplicate_filter["meta_ad_account_id"] = request.meta_ad_account_id
             else:
                 duplicate_filter = None
 
@@ -672,6 +733,32 @@ async def create_client_group_optimized(
                             f"Each integration can only be linked to one client group at a time."
                         ),
                     )
+
+            # SHARED META AD ACCOUNT
+            # Validated before anything is written (including the GHL token
+            # below), so a rejected selection leaves no trace.
+            meta_campaign_ids = (
+                list(dict.fromkeys(request.meta_campaign_ids))
+                if request.meta_campaign_ids is not None and request.meta_ad_account_id
+                else None
+            )
+            account_siblings: list = []
+            live_campaigns = None
+            if request.meta_ad_account_id:
+                account_siblings = await meta_scope_svc.siblings(
+                    db, current_user, request.meta_ad_account_id
+                )
+                if account_siblings or meta_campaign_ids is not None:
+                    live_campaigns = await _live_account_campaigns(
+                        current_user, request.meta_ad_account_id, mongo_client
+                    )
+                    names = {c["id"]: c.get("name") for c in live_campaigns if c.get("id")}
+                    try:
+                        meta_scope_svc.validate_selection(
+                            "__new_group__", meta_campaign_ids, account_siblings, names
+                        )
+                    except meta_scope_svc.ScopeConflict as e:
+                        raise HTTPException(status_code=409, detail=e.message)
 
             # STEP 1: Generate GHL location token if provided
             if request.ghl_location_id:
@@ -735,6 +822,8 @@ async def create_client_group_optimized(
                 "ad_account_currency": request.ad_account_currency,
                 "ghl_location_id": request.ghl_location_id,
                 "meta_ad_account_id": request.meta_ad_account_id,
+                # None = every campaign on the account (unshared only).
+                "meta_campaign_ids": meta_campaign_ids,
                 "hotprospector_group_id": request.hotprospector_group_id,
                 # "ghl" is the fallback for a caller that said nothing, not a
                 # floor. "none" — the onboarding wizard's "I don't currently
@@ -808,6 +897,28 @@ async def create_client_group_optimized(
             await client_groups_collection.insert_one(client_group)
             logger.info(f"Created client group {group_id}")
 
+            converted: list = []
+            if live_campaigns is not None:
+                if account_siblings:
+                    # First share of the account: siblings still on "all"
+                    # are split down to the campaigns nobody else owns.
+                    try:
+                        applied = await meta_scope_svc.apply_selection(
+                            db, current_user, group_id, meta_campaign_ids, live_campaigns
+                        )
+                    except meta_scope_svc.ScopeConflict as e:
+                        # Lost a race with another save since the check above.
+                        await client_groups_collection.delete_one({"id": group_id})
+                        raise HTTPException(status_code=409, detail=e.message)
+                    converted = applied["converted"]
+                await _store_account_campaigns(
+                    db, current_user, request.meta_ad_account_id, live_campaigns
+                )
+                # The new group's own first load is _initial_client_data_load.
+                await _schedule_meta_refreshes(
+                    db, background_tasks, current_user, [c["id"] for c in converted]
+                )
+
             # The first data pull happens after the response. See
             # _initial_client_data_load for why it cannot live in this request.
             background_tasks.add_task(
@@ -824,6 +935,7 @@ async def create_client_group_optimized(
 
             return {
                 "client_group": mongo_to_dict(final_group),
+                "converted": converted,
                 "message": "Client group created successfully",
             }
 
@@ -1173,9 +1285,19 @@ async def get_client_group_comprehensive(
                     cache_age = (datetime.utcnow() - oldest_refresh).total_seconds()
                     has_fresh_cache = cache_age < CACHE_DURATION_SECONDS
 
+            group_info = mongo_to_dict(group)
+            group_info["meta_campaign_ids"] = group.get("meta_campaign_ids")
+            group_info["meta_scope"] = (
+                meta_scope_svc.scope_summary(group, await meta_scope_svc.siblings(
+                    db, current_user, group["meta_ad_account_id"], exclude_group_id=group_id,
+                ))
+                if group.get("meta_ad_account_id") else None
+            )
+            group_info.pop("meta_account_campaigns", None)
+
             # Initialize response structure
             response_data = {
-                "group_info": mongo_to_dict(group),
+                "group_info": group_info,
                 "ghl_data": {},
                 "meta_data": {},
                 "hotprospector_data": {},
@@ -1284,8 +1406,13 @@ async def get_client_group_comprehensive(
 
                 try:
                     meta_ad_account_id = group["meta_ad_account_id"]
+                    # A group owning chosen campaigns of a shared account may
+                    # only be served its own cache. The live and account_data
+                    # paths below are account-wide — they would show every
+                    # sharer's spend as this group's.
+                    scoped = group.get("meta_campaign_ids") is not None
 
-                    if has_fresh_cache and group.get("facebook_cache"):
+                    if (has_fresh_cache or scoped) and group.get("facebook_cache"):
                         cached = group["facebook_cache"]
                         primary_preset = (
                             cached.get("data_maximum")
@@ -1310,6 +1437,20 @@ async def get_client_group_comprehensive(
                             "leads": [],
                             "summary": summary_insights,
                             "from_cache": True,
+                        }
+
+                    if scoped:
+                        # Cache cleared by a selection change; the refresh
+                        # started with it fills it shortly.
+                        return {
+                            "ad_account_id": meta_ad_account_id,
+                            "campaigns": [],
+                            "adsets": [],
+                            "ads": [],
+                            "leads": [],
+                            "summary": {},
+                            "from_cache": True,
+                            "syncing": True,
                         }
 
                     token = await get_facebook_token(current_user, mongo_client)
@@ -2721,6 +2862,66 @@ async def get_unified_leads(
 
 
 # ---------------------------------------------------------------------------
+# PATCH /api/client-groups/{group_id}/meta-campaigns
+# ---------------------------------------------------------------------------
+
+@router.patch("/api/client-groups/{group_id}/meta-campaigns")
+async def update_meta_campaigns(
+    group_id: str,
+    request: MetaCampaignsRequest,
+    background_tasks: BackgroundTasks,
+    current_user: str = Depends(get_current_user),
+):
+    """
+    Save which campaigns of its Meta ad account this group owns (null = all).
+
+    Siblings still on "all" are split to the remainder (`converted`). Every
+    group whose selection changed has its Meta cache cleared and a refresh
+    started; until it lands the detail endpoint serves an empty, syncing block.
+    """
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        group = await db.client_groups.find_one(
+            {"id": group_id, "user_id": current_user},
+            {"_id": 0, "id": 1, "meta_ad_account_id": 1},
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Client group not found")
+        ad_account_id = group.get("meta_ad_account_id")
+        if not ad_account_id:
+            raise HTTPException(status_code=400, detail="This client has no Meta ad account")
+
+        live_campaigns = await _live_account_campaigns(current_user, ad_account_id, mongo_client)
+        try:
+            applied = await meta_scope_svc.apply_selection(
+                db, current_user, group_id, request.campaign_ids, live_campaigns
+            )
+        except LookupError:
+            raise HTTPException(status_code=404, detail="Client group not found")
+        except meta_scope_svc.ScopeConflict as e:
+            raise HTTPException(status_code=409, detail=e.message)
+
+        await _store_account_campaigns(db, current_user, ad_account_id, live_campaigns)
+        await _schedule_meta_refreshes(
+            db, background_tasks, current_user, applied["changed_group_ids"]
+        )
+
+        saved = await db.client_groups.find_one(
+            {"id": group_id, "user_id": current_user},
+            {"_id": 0, "id": 1, "meta_ad_account_id": 1, "meta_campaign_ids": 1,
+             "meta_account_campaigns": 1},
+        )
+        others = await meta_scope_svc.siblings(
+            db, current_user, ad_account_id, exclude_group_id=group_id
+        )
+        return {
+            "meta_campaign_ids": saved.get("meta_campaign_ids"),
+            "converted": applied["converted"],
+            "meta_scope": meta_scope_svc.scope_summary(saved, others),
+        }
+
+
+# ---------------------------------------------------------------------------
 # POST /api/client-groups/{group_id}/refresh/{integration}
 # ---------------------------------------------------------------------------
 
@@ -2888,7 +3089,7 @@ async def delete_client_group(
             # Verify ownership
             group = await client_groups_collection.find_one(
                 {"id": group_id, "user_id": current_user},
-                {"id": 1, "name": 1},
+                {"id": 1, "name": 1, "meta_ad_account_id": 1},
             )
             if not group:
                 raise HTTPException(status_code=404, detail="Client group not found")
@@ -2909,6 +3110,13 @@ async def delete_client_group(
                 {"id": group_id, "user_id": current_user}
             )
             logger.info(f"Deleted client group {group_id} ('{group_name}') for user {current_user}")
+
+            # Its Meta leads go to whichever sibling owns their campaigns now,
+            # or become unassigned. The siblings keep their own selections.
+            if group.get("meta_ad_account_id"):
+                await meta_scope_svc.on_group_deleted(
+                    db, current_user, group["meta_ad_account_id"]
+                )
 
             return {
                 "success": True,

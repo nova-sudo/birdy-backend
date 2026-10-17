@@ -38,6 +38,8 @@ from integrations.gohighlevel import (
 )
 from services.meta_service import get_facebook_data, save_facebook_data
 from services.meta_status_service import set_object_status, MetaStatusError
+# Called through the module so tests can swap the live Graph listing.
+from services import meta_campaign_scope as meta_scope_svc
 
 logger = logging.getLogger(__name__)
 
@@ -328,6 +330,58 @@ async def get_facebook_adaccounts(current_user: str = Depends(get_current_user))
                 status_code=500,
                 detail=f"Failed to fetch ad accounts: {str(e)}",
             )
+
+
+# ---------------------------------------------------------------------------
+# GET /api/facebook/adaccounts/{ad_account_id}/campaigns — campaign picker
+# ---------------------------------------------------------------------------
+
+_STATUS_ORDER = {"ACTIVE": 0, "PAUSED": 1}
+
+
+@router.get("/api/facebook/adaccounts/{ad_account_id}/campaigns")
+async def get_ad_account_campaigns(ad_account_id: str, current_user: str = Depends(get_current_user)):
+    """
+    Live campaign list for one ad account, each marked with the client group
+    (of this user) that owns it. A group on "all campaigns" claims nothing.
+    ACTIVE first, then PAUSED, then the rest; by name within each.
+    """
+    async with get_mongo_client() as mongo_client:
+        token = await get_facebook_token(current_user, mongo_client)
+        if not token or not token.get("access_token"):
+            raise HTTPException(
+                status_code=400,
+                detail="No Meta token available. Please connect Meta in Settings.",
+            )
+        campaigns = await meta_scope_svc.fetch_account_campaigns(ad_account_id, token["access_token"])
+        if campaigns is None:
+            raise HTTPException(
+                status_code=502,
+                detail="Couldn't load this ad account's campaigns from Meta. Please try again.",
+            )
+
+        groups = await mongo_client[DB_NAME]["client_groups"].find(
+            {"user_id": current_user, "meta_ad_account_id": ad_account_id},
+            {"_id": 0, "id": 1, "name": 1, "meta_campaign_ids": 1},
+        ).to_list(length=None)
+        owner: dict = {}
+        for g in groups:
+            for cid in g.get("meta_campaign_ids") or []:
+                owner.setdefault(cid, {"group_id": g.get("id"), "name": g.get("name")})
+
+        rows = [
+            {
+                "id": c.get("id"),
+                "name": c.get("name"),
+                "effective_status": c.get("effective_status"),
+                "claimed_by": owner.get(c.get("id")),
+            }
+            for c in campaigns if c.get("id")
+        ]
+        rows.sort(key=lambda r: (
+            _STATUS_ORDER.get(r["effective_status"], 2), (r["name"] or "").lower(),
+        ))
+        return {"campaigns": rows}
 
 
 # ---------------------------------------------------------------------------
