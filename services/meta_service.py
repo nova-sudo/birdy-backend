@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import time
+import urllib.parse
 
 import httpx
 from datetime import datetime
@@ -29,6 +30,7 @@ from services.ad_leads import (
 )
 from services.facebook_cache_shape import split_preset_data
 from integrations.facebook_utils.facebook import get_facebook_token
+from services.meta_campaign_scope import campaign_filter
 
 logger = logging.getLogger(__name__)
 
@@ -113,11 +115,26 @@ async def get_facebook_data(
 # fetch_meta_data_for_group  (legacy single-preset fetcher)
 # ---------------------------------------------------------------------------
 
+def _scope_params(campaign_ids: list[str] | None, field: str) -> dict:
+    """`filtering` Graph param for a scoped group; empty (no param) when unscoped."""
+    f = campaign_filter(campaign_ids, field)
+    return {"filtering": f} if f is not None else {}
+
+
+def _zero_preset(date_preset: str) -> dict:
+    """Preset for a group that owns no campaigns: same shape, no Graph call."""
+    return _finalize_preset_result(
+        date_preset, [], [], [],
+        {"spend": 0.0, "impressions": 0, "clicks": 0, "reach": 0, "results": 0},
+    )
+
+
 async def fetch_meta_data_for_group(
     meta_ad_account_id: str,
     current_user: str,
     mongo_client,
     facebook_ad_accounts: list,
+    campaign_ids: list[str] | None = None,
 ):
     """
     Fetch Meta data for a single group in parallel.
@@ -142,6 +159,7 @@ async def fetch_meta_data_for_group(
                     response = await client.get(
                         f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                         params={
+                            **_scope_params(campaign_ids, "id"),
                             "fields": "name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,cost_per_result,impressions,cpm,clicks,cpc,ctr},adsets{name,status,insights.date_preset(maximum){actions,attribution_setting,spend,results,reach,frequency,impressions,cpm,clicks,cpc,ctr}},ads{name,adset_id,status,creative{title,body,image_url,thumbnail_url,video_id,object_story_spec},insights.date_preset(maximum){actions,attribution_setting,results,reach,frequency,spend,quality_ranking,engagement_rate_ranking,conversion_rate_ranking,impressions,cpm,inline_link_clicks,cpc,clicks}}",
                             "access_token": token["access_token"],
                         },
@@ -172,6 +190,7 @@ async def fetch_meta_data_for_group(
                     response = await client.get(
                         f"https://graph.facebook.com/v25.0/{meta_ad_account_id}/campaigns",
                         params={
+                            **_scope_params(campaign_ids, "id"),
                             "fields": "ads{leads.date_preset(maximum){id}}",
                             "access_token": token["access_token"],
                         },
@@ -987,6 +1006,7 @@ async def _fetch_meta_campaigns_for_preset(
     access_token: str,
     date_preset: str,
     creatives_by_ad: dict[str, dict] | None = None,
+    campaign_ids: list[str] | None = None,
 ) -> dict:
     """
     Fetch campaigns + aggregated metrics from Meta for one date_preset.
@@ -997,6 +1017,9 @@ async def _fetch_meta_campaigns_for_preset(
     when it is None this function fetches its own, so a one-off call still
     returns complete rows.
     """
+
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        return _zero_preset(date_preset)
 
     fields = _campaigns_fields_for_preset(date_preset)
     if creatives_by_ad is None:
@@ -1010,7 +1033,10 @@ async def _fetch_meta_campaigns_for_preset(
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             url = f"https://graph.facebook.com/v25.0/{ad_account_id}/campaigns"
-            params = {"fields": fields, "access_token": access_token, "limit": 100}
+            params = {
+                "fields": fields, "access_token": access_token, "limit": 100,
+                **_scope_params(campaign_ids, "id"),
+            }
             next_url = None
             page = 0
 
@@ -1084,6 +1110,7 @@ async def _fetch_meta_campaigns_for_preset(
                     "date_preset": date_preset,
                     "fields": _ACCOUNT_INSIGHTS_FIELDS,
                     "access_token": access_token,
+                    **_scope_params(campaign_ids, "campaign.id"),
                 },
             )
         if r.status_code == 200:
@@ -1114,6 +1141,7 @@ async def _fetch_meta_presets_batch(
     access_token: str,
     presets: list[str],
     creatives_by_ad: dict[str, dict] | None = None,
+    campaign_ids: list[str] | None = None,
 ) -> dict[str, dict]:
     """
     Fetch all `presets` in ONE HTTP request via Meta's Batch API. Returns
@@ -1144,6 +1172,17 @@ async def _fetch_meta_presets_batch(
     if not presets:
         return {}
 
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        return {p: _zero_preset(p) for p in presets}
+
+    # Filter JSON must be URL-encoded inside a Batch relative_url.
+    def _enc(field: str) -> str:
+        f = campaign_filter(campaign_ids, field)
+        return f"&filtering={urllib.parse.quote(f)}" if f is not None else ""
+
+    camp_filter_qs = _enc("id")
+    ins_filter_qs = _enc("campaign.id")
+
     # Two subrequests per preset now (campaigns + account insights), so the
     # cap bites at 25 presets rather than 50. We send 13.
     if len(presets) * 2 > 50:
@@ -1161,6 +1200,7 @@ async def _fetch_meta_presets_batch(
                 f"{ad_account_id}/campaigns"
                 f"?fields={_campaigns_fields_for_preset(p)}"
                 f"&limit=500"
+                f"{camp_filter_qs}"
             ),
         }
         for p in presets
@@ -1171,6 +1211,7 @@ async def _fetch_meta_presets_batch(
                 f"{ad_account_id}/insights"
                 f"?date_preset={p}"
                 f"&fields={_ACCOUNT_INSIGHTS_FIELDS}"
+                f"{ins_filter_qs}"
             ),
         }
         for p in presets
@@ -1294,6 +1335,7 @@ async def _fetch_meta_presets_batch(
             )
             out[preset] = await _fetch_meta_campaigns_for_preset(
                 ad_account_id, access_token, preset, creatives_by_ad,
+                campaign_ids=campaign_ids,
             )
             continue
 
@@ -1349,8 +1391,11 @@ async def fetch_meta_all_presets_for_group(
     except Exception:
         user_currency = ad_account_currency
 
+    grp = await client_groups_collection.find_one(
+        {"id": group_id}, {"ad_account_currency": 1, "meta_campaign_ids": 1}
+    )
+    campaign_ids = (grp or {}).get("meta_campaign_ids")
     if not ad_account_currency:
-        grp = await client_groups_collection.find_one({"id": group_id}, {"ad_account_currency": 1})
         ad_account_currency = (grp or {}).get("ad_account_currency")
 
     # -- token --
@@ -1402,11 +1447,15 @@ async def fetch_meta_all_presets_for_group(
     # Once for the whole refresh, not once per preset: ad creatives have no
     # date dimension, and they can no longer ride along inside the campaigns
     # query without Meta rejecting it outright. See _fetch_ad_creatives.
-    creatives_by_ad = await _fetch_ad_creatives(meta_ad_account_id, access_token)
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        creatives_by_ad = {}
+    else:
+        creatives_by_ad = await _fetch_ad_creatives(meta_ad_account_id, access_token)
 
     try:
         batch_results = await _fetch_meta_presets_batch(
-            meta_ad_account_id, access_token, list(presets), creatives_by_ad
+            meta_ad_account_id, access_token, list(presets), creatives_by_ad,
+            campaign_ids=campaign_ids,
         )
     except MetaAuthError:
         # Circuit breaker — refresh manager sets meta_token_error=True
@@ -1458,7 +1507,8 @@ async def fetch_meta_all_presets_for_group(
         for attempt in range(3):
             try:
                 result = await _fetch_meta_campaigns_for_preset(
-                    meta_ad_account_id, access_token, preset, creatives_by_ad
+                    meta_ad_account_id, access_token, preset, creatives_by_ad,
+                    campaign_ids=campaign_ids,
                 )
                 if result.get("_rate_limited"):
                     wait = 30 * (2 ** attempt)
