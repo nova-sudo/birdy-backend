@@ -100,8 +100,9 @@ Meta" in the picker, otherwise ignored.
 **On selection change**, for that group:
 1. Unset `facebook_cache`, `meta_daily_spend` and `last_meta_refresh`.
 2. Reassign leads (below).
-3. Queue the existing manual Meta refresh, with a full daily-spend history
-   refetch (the incremental path would leave old days account-wide).
+3. Queue the existing manual Meta refresh. `cache_account_daily_spend`
+   already rewrites the full 400-day window on every run, so old days are
+   re-fetched under the new scope with no extra work.
 
 ## Leads
 
