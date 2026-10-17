@@ -4,10 +4,11 @@ from pymongo import UpdateOne
 import os
 import logging
 from datetime import datetime
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 import httpx
 
 from utils.phone_normalize import compute_match_keys
+from services.meta_campaign_scope import campaign_filter
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,8 @@ async def fetch_and_cache_facebook_leads_FIXED(
             f"for '{client_group_name}' (account: {meta_ad_account_id})"
         )
 
+        campaign_ids = (client_group or {}).get("meta_campaign_ids")
+
         total_spend_on_leads = 0.0
 
         if is_initial_load:
@@ -133,7 +136,8 @@ async def fetch_and_cache_facebook_leads_FIXED(
                 user_id,
                 group_id,
                 client_group_name,
-                max_concurrent_ads=5
+                max_concurrent_ads=5,
+                campaign_ids=campaign_ids,
             )
 
             total_saved = 0
@@ -195,6 +199,7 @@ async def fetch_and_cache_facebook_leads_FIXED(
                 client_group_name=client_group_name,
                 mongo_client=mongo_client,
                 max_concurrent_ads=5,
+                campaign_ids=campaign_ids,
             )
 
             if new_leads:
@@ -336,14 +341,19 @@ async def fetch_and_cache_facebook_leads_FIXED(
 
 async def stage1_get_all_ad_ids(
         ad_account_id: str,
-        access_token: str
+        access_token: str,
+        campaign_ids: Optional[List[str]] = None
 ) -> List[str]:
     """
     STAGE 1: Get ALL ad IDs from the account.
     Handles pagination to get complete list.
+    `campaign_ids` limits it to ads in those campaigns (None = all, [] = none).
     Returns: List of ad IDs
     """
     all_ad_ids = []
+
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        return []
 
     try:
         async with httpx.AsyncClient(timeout=60.0) as client:
@@ -355,6 +365,9 @@ async def stage1_get_all_ad_ids(
                 "limit": 500,
                 "date_preset": "maximum"
             }
+            scope = campaign_filter(campaign_ids)
+            if scope:
+                params["filtering"] = scope
 
             page = 0
             next_url = None
@@ -522,7 +535,8 @@ async def fetch_all_facebook_leads_staged(
         user_id: str,
         client_group_id: str,
         client_group_name: str,
-        max_concurrent_ads: int = 5
+        max_concurrent_ads: int = 5,
+        campaign_ids: Optional[List[str]] = None
 ) -> Tuple[int, List[dict]]:
     """
     MAIN FUNCTION: Fetch all Facebook leads using staged approach.
@@ -538,7 +552,9 @@ async def fetch_all_facebook_leads_staged(
     # STAGE 1: Get all ad IDs
     # ============================================
     logger.info("📋 STAGE 1: Fetching all ad IDs...")
-    ad_ids = await stage1_get_all_ad_ids(ad_account_id, access_token)
+    ad_ids = await stage1_get_all_ad_ids(
+        ad_account_id, access_token, campaign_ids=campaign_ids
+    )
 
     if not ad_ids:
         logger.warning("⚠️ No ad IDs found")

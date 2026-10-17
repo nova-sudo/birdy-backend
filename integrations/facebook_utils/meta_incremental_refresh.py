@@ -395,7 +395,8 @@ async def fetch_todays_facebook_leads_incremental(
         client_group_id: str,
         client_group_name: str,
         mongo_client,
-        max_concurrent_ads: int = 5
+        max_concurrent_ads: int = 5,
+        campaign_ids: Optional[List[str]] = None
 ) -> Tuple[int, List[dict]]:
     """
     INCREMENTAL: Fetch every Facebook lead created since our last-known
@@ -467,7 +468,9 @@ async def fetch_todays_facebook_leads_incremental(
         # Full ad list — the previous implementation used a "today's active
         # ads" filter which silently dropped ads paused today with unread
         # leads from yesterday. See docstring.
-        ad_ids = await stage1_get_all_ad_ids(ad_account_id, access_token)
+        ad_ids = await stage1_get_all_ad_ids(
+            ad_account_id, access_token, campaign_ids=campaign_ids
+        )
 
         if not ad_ids:
             logger.info("No ads found on this account — nothing to fetch")

@@ -274,3 +274,51 @@ async def test_impressions_survive_currency_conversion(patch_client):
     row = groups.updates[0][1]["$set"]["meta_daily_spend"][0]
     assert row["impressions"] == 41233
     assert row["spend"] < 100.00
+
+
+@pytest.mark.asyncio
+async def test_daily_spend_sends_campaign_filter(patch_client):
+    import json
+    from urllib.parse import parse_qs, urlparse
+
+    seen = []
+    patch_client([{"body": {"data": []}}], seen)
+    await fetch_account_daily_spend(
+        "act_1", "T", "2026-08-15", "2026-08-16", campaign_ids=["c1"]
+    )
+    qs = parse_qs(urlparse(seen[0]).query)
+    assert json.loads(qs["filtering"][0]) == [
+        {"field": "campaign.id", "operator": "IN", "value": ["c1"]}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_daily_spend_no_filter_when_none(patch_client):
+    seen = []
+    patch_client([{"body": {"data": []}}], seen)
+    await fetch_account_daily_spend("act_1", "T", "2026-08-15", "2026-08-16")
+    assert "filtering" not in seen[0]
+
+
+@pytest.mark.asyncio
+async def test_daily_spend_empty_list_writes_no_rows(patch_client):
+    seen = []
+    patch_client([{"body": {"data": [{"date_start": "2026-08-15", "spend": "9"}]}}], seen)
+    rows = await fetch_account_daily_spend(
+        "act_1", "T", "2026-08-15", "2026-08-16", campaign_ids=[]
+    )
+    assert rows == []
+    assert seen == []
+
+
+@pytest.mark.asyncio
+async def test_cache_reads_group_selection_and_stores_empty_for_empty_list(patch_client):
+    seen = []
+    patch_client([{"body": {"data": [{"date_start": "2026-08-15", "spend": "9"}]}}], seen)
+    groups = FakeGroups({
+        "user_id": "u1", "ad_account_currency": "GBP", "meta_campaign_ids": [],
+    })
+    n = await cache_account_daily_spend("g1", "act_1", "T", FakeMongo(groups))
+    assert n == 0
+    assert seen == []
+    assert groups.updates[-1][1]["$set"]["meta_daily_spend"] == []

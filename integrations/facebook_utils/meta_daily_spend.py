@@ -54,6 +54,7 @@ from typing import Dict, List, Optional
 import httpx
 
 from integrations.facebook_utils._api_helpers import api_get_with_backoff
+from services.meta_campaign_scope import campaign_filter
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +160,7 @@ async def fetch_account_daily_spend(
         access_token: str,
         since: str,
         until: str,
+        campaign_ids: Optional[List[str]] = None,
 ) -> Optional[List[Dict]]:
     """
     One row per day for one ad account, over [since, until] (yyyy-mm-dd).
@@ -166,7 +168,13 @@ async def fetch_account_daily_spend(
     Returns None on failure — distinct from [], which legitimately means "the
     account spent nothing in this window". Callers must not treat a failure as
     an empty history and overwrite good data with it.
+
+    `campaign_ids` scopes the totals to a group's own campaigns on a shared
+    account: None = whole account, [] = nothing (no request is made).
     """
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        return []
+
     rows: List[Dict] = []
     url = f"{GRAPH}/{ad_account_id}/insights"
     params = {
@@ -183,6 +191,9 @@ async def fetch_account_daily_spend(
         "fields": "spend,impressions,clicks,date_start",
         "limit": PAGE_LIMIT,
     }
+    scope = campaign_filter(campaign_ids)
+    if scope:
+        params["filtering"] = scope
 
     page = 0
     next_url = None
@@ -254,13 +265,20 @@ async def cache_account_daily_spend(
     until = date.today()
     since = until - timedelta(days=days)
 
+    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
+
+    # A group sharing the ad account only sees its own campaigns' spend.
+    grp = await db["client_groups"].find_one(
+        {"id": group_id}, {"meta_campaign_ids": 1}
+    )
+    campaign_ids = (grp or {}).get("meta_campaign_ids")
+
     rows = await fetch_account_daily_spend(
-        ad_account_id, access_token, since.isoformat(), until.isoformat()
+        ad_account_id, access_token, since.isoformat(), until.isoformat(),
+        campaign_ids=campaign_ids,
     )
     if rows is None:
         return 0
-
-    db = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]
 
     target, source = await _resolve_currencies(
         db, group_id, user_currency, ad_account_currency

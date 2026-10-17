@@ -444,6 +444,19 @@ async def execute_refresh(
             )
             logger.error(f"[{job_id}] Lead counts failed: {error_msg}")
 
+    # ── OPTIONAL: account campaign list ──────────────────────────────────
+    # Feeds the campaign picker for client groups sharing an ad account. Like
+    # daily spend it is outside the state machine and swallows its own errors.
+    if not out_of_budget():
+        try:
+            from services.meta_campaign_scope import refresh_account_campaigns
+
+            await refresh_account_campaigns(
+                db, user_id, ad_account_id, token["access_token"]
+            )
+        except Exception as e:
+            logger.warning(f"[{job_id}] Account campaign list skipped: {str(e)[:200]}")
+
     # ── OPTIONAL: daily spend ────────────────────────────────────────────
     # Deliberately NOT a step in job["steps"].
     #
