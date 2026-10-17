@@ -1203,6 +1203,18 @@ async def import_subaccounts(
         # get them.
         default_targets = await client_targets_service.defaults_for(current_user, db)
 
+        # Sharing a Meta account happens only through the campaign picker, so a
+        # row naming an account any of this user's groups already uses (or an
+        # earlier row of this request took) is imported without Meta.
+        used_meta = {
+            g["meta_ad_account_id"]
+            for g in await groups.find(
+                {"user_id": current_user, "meta_ad_account_id": {"$ne": None}},
+                {"meta_ad_account_id": 1, "_id": 0},
+            ).to_list(length=None)
+            if g.get("meta_ad_account_id")
+        }
+
         imported, skipped_existing, skipped_limit = [], [], []
         seen_this_batch = set()
         for account in body.accounts:
@@ -1217,13 +1229,18 @@ async def import_subaccounts(
 
             group_id = f"{current_user}_{int(datetime.now().timestamp() * 1000)}_{len(imported)}"
             client_status = "Inactive" if (account.client_status or "").lower() == "inactive" else "Active"
+            meta_id, currency, meta_skipped = account.meta_ad_account_id, account.ad_account_currency, False
+            if meta_id and meta_id in used_meta:
+                meta_id, currency, meta_skipped = None, None, True
+            elif meta_id:
+                used_meta.add(meta_id)
             await groups.insert_one({
                 "id": group_id,
                 "user_id": current_user,
                 "name": account.name,
-                "ad_account_currency": account.ad_account_currency,
+                "ad_account_currency": currency,
                 "ghl_location_id": account.location_id,
-                "meta_ad_account_id": account.meta_ad_account_id,
+                "meta_ad_account_id": meta_id,
                 "hotprospector_group_id": None,
                 "call_log_provider": provider,
                 # Declared per client in the review step. An agency's clients do
@@ -1269,7 +1286,10 @@ async def import_subaccounts(
                 )
 
             seen_this_batch.add(account.location_id)
-            imported.append({"group_id": group_id, "location_id": account.location_id})
+            result = {"group_id": group_id, "location_id": account.location_id}
+            if meta_skipped:
+                result["meta_skipped_reason"] = "shared_account"
+            imported.append(result)
 
         if imported:
             background_tasks.add_task(_mint_location_tokens, current_user, imported)

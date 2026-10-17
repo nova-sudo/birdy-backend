@@ -377,3 +377,48 @@ async def test_delete_group_reassigns_account_leads(api, mock_db):
     assert leads["c1"]["client_group_id"] == "g1"
     assert leads["c2"]["client_group_id"] is None
     assert (await mock_db["client_groups"].find_one({"id": "g1"}))["meta_campaign_ids"] == ["c1"]
+
+
+# ── POST /api/onboarding/import-subaccounts ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bulk_import_row_on_used_account_created_without_meta(
+    mock_mongo_client, mock_db, monkeypatch
+):
+    import routers.onboarding as onboarding
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+
+    async def no_limit(user, mongo_client):
+        return True
+
+    monkeypatch.setattr(onboarding, "get_mongo_client", fake_client)
+    monkeypatch.setattr(onboarding, "check_client_limit", no_limit)
+    await a_group(mock_db, "g1", None, act="act_1", ghl_location_id="loc_old")
+
+    def row(loc, act):
+        return onboarding.ImportAccount(
+            location_id=loc, name=loc, meta_ad_account_id=act, ad_account_currency="USD"
+        )
+
+    out = await onboarding.import_subaccounts(
+        onboarding.ImportSubaccountsRequest(
+            accounts=[row("A", "act_1"), row("B", "act_2"), row("C", "act_2")]
+        ),
+        BackgroundTasks(),
+        current_user=USER,
+    )
+    by_loc = {r["location_id"]: r for r in out["imported"]}
+    docs = {
+        d["ghl_location_id"]: d
+        for d in await mock_db["client_groups"].find({"ghl_location_id": {"$in": ["A", "B", "C"]}}).to_list(length=None)
+    }
+    assert by_loc["A"]["meta_skipped_reason"] == "shared_account"
+    assert docs["A"]["meta_ad_account_id"] is None and docs["A"]["ad_account_currency"] is None
+    assert "meta_skipped_reason" not in by_loc["B"]
+    assert docs["B"]["meta_ad_account_id"] == "act_2" and docs["B"]["ad_account_currency"] == "USD"
+    assert by_loc["C"]["meta_skipped_reason"] == "shared_account"
+    assert docs["C"]["meta_ad_account_id"] is None and docs["C"]["ad_account_currency"] is None
