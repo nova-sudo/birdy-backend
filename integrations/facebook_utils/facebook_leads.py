@@ -8,7 +8,7 @@ from typing import List, Optional, Tuple
 import httpx
 
 from utils.phone_normalize import compute_match_keys
-from services.meta_campaign_scope import campaign_filter
+from services.meta_campaign_scope import campaign_filter, reassign_account_leads, scope_guard
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +255,16 @@ async def fetch_and_cache_facebook_leads_FIXED(
             # count. Query it once at the end and reuse.
             total_saved = 0  # placeholder — recomputed via count_documents below
 
+        # ─── Selection changed mid-fetch? ─────────────────────────────
+        # The rows above were tagged with this group under the selection read
+        # at the start. If it changed meanwhile, apply_selection's reassign may
+        # already have run, so run it again over the rows we just wrote.
+        now_doc = await client_groups_collection.find_one(
+            {"id": group_id}, {"meta_campaign_ids": 1}
+        )
+        if (now_doc or {}).get("meta_campaign_ids") != campaign_ids:
+            await reassign_account_leads(db, user_id, meta_ad_account_id)
+
         # ─── Accurate persisted count ─────────────────────────────────
         # Recompute from Mongo so cache.total_leads stays correct on
         # both paths — the initial-load `total_saved` counts insert_ids
@@ -302,7 +312,7 @@ async def fetch_and_cache_facebook_leads_FIXED(
         cost_per_lead = (total_spend_user_currency / total_saved) if total_saved > 0 else 0
 
         await client_groups_collection.update_one(
-            {"id": group_id},
+            scope_guard(group_id, campaign_ids),
             {
                 "$set": {
                     "facebook_cache.total_leads": total_saved,

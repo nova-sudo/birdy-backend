@@ -54,7 +54,7 @@ from typing import Dict, List, Optional
 import httpx
 
 from integrations.facebook_utils._api_helpers import api_get_with_backoff
-from services.meta_campaign_scope import campaign_filter
+from services.meta_campaign_scope import campaign_filter, scope_guard
 
 logger = logging.getLogger(__name__)
 
@@ -286,7 +286,7 @@ async def cache_account_daily_spend(
     rows = _convert_rows(rows, source, target)
 
     await db["client_groups"].update_one(
-        {"id": group_id},
+        scope_guard(group_id, campaign_ids),
         {"$set": {
             "meta_daily_spend": rows,
             "meta_daily_spend_updated_at": datetime.utcnow().isoformat(),

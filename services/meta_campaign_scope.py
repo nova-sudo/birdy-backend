@@ -41,6 +41,18 @@ def campaign_filter(campaign_ids: Optional[list], field: str = "campaign.id") ->
     return json.dumps([{"field": field, "operator": "IN", "value": list(campaign_ids)}])
 
 
+def scope_guard(group_id: str, campaign_ids: Optional[list]) -> dict:
+    """
+    Filter for writing data fetched under `campaign_ids` back to the group.
+
+    Once the selection changes it matches nothing, so a fetch that was already
+    in flight cannot store old-scope numbers or stamp them fresh. On Mongo a
+    None value also matches a missing field.
+    """
+    return {"id": group_id,
+            "meta_campaign_ids": None if campaign_ids is None else list(campaign_ids)}
+
+
 async def siblings(db, user_id: str, ad_account_id: str, exclude_group_id: Optional[str] = None) -> list:
     """Other groups of this user on the same Meta ad account."""
     query = {"user_id": user_id, "meta_ad_account_id": ad_account_id}

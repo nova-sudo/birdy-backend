@@ -415,3 +415,163 @@ async def test_superseded_inflight_job_stops_before_next_preset(mock_mongo_clien
     assert fetched == ["p1"]
     assert (await mock_db.meta_refresh_jobs.find_one({"job_id": "j1"}))["status"] == "superseded"
     assert "last_meta_refresh" not in await mock_db.client_groups.find_one({"id": "g1"})
+
+
+# ── Fix round 1: writes inside a step race a selection change ─────────────
+#
+# Each fake below runs between the step's scope read and its write, and saves a
+# new selection for g2 there — which converts g1 (null) to ["c1", "c3"]. The
+# old-scope write must then match nothing, and leads must end with the owner
+# of their campaign.
+
+async def _race_setup(mock_db):
+    await mock_db.client_groups.insert_many([
+        _group("g1", "Plush Body", ad_account_currency="USD",
+               last_meta_refresh="old-stamp"),
+        _group("g2", "Plush Face", [], created_at="2026-06-01T00:00:00"),
+    ])
+    await mock_db.client_groups.update_one({"id": "g1"}, {"$unset": {"last_meta_refresh": ""}})
+
+
+async def _no_sleep(*_a, **_k):
+    return None
+
+
+async def _change_selection(mock_db):
+    await apply_selection(mock_db, "A", "g2", ["c2"], ACCOUNT)
+
+
+async def test_preset_write_skipped_when_selection_changes_mid_fetch(
+        mock_mongo_client, mock_db, monkeypatch):
+    import httpx
+    import json as _json
+    import urllib.parse
+    from services import meta_service
+
+    await _race_setup(mock_db)
+
+    def handler(request):
+        if request.method == "POST":
+            n = len(_json.loads(dict(urllib.parse.parse_qsl(request.content.decode()))["batch"]))
+            return httpx.Response(200, json=[
+                {"code": 200, "body": _json.dumps({"data": []})} for _ in range(n)])
+        return httpx.Response(200, json={"data": []})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr("services.meta_service.httpx.AsyncClient", lambda *a, **kw: real(
+        transport=httpx.MockTransport(handler), **{k: v for k, v in kw.items() if k != "timeout"}))
+
+    async def token(*_a, **_k):
+        return {"access_token": "T"}
+
+    async def creatives_then_change(*_a, **_k):
+        await _change_selection(mock_db)
+        return {}
+
+    monkeypatch.setattr(meta_service, "get_facebook_token", token)
+    monkeypatch.setattr(meta_service.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(meta_service, "_fetch_ad_creatives", creatives_then_change)
+
+    await meta_service.fetch_meta_all_presets_for_group(
+        "g1", "act_1", "A", mock_mongo_client, ad_account_currency="USD", presets=["today"])
+
+    g1 = await mock_db.client_groups.find_one({"id": "g1"})
+    assert g1["meta_campaign_ids"] == ["c1", "c3"]
+    assert "facebook_cache" not in g1
+    assert "last_meta_refresh" not in g1
+
+
+async def test_preset_write_lands_when_selection_unchanged(
+        mock_mongo_client, mock_db, monkeypatch):
+    import httpx
+    from services import meta_service
+
+    await mock_db.client_groups.insert_one(_group("g1", "Plush Body", ["c1"]))
+    real = httpx.AsyncClient
+    monkeypatch.setattr("services.meta_service.httpx.AsyncClient", lambda *a, **kw: real(
+        transport=httpx.MockTransport(lambda r: httpx.Response(500, json={})),
+        **{k: v for k, v in kw.items() if k != "timeout"}))
+
+    async def token(*_a, **_k):
+        return {"access_token": "T"}
+
+    async def creatives(*_a, **_k):
+        return {}
+
+    monkeypatch.setattr(meta_service, "get_facebook_token", token)
+    monkeypatch.setattr(meta_service.asyncio, "sleep", _no_sleep)
+    monkeypatch.setattr(meta_service, "_fetch_ad_creatives", creatives)
+    try:
+        await meta_service.fetch_meta_all_presets_for_group(
+            "g1", "act_1", "A", mock_mongo_client, ad_account_currency="USD", presets=["today"])
+    except RuntimeError:
+        pass  # preset missing after retries; the account-level fields still land
+    assert "last_meta_refresh" in await mock_db.client_groups.find_one({"id": "g1"})
+
+
+async def test_leads_written_mid_change_end_with_right_owner(
+        mock_mongo_client, mock_db, monkeypatch):
+    import integrations.facebook_utils.facebook as fb
+    import integrations.facebook_utils.meta_incremental_refresh as inc
+    from integrations.facebook_utils.facebook_leads import fetch_and_cache_facebook_leads_FIXED
+    from utils.currency_exchange import CurrencyService
+
+    await _race_setup(mock_db)
+    await mock_db.facebook_leads.insert_one(_lead("l0", "c2"))
+
+    async def token(*_a, **_k):
+        return {"access_token": "T"}
+
+    async def currency(*_a, **_k):
+        return "USD"
+
+    async def fetch_then_change(**_k):
+        await _change_selection(mock_db)
+        return 2, [{"lead_id": "l1", "campaign_id": "c1"}, {"lead_id": "l2", "campaign_id": "c2"}]
+
+    monkeypatch.setattr(fb, "get_facebook_token", token)
+    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(currency))
+    monkeypatch.setattr(inc, "fetch_todays_facebook_leads_incremental", fetch_then_change)
+
+    await fetch_and_cache_facebook_leads_FIXED(
+        "USD", "g1", "act_1", "A", mock_mongo_client, is_initial_load=False)
+
+    owners = await _owners(mock_db)
+    assert owners["l1"] == ("g1", "Plush Body")
+    assert owners["l2"] == ("g2", "Plush Face")
+    assert owners["l0"] == ("g2", "Plush Face")
+    g1 = await mock_db.client_groups.find_one({"id": "g1"})
+    assert "facebook_cache" not in g1 and "last_meta_refresh" not in g1
+    assert not g1.get("leads_initial_sync_done")
+
+
+async def test_lead_counts_write_skipped_when_selection_changes(
+        mock_mongo_client, mock_db, monkeypatch):
+    from services import meta_service
+
+    await _race_setup(mock_db)
+
+    async def timeline_then_change(*_a, **_k):
+        await _change_selection(mock_db)
+        return []
+
+    monkeypatch.setattr(meta_service, "fetch_lead_timeline", timeline_then_change)
+    await meta_service.update_preset_lead_counts("g1", "A", mock_mongo_client, presets=["today"])
+    g1 = await mock_db.client_groups.find_one({"id": "g1"})
+    assert "facebook_cache" not in g1
+
+
+async def test_daily_spend_write_skipped_when_selection_changes(
+        mock_mongo_client, mock_db, monkeypatch):
+    from integrations.facebook_utils import meta_daily_spend
+
+    await _race_setup(mock_db)
+
+    async def rows_then_change(*_a, **_k):
+        await _change_selection(mock_db)
+        return [{"date": "2026-10-01", "spend": 5.0, "currency": "USD"}]
+
+    monkeypatch.setattr(meta_daily_spend, "fetch_account_daily_spend", rows_then_change)
+    await meta_daily_spend.cache_account_daily_spend(
+        "g1", "act_1", "T", mock_mongo_client, user_currency="USD", ad_account_currency="USD")
+    assert "meta_daily_spend" not in await mock_db.client_groups.find_one({"id": "g1"})

@@ -30,7 +30,7 @@ from services.ad_leads import (
 )
 from services.facebook_cache_shape import split_preset_data
 from integrations.facebook_utils.facebook import get_facebook_token
-from services.meta_campaign_scope import campaign_filter
+from services.meta_campaign_scope import campaign_filter, scope_guard
 
 logger = logging.getLogger(__name__)
 
@@ -1650,10 +1650,16 @@ async def fetch_meta_all_presets_for_group(
         facebook_cache_update["facebook_cache.adsets"] = primary.get("adsets", [])
         facebook_cache_update["facebook_cache.ads"] = primary.get("ads", [])
 
-    await client_groups_collection.update_one(
-        {"id": group_id},
+    saved = await client_groups_collection.update_one(
+        scope_guard(group_id, campaign_ids),
         {"$set": facebook_cache_update},
     )
+    if not saved.matched_count:
+        logger.info(
+            f"Campaign selection for group {group_id} changed mid-fetch; "
+            f"discarded {len(preset_data)} old-scope preset buckets"
+        )
+        return
 
     logger.info(
         f"Saved {len(preset_data)} Meta preset buckets for group {group_id}"
@@ -1707,16 +1713,18 @@ async def update_preset_lead_counts(
     db = mongo_client[DB_NAME]
     client_groups_collection = db["client_groups"]
 
+    # Fetch all current spend values in one DB read. Read before the timeline
+    # so the selection captured here is the one the counts were made under.
+    group_doc = await client_groups_collection.find_one(
+        {"id": group_id},
+        {"facebook_cache": 1, "meta_campaign_ids": 1},
+    )
+    facebook_cache = (group_doc or {}).get("facebook_cache", {})
+    scope_ids = (group_doc or {}).get("meta_campaign_ids")
+
     timeline = await fetch_lead_timeline(user_id, [group_id], mongo_client)
     total_leads_count = len(timeline)
     lead_source = describe_lead_source(timeline)
-
-    # Fetch all current spend values in one DB read
-    group_doc = await client_groups_collection.find_one(
-        {"id": group_id},
-        {"facebook_cache": 1},
-    )
-    facebook_cache = (group_doc or {}).get("facebook_cache", {})
 
     update_fields = {
         "facebook_cache.total_leads": total_leads_count,
@@ -1776,8 +1784,10 @@ async def update_preset_lead_counts(
     update_fields["facebook_cache.metrics.insights.cost_per_result"] = maximum_cpl
     update_fields["facebook_cache.metrics.insights.results"] = maximum_leads_count
 
+    # The spend above was read under this selection; if it changes before the
+    # write, these counts belong to the old scope.
     await client_groups_collection.update_one(
-        {"id": group_id},
+        scope_guard(group_id, scope_ids),
         {"$set": update_fields},
     )
 
