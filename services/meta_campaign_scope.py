@@ -181,3 +181,128 @@ async def refresh_account_campaigns(db, user_id: str, ad_account_id: str,
         )
     except Exception as e:
         logger.warning("refresh_account_campaigns failed for %s: %s", ad_account_id, str(e)[:200])
+
+
+# ── Writing a selection ────────────────────────────────────────────────────
+
+# Job statuses a refresh can still advance from (see meta_refresh_manager:
+# claim_next_jobs only claims these, schedule_stale_groups treats them as busy).
+_OPEN_JOB_STATUSES = ["pending", "in_progress", "partial"]
+SUPERSEDED = "superseded"
+_SCOPED_CACHES = {"facebook_cache": "", "meta_daily_spend": "", "last_meta_refresh": ""}
+
+
+async def reassign_account_leads(db, user_id: str, ad_account_id: str) -> int:
+    """
+    Point every cached lead on the account at the group owning its campaign.
+
+    A lone group with a null list owns every lead. Otherwise each list claims
+    its campaigns and unclaimed leads become unassigned. One update_many per
+    owner plus one for unassigned; rows already correct are not touched.
+    Returns the number of rows modified.
+    """
+    groups = await db[_COLLECTION].find(
+        {"user_id": user_id, "meta_ad_account_id": ad_account_id},
+        {"_id": 0, "id": 1, "name": 1, "meta_campaign_ids": 1},
+    ).to_list(length=None)
+    leads = db["facebook_leads"]
+    base = {"user_id": user_id, "ad_account_id": ad_account_id}
+
+    def stale_owner(gid, name):
+        return {"$or": [{"client_group_id": {"$ne": gid}}, {"client_group_name": {"$ne": name}}]}
+
+    async def assign(extra: dict, gid, name) -> int:
+        res = await leads.update_many(
+            {**base, **extra, **stale_owner(gid, name)},
+            {"$set": {"client_group_id": gid, "client_group_name": name}},
+        )
+        return res.modified_count
+
+    if len(groups) == 1 and groups[0].get("meta_campaign_ids") is None:
+        g = groups[0]
+        return await assign({}, g["id"], g.get("name"))
+
+    modified = 0
+    claimed: set = set()
+    for g in groups:
+        ids = g.get("meta_campaign_ids")
+        if ids is None:
+            continue
+        claimed.update(ids)
+        if ids:
+            modified += await assign(
+                {"lead_data.campaign_id": {"$in": list(ids)}}, g["id"], g.get("name"))
+
+    # Legacy accounts linked to several groups with null lists keep the rows
+    # those groups already hold; everything else unclaimed is unassigned.
+    keep = [g["id"] for g in groups if g.get("meta_campaign_ids") is None]
+    unassigned = {"lead_data.campaign_id": {"$nin": list(claimed)}}
+    if keep:
+        unassigned["client_group_id"] = {"$nin": keep}
+    modified += await assign(unassigned, None, None)
+    return modified
+
+
+def _created_key(group: dict):
+    created = group.get("created_at")
+    return (created is None, str(created or ""), group.get("id") or "")
+
+
+async def apply_selection(db, user_id: str, group_id: str, campaign_ids: Optional[list],
+                          account_campaigns: list) -> dict:
+    """
+    Save `campaign_ids` (None = all) for a group and keep its siblings consistent.
+
+    `account_campaigns` is the live [{id, name, effective_status}] list. Raises
+    LookupError when the group is not this user's, ScopeConflict on a rule
+    violation; both before anything is written. Siblings still on "all" are
+    converted to the campaigns nobody else owns (the oldest one gets them,
+    any other null sibling gets []). Every changed group loses its cached Meta
+    data and open refresh jobs, then the account's leads are reassigned.
+    """
+    group = await db[_COLLECTION].find_one(
+        {"id": group_id, "user_id": user_id},
+        {"_id": 0, "id": 1, "name": 1, "meta_ad_account_id": 1},
+    )
+    if not group:
+        raise LookupError(f"Client group {group_id} not found")
+    ad_account_id = group.get("meta_ad_account_id")
+    if not ad_account_id:
+        raise ScopeConflict("Link a Meta ad account to this client group first.")
+
+    if campaign_ids is not None:
+        campaign_ids = list(dict.fromkeys(campaign_ids))
+    others = await siblings(db, user_id, ad_account_id, exclude_group_id=group_id)
+    names = {c["id"]: c.get("name") for c in account_campaigns if c.get("id")}
+    validate_selection(group_id, campaign_ids, others, names)
+
+    updates = [(group_id, campaign_ids)]
+    converted = []
+    null_others = sorted((o for o in others if o.get("meta_campaign_ids") is None), key=_created_key)
+    if null_others:
+        taken = set(campaign_ids or [])
+        for o in others:
+            taken.update(o.get("meta_campaign_ids") or [])
+        remainder = list(dict.fromkeys(
+            c["id"] for c in account_campaigns if c.get("id") and c["id"] not in taken))
+        for i, o in enumerate(null_others):
+            updates.append((o["id"], remainder if i == 0 else []))
+            converted.append({"id": o["id"], "name": o.get("name")})
+
+    for gid, ids in updates:
+        await db[_COLLECTION].update_one(
+            {"id": gid, "user_id": user_id},
+            {"$set": {"meta_campaign_ids": ids}, "$unset": _SCOPED_CACHES},
+        )
+    changed = [gid for gid, _ in updates]
+    await db["meta_refresh_jobs"].update_many(
+        {"group_id": {"$in": changed}, "status": {"$in": _OPEN_JOB_STATUSES}},
+        {"$set": {"status": SUPERSEDED, "_claimed_at": None, "updated_at": datetime.utcnow()}},
+    )
+    await reassign_account_leads(db, user_id, ad_account_id)
+    return {"changed_group_ids": changed, "converted": converted}
+
+
+async def on_group_deleted(db, user_id: str, ad_account_id: str) -> None:
+    """Hand a deleted group's leads to whoever owns their campaigns now."""
+    await reassign_account_leads(db, user_id, ad_account_id)

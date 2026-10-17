@@ -73,6 +73,19 @@ LEADS_MIN_BUDGET_SECONDS = 60
 # Public API
 # ---------------------------------------------------------------------------
 
+# Set by services.meta_campaign_scope.apply_selection when a group's campaign
+# selection changes. Terminal: never claimed (claim_next_jobs allow-lists its
+# statuses), not "busy" for schedule_stale_groups, and an execute_refresh that
+# was already running stops at its next checkpoint without finalizing, so it
+# cannot stamp old-scope data as fresh.
+SUPERSEDED_STATUS = "superseded"
+
+
+async def _is_superseded(jobs_col, job_id: str) -> bool:
+    job = await jobs_col.find_one({"job_id": job_id}, {"status": 1})
+    return bool(job) and job.get("status") == SUPERSEDED_STATUS
+
+
 async def create_refresh_job(
     group_id: str,
     user_id: str,
@@ -226,8 +239,8 @@ async def execute_refresh(
         Budget-partials don't consume the attempt budget and are eligible
         for immediate reclaim on the next tick.
         """
-        await jobs_col.update_one(
-            {"job_id": job_id},
+        res = await jobs_col.update_one(
+            {"job_id": job_id, "status": {"$ne": SUPERSEDED_STATUS}},
             {"$set": {
                 "status": "partial",
                 "_partial_kind": "budget",
@@ -236,6 +249,8 @@ async def execute_refresh(
                 "updated_at": datetime.utcnow(),
             }},
         )
+        if not res.matched_count:
+            return  # superseded mid-run: nothing to resume
         # Keep client_group in "running" so UI knows refresh is still ongoing
         await db["client_groups"].update_one(
             {"id": group_id},
@@ -256,6 +271,10 @@ async def execute_refresh(
     for preset_key, preset_state in steps["presets"].items():
         if preset_state["status"] == "success":
             continue  # already done
+
+        if await _is_superseded(jobs_col, job_id):
+            logger.info(f"[{job_id}] Superseded by a campaign selection change; stopping")
+            return
 
         # Budget check before starting next preset
         if out_of_budget():
@@ -333,6 +352,8 @@ async def execute_refresh(
     # ── PHASE 2: Leads ───────────────────────────────────────────────────
     # Reload job to get updated state
     job = await jobs_col.find_one({"job_id": job_id})
+    if job.get("status") == SUPERSEDED_STATUS:
+        return
     steps = job["steps"]
 
     if steps["leads"]["status"] != "success":
@@ -407,6 +428,8 @@ async def execute_refresh(
 
     # ── PHASE 3: Lead counts ─────────────────────────────────────────────
     job = await jobs_col.find_one({"job_id": job_id})
+    if job.get("status") == SUPERSEDED_STATUS:
+        return
     steps = job["steps"]
 
     if steps["lead_counts"]["status"] != "success":
@@ -609,7 +632,9 @@ async def _mark_all_auth_error(
 async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
     """Check all steps and set final job status + update client_groups."""
     job = await jobs_col.find_one({"job_id": job_id})
-    if not job:
+    if not job or job.get("status") == SUPERSEDED_STATUS:
+        # A superseded job must not overwrite its status or stamp the group
+        # (last_meta_refresh would make old-scope data look fresh).
         return
 
     steps = job["steps"]
@@ -668,7 +693,13 @@ async def _finalize_job(db, jobs_col, job_id: str, group_id: str):
         # on a completed / failed job (would only confuse observability).
         job_update["$unset"] = {"_partial_kind": ""}
 
-    await jobs_col.update_one({"job_id": job_id}, job_update)
+    # Conditional so a supersede landing between the read above and this write
+    # still wins.
+    res = await jobs_col.update_one(
+        {"job_id": job_id, "status": {"$ne": SUPERSEDED_STATUS}}, job_update
+    )
+    if not res.matched_count:
+        return
 
     # Update client group status
     update_fields = {
