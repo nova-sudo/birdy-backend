@@ -16,10 +16,22 @@ from ai.tools.derived_metrics import enrich
 from ai.config import MAX_RESULT_ITEMS
 from core.utils import get_result_value
 from integrations.facebook_utils.facebook import get_facebook_token
+from services.meta_campaign_scope import campaign_filter
 
 logger = logging.getLogger(__name__)
 
 META_API = "https://graph.facebook.com/v25.0"
+
+NO_CAMPAIGNS_NOTE = (
+    "No campaigns are selected for this client, so there is no Meta data to "
+    "report. Tell the user to pick campaigns in client settings."
+)
+
+
+def _scope_params(campaign_ids, field):
+    """`filtering` Graph param for a scoped group; empty (no param) when unscoped."""
+    f = campaign_filter(campaign_ids, field)
+    return {"filtering": f} if f is not None else {}
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -37,7 +49,8 @@ async def _get_token_and_groups(db, user_id, group_ids=None):
         query["id"] = {"$in": group_ids}
 
     groups = await db["client_groups"].find(
-        query, {"id": 1, "name": 1, "meta_ad_account_id": 1, "ad_account_currency": 1, "_id": 0}
+        query, {"id": 1, "name": 1, "meta_ad_account_id": 1, "ad_account_currency": 1,
+         "meta_campaign_ids": 1, "_id": 0}
     ).to_list(None)
 
     if not groups:
@@ -46,7 +59,7 @@ async def _get_token_and_groups(db, user_id, group_ids=None):
     return access_token, groups, None
 
 
-async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date):
+async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date, campaign_ids=None):
     """
     Call Meta Graph API with a time_range for campaigns + nested adsets + ads.
     Returns the same shape as _fetch_meta_campaigns_for_preset but with arbitrary dates.
@@ -71,7 +84,8 @@ async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             url = f"{META_API}/{ad_account_id}/campaigns"
-            params = {"fields": fields, "access_token": access_token, "limit": 100}
+            params = {"fields": fields, "access_token": access_token, "limit": 100,
+                      **_scope_params(campaign_ids, "id")}
             next_url = None
             page = 0
 
@@ -194,7 +208,7 @@ async def _fetch_insights_live(ad_account_id, access_token, start_date, end_date
     }
 
 
-async def _fetch_monthly_insights_live(ad_account_id, access_token, year):
+async def _fetch_monthly_insights_live(ad_account_id, access_token, year, campaign_ids=None):
     """
     Fetch account-level insights broken out by calendar month in ONE Graph API
     call, using Meta's native `time_increment=monthly` — this is the correct
@@ -209,6 +223,7 @@ async def _fetch_monthly_insights_live(ad_account_id, access_token, year):
         "time_increment": "monthly",
         "access_token": access_token,
         "limit": 100,
+        **_scope_params(campaign_ids, "campaign.id"),
     }
 
     try:
@@ -252,14 +267,15 @@ async def _fetch_monthly_insights_live(ad_account_id, access_token, year):
     return {"months": months}
 
 
-async def _fetch_leads_live(ad_account_id, access_token, start_date, end_date):
+async def _fetch_leads_live(ad_account_id, access_token, start_date, end_date, campaign_ids=None):
     """Fetch leads from Meta for a specific date range using filtering."""
     leads = []
     try:
         async with httpx.AsyncClient(timeout=120.0) as client:
             # Get all ad IDs first
             url = f"{META_API}/{ad_account_id}/ads"
-            params = {"fields": "id,name", "access_token": access_token, "limit": 500}
+            params = {"fields": "id,name", "access_token": access_token, "limit": 500,
+                      **_scope_params(campaign_ids, "campaign.id")}
             ad_ids = []
 
             while True:
@@ -332,7 +348,16 @@ async def get_meta_insights_live(db, user_id, start_date, end_date, group_ids=No
     all_results = []
     for g in groups:
         ad_account_id = g["meta_ad_account_id"]
-        data = await _fetch_insights_live(ad_account_id, access_token, start_date, end_date)
+        campaign_ids = g.get("meta_campaign_ids")
+        if campaign_ids is not None and len(campaign_ids) == 0:
+            all_results.append({
+                "group_id": g["id"], "group_name": g["name"],
+                "date_range": f"{start_date} to {end_date}",
+                "items": [], "total_items": 0, "aggregated_metrics": {},
+                "note": NO_CAMPAIGNS_NOTE,
+            })
+            continue
+        data = await _fetch_insights_live(ad_account_id, access_token, start_date, end_date, campaign_ids)
 
         if "error" in data:
             all_results.append({
@@ -379,7 +404,15 @@ async def get_meta_insights_monthly(db, user_id, year, group_ids=None):
     all_results = []
     for g in groups:
         ad_account_id = g["meta_ad_account_id"]
-        data = await _fetch_monthly_insights_live(ad_account_id, access_token, year)
+        campaign_ids = g.get("meta_campaign_ids")
+        if campaign_ids is not None and len(campaign_ids) == 0:
+            all_results.append({
+                "group_id": g["id"], "group_name": g["name"], "year": year,
+                "months": [], "yearly_total_spend": 0, "yearly_total_results": 0,
+                "note": NO_CAMPAIGNS_NOTE,
+            })
+            continue
+        data = await _fetch_monthly_insights_live(ad_account_id, access_token, year, campaign_ids)
 
         if "error" in data:
             all_results.append({"group_id": g["id"], "group_name": g["name"], "error": data["error"]})
@@ -405,9 +438,14 @@ async def get_meta_leads_live(db, user_id, start_date, end_date, group_ids=None)
         return {"error": err}
 
     all_leads = []
+    notes = []
     for g in groups:
         ad_account_id = g["meta_ad_account_id"]
-        data = await _fetch_leads_live(ad_account_id, access_token, start_date, end_date)
+        campaign_ids = g.get("meta_campaign_ids")
+        if campaign_ids is not None and len(campaign_ids) == 0:
+            notes.append(f"{g['name']}: {NO_CAMPAIGNS_NOTE}")
+            continue
+        data = await _fetch_leads_live(ad_account_id, access_token, start_date, end_date, campaign_ids)
 
         if "error" in data:
             continue
@@ -417,7 +455,10 @@ async def get_meta_leads_live(db, user_id, start_date, end_date, group_ids=None)
             lead["group_id"] = g["id"]
         all_leads.extend(data.get("leads", []))
 
-    return {"leads": all_leads[:MAX_RESULT_ITEMS], "total": len(all_leads)}
+    result = {"leads": all_leads[:MAX_RESULT_ITEMS], "total": len(all_leads)}
+    if notes:
+        result["notes"] = notes
+    return result
 
 
 # ── Registration ───────────────────────────────────────────────────────────

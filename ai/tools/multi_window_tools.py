@@ -42,17 +42,26 @@ from ai.tools.derived_metrics import _safe_div
 from ai.config import MAX_RESULT_ITEMS
 from core.utils import get_result_value
 from integrations.facebook_utils.facebook import get_facebook_token
+from services.meta_campaign_scope import campaign_filter
 
 logger = logging.getLogger(__name__)
 
 META_API = "https://graph.facebook.com/v25.0"
+
+NO_CAMPAIGNS_NOTE = (
+    "No campaigns are selected for this client, so there is no Meta data to "
+    "report. Tell the user to pick campaigns in client settings."
+)
 
 MAX_WINDOWS = 6  # bounds worst-case cost; 30/60/90/etc. never needs more than this
 
 
 # ── Meta: fetch once at daily granularity, bucket per window in code ───────
 
-async def _fetch_daily_insights(ad_account_id: str, access_token: str, since: str, until: str) -> dict:
+async def _fetch_daily_insights(
+    ad_account_id: str, access_token: str, since: str, until: str,
+    campaign_ids: list[str] | None = None,
+) -> dict:
     """
     ONE live call: account-level insights broken out per calendar day via
     Meta's time_increment=1, covering [since, until]. Mirrors
@@ -67,6 +76,9 @@ async def _fetch_daily_insights(ad_account_id: str, access_token: str, since: st
         "access_token": access_token,
         "limit": 500,
     }
+    f = campaign_filter(campaign_ids, "campaign.id")
+    if f is not None:
+        params["filtering"] = f
     try:
         async with httpx.AsyncClient(timeout=90.0) as client:
             resp = await client.get(f"{META_API}/{ad_account_id}/insights", params=params)
@@ -201,7 +213,7 @@ async def get_metrics_by_day_windows(db, user_id, windows_days, group_ids=None, 
         query,
         {
             "id": 1, "name": 1, "meta_ad_account_id": 1, "ad_account_currency": 1,
-            "ghl_location_id": 1, "_id": 0,
+            "ghl_location_id": 1, "meta_campaign_ids": 1, "_id": 0,
         },
     ).to_list(None)
 
@@ -229,8 +241,13 @@ async def get_metrics_by_day_windows(db, user_id, windows_days, group_ids=None, 
 
         # -- Meta: one daily fetch covering the widest window --
         daily_rows = []
-        if g.get("meta_ad_account_id") and meta_token:
-            meta_data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, since_iso, today_iso)
+        campaign_ids = g.get("meta_campaign_ids")
+        if g.get("meta_ad_account_id") and campaign_ids is not None and len(campaign_ids) == 0:
+            group_result["meta_note"] = NO_CAMPAIGNS_NOTE
+        elif g.get("meta_ad_account_id") and meta_token:
+            meta_data = await _fetch_daily_insights(
+                g["meta_ad_account_id"], meta_token, since_iso, today_iso, campaign_ids
+            )
             if "error" in meta_data:
                 group_result["meta_error"] = meta_data["error"]
             else:
