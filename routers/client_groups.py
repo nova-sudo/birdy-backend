@@ -932,6 +932,9 @@ async def create_client_group_optimized(
             )
 
             final_group = await client_groups_collection.find_one({"id": group_id})
+            # The account's campaign list is picker data, served by its own
+            # endpoint; it does not belong in the group payload.
+            final_group.pop("meta_account_campaigns", None)
 
             return {
                 "client_group": mongo_to_dict(final_group),
@@ -3096,6 +3099,17 @@ async def delete_client_group(
 
             group_name = group.get("name", group_id)
 
+            # Read before the delete: the group's cached ads help place lead
+            # rows that were stored without a campaign id.
+            ad_campaigns = None
+            if group.get("meta_ad_account_id"):
+                try:
+                    ad_campaigns = await meta_scope_svc.account_ad_campaigns(
+                        db, current_user, group["meta_ad_account_id"]
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not read ad map before deleting {group_id}: {e}")
+
             # 1. Delete all GHL contacts for this group
             contacts_result = await db["ghl_contacts"].delete_many(
                 {"user_id": current_user, "client_group_id": group_id}
@@ -3113,10 +3127,19 @@ async def delete_client_group(
 
             # Its Meta leads go to whichever sibling owns their campaigns now,
             # or become unassigned. The siblings keep their own selections.
+            # The group is already gone, so a failure here must not turn a
+            # successful delete into a 500; the next selection save or delete
+            # on the account reassigns again.
             if group.get("meta_ad_account_id"):
-                await meta_scope_svc.on_group_deleted(
-                    db, current_user, group["meta_ad_account_id"]
-                )
+                try:
+                    await meta_scope_svc.on_group_deleted(
+                        db, current_user, group["meta_ad_account_id"], ad_campaigns
+                    )
+                except Exception as e:
+                    logger.error(
+                        f"Lead reassignment after deleting {group_id} failed: {e}",
+                        exc_info=True,
+                    )
 
             return {
                 "success": True,

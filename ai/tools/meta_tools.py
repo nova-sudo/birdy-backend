@@ -19,6 +19,48 @@ def _build_insights_query(user_id, start_date=None, end_date=None, group_ids=Non
     return query
 
 
+async def _legacy_insights_query(db, user_id, start_date=None, end_date=None, group_ids=None):
+    """
+    Query for the legacy per-day insights collections, or None if nothing may be read.
+
+    Those rows were stored per ad account before campaign scoping and cover
+    every campaign on it, so they are wrong for a group with chosen campaigns
+    (meta_campaign_ids not None). Such groups are left out; their answer is
+    their own cache, which is empty until the scoped refresh fills it.
+    """
+    scoped_q = {"user_id": user_id, "meta_campaign_ids": {"$ne": None}}
+    if group_ids:
+        scoped_q["id"] = {"$in": group_ids}
+    scoped = [g["id"] for g in await db["client_groups"].find(
+        scoped_q, {"_id": 0, "id": 1}).to_list(None)]
+
+    query = _build_insights_query(user_id, start_date, end_date, group_ids)
+    if scoped:
+        if group_ids:
+            allowed = [g for g in group_ids if g not in set(scoped)]
+            if not allowed:
+                return None
+            query["client_group_id"] = {"$in": allowed}
+        else:
+            query["client_group_id"] = {"$nin": scoped}
+    return query
+
+
+_EMPTY_INSIGHTS = {
+    "insights": [], "total": 0,
+    "note": "Meta data for the selected campaigns is still syncing.",
+}
+
+
+async def _legacy_insights(db, collection, user_id, start_date, end_date, group_ids):
+    query = await _legacy_insights_query(db, user_id, start_date, end_date, group_ids)
+    if query is None:
+        return dict(_EMPTY_INSIGHTS)
+    cursor = db[collection].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
+    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
+    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+
+
 def _flatten_insight(doc):
     """Extract key metrics from insight_data into a flat dict for the AI."""
     data = doc.get("insight_data", {})
@@ -146,11 +188,8 @@ async def get_campaign_insights(db, user_id, start_date=None, end_date=None, gro
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    # Fallback to per-day insights collection
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_campaign_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_campaign_insights", user_id, start_date, end_date, group_ids)
 
 
 async def get_adset_insights(db, user_id, start_date=None, end_date=None, group_ids=None):
@@ -158,10 +197,8 @@ async def get_adset_insights(db, user_id, start_date=None, end_date=None, group_
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_adset_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_adset_insights", user_id, start_date, end_date, group_ids)
 
 
 async def get_ad_insights(db, user_id, start_date=None, end_date=None, group_ids=None):
@@ -169,10 +206,8 @@ async def get_ad_insights(db, user_id, start_date=None, end_date=None, group_ids
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_ad_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_ad_insights", user_id, start_date, end_date, group_ids)
 
 
 async def get_facebook_leads(db, user_id, start_date=None, end_date=None, limit=100, group_ids=None):

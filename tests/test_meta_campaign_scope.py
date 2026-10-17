@@ -236,9 +236,10 @@ async def test_two_null_siblings_oldest_gets_remainder(mock_db):
 async def test_apply_clears_caches_and_supersedes_jobs(mock_db):
     await mock_db.client_groups.insert_many([
         _group("g1", "Plush Body", None, facebook_cache={"last_7d": {"spend": 1}},
-               meta_daily_spend=[{"d": 1}], last_meta_refresh="2026-10-01"),
+               meta_daily_spend=[{"d": 1}], last_meta_refresh="2026-10-01",
+               last_meta_static_refresh="2026-10-01"),
         _group("g2", "Plush Face", None, facebook_cache={"x": 1}, meta_daily_spend=[],
-               last_meta_refresh="2026-10-01"),
+               last_meta_refresh="2026-10-01", last_meta_static_refresh="2026-10-01"),
         _group("g9", "Untouched", None, facebook_cache={"x": 1}, meta_ad_account_id="act_9"),
     ])
     await mock_db.meta_refresh_jobs.insert_many([
@@ -253,7 +254,8 @@ async def test_apply_clears_caches_and_supersedes_jobs(mock_db):
 
     for gid in ("g1", "g2"):
         doc = await mock_db.client_groups.find_one({"id": gid})
-        for f in ("facebook_cache", "meta_daily_spend", "last_meta_refresh"):
+        for f in ("facebook_cache", "meta_daily_spend", "last_meta_refresh",
+                  "last_meta_static_refresh"):
             assert f not in doc, (gid, f)
     assert "facebook_cache" in await mock_db.client_groups.find_one({"id": "g9"})
     status = {j["job_id"]: j["status"]

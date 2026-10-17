@@ -18,53 +18,8 @@ from ai.tools.derived_metrics import enrich
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.server import mcp, current_user_id as _current_user_id
-
-
-def _build_insights_query(user_id, start_date=None, end_date=None, group_ids=None):
-    query = {"user_id": user_id}
-    if group_ids:
-        query["client_group_id"] = {"$in": group_ids}
-    if start_date or end_date:
-        date_filter = {}
-        if start_date:
-            date_filter["$gte"] = start_date
-        if end_date:
-            date_filter["$lte"] = end_date
-        query["date_start"] = date_filter
-    return query
-
-
-def _flatten_insight(doc):
-    """Extract key metrics from insight_data into a flat dict for the AI."""
-    data = doc.get("insight_data", {})
-    flat = {
-        "campaign_id": doc.get("campaign_id") or data.get("campaign_id"),
-        "campaign_name": doc.get("campaign_name") or data.get("campaign_name"),
-        "adset_id": doc.get("adset_id") or data.get("adset_id"),
-        "adset_name": doc.get("adset_name") or data.get("adset_name"),
-        "ad_id": doc.get("ad_id") or data.get("ad_id"),
-        "ad_name": doc.get("ad_name") or data.get("ad_name"),
-        "date_start": doc.get("date_start"),
-        "client_group_id": doc.get("client_group_id"),
-        "client_group_name": doc.get("client_group_name"),
-        "spend": data.get("spend"),
-        "impressions": data.get("impressions"),
-        "clicks": data.get("clicks"),
-        "ctr": data.get("ctr"),
-        "cpc": data.get("cpc"),
-        "cpm": data.get("cpm"),
-        "reach": data.get("reach"),
-        "results": data.get("results"),
-    }
-    return enrich(flat)
-
-
-# Only fetch the fields we need from MongoDB
-_PROJECTION = {
-    "_id": 0, "campaign_id": 1, "campaign_name": 1, "adset_id": 1,
-    "adset_name": 1, "ad_id": 1, "ad_name": 1, "date_start": 1,
-    "client_group_id": 1, "client_group_name": 1, "insight_data": 1,
-}
+from ai.tools.meta_tools import _legacy_insights
+from services.facebook_cache_shape import read_preset
 
 
 # ---------------------------------------------------------------------------
@@ -176,11 +131,8 @@ async def get_campaign_insights(
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    # Fallback to per-day insights collection
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_campaign_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_campaign_insights", user_id, start_date, end_date, group_ids)
 
 
 @mcp.tool
@@ -203,10 +155,8 @@ async def get_adset_insights(
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_adset_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_adset_insights", user_id, start_date, end_date, group_ids)
 
 
 @mcp.tool
@@ -229,10 +179,8 @@ async def get_ad_insights(
     if cached:
         return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
 
-    query = _build_insights_query(user_id, start_date, end_date, group_ids)
-    cursor = db["facebook_ad_insights"].find(query, _PROJECTION).sort("date_start", -1).limit(MAX_RESULT_ITEMS)
-    docs = await cursor.to_list(length=MAX_RESULT_ITEMS)
-    return {"insights": [_flatten_insight(d) for d in docs], "total": len(docs)}
+    # Fallback to the per-day insights collection (never for scoped groups).
+    return await _legacy_insights(db, "facebook_ad_insights", user_id, start_date, end_date, group_ids)
 
 
 @mcp.tool

@@ -201,16 +201,64 @@ async def refresh_account_campaigns(db, user_id: str, ad_account_id: str,
 # claim_next_jobs only claims these, schedule_stale_groups treats them as busy).
 _OPEN_JOB_STATUSES = ["pending", "in_progress", "partial"]
 SUPERSEDED = "superseded"
-_SCOPED_CACHES = {"facebook_cache": "", "meta_daily_spend": "", "last_meta_refresh": ""}
+_SCOPED_CACHES = {"facebook_cache": "", "meta_daily_spend": "", "last_meta_refresh": "",
+                  "last_meta_static_refresh": ""}
+
+# A lead row whose campaign is not known: field missing, null, or "" (what the
+# normalizers store when Meta omits it).
+_NO_CAMPAIGN = [None, ""]
 
 
-async def reassign_account_leads(db, user_id: str, ad_account_id: str) -> int:
+async def account_ad_campaigns(db, user_id: str, ad_account_id: str) -> dict:
+    """{ad_id: campaign_id} from the cached ad entities of every group on the account."""
+    groups = await db[_COLLECTION].find(
+        {"user_id": user_id, "meta_ad_account_id": ad_account_id},
+        {"_id": 0, "facebook_cache.entities.ads": 1},
+    ).to_list(length=None)
+    out: dict = {}
+    for g in groups:
+        ads = (((g.get("facebook_cache") or {}).get("entities") or {}).get("ads")) or []
+        for ad in ads:
+            if ad.get("id") and ad.get("campaign_id"):
+                out[str(ad["id"])] = str(ad["campaign_id"])
+    return out
+
+
+async def _backfill_campaign_ids(leads, base: dict, ad_campaigns: dict) -> None:
+    """
+    Fill lead_data.campaign_id on rows that lack it, from their ad's campaign.
+
+    Rows written by the incremental lead path before it asked Meta for
+    campaign_id carry only ad_id. One update_many per campaign, and only for
+    ads that actually have such rows.
+    """
+    missing = {**base, "lead_data.campaign_id": {"$in": _NO_CAMPAIGN}}
+    ad_ids = await leads.distinct("lead_data.ad_id", missing)
+    by_campaign: dict = {}
+    for ad in ad_ids:
+        campaign = ad_campaigns.get(str(ad)) if ad else None
+        if campaign:
+            by_campaign.setdefault(campaign, []).append(ad)
+    for campaign, ads in by_campaign.items():
+        await leads.update_many(
+            {**missing, "lead_data.ad_id": {"$in": ads}},
+            {"$set": {"lead_data.campaign_id": campaign}},
+        )
+
+
+async def reassign_account_leads(db, user_id: str, ad_account_id: str,
+                                 ad_campaigns: Optional[dict] = None) -> int:
     """
     Point every cached lead on the account at the group owning its campaign.
 
     A lone group with a null list owns every lead. Otherwise each list claims
     its campaigns and unclaimed leads become unassigned. One update_many per
     owner plus one for unassigned; rows already correct are not touched.
+
+    Rows without a campaign id are first resolved through their ad
+    (`ad_campaigns`, default: the groups' cached ad entities) and backfilled.
+    A row that still has no campaign keeps its current owner: not knowing the
+    campaign is no evidence that nobody owns it.
     Returns the number of rows modified.
     """
     groups = await db[_COLLECTION].find(
@@ -234,6 +282,11 @@ async def reassign_account_leads(db, user_id: str, ad_account_id: str) -> int:
         g = groups[0]
         return await assign({}, g["id"], g.get("name"))
 
+    if ad_campaigns is None:
+        ad_campaigns = await account_ad_campaigns(db, user_id, ad_account_id)
+    if ad_campaigns:
+        await _backfill_campaign_ids(leads, base, ad_campaigns)
+
     modified = 0
     claimed: set = set()
     for g in groups:
@@ -248,7 +301,7 @@ async def reassign_account_leads(db, user_id: str, ad_account_id: str) -> int:
     # Legacy accounts linked to several groups with null lists keep the rows
     # those groups already hold; everything else unclaimed is unassigned.
     keep = [g["id"] for g in groups if g.get("meta_campaign_ids") is None]
-    unassigned = {"lead_data.campaign_id": {"$nin": list(claimed)}}
+    unassigned = {"lead_data.campaign_id": {"$nin": list(claimed) + _NO_CAMPAIGN}}
     if keep:
         unassigned["client_group_id"] = {"$nin": keep}
     modified += await assign(unassigned, None, None)
@@ -285,6 +338,9 @@ async def apply_selection(db, user_id: str, group_id: str, campaign_ids: Optiona
     if campaign_ids is not None:
         campaign_ids = list(dict.fromkeys(campaign_ids))
     others = await siblings(db, user_id, ad_account_id, exclude_group_id=group_id)
+    # Read before the caches below are cleared: they hold the only ad ->
+    # campaign map for lead rows stored without a campaign id.
+    ad_campaigns = await account_ad_campaigns(db, user_id, ad_account_id)
     names = {c["id"]: c.get("name") for c in account_campaigns if c.get("id")}
     validate_selection(group_id, campaign_ids, others, names)
 
@@ -311,10 +367,15 @@ async def apply_selection(db, user_id: str, group_id: str, campaign_ids: Optiona
         {"group_id": {"$in": changed}, "status": {"$in": _OPEN_JOB_STATUSES}},
         {"$set": {"status": SUPERSEDED, "_claimed_at": None, "updated_at": datetime.utcnow()}},
     )
-    await reassign_account_leads(db, user_id, ad_account_id)
+    await reassign_account_leads(db, user_id, ad_account_id, ad_campaigns)
     return {"changed_group_ids": changed, "converted": converted}
 
 
-async def on_group_deleted(db, user_id: str, ad_account_id: str) -> None:
-    """Hand a deleted group's leads to whoever owns their campaigns now."""
-    await reassign_account_leads(db, user_id, ad_account_id)
+async def on_group_deleted(db, user_id: str, ad_account_id: str,
+                           ad_campaigns: Optional[dict] = None) -> None:
+    """
+    Hand a deleted group's leads to whoever owns their campaigns now.
+    Pass `ad_campaigns` read before the delete so the deleted group's cached
+    ads still help resolve rows stored without a campaign id.
+    """
+    await reassign_account_leads(db, user_id, ad_account_id, ad_campaigns)

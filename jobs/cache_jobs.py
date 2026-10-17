@@ -93,8 +93,13 @@ async def populate_cache_for_existing_groups():
                                     )
                                 )
 
-                            # Meta task
-                            if group.get("meta_ad_account_id") and not group.get("facebook_cache"):
+                            # Meta task. Only for groups that see the whole
+                            # account: this fetch is unscoped, and a group with
+                            # chosen campaigns (meta_campaign_ids not None) is
+                            # filled by the scoped refresh pipeline instead.
+                            if (group.get("meta_ad_account_id")
+                                    and not group.get("facebook_cache")
+                                    and group.get("meta_campaign_ids") is None):
                                 tasks.append(
                                     fetch_and_cache_meta_data(
                                         group_id,

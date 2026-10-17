@@ -586,6 +586,12 @@ async def _get_todays_active_ad_ids(ad_account_id: str, access_token: str) -> Li
     return all_ids
 
 
+_LEAD_FIELDS = (
+    "created_time,id,ad_id,form_id,field_data,ad_name,adset_id,adset_name,"
+    "campaign_id,campaign_name,is_organic,platform"
+)
+
+
 async def _get_todays_leads_for_ad(
         ad_id: str,
         access_token: str,
@@ -606,7 +612,11 @@ async def _get_todays_leads_for_ad(
             data = await _api_get_with_retry(
                 client,
                 f"https://graph.facebook.com/v25.0/{ad_id}",
-                {"fields": "leads,name", "date_preset": "maximum", "access_token": access_token}
+                # Same lead fields as the initial sync (facebook_leads.py), so
+                # incremental rows carry campaign_id too. Lead reassignment
+                # between client groups sharing the account routes on it.
+                {"fields": f"name,leads{{{_LEAD_FIELDS}}}", "date_preset": "maximum",
+                 "access_token": access_token}
             )
             if not data:
                 return [], False
@@ -707,9 +717,15 @@ def _normalize_leads(
 
         result.append({
             "lead_id": lead.get("id"),
-            "ad_name": lead.get("ad_name", ""),
             "ad_id": lead.get("ad_id", ""),
+            "form_id": lead.get("form_id", ""),
+            "adset_id": lead.get("adset_id", ""),
+            "campaign_id": lead.get("campaign_id", ""),
+            "ad_name": lead.get("ad_name", ""),
+            "adset_name": lead.get("adset_name", ""),
+            "campaign_name": lead.get("campaign_name", ""),
             "platform": lead.get("platform", ""),
+            "is_organic": lead.get("is_organic", False),
             "created_time": lead.get("created_time", ""),
             "full_name": field_data.get("full_name", ""),
             "email": field_data.get("email", ""),
