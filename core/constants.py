@@ -70,17 +70,19 @@ PRESET_ALIAS = {
 }
 
 # The window immediately before each preset, for dashkit's `compare: 'previous'`.
-# Only targets that are themselves PRESET_ALIAS keys can be read: the caches
-# store one bucket per canonical preset, and there is no prev_7d / prev_14d /
-# prev_30d / last_week bucket, so those comparisons resolve to None (no
-# `previous`) via previous_preset() until such buckets exist.
+# Only targets that are themselves cached presets (PRESET_ALIAS keys) are
+# listed: the caches store one bucket per canonical preset. The rolling
+# windows (last_7d / last_14d / last_30d) have no "previous N days" bucket;
+# for metrics with a daily series services/dashboards_resolve computes their
+# previous window from the daily rows instead, and for everything else they
+# have no `previous`. this_week has no last_week bucket, so no `previous`.
+# Whether a group actually holds the target bucket is checked per group by the
+# resolver (_covers), so a missing bucket never produces an all-time fallback.
 PREVIOUS_PRESET = {
-    "last_7d":             "prev_7d",
-    "last_14d":            "prev_14d",
-    "last_30d":            "prev_30d",
-    "this_month":          "last_month",
-    "this_week":           "last_week",
-    "this_week_mon_today": "last_week",
+    "this_month":   "last_month",
+    "this_quarter": "last_quarter",
+    "this_year":    "last_year",
+    "today":        "yesterday",
 }
 
 

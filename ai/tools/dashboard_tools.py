@@ -140,6 +140,12 @@ def _binding_error(binding: dict, at: str, metrics: dict, dimensions: set) -> Op
         if dim not in dimensions:
             return _fail("FILTER_DIMENSION_UNKNOWN", f"{at}/filters/{dim}", f'Unknown filter dimension "{dim}"')
     window = binding.get("window") or {}
+    if "from" in window and by != "day":
+        # The resolver reads value and by-client numbers from cached presets only;
+        # a custom range would render as an error on the widget.
+        return _fail("WINDOW_UNSUPPORTED", f"{at}/window",
+                     'Custom {from, to} windows only work with by: "day"; '
+                     'use a window preset (e.g. last_30d) or split the metric by "day"')
     if "from" in window:
         for edge in ("from", "to"):
             if not _ISO_DATE.match(str(window.get(edge, ""))):

@@ -182,6 +182,27 @@ async def test_propose_widget_rejects_a_dimension_the_metric_lacks(mock_db):
     assert result["error"]["path"] == "/bindings/series/by"
 
 
+async def test_custom_window_is_rejected_unless_split_by_day(mock_db):
+    custom = {"from": "2026-09-01", "to": "2026-09-30"}
+    value = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="kpi",
+                                           bindings={"value": {"metric": "spend", "window": custom}})
+    assert value["ok"] is False
+    assert value["error"]["code"] == "WINDOW_UNSUPPORTED"
+    assert value["error"]["path"] == "/bindings/value/window"
+    assert "by" in value["error"]["message"] and "preset" in value["error"]["message"]
+
+    ops = [{"op": "setBinding", "widgetId": "w1", "slot": "value",
+            "binding": {"metric": "spend", "by": "client", "window": custom}}]
+    by_client = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert by_client["ok"] is False
+    assert by_client["error"]["code"] == "WINDOW_UNSUPPORTED"
+    assert by_client["error"]["path"] == "/ops/0/binding/window"
+
+    by_day = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="trend",
+                                            bindings={"series": {"metric": "spend", "by": "day", "window": custom}})
+    assert by_day["ok"] is True
+
+
 async def test_propose_widget_puts_ops_in_the_sink(mock_db):
     sink = []
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="kpi",
@@ -338,7 +359,7 @@ def test_prompt_fragment_lists_widgets_metrics_and_windows():
     assert "- `kpi` — KPI: " in text
     assert "(slots: value (value, required); default 3×1, min 2×1, max 6×2)" in text
     assert "- `meta_spend` — Meta Spend [currency, higher is better] by: client, day" in text
-    assert "- `meta_cpc` — Meta Cpc [currency, lower is better] by: client" in text
+    assert "- `meta_cpc` — Meta CPC [currency, lower is better] by: client" in text
     assert "- `day` — Day" in text
     assert "## Examples" in text
 

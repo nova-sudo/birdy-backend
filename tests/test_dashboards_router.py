@@ -176,7 +176,9 @@ def test_catalog_polarity_marks_cost_metrics_lower_is_better(client):
     cat = client.get("/api/dashboards/catalog").json()
     for key in ("cpc", "cpm", "cpl", "cost_per_result", "cost_per_lead"):
         assert _metric(cat, key)["polarity"] == "lower_is_better", key
-    for key in ("spend", "ctr", "leads"):
+    for key in ("ghl_lost_opps", "ghl_abandoned_opps"):
+        assert _metric(cat, key)["polarity"] == "lower_is_better", key
+    for key in ("spend", "ctr", "leads", "ghl_won_opps", "ghl_open_opps"):
         assert _metric(cat, key)["polarity"] == "higher_is_better", key
 
 
@@ -185,7 +187,30 @@ def test_windows_exclude_data_maximum(client):
     presets = [w["preset"] for w in windows]
     assert "data_maximum" not in presets
     assert "last_7d" in presets and "maximum" in presets
-    assert next(w for w in windows if w["preset"] == "last_7d")["label"] == "Last 7d"
+    assert next(w for w in windows if w["preset"] == "last_7d")["label"] == "Last 7 days"
+
+
+def test_window_labels_read_as_sentences(client):
+    labels = {w["preset"]: w["label"] for w in client.get("/api/dashboards/catalog").json()["windows"]}
+    assert labels["last_14d"] == "Last 14 days"
+    assert labels["last_30d"] == "Last 30 days"
+    assert labels["maximum"] == "All time"
+    assert labels["this_week"] == "This week"
+    assert labels["this_month"] == "This month"
+    assert labels["last_quarter"] == "Last quarter"
+    assert labels["this_year"] == "This year"
+    assert labels["today"] == "Today"
+    assert labels["yesterday"] == "Yesterday"
+
+
+def test_metric_labels_keep_acronyms_in_capitals(client):
+    cat = client.get("/api/dashboards/catalog").json()
+    assert _metric(cat, "ctr")["label"] == "CTR"
+    assert _metric(cat, "cpl")["label"] == "CPL"
+    assert _metric(cat, "meta_cpc")["label"] == "Meta CPC"
+    assert _metric(cat, "ghl_won_opps")["label"] == "GHL Won Opps"
+    assert _metric(cat, "hp_total_calls")["label"] == "HP Total Calls"
+    assert _metric(cat, "cost_per_lead")["label"] == "Cost Per Lead"
 
 
 def test_windows_dedupe_by_alias_target_keeping_first_key(client):

@@ -15,11 +15,17 @@ and an `errors` entry rather than failing the whole request.
   `by: 'client'` -> series slot  (one point per group, sorted + limited)
   `by: 'day'`    -> series slot  (daily rows summed across groups per date)
   shapes[i] == 'table' -> the same data as a table slot.
+
+`compare: 'previous'` reads the cached bucket before the preset (PREVIOUS_PRESET:
+this_month -> last_month, this_quarter -> last_quarter, ...) or, for metrics with
+a daily series on last_7d / last_14d / last_30d, sums the daily rows of the N
+days before the window. By-day series never carry `previous`.
 """
 
 import logging
 import math
-from typing import Optional
+from datetime import date, timedelta
+from typing import Callable, Optional
 
 from core.constants import PRESET_ALIAS, ghl_date_bounds, previous_preset
 from services.dashboards_catalog import DAILY_SOURCES, build_catalog
@@ -136,8 +142,71 @@ def _covers(group: dict, sources: set[str], preset: str) -> bool:
     return all(_has_bucket(group, s, preset) for s in sources)
 
 
-def _previous_preset_for(binding: dict, preset: str) -> Optional[str]:
-    return previous_preset(preset) if binding.get("compare") == "previous" else None
+# Rolling windows whose previous period is read from the daily rows (there is
+# no cached "previous N days" bucket; see PREVIOUS_PRESET in core/constants).
+_DAILY_PREVIOUS_PRESETS = {"last_7d", "last_14d", "last_30d"}
+
+
+def _daily_rows(group: dict, field: str, start: Optional[str], end: Optional[str]):
+    """(iso day, row) for each daily row of `field` inside [start, end] (open bounds when None)."""
+    for row in group.get(field) or []:
+        day = row.get("date") if isinstance(row, dict) else None
+        if not isinstance(day, str):
+            continue
+        day = day[:10]
+        if (start and day < start) or (end and day > end):
+            continue
+        yield day, row
+
+
+class _Previous:
+    """
+    How to read the previous window for one binding:
+      covers(group) -> the group has real data for the previous window
+      total(groups) -> the metric over those groups for the previous window
+      point(group)  -> the metric for one group for the previous window
+    """
+
+    def __init__(self, covers: Callable, total: Callable, point: Callable):
+        self.covers, self.total, self.point = covers, total, point
+
+
+def _previous_for(metric: dict, binding: dict, preset: str) -> Optional[_Previous]:
+    """The previous-window reader for a compare binding, or None when it has no previous window."""
+    if binding.get("compare") != "previous":
+        return None
+    key = metric["key"]
+
+    prev = previous_preset(preset)
+    if prev:
+        sources = _metric_sources(key)
+        return _Previous(
+            covers=lambda g: _covers(g, sources, prev),
+            total=lambda gs: _finite(aggregate_metric(key, gs, prev)),
+            point=lambda g: _finite(get_metric_value(key, g, prev)),
+        )
+
+    source = DAILY_SOURCES.get(key)
+    if source and preset in _DAILY_PREVIOUS_PRESETS:
+        # The current window is [start, end] (ghl_date_bounds, inclusive); the
+        # previous one is the N days right before it, N = days in [start, end].
+        start_iso, end_iso = ghl_date_bounds(preset)
+        start, end = date.fromisoformat(start_iso), date.fromisoformat(end_iso)
+        n = (end - start).days + 1
+        p_start = (start - timedelta(days=n)).isoformat()
+        p_end = (start - timedelta(days=1)).isoformat()
+        field, row_key = source["field"], source["key"]
+
+        def point(g: dict) -> float:
+            return sum(_finite(row.get(row_key)) for _, row in _daily_rows(g, field, p_start, p_end))
+
+        return _Previous(
+            # A group counts as covered when it has at least one row in the previous range.
+            covers=lambda g: any(True for _ in _daily_rows(g, field, p_start, p_end)),
+            total=lambda gs: sum(point(g) for g in gs),
+            point=point,
+        )
+    return None
 
 
 # --- resolvers ---------------------------------------------------------------
@@ -162,35 +231,40 @@ def _sorted_limited(points: list[dict], binding: dict, default_sort: str) -> lis
 
 def _resolve_value(metric: dict, binding: dict, groups: list[dict]) -> dict:
     preset = _required_preset(binding)
+    value_groups, previous = groups, None
+    reader = _previous_for(metric, binding, preset)
+    if reader:
+        # Compare only when every group with data for the current window also
+        # has data for the previous one; a group with neither stays out of both,
+        # so the current value is then taken over the same groups as `previous`.
+        sources = _metric_sources(metric["key"])
+        contributing = [g for g in groups if _covers(g, sources, preset)]
+        if contributing and all(reader.covers(g) for g in contributing):
+            value_groups, previous = contributing, reader.total(contributing)
     slot = {
         "shape": "value",
-        "value": _finite(aggregate_metric(metric["key"], groups, preset)),
+        "value": _finite(aggregate_metric(metric["key"], value_groups, preset)),
         "format": metric["format"],
         "polarity": metric["polarity"],
     }
-    prev = _previous_preset_for(binding, preset)
-    if prev:
-        # Compare only when every group with data for the current window also
-        # has data for the previous one; a group with neither stays out of both.
-        sources = _metric_sources(metric["key"])
-        contributing = [g for g in groups if _covers(g, sources, preset)]
-        if contributing and all(_covers(g, sources, prev) for g in contributing):
-            slot["previous"] = _finite(aggregate_metric(metric["key"], contributing, prev))
+    if previous is not None:
+        slot["previous"] = _finite(previous)
     return slot
 
 
 def _resolve_by_client(metric: dict, binding: dict, groups: list[dict]) -> dict:
     preset = _required_preset(binding)
-    prev = _previous_preset_for(binding, preset)
-    sources = _metric_sources(metric["key"]) if prev else set()
+    reader = _previous_for(metric, binding, preset)
+    sources = _metric_sources(metric["key"]) if reader else set()
     points = []
     for g in groups:
         point = {
             "label": g.get("name") or g.get("id") or "",
             "value": _finite(get_metric_value(metric["key"], g, preset)),
         }
-        if prev and _covers(g, sources, prev):
-            point["previous"] = _finite(get_metric_value(metric["key"], g, prev))
+        # A point compares only when the group has real data for both windows.
+        if reader and _covers(g, sources, preset) and reader.covers(g):
+            point["previous"] = _finite(reader.point(g))
         points.append(point)
     return {
         "shape": "series",
@@ -209,6 +283,7 @@ def _day_bounds(binding: dict) -> tuple[Optional[str], Optional[str]]:
 
 
 def _resolve_by_day(metric: dict, binding: dict, groups: list[dict]) -> dict:
+    # By-day series never carry `previous`.
     source = DAILY_SOURCES.get(metric["key"])
     if not source:
         raise BindingError("DAY_SERIES_UNAVAILABLE", f"'{metric['key']}' has no daily series")
@@ -217,13 +292,7 @@ def _resolve_by_day(metric: dict, binding: dict, groups: list[dict]) -> dict:
 
     totals: dict[str, float] = {}
     for g in groups:
-        for row in g.get(field) or []:
-            day = row.get("date") if isinstance(row, dict) else None
-            if not isinstance(day, str):
-                continue
-            day = day[:10]
-            if (start and day < start) or (end and day > end):
-                continue
+        for day, row in _daily_rows(g, field, start, end):
             totals[day] = totals.get(day, 0.0) + _finite(row.get(row_key))
 
     # `limit` keeps the most recent days; `sort` then orders them by date (asc by default).
