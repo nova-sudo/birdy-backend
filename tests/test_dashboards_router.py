@@ -133,3 +133,74 @@ async def test_unique_index_on_user_and_id(mock_mongo_client, mock_db):
     await mock_db["dashboards"].insert_one({"user_id": "v", "id": "d1"})
     with pytest.raises(DuplicateKeyError):
         await mock_db["dashboards"].insert_one({"user_id": "u", "id": "d1"})
+
+
+# --- catalog ---------------------------------------------------------------
+
+_FORMATS = {"integer", "currency", "percentage", "decimal", "compact"}
+_AGGREGATIONS = {"sum", "avg", "last"}
+_POLARITIES = {"higher_is_better", "lower_is_better"}
+
+
+def _metric(catalog, key):
+    return next(m for m in catalog["metrics"] if m["key"] == key)
+
+
+def test_catalog_lists_spend_with_dimensions_client_and_day(client):
+    r = client.get("/api/dashboards/catalog")
+    assert r.status_code == 200
+    spend = _metric(r.json(), "spend")
+    assert spend["dimensions"] == ["client", "day"]
+    assert spend["format"] == "currency"
+    assert spend["aggregation"] == "sum"
+    assert spend["label"] == "Spend"
+    assert _metric(r.json(), "meta_leads")["dimensions"] == ["client", "day"]
+
+
+def test_catalog_lists_ctr_with_dimensions_client_only(client):
+    ctr = _metric(client.get("/api/dashboards/catalog").json(), "ctr")
+    assert ctr["dimensions"] == ["client"]
+    assert ctr["aggregation"] == "avg"
+    assert ctr["format"] == "percentage"
+
+
+def test_catalog_polarity_marks_cost_metrics_lower_is_better(client):
+    cat = client.get("/api/dashboards/catalog").json()
+    for key in ("cpc", "cpm", "cpl", "cost_per_result", "cost_per_lead"):
+        assert _metric(cat, key)["polarity"] == "lower_is_better", key
+    for key in ("spend", "ctr", "leads"):
+        assert _metric(cat, key)["polarity"] == "higher_is_better", key
+
+
+def test_windows_exclude_data_maximum(client):
+    windows = client.get("/api/dashboards/catalog").json()["windows"]
+    presets = [w["preset"] for w in windows]
+    assert "data_maximum" not in presets
+    assert "last_7d" in presets and "maximum" in presets
+    assert next(w for w in windows if w["preset"] == "last_7d")["label"] == "Last 7d"
+
+
+def test_catalog_validates_against_dashkit_catalog_schema_shape(client):
+    cat = client.get("/api/dashboards/catalog").json()
+    assert set(cat) == {"metrics", "dimensions", "windows"}
+    assert cat["dimensions"] == [
+        {"key": "client", "label": "Client"},
+        {"key": "day", "label": "Day"},
+    ]
+    dim_keys = {d["key"] for d in cat["dimensions"]}
+    assert cat["metrics"]
+    for m in cat["metrics"]:
+        assert {"key", "label", "format", "dimensions"} <= set(m)
+        assert set(m) <= {"key", "label", "unit", "format", "dimensions",
+                          "description", "aggregation", "polarity"}
+        assert m["format"] in _FORMATS
+        assert m["aggregation"] in _AGGREGATIONS
+        assert m["polarity"] in _POLARITIES
+        assert "client" in m["dimensions"] and set(m["dimensions"]) <= dim_keys
+    for w in cat["windows"]:
+        assert set(w) == {"preset", "label"}
+
+
+def test_catalog_requires_auth(mock_db):
+    app.dependency_overrides.pop(get_current_user, None)
+    assert TestClient(app).get("/api/dashboards/catalog").status_code in (401, 403)

@@ -18,6 +18,7 @@ from fastapi import APIRouter, Body, Depends, HTTPException, Response
 
 from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
+from services.dashboards_catalog import build_catalog
 from services.dashboards_schema import schema_has_meta_updated_at, validate_doc
 
 logger = logging.getLogger(__name__)
@@ -60,6 +61,12 @@ async def list_dashboards(current_user: str = Depends(get_current_user)):
         except Exception as e:
             logger.error(f"Error listing dashboards for {current_user}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to load dashboards")
+
+
+@router.get("/api/dashboards/catalog")
+async def get_catalog(current_user: str = Depends(get_current_user)):
+    """What a dashboard can bind to: metrics, dimensions and time windows."""
+    return build_catalog()
 
 
 # --- fixed-path routes (/catalog, /resolve) go above this line; /{id} must stay last ---
