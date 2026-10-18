@@ -89,12 +89,18 @@ async def _store(db, doc=None, user=USER):
 KPI_BINDING = {"metric": "meta_spend", "window": {"preset": "last_30d"}, "compare": "previous"}
 
 
+def _summary():
+    """What the editor sends: summarize(doc) of the live doc."""
+    return summarize_doc(_doc())
+
+
 # ── propose ────────────────────────────────────────────────────────────────
 
 
 async def test_propose_widget_returns_add_widget_and_set_binding_ops(mock_db):
     result = await dashboard_propose_widget(
-        mock_db, USER, sectionId="s1", type="kpi", title="Spend", bindings={"value": KPI_BINDING},
+        mock_db, USER, summary=_summary(), sectionId="s1", type="kpi", title="Spend",
+        bindings={"value": KPI_BINDING},
     )
     assert result["ok"] is True
     add, bind = result["ops"]
@@ -132,6 +138,34 @@ async def test_propose_widget_without_any_section_is_rejected(mock_db):
     assert result["error"]["code"] == "NO_SECTION"
 
 
+async def test_propose_widget_trusts_a_summary_without_sections_over_the_stored_doc(mock_db):
+    await _store(mock_db)
+    result = await dashboard_propose_widget(mock_db, USER, dashboard_id="d1", summary="# Empty (0 sections, 0 widgets)",
+                                            type="kpi", bindings={"value": KPI_BINDING})
+    assert result["ok"] is False
+    assert result["error"]["code"] == "NO_SECTION"
+
+
+async def test_propose_widget_into_an_unknown_section_is_rejected(mock_db):
+    result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="nope", type="kpi",
+                                            bindings={"value": KPI_BINDING})
+    assert result["ok"] is False
+    assert result["error"] == {"code": "SECTION_NOT_FOUND", "path": "/sectionId",
+                               "message": result["error"]["message"]}
+
+
+async def test_propose_then_move_the_new_widget_in_the_same_turn(mock_db):
+    sink = []
+    proposed = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
+                                              bindings={"value": KPI_BINDING}, dashboard_ops_sink=sink)
+    moved = await dashboard_apply(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink, ops=[
+        {"op": "moveWidget", "widgetId": proposed["widgetId"], "toSectionId": "s2", "toIndex": 0},
+        {"op": "resizeWidget", "widgetId": proposed["widgetId"], "span": {"cols": 4, "rows": 1}},
+    ])
+    assert moved["ok"] is True
+    assert [o["op"] for o in sink] == ["addWidget", "setBinding", "moveWidget", "resizeWidget"]
+
+
 async def test_propose_widget_requires_required_slots(mock_db):
     result = await dashboard_propose_widget(mock_db, USER, sectionId="s1", type="kpi", bindings={})
     assert result["ok"] is False
@@ -150,7 +184,7 @@ async def test_propose_widget_rejects_a_dimension_the_metric_lacks(mock_db):
 
 async def test_propose_widget_puts_ops_in_the_sink(mock_db):
     sink = []
-    result = await dashboard_propose_widget(mock_db, USER, sectionId="s1", type="kpi",
+    result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="kpi",
                                             bindings={"value": KPI_BINDING}, dashboard_ops_sink=sink)
     assert sink == result["ops"]
 
@@ -160,8 +194,56 @@ async def test_propose_widget_puts_ops_in_the_sink(mock_db):
 
 async def test_apply_returns_the_ops(mock_db):
     ops = [{"op": "resizeWidget", "widgetId": "w1", "span": {"cols": 6, "rows": 2}}]
-    result = await dashboard_apply(mock_db, USER, ops=ops)
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
     assert result == {"ok": True, "ops": ops, "note": "Applied in the user's editor."}
+
+
+async def test_apply_with_unknown_widget_id_is_rejected_with_path(mock_db):
+    sink = []
+    ops = [{"op": "resizeWidget", "widgetId": "w1", "span": {"cols": 6, "rows": 2}},
+           {"op": "removeWidget", "widgetId": "ghost"}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops, dashboard_ops_sink=sink)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "WIDGET_NOT_FOUND"
+    assert result["error"]["path"] == "/ops/1/widgetId"
+    assert sink == []
+
+
+async def test_apply_with_unknown_target_section_is_rejected_with_path(mock_db):
+    ops = [{"op": "moveWidget", "widgetId": "w1", "toSectionId": "ghost", "toIndex": 0}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["error"]["code"] == "SECTION_NOT_FOUND"
+    assert result["error"]["path"] == "/ops/0/toSectionId"
+    removed = await dashboard_apply(mock_db, USER, summary=_summary(),
+                                    ops=[{"op": "removeSection", "sectionId": "ghost"}])
+    assert removed["error"]["path"] == "/ops/0/sectionId"
+
+
+async def test_apply_ids_come_from_the_stored_doc_when_no_summary_is_sent(mock_db):
+    await _store(mock_db)
+    ok = await dashboard_apply(mock_db, USER, dashboard_id="d1", ops=[{"op": "removeWidget", "widgetId": "w2"}])
+    assert ok["ok"] is True
+    missing = await dashboard_apply(mock_db, USER, ops=[{"op": "removeWidget", "widgetId": "w2"}])
+    assert missing["error"]["code"] == "WIDGET_NOT_FOUND"
+
+
+async def test_apply_ops_see_ids_created_and_removed_earlier_in_the_call(mock_db):
+    created = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "addSection", "section": {"id": "s3", "title": "New"}},
+        {"op": "addWidget", "sectionId": "s3", "widget": {"id": "w9", "type": "kpi"}},
+        {"op": "setBinding", "widgetId": "w9", "slot": "value", "binding": KPI_BINDING},
+    ])
+    assert created["ok"] is True
+    removed = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "removeSection", "sectionId": "s1"},
+        {"op": "resizeWidget", "widgetId": "w1", "span": {"cols": 6, "rows": 2}},
+    ])
+    assert removed["error"] == {"code": "WIDGET_NOT_FOUND", "path": "/ops/1/widgetId",
+                                "message": removed["error"]["message"]}
+    duplicate = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "addWidget", "sectionId": "s1", "widget": {"id": "w1", "type": "kpi"}},
+    ])
+    assert duplicate["error"]["code"] == "DUPLICATE_ID"
 
 
 async def test_apply_with_unknown_metric_returns_ok_false_with_path(mock_db):
@@ -179,13 +261,14 @@ async def test_apply_with_unknown_metric_returns_ok_false_with_path(mock_db):
 async def test_apply_rejects_replace_dashboard(mock_db):
     result = await dashboard_apply(mock_db, USER, ops=[{"op": "replaceDashboard", "doc": _doc()}])
     assert result["ok"] is False
+    assert result["error"]["code"] == "OP_FORBIDDEN"
     assert result["error"]["path"].startswith("/ops/0")
 
 
 async def test_apply_rejects_a_dimension_the_metric_lacks(mock_db):
     ops = [{"op": "setBinding", "widgetId": "w1", "slot": "value",
             "binding": {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}}]
-    result = await dashboard_apply(mock_db, USER, ops=ops)
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
     assert result["ok"] is False
     assert result["error"]["code"] == "DIMENSION_NOT_ALLOWED"
     assert result["error"]["path"] == "/ops/0/binding/by"
@@ -217,6 +300,15 @@ async def test_describe_returns_the_sent_summary_verbatim(mock_db):
     sent = "# Live edits (1 sections, 0 widgets)\n## Draft [x] (0 widgets)"
     result = await dashboard_describe(mock_db, USER, dashboard_id="d1", summary=sent)
     assert result == {"summary": sent}
+
+
+async def test_describe_notes_ops_returned_earlier_in_the_turn(mock_db):
+    sink = [{"op": "removeWidget", "widgetId": "w2"}]
+    result = await dashboard_describe(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink)
+    assert result["summary"] == _summary()
+    assert "1 op(s)" in result["note"]
+    fresh = await dashboard_describe(mock_db, USER, summary=_summary(), dashboard_ops_sink=[])
+    assert "note" not in fresh
 
 
 async def test_describe_does_not_read_another_users_dashboard(mock_db):
@@ -264,7 +356,10 @@ def test_chat_models_carry_dashboard_fields():
 
 
 @pytest.fixture
-def dash_registry():
+def dash_registry(monkeypatch):
+    # get_client_groups is an MCP tool, so the dashboards page would open a real
+    # MCP connection; the registry fallback is what these tests exercise.
+    monkeypatch.setattr("ai.orchestrator.mcp_client.needs_mcp", lambda allowed: False)
     reg = ToolRegistry()
     register_dashboard_tools(reg)
     return reg
