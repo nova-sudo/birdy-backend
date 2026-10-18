@@ -8,6 +8,8 @@ from ai.providers.base import BaseLLMProvider
 from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
 from ai.prompts.media_buying import get_media_buying_module
+from ai.prompts import dashboards as dashboards_prompt
+from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai import mcp_client
 from ai import session_store
 from ai import conversation_log
@@ -88,6 +90,13 @@ _PAGE_TOOLS = {
         "propose_report",
         "get_account_summary",
     ],
+    "dashboards": [
+        "dashboard_describe",
+        "dashboard_apply",
+        "dashboard_propose_widget",
+        "catalog_search",
+        "get_client_groups",
+    ],
     "client_detail": [
         "get_client_groups",
         "get_campaign_insights",
@@ -113,6 +122,12 @@ _PAGE_TOOLS = {
 # cut off mid-JSON — which parsed as no arguments at all.
 _PAGE_MAX_TOKENS = {"report_designer": 8000}
 DEFAULT_MAX_TOKENS = 2048
+
+# Tools offered only on a page that lists them. The general chat (no or unknown
+# page) gets every registered tool otherwise; the dashboard tools would only add
+# ~13k characters of catalog-laden schemas there, and their ops have no editor
+# to land in.
+_PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES)
 
 # Client-scoped pages hard-pin these tools to the page's client server-side:
 # whatever group_id the model passes (or omits) is overwritten with the page's
@@ -392,6 +407,8 @@ _PAGE_SYSTEM_PROMPTS = {
     "dashboard": _DASHBOARD_SYSTEM_PROMPT,
     "call_center": _CALL_CENTER_SYSTEM_PROMPT,
     "report_designer": _REPORT_DESIGNER_SYSTEM_PROMPT,
+    # Built when a session starts (a callable), so it reads the current catalog.
+    "dashboards": dashboards_prompt.system_prompt,
 }
 
 # Surfaces where the optional "media_buying" capability (Settings -> Capabilities)
@@ -489,6 +506,8 @@ async def run_chat(
     client_group_id: Optional[str] = None,
     client_name: Optional[str] = None,
     source: str = conversation_log.SOURCE_BIRDY,
+    dashboard_id: Optional[str] = None,
+    dashboard_summary: Optional[str] = None,
 ) -> dict:
     # Restore or create session
     session_id, history = await session_store.get_or_create(db, session_id, user_id)
@@ -502,6 +521,8 @@ async def run_chat(
             system_content = _build_client_detail_prompt(client_name, client_group_id)
         elif page:
             system_content = _PAGE_SYSTEM_PROMPTS.get(page, get_system_prompt())
+            if callable(system_content):
+                system_content = system_content()
         else:
             system_content = get_system_prompt()
         # Optionally layer the media-buying analyst module on the analysis
@@ -538,6 +559,11 @@ async def run_chat(
     # group id via get_client_groups before querying, so the ids it filters by
     # ARE the answer to "which client is this turn about" — no extra AI call.
     groups_touched: set = set()
+    # Edit ops for the dashboards editor, in order, from every successful
+    # dashboard_apply / dashboard_propose_widget call this turn. The executors
+    # append to this list themselves (see ai/tools/dashboard_tools.py), so the
+    # ops survive even when the model-facing result is truncated.
+    dashboard_ops: list = []
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -601,6 +627,7 @@ async def run_chat(
         registry_schemas = [
             s for s in tool_registry.get_schemas(allowed=allowed)
             if s["function"]["name"] not in mcp_client.MCP_TOOL_NAMES
+            and (allowed is not None or s["function"]["name"] not in _PAGE_ONLY_TOOLS)
         ]
         mcp_schemas = await mcp_client.get_mcp_schemas(mcp, allowed) if mcp else None
         if mcp_schemas is None:
@@ -682,6 +709,7 @@ async def run_chat(
                     "reply": reply,
                     "tools_used": tools_used,
                     "session_id": session_id,
+                    "dashboard_ops": dashboard_ops,
                     **(await _resolve_turn_scope()),
                 }
 
@@ -735,12 +763,19 @@ async def run_chat(
                 elif tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:
+                    call_args = args
+                    if tc.name in DASHBOARD_TOOL_NAMES:
+                        # Server-side context for the dashboard tools: the open
+                        # dashboard, the editor's live summary and the turn's op
+                        # list. Overrides anything the model passed under these names.
+                        call_args = {**args, "dashboard_id": dashboard_id,
+                                     "summary": dashboard_summary, "dashboard_ops_sink": dashboard_ops}
                     result = await tool_registry.execute(
                         tc.name,
                         db=db,
                         user_id=user_id,
                         mongo_client=mongo_client,
-                        **args,
+                        **call_args,
                     )
 
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
@@ -775,5 +810,6 @@ async def run_chat(
             "reply": reply,
             "tools_used": tools_used,
             "session_id": session_id,
+            "dashboard_ops": dashboard_ops,
             **(await _resolve_turn_scope()),
         }

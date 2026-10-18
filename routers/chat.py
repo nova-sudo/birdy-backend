@@ -22,6 +22,7 @@ from ai.tools.multi_window_tools import register_multi_window_tools
 from ai.tools.hp_tools import register_hp_tools
 from ai.tools.call_analysis_tools import register_call_analysis_tools
 from ai.tools.report_designer_tools import register_report_designer_tools
+from ai.tools.dashboard_tools import register_dashboard_tools
 from ai.orchestrator import run_chat
 
 logger = logging.getLogger(__name__)
@@ -42,6 +43,7 @@ register_multi_window_tools()
 register_hp_tools()
 register_call_analysis_tools()
 register_report_designer_tools()
+register_dashboard_tools()
 
 
 async def _onboarding_complete(db, user_id: str) -> bool:
@@ -76,6 +78,8 @@ async def chat(
                 mongo_client=mongo_client,
                 client_group_id=request.client_group_id,
                 client_name=request.client_name,
+                dashboard_id=request.dashboard_id,
+                dashboard_summary=request.summary,
             )
             return ChatResponse(**result)
         except HTTPException:

@@ -175,6 +175,10 @@ class ChatRequest(BaseModel):
     page: Optional[str] = None
     client_group_id: Optional[str] = None
     client_name: Optional[str] = None
+    # "My dashboards" chat: the dashboard open in the editor, and the editor's
+    # `summarize(doc)` of it (unsaved edits included) for dashboard_describe.
+    dashboard_id: Optional[str] = None
+    summary: Optional[str] = None
 
 
 class ChatResponse(BaseModel):
@@ -188,6 +192,9 @@ class ChatResponse(BaseModel):
     scope: Optional[str] = None
     client_group_id: Optional[str] = None
     client_name: Optional[str] = None
+    # dashkit edit ops for the dashboards editor to apply, in order (empty
+    # unless a dashboard tool succeeded this turn).
+    dashboard_ops: list = []
 
 
 # ── Capabilities (per-user agent toggles) ─────────────────────────────────────
