@@ -18,22 +18,21 @@ and an `errors` entry rather than failing the whole request.
 """
 
 import logging
+import math
 from typing import Optional
 
 from core.constants import PRESET_ALIAS, ghl_date_bounds, previous_preset
 from services.dashboards_catalog import DAILY_SOURCES, build_catalog
-from services.metric_orchestrator import aggregate_metric, get_metric_value, resolve_preset
+from services.metric_orchestrator import (
+    METRIC_REGISTRY,
+    aggregate_metric,
+    get_metric_value,
+    resolve_preset,
+)
 
 logger = logging.getLogger(__name__)
 
 MAX_BINDINGS = 50
-
-# daily field -> the per-row key holding that day's figure
-_DAILY_ROW_KEYS = {
-    "meta_daily_spend": "spend",
-    "ghl_daily_leads": "leads",
-    "hp_daily_calls": "calls",
-}
 
 # Everything metric_orchestrator's source readers touch, plus the daily series.
 _GROUP_PROJECTION = {
@@ -45,7 +44,7 @@ _GROUP_PROJECTION = {
     "gohighlevel_cache": 1,
     "hotprospector_call_cache": 1,
     "hotprospector_cache": 1,
-    **{field: 1 for field in _DAILY_ROW_KEYS},
+    **{src["field"]: 1 for src in DAILY_SOURCES.values()},
 }
 
 
@@ -67,12 +66,21 @@ async def load_groups(db, user_id: str) -> list[dict]:
 
 
 def _filter_groups(groups: list[dict], filters: Optional[dict]) -> list[dict]:
-    """`filters.client` is a list of group ids; any other filter key is ignored."""
+    """`filters.client` is a list of group ids (empty = no filter); other filter keys are ignored."""
     ids = (filters or {}).get("client")
-    if ids is None:
+    if not ids:
         return groups
     wanted = set(ids)
     return [g for g in groups if g.get("id") in wanted]
+
+
+def _finite(value) -> float:
+    """NaN / inf would make the JSON response fail; read them as 0 like any other unusable value."""
+    try:
+        value = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if math.isfinite(value) else 0.0
 
 
 def _preset_of(binding: dict) -> Optional[str]:
@@ -86,7 +94,56 @@ def _preset_of(binding: dict) -> Optional[str]:
     return resolve_preset(preset)
 
 
+def _required_preset(binding: dict) -> str:
+    """The binding's canonical preset; custom {from, to} windows are only for by: 'day'."""
+    preset = _preset_of(binding)
+    if preset is None:
+        raise BindingError("WINDOW_UNSUPPORTED", "Custom date windows are only supported with by: 'day'")
+    return preset
+
+
+# --- previous-window coverage --------------------------------------------------
+# metric_orchestrator's readers never come back empty-handed: a missing preset
+# bucket falls back to `maximum` (ghl_opp, hp_call) or the legacy flat insights
+# (meta), and the general `ghl` source ignores the preset entirely. Reading the
+# previous window through them would compare against all-time numbers, so a
+# group only counts towards `previous` when every source the metric reads holds
+# a real bucket for that window.
+
+def _metric_sources(metric_id: str) -> set[str]:
+    entry = METRIC_REGISTRY.get(metric_id) or {}
+    if entry.get("aggregation") == "recompute":
+        num_id, den_id = entry["components"]
+        return _metric_sources(num_id) | _metric_sources(den_id)
+    return {entry.get("source")}
+
+
+def _has_bucket(group: dict, source: Optional[str], preset: str) -> bool:
+    if source == "meta":
+        fb = group.get("facebook_cache") or {}
+        bucket = (fb.get("presets") or {}).get(preset) or fb.get(preset) or {}
+        return bool((bucket.get("metrics") or {}).get("insights"))
+    if source == "ghl_opp":
+        bucket = (group.get("ghl_opp_cache") or {}).get(preset)
+        return isinstance(bucket, dict) and bool(bucket)
+    if source == "hp_call":
+        bucket = (group.get("hotprospector_call_cache") or {}).get(preset)
+        return isinstance(bucket, dict) and bool(bucket)
+    return False  # `ghl` general metrics are not windowed at all
+
+
+def _covers(group: dict, sources: set[str], preset: str) -> bool:
+    return all(_has_bucket(group, s, preset) for s in sources)
+
+
+def _previous_preset_for(binding: dict, preset: str) -> Optional[str]:
+    return previous_preset(preset) if binding.get("compare") == "previous" else None
+
+
+# --- resolvers ---------------------------------------------------------------
+
 def _limited(points: list[dict], binding: dict) -> list[dict]:
+    """The first `limit` points."""
     limit = binding.get("limit")
     if isinstance(limit, (int, float)) and limit >= 0:
         return points[: int(limit)]
@@ -104,31 +161,34 @@ def _sorted_limited(points: list[dict], binding: dict, default_sort: str) -> lis
 
 
 def _resolve_value(metric: dict, binding: dict, groups: list[dict]) -> dict:
-    preset = _preset_of(binding)
-    if preset is None:
-        raise BindingError("WINDOW_UNSUPPORTED", "Custom date windows are only supported with by: 'day'")
+    preset = _required_preset(binding)
     slot = {
         "shape": "value",
-        "value": aggregate_metric(metric["key"], groups, preset),
+        "value": _finite(aggregate_metric(metric["key"], groups, preset)),
         "format": metric["format"],
         "polarity": metric["polarity"],
     }
-    prev = previous_preset(preset) if binding.get("compare") == "previous" else None
+    prev = _previous_preset_for(binding, preset)
     if prev:
-        slot["previous"] = aggregate_metric(metric["key"], groups, prev)
+        sources = _metric_sources(metric["key"])
+        covered = [g for g in groups if _covers(g, sources, prev)]
+        if covered:
+            slot["previous"] = _finite(aggregate_metric(metric["key"], covered, prev))
     return slot
 
 
 def _resolve_by_client(metric: dict, binding: dict, groups: list[dict]) -> dict:
-    preset = _preset_of(binding)
-    if preset is None:
-        raise BindingError("WINDOW_UNSUPPORTED", "Custom date windows are only supported with by: 'day'")
-    prev = previous_preset(preset) if binding.get("compare") == "previous" else None
+    preset = _required_preset(binding)
+    prev = _previous_preset_for(binding, preset)
+    sources = _metric_sources(metric["key"]) if prev else set()
     points = []
     for g in groups:
-        point = {"label": g.get("name") or g.get("id") or "", "value": get_metric_value(metric["key"], g, preset)}
-        if prev:
-            point["previous"] = get_metric_value(metric["key"], g, prev)
+        point = {
+            "label": g.get("name") or g.get("id") or "",
+            "value": _finite(get_metric_value(metric["key"], g, preset)),
+        }
+        if prev and _covers(g, sources, prev):
+            point["previous"] = _finite(get_metric_value(metric["key"], g, prev))
         points.append(point)
     return {
         "shape": "series",
@@ -139,41 +199,41 @@ def _resolve_by_client(metric: dict, binding: dict, groups: list[dict]) -> dict:
 
 
 def _day_bounds(binding: dict) -> tuple[Optional[str], Optional[str]]:
-    window = binding.get("window") or {"preset": "maximum"}
-    if "preset" in window:
-        return ghl_date_bounds(_preset_of(binding))
+    preset = _preset_of(binding)
+    if preset is not None:
+        return ghl_date_bounds(preset)
+    window = binding["window"]
     return window.get("from"), window.get("to")
 
 
 def _resolve_by_day(metric: dict, binding: dict, groups: list[dict]) -> dict:
-    field = DAILY_SOURCES.get(metric["key"])
-    if not field:
+    source = DAILY_SOURCES.get(metric["key"])
+    if not source:
         raise BindingError("DAY_SERIES_UNAVAILABLE", f"'{metric['key']}' has no daily series")
-    row_key = _DAILY_ROW_KEYS[field]
+    field, row_key = source["field"], source["key"]
     start, end = _day_bounds(binding)
 
     totals: dict[str, float] = {}
     for g in groups:
         for row in g.get(field) or []:
-            day = row.get("date")
+            day = row.get("date") if isinstance(row, dict) else None
             if not isinstance(day, str):
                 continue
             day = day[:10]
             if (start and day < start) or (end and day > end):
                 continue
-            try:
-                value = float(row.get(row_key) or 0)
-            except (TypeError, ValueError):
-                value = 0.0
-            totals[day] = totals.get(day, 0.0) + value
+            totals[day] = totals.get(day, 0.0) + _finite(row.get(row_key))
 
-    # A day series sorts by date (ascending by default), then keeps the first `limit`.
+    # `limit` keeps the most recent days; `sort` then orders them by date (asc by default).
     points = [{"label": day, "value": totals[day]} for day in sorted(totals)]
+    limit = binding.get("limit")
+    if isinstance(limit, (int, float)) and limit >= 0:
+        points = points[len(points) - min(int(limit), len(points)):]
     if binding.get("sort") == "desc":
         points.reverse()
     return {
         "shape": "series",
-        "points": _limited(points, binding),
+        "points": points,
         "format": metric["format"],
         "polarity": metric["polarity"],
     }

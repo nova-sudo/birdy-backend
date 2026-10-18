@@ -12,13 +12,21 @@ daily source (the fields /api/client-groups/daily serves).
 from core.constants import PRESET_ALIAS
 from services.metric_orchestrator import METRIC_REGISTRY
 
-# metric key -> daily field in the daily-series data
-DAILY_SOURCES: dict[str, str] = {
-    "leads": "ghl_daily_leads",
-    "meta_leads": "ghl_daily_leads",
-    "spend": "meta_daily_spend",
-    "meta_spend": "meta_daily_spend",
-    "calls": "hp_daily_calls",
+# metric key -> where its daily series lives: the client-group field holding the
+# rows (the fields /api/client-groups/daily serves) and the per-row key. Only
+# metrics whose daily rows measure the same thing as the metric's value source
+# are listed: `leads` / `meta_leads` read Meta `results`, which has no daily
+# series, so they are not here.
+DAILY_SOURCES: dict[str, dict[str, str]] = {
+    "spend":            {"field": "meta_daily_spend", "key": "spend"},
+    "meta_spend":       {"field": "meta_daily_spend", "key": "spend"},
+    "impressions":      {"field": "meta_daily_spend", "key": "impressions"},
+    "meta_impressions": {"field": "meta_daily_spend", "key": "impressions"},
+    "clicks":           {"field": "meta_daily_spend", "key": "clicks"},
+    "meta_clicks":      {"field": "meta_daily_spend", "key": "clicks"},
+    "ghl_leads":        {"field": "ghl_daily_leads",  "key": "leads"},
+    "ghl_contacts":     {"field": "ghl_daily_leads",  "key": "leads"},
+    "hp_total_calls":   {"field": "hp_daily_calls",   "key": "calls"},
 }
 
 _DIMENSIONS = [

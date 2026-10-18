@@ -26,7 +26,7 @@ def _insights(spend, impressions, clicks, results):
 
 
 def _group(gid, name, *, maximum, this_month=None, last_month=None, daily=None,
-           user=USER, status="Active"):
+           user=USER, status="Active", **extra):
     presets = {"maximum": maximum}
     if this_month is not None:
         presets["this_month"] = this_month
@@ -41,6 +41,7 @@ def _group(gid, name, *, maximum, this_month=None, last_month=None, daily=None,
         "meta_daily_spend": daily or [],
         "ghl_daily_leads": [],
         "hp_daily_calls": [],
+        **extra,
     }
 
 
@@ -60,6 +61,17 @@ def seeded(mock_db):
                 {"date": d(2), "spend": 7},
                 {"date": d(40), "spend": 1},
             ],
+            ghl_daily_leads=[
+                {"date": "2020-01-01", "leads": 2},
+                {"date": "2020-01-05", "leads": "abc"},
+            ],
+            gohighlevel_cache={"metrics": {"total_contacts": 12}},
+            ghl_opp_cache={"maximum": {"won": 50}, "this_month": {"won": 4}, "last_month": {"won": 3}},
+            hotprospector_call_cache={
+                "maximum": {"total_calls": 500},
+                "this_month": {"total_calls": 40},
+                "last_month": {"total_calls": 30},
+            },
         ),
         _group(
             "g2", "Beta",
@@ -71,10 +83,14 @@ def seeded(mock_db):
                 {"date": "2020-01-03", "spend": 4},
                 {"date": d(2), "spend": 2},
             ],
+            gohighlevel_cache={"metrics": {"total_contacts": 8}},
+            ghl_opp_cache={"maximum": {"won": 70}, "this_month": {"won": 6}},
+            hotprospector_call_cache={"maximum": {"total_calls": 900}, "this_month": {"total_calls": 60}},
         ),
         _group("g3", "Dormant", maximum=_insights(999, 1, 1, 1), status="Inactive"),
         _group("g4", "Someone else", maximum=_insights(777, 1, 1, 1), user="bob@example.com"),
     ]
+    del groups[1]["ghl_daily_leads"]  # a group that has never had the daily field written
     asyncio.run(mock_db["client_groups"].insert_many(groups))
     return {"today": today, "d": d}
 
@@ -290,12 +306,12 @@ def test_table_shape_returns_columns(client):
     }
 
 
-def test_table_shape_by_day_and_value(client):
+def test_table_shape_by_day_and_value(client, seeded):
     day, value = _resolve(
         client, [_b("spend", by="day", limit=1), _b("spend")], shapes=["table", "table"]
     )["slots"]
     assert day["columns"][0] == {"key": "label", "label": "Day"}
-    assert day["rows"] == [{"label": "2020-01-01", "value": 8.0}]
+    assert day["rows"] == [{"label": seeded["d"](2), "value": 9.0}]
     assert value["rows"] == [{"label": "Total", "value": 350.0}]
 
 
@@ -308,3 +324,124 @@ def test_resolve_requires_auth(mock_db):
     app.dependency_overrides.pop(get_current_user, None)
     r = TestClient(app).post("/api/dashboards/resolve", json={"bindings": []})
     assert r.status_code in (401, 403)
+
+
+# --- fix round 1 -------------------------------------------------------------
+
+def test_compare_on_ghl_general_metric_has_no_previous(client):
+    value, by_client = _resolve(client, [
+        _b("ghl_leads", "this_month", compare="previous"),
+        _b("ghl_leads", "this_month", by="client", compare="previous"),
+    ])["slots"]
+    assert value["value"] == 20.0
+    assert "previous" not in value
+    assert all("previous" not in p for p in by_client["points"])
+
+
+def test_compare_on_recompute_metric_with_a_ghl_component_has_no_previous(client):
+    slot = _resolve(client, [_b("cost_per_lead", "this_month", compare="previous")])["slots"][0]
+    assert "previous" not in slot
+
+
+def test_compare_on_hp_metric_uses_only_groups_with_the_previous_bucket(client):
+    slot = _resolve(client, [_b("hp_total_calls", "this_month", compare="previous")])["slots"][0]
+    assert slot["value"] == 100.0
+    # g2 has no last_month bucket; its reader would fall back to all-time (900).
+    assert slot["previous"] == 30.0
+
+
+def test_compare_on_hp_metric_without_any_previous_bucket_has_no_previous(client):
+    slot = _resolve(client, [
+        _b("hp_total_calls", "this_month", compare="previous", filters={"client": ["g2"]}),
+    ])["slots"][0]
+    assert slot["value"] == 60.0
+    assert "previous" not in slot
+
+
+def test_compare_on_ghl_opp_metric_by_client_per_point(client):
+    slot = _resolve(client, [_b("ghl_won_opps", "this_month", by="client", compare="previous")])["slots"][0]
+    assert slot["points"] == [
+        {"label": "Beta", "value": 6.0},
+        {"label": "Acme", "value": 4.0, "previous": 3.0},
+    ]
+
+
+def test_compare_on_ghl_opp_metric_without_previous_bucket(client):
+    slot = _resolve(client, [
+        _b("ghl_won_opps", "this_month", compare="previous", filters={"client": ["g2"]}),
+    ])["slots"][0]
+    assert "previous" not in slot
+
+
+def test_compare_on_meta_metric_ignores_the_legacy_flat_fallback(client, mock_db):
+    legacy = _group("g6", "Legacy", maximum=_insights(1, 1, 1, 1), this_month=_insights(5, 1, 1, 1))
+    legacy["facebook_cache"]["metrics"] = {"insights": {"spend": 999}}
+    asyncio.run(mock_db["client_groups"].insert_one(legacy))
+    slot = _resolve(client, [_b("spend", "this_month", compare="previous", filters={"client": ["g6"]})])["slots"][0]
+    assert slot["value"] == 5.0
+    assert "previous" not in slot
+
+
+def test_meta_leads_by_day_is_unavailable(client):
+    out = _resolve(client, [_b("leads", by="day"), _b("meta_leads", by="day")])
+    assert out["slots"] == [None, None]
+    assert [e["code"] for e in out["errors"]] == ["DAY_SERIES_UNAVAILABLE"] * 2
+
+
+def test_ghl_leads_by_day_reads_ghl_daily_leads(client):
+    slot = _resolve(client, [_b("ghl_leads", by="day")])["slots"][0]
+    # Beta has no ghl_daily_leads field at all; "abc" counts as 0.
+    assert slot["points"] == [{"label": "2020-01-01", "value": 2.0}, {"label": "2020-01-05", "value": 0.0}]
+    assert slot["format"] == "integer"
+
+
+def test_impressions_by_day_reads_the_impressions_key(client):
+    slot = _resolve(client, [_b("impressions", by="day", filters={"client": ["g1"]})])["slots"][0]
+    assert {"label": "2020-01-02", "value": 100.0} in slot["points"]
+    assert {"label": "2020-01-01", "value": 0.0} in slot["points"]
+
+
+def test_non_finite_numbers_become_zero(client, mock_db):
+    asyncio.run(mock_db["client_groups"].insert_one(_group(
+        "g5", "Broken",
+        maximum=_insights(float("nan"), 0, 0, 0),
+        daily=[{"date": "2020-01-01", "spend": float("inf")}],
+    )))
+    value, by_client, by_day = _resolve(client, [
+        _b("spend", filters={"client": ["g5"]}),
+        _b("spend", by="client", filters={"client": ["g5"]}),
+        _b("spend", by="day", filters={"client": ["g5"]}),
+    ])["slots"]
+    assert value["value"] == 0.0
+    assert by_client["points"] == [{"label": "Broken", "value": 0.0}]
+    assert by_day["points"] == [{"label": "2020-01-01", "value": 0.0}]
+
+
+def test_by_day_limit_keeps_most_recent_days_in_requested_order(client, seeded):
+    d = seeded["d"]
+    asc, desc = _resolve(client, [
+        _b("spend", by="day", limit=2),
+        _b("spend", by="day", limit=2, sort="desc"),
+    ])["slots"]
+    assert [p["label"] for p in asc["points"]] == [d(40), d(2)]
+    assert [p["label"] for p in desc["points"]] == [d(2), d(40)]
+
+
+def test_limit_zero_returns_no_points(client):
+    by_client, by_day = _resolve(client, [
+        _b("spend", by="client", limit=0),
+        _b("spend", by="day", limit=0),
+    ])["slots"]
+    assert by_client["points"] == []
+    assert by_day["points"] == []
+
+
+def test_empty_client_filter_means_no_filter(client):
+    slot = _resolve(client, [_b("spend", filters={"client": []})])["slots"][0]
+    assert slot["value"] == 350.0
+
+
+def test_shapes_longer_than_bindings_are_ignored(client):
+    out = _resolve(client, [_b("spend")], shapes=["table", "table", "series"])
+    assert len(out["slots"]) == 1
+    assert out["slots"][0]["shape"] == "table"

@@ -154,7 +154,15 @@ def test_catalog_lists_spend_with_dimensions_client_and_day(client):
     assert spend["format"] == "currency"
     assert spend["aggregation"] == "sum"
     assert spend["label"] == "Spend"
-    assert _metric(r.json(), "meta_leads")["dimensions"] == ["client", "day"]
+    # leads / meta_leads read Meta results, which have no daily series.
+    assert _metric(r.json(), "meta_leads")["dimensions"] == ["client"]
+    assert _metric(r.json(), "leads")["dimensions"] == ["client"]
+
+
+def test_catalog_day_dimension_for_daily_backed_metrics(client):
+    cat = client.get("/api/dashboards/catalog").json()
+    for key in ("ghl_leads", "ghl_contacts", "impressions", "clicks", "meta_spend", "hp_total_calls"):
+        assert _metric(cat, key)["dimensions"] == ["client", "day"], key
 
 
 def test_catalog_lists_ctr_with_dimensions_client_only(client):
