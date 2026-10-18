@@ -19,7 +19,7 @@ and an `errors` entry rather than failing the whole request.
 `compare: 'previous'` reads the cached bucket before the preset (PREVIOUS_PRESET:
 this_month -> last_month, this_quarter -> last_quarter, ...) or, for metrics with
 a daily series on last_7d / last_14d / last_30d, sums the daily rows of the N
-days before the window. By-day series never carry `previous`.
+days before Meta's window, when the group's history reaches back that far. By-day series never carry `previous`.
 """
 
 import logging
@@ -144,7 +144,7 @@ def _covers(group: dict, sources: set[str], preset: str) -> bool:
 
 # Rolling windows whose previous period is read from the daily rows (there is
 # no cached "previous N days" bucket; see PREVIOUS_PRESET in core/constants).
-_DAILY_PREVIOUS_PRESETS = {"last_7d", "last_14d", "last_30d"}
+_DAILY_PREVIOUS_PRESETS = {"last_7d": 7, "last_14d": 14, "last_30d": 30}
 
 
 def _daily_rows(group: dict, field: str, start: Optional[str], end: Optional[str]):
@@ -188,24 +188,31 @@ def _previous_for(metric: dict, binding: dict, preset: str) -> Optional[_Previou
 
     source = DAILY_SOURCES.get(key)
     if source and preset in _DAILY_PREVIOUS_PRESETS:
-        # The current window is [start, end] (ghl_date_bounds, inclusive); the
-        # previous one is the N days right before it, N = days in [start, end].
-        start_iso, end_iso = ghl_date_bounds(preset)
-        start, end = date.fromisoformat(start_iso), date.fromisoformat(end_iso)
-        n = (end - start).days + 1
-        p_start = (start - timedelta(days=n)).isoformat()
-        p_end = (start - timedelta(days=1)).isoformat()
+        # The current value comes from the cached Meta bucket for this preset,
+        # fetched with Meta's `date_preset` (services/meta_service). Meta's
+        # last_7d / last_14d / last_30d cover the N days ending yesterday and
+        # exclude today (Marketing API Insights, `date_preset`:
+        # https://developers.facebook.com/docs/marketing-api/insights/parameters/),
+        # so current = [today-N, today-1] and the previous window is the N days
+        # before it, [today-2N, today-N-1]. (ghl_date_bounds is inclusive of
+        # today, N+1 days; by-day series keep those bounds, like the Leads page.)
+        n = _DAILY_PREVIOUS_PRESETS[preset]
+        today = date.today()
+        p_start = (today - timedelta(days=2 * n)).isoformat()
+        p_end = (today - timedelta(days=n + 1)).isoformat()
         field, row_key = source["field"], source["key"]
 
         def point(g: dict) -> float:
             return sum(_finite(row.get(row_key)) for _, row in _daily_rows(g, field, p_start, p_end))
 
-        return _Previous(
-            # A group counts as covered when it has at least one row in the previous range.
-            covers=lambda g: any(True for _ in _daily_rows(g, field, p_start, p_end)),
-            total=lambda gs: sum(point(g) for g in gs),
-            point=point,
-        )
+        def covers(g: dict) -> bool:
+            # The group's history must reach back to the previous window's start;
+            # a partly recorded window would compare a short period against a
+            # full one. Days missing inside the window are fine.
+            days = [day for day, _ in _daily_rows(g, field, None, None)]
+            return bool(days) and min(days) <= p_start
+
+        return _Previous(covers=covers, total=lambda gs: sum(point(g) for g in gs), point=point)
     return None
 
 

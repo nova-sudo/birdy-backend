@@ -477,15 +477,16 @@ def _rolling_group(gid, name, *, last_7d_spend, daily, **presets):
 
 def test_last_7d_previous_for_spend_comes_from_the_preceding_daily_rows(client, mock_db, seeded):
     d = seeded["d"]
-    # last_7d is [today-7, today] (8 days, inclusive), so the previous window is
-    # [today-15, today-8].
+    # Meta's last_7d is [today-7, today-1]; the previous window is the 7 days
+    # before it, [today-14, today-8].
     asyncio.run(mock_db["client_groups"].insert_one(_rolling_group(
         "g8", "Rolling", last_7d_spend=70,
         daily=[
-            {"date": d(3), "spend": 50},    # current window: not part of previous
-            {"date": d(8), "spend": 5},
-            {"date": d(15), "spend": 3},
-            {"date": d(16), "spend": 100},  # before the previous window
+            {"date": d(3), "spend": 50},    # current window
+            {"date": d(7), "spend": 1000},  # current window's first day
+            {"date": d(8), "spend": 5},     # previous window's last day
+            {"date": d(14), "spend": 3},    # previous window's first day
+            {"date": d(15), "spend": 100},  # before it (history reaches back)
         ],
     )))
     value, by_client = _resolve(client, [
@@ -497,11 +498,13 @@ def test_last_7d_previous_for_spend_comes_from_the_preceding_daily_rows(client, 
     assert by_client["points"] == [{"label": "Rolling", "value": 70.0, "previous": 8.0}]
 
 
-def test_last_7d_previous_blocked_by_a_group_without_rows_in_the_previous_window(client, mock_db, seeded):
+def test_last_7d_previous_blocked_by_a_group_whose_history_starts_too_late(client, mock_db, seeded):
     d = seeded["d"]
     asyncio.run(mock_db["client_groups"].insert_many([
-        _rolling_group("g8", "Rolling", last_7d_spend=70, daily=[{"date": d(9), "spend": 5}]),
-        _rolling_group("g9", "Fresh", last_7d_spend=30, daily=[{"date": d(2), "spend": 30}]),
+        # Sparse inside the previous window is fine: history reaches back to d(20).
+        _rolling_group("g8", "Rolling", last_7d_spend=70, daily=[{"date": d(9), "spend": 5}, {"date": d(20), "spend": 0}]),
+        # Has a row inside the previous window, but nothing before d(13): partial history.
+        _rolling_group("g9", "Fresh", last_7d_spend=30, daily=[{"date": d(13), "spend": 4}, {"date": d(2), "spend": 30}]),
     ]))
     value, by_client = _resolve(client, [
         _b("spend", "last_7d", compare="previous", filters={"client": ["g8", "g9"]}),
@@ -515,16 +518,23 @@ def test_last_7d_previous_blocked_by_a_group_without_rows_in_the_previous_window
     ]
 
 
-def test_last_30d_previous_needs_a_daily_source(client, mock_db, seeded):
-    g = _rolling_group("g8", "Rolling", last_7d_spend=70, daily=[{"date": seeded["d"](40), "spend": 5}])
-    g["facebook_cache"]["presets"]["last_30d"] = _insights(70, 700, 70, 7)
+def test_46_days_of_history_give_previous_for_last_7d_and_14d_but_not_30d(client, mock_db, seeded):
+    d = seeded["d"]
+    g = _rolling_group("g8", "Rolling", last_7d_spend=70,
+                       daily=[{"date": d(n), "spend": 1} for n in range(46)])
+    g["facebook_cache"]["presets"]["last_14d"] = _insights(140, 1400, 140, 14)
+    g["facebook_cache"]["presets"]["last_30d"] = _insights(300, 3000, 300, 30)
     asyncio.run(mock_db["client_groups"].insert_one(g))
-    spend, ctr = _resolve(client, [
+    last_7d, last_14d, last_30d, ctr = _resolve(client, [
+        _b("spend", "last_7d", compare="previous", filters={"client": ["g8"]}),
+        _b("spend", "last_14d", compare="previous", filters={"client": ["g8"]}),
         _b("spend", "last_30d", compare="previous", filters={"client": ["g8"]}),
-        _b("ctr", "last_30d", compare="previous", filters={"client": ["g8"]}),
+        _b("ctr", "last_7d", compare="previous", filters={"client": ["g8"]}),
     ])["slots"]
-    assert spend["previous"] == 5.0  # [today-61, today-31]
-    assert "previous" not in ctr     # no daily series for a ratio metric
+    assert last_7d["previous"] == 7.0    # [today-14, today-8]
+    assert last_14d["previous"] == 14.0  # [today-28, today-15]
+    assert "previous" not in last_30d    # needs rows back to today-60
+    assert "previous" not in ctr         # no daily series for a ratio metric
 
 
 def test_this_quarter_previous_is_last_quarter(client, mock_db):
