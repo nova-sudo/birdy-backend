@@ -17,8 +17,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Body, Depends, HTTPException, Response
 
 from core.database import DB_NAME
+from core.models import ResolveBody
 from dependencies import get_mongo_client, get_current_user
 from services.dashboards_catalog import build_catalog
+from services.dashboards_resolve import MAX_BINDINGS, resolve_bindings
 from services.dashboards_schema import schema_has_meta_updated_at, validate_doc
 
 logger = logging.getLogger(__name__)
@@ -67,6 +69,25 @@ async def list_dashboards(current_user: str = Depends(get_current_user)):
 async def get_catalog(current_user: str = Depends(get_current_user)):
     """What a dashboard can bind to: metrics, dimensions and time windows."""
     return build_catalog()
+
+
+@router.post("/api/dashboards/resolve")
+async def resolve(body: ResolveBody, current_user: str = Depends(get_current_user)):
+    """Live data for a dashboard's widgets: one slot per binding, null where a binding failed (see `errors`)."""
+    if len(body.bindings) > MAX_BINDINGS:
+        raise HTTPException(status_code=422, detail={
+            "code": "TOO_MANY_BINDINGS",
+            "message": f"At most {MAX_BINDINGS} bindings per request (got {len(body.bindings)})",
+        })
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            return await resolve_bindings(db, current_user, body.bindings, body.shapes)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error resolving dashboard bindings for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to resolve dashboard data")
 
 
 # --- fixed-path routes (/catalog, /resolve) go above this line; /{id} must stay last ---

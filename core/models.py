@@ -266,3 +266,9 @@ class SlackChannelsResponse(BaseModel):
 class SetSlackChannelRequest(BaseModel):
     channel_id: Optional[str] = None  # null clears the selection (stops posting)
     channel_name: Optional[str] = None
+
+
+class ResolveBody(BaseModel):
+    """POST /api/dashboards/resolve: dashkit bindings, plus the shape each widget wants."""
+    bindings: List[dict]
+    shapes: Optional[List[Optional[str]]] = None

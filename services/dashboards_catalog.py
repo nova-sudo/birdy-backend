@@ -59,10 +59,14 @@ def build_catalog() -> dict:
             "polarity": _polarity(key),
         })
 
-    windows = [
-        {"preset": preset, "label": _label(preset)}
-        for preset in PRESET_ALIAS
-        if preset != "data_maximum"
-    ]
+    # Several PRESET_ALIAS keys name the same cached window (data_maximum ->
+    # maximum, this_week -> this_week_mon_today); offer each window once, under
+    # the first key that names it.
+    windows, seen_targets = [], set()
+    for preset, target in PRESET_ALIAS.items():
+        if target in seen_targets:
+            continue
+        seen_targets.add(target)
+        windows.append({"preset": preset, "label": _label(preset)})
 
     return {"metrics": metrics, "dimensions": [dict(d) for d in _DIMENSIONS], "windows": windows}

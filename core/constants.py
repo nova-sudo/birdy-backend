@@ -69,6 +69,27 @@ PRESET_ALIAS = {
     "last_year":           "last_year",
 }
 
+# The window immediately before each preset, for dashkit's `compare: 'previous'`.
+# Only targets that are themselves PRESET_ALIAS keys can be read: the caches
+# store one bucket per canonical preset, and there is no prev_7d / prev_14d /
+# prev_30d / last_week bucket, so those comparisons resolve to None (no
+# `previous`) via previous_preset() until such buckets exist.
+PREVIOUS_PRESET = {
+    "last_7d":             "prev_7d",
+    "last_14d":            "prev_14d",
+    "last_30d":            "prev_30d",
+    "this_month":          "last_month",
+    "this_week":           "last_week",
+    "this_week_mon_today": "last_week",
+}
+
+
+def previous_preset(preset: str):
+    """The cached preset covering the window before `preset`, or None when there is none."""
+    target = PREVIOUS_PRESET.get(preset)
+    return target if target in PRESET_ALIAS else None
+
+
 GHL_PRESET_DATE_RANGE = {
     "maximum":             None,
     "today":               (0, 0),

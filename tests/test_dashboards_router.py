@@ -180,6 +180,13 @@ def test_windows_exclude_data_maximum(client):
     assert next(w for w in windows if w["preset"] == "last_7d")["label"] == "Last 7d"
 
 
+def test_windows_dedupe_by_alias_target_keeping_first_key(client):
+    presets = [w["preset"] for w in client.get("/api/dashboards/catalog").json()["windows"]]
+    assert "this_week" in presets
+    assert "this_week_mon_today" not in presets
+    assert len(presets) == len(set(presets))
+
+
 def test_catalog_validates_against_dashkit_catalog_schema_shape(client):
     cat = client.get("/api/dashboards/catalog").json()
     assert set(cat) == {"metrics", "dimensions", "windows"}
