@@ -17,9 +17,10 @@ and an `errors` entry rather than failing the whole request.
   shapes[i] == 'table' -> the same data as a table slot.
 
 `compare: 'previous'` reads the cached bucket before the preset (PREVIOUS_PRESET:
-this_month -> last_month, this_quarter -> last_quarter, ...) or, for metrics with
-a daily series on last_7d / last_14d / last_30d, sums the daily rows of the N
-days before Meta's window, when the group's history reaches back that far. By-day series never carry `previous`.
+this_month -> last_month, this_quarter -> last_quarter, ...) or, for Meta-backed
+metrics (daily rows in meta_daily_spend) on last_7d / last_14d / last_30d, sums
+the daily rows of the N days before Meta's window, when the group's history
+reaches back that far. By-day series never carry `previous`.
 """
 
 import logging
@@ -187,7 +188,12 @@ def _previous_for(metric: dict, binding: dict, preset: str) -> Optional[_Previou
         )
 
     source = DAILY_SOURCES.get(key)
-    if source and preset in _DAILY_PREVIOUS_PRESETS:
+    # Only Meta-backed daily rows: the window arithmetic below assumes the
+    # current value is a Meta date_preset bucket. Other daily-backed metrics
+    # read caches built over ghl_date_bounds (e.g. hotprospector_call_cache,
+    # N+1 days including today), so an N-day previous would skew their delta;
+    # they get no `previous` on last_Nd windows.
+    if source and source["field"] == "meta_daily_spend" and preset in _DAILY_PREVIOUS_PRESETS:
         # The current value comes from the cached Meta bucket for this preset,
         # fetched with Meta's `date_preset` (services/meta_service). Meta's
         # last_7d / last_14d / last_30d cover the N days ending yesterday and

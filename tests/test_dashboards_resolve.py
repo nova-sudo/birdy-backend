@@ -561,3 +561,20 @@ def test_compare_takes_the_current_value_over_the_contributing_groups_only(clien
     assert plain["value"] == 1039.0
     assert compared["value"] == 40.0
     assert compared["previous"] == 30.0
+
+
+def test_hp_total_calls_last_7d_has_no_previous(client, mock_db, seeded):
+    # The call cache is built over ghl_date_bounds (8 days including today), so an
+    # N-day previous from hp_daily_calls would fake a delta: no previous at all.
+    d = seeded["d"]
+    g = _group("g13", "Caller", maximum=_insights(1, 1, 1, 1),
+               hotprospector_call_cache={"maximum": {"total_calls": 999}, "last_7d": {"total_calls": 80}})
+    g["hp_daily_calls"] = [{"date": d(n), "calls": 10} for n in range(30)]
+    asyncio.run(mock_db["client_groups"].insert_one(g))
+    value, by_client = _resolve(client, [
+        _b("hp_total_calls", "last_7d", compare="previous", filters={"client": ["g13"]}),
+        _b("hp_total_calls", "last_7d", by="client", compare="previous", filters={"client": ["g13"]}),
+    ])["slots"]
+    assert value["value"] == 80.0
+    assert "previous" not in value
+    assert by_client["points"] == [{"label": "Caller", "value": 80.0}]

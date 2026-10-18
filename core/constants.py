@@ -73,9 +73,9 @@ PRESET_ALIAS = {
 # Only targets that are themselves cached presets (PRESET_ALIAS keys) are
 # listed: the caches store one bucket per canonical preset. The rolling
 # windows (last_7d / last_14d / last_30d) have no "previous N days" bucket;
-# for metrics with a daily series services/dashboards_resolve computes their
-# previous window from the daily rows instead, and for everything else they
-# have no `previous`. this_week has no last_week bucket, so no `previous`.
+# for Meta-backed metrics (daily rows in meta_daily_spend)
+# services/dashboards_resolve computes their previous window from the daily
+# rows instead, and for everything else they have no `previous`. this_week has no last_week bucket, so no `previous`.
 # Whether a group actually holds the target bucket is checked per group by the
 # resolver (_covers), so a missing bucket never produces an all-time fallback.
 PREVIOUS_PRESET = {
