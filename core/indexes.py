@@ -46,6 +46,7 @@ def _load_creators():
     from integrations.facebook_utils.facebook_campaigns import create_campaign_insights_indexes
     from integrations.facebook_utils.facebook_leads import create_facebook_leads_indexes
     from routers.client_notes import create_note_indexes
+    from routers.dashboards import create_dashboards_indexes
     from services.ad_leads import create_ad_leads_indexes
     from services.attribution_service import create_attribution_indexes
     from services.call_logs_service import create_call_logs_indexes
@@ -77,6 +78,7 @@ def _load_creators():
         create_note_indexes,
         create_ai_usage_indexes,
         create_client_groups_scope_indexes,
+        create_dashboards_indexes,
     ]
 
 
