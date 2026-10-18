@@ -170,10 +170,12 @@ def _resolve_value(metric: dict, binding: dict, groups: list[dict]) -> dict:
     }
     prev = _previous_preset_for(binding, preset)
     if prev:
+        # Compare only when every group with data for the current window also
+        # has data for the previous one; a group with neither stays out of both.
         sources = _metric_sources(metric["key"])
-        covered = [g for g in groups if _covers(g, sources, prev)]
-        if covered:
-            slot["previous"] = _finite(aggregate_metric(metric["key"], covered, prev))
+        contributing = [g for g in groups if _covers(g, sources, preset)]
+        if contributing and all(_covers(g, sources, prev) for g in contributing):
+            slot["previous"] = _finite(aggregate_metric(metric["key"], contributing, prev))
     return slot
 
 

@@ -343,10 +343,29 @@ def test_compare_on_recompute_metric_with_a_ghl_component_has_no_previous(client
     assert "previous" not in slot
 
 
-def test_compare_on_hp_metric_uses_only_groups_with_the_previous_bucket(client):
+def test_compare_on_hp_metric_with_mixed_coverage_has_no_previous(client):
+    # g2 has a this_month bucket but no last_month one: its reader would fall
+    # back to all-time (900), so the comparison is omitted rather than skewed.
     slot = _resolve(client, [_b("hp_total_calls", "this_month", compare="previous")])["slots"][0]
     assert slot["value"] == 100.0
-    # g2 has no last_month bucket; its reader would fall back to all-time (900).
+    assert "previous" not in slot
+
+
+def test_compare_on_hp_metric_with_full_coverage_has_previous(client):
+    slot = _resolve(client, [
+        _b("hp_total_calls", "this_month", compare="previous", filters={"client": ["g1"]}),
+    ])["slots"][0]
+    assert slot["value"] == 40.0
+    assert slot["previous"] == 30.0
+
+
+def test_group_without_a_current_bucket_does_not_block_previous(client, mock_db):
+    idle = _group("g7", "Idle", maximum=_insights(0, 0, 0, 0),
+                  hotprospector_call_cache={"maximum": {"total_calls": 5}})
+    asyncio.run(mock_db["client_groups"].insert_one(idle))
+    slot = _resolve(client, [
+        _b("hp_total_calls", "this_month", compare="previous", filters={"client": ["g1", "g7"]}),
+    ])["slots"][0]
     assert slot["previous"] == 30.0
 
 
