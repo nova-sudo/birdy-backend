@@ -216,7 +216,12 @@ def _previous_for(metric: dict, binding: dict, preset: str) -> Optional[_Previou
             # a partly recorded window would compare a short period against a
             # full one. Days missing inside the window are fine.
             days = [day for day, _ in _daily_rows(g, field, None, None)]
-            return bool(days) and min(days) <= p_start
+            if not days or min(days) > p_start:
+                return False
+            # Rows written before this key existed (e.g. `results`, added to the
+            # Meta rows later) would sum to a fake zero; wait for the rewrite.
+            rows = [row for _, row in _daily_rows(g, field, p_start, p_end)]
+            return not rows or any(row_key in row for row in rows)
 
         return _Previous(covers=covers, total=lambda gs: sum(point(g) for g in gs), point=point)
     return None

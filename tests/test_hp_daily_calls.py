@@ -25,8 +25,10 @@ def test_buckets_calls_by_day():
     rows = _compute_daily_call_series(calls)
 
     assert rows == [
-        {"date": "2026-07-01", "calls": 1, "inbound": 0, "talk_min": 1.0, "called": 1},
-        {"date": "2026-07-02", "calls": 2, "inbound": 1, "talk_min": 2.0, "called": 1},
+        {"date": "2026-07-01", "calls": 1, "inbound": 0, "outbound": 1, "answered": 1,
+         "transfers": 0, "talk_min": 1.0, "talk_time": 1.0, "leads_with_calls": 1, "called": 1},
+        {"date": "2026-07-02", "calls": 2, "inbound": 1, "outbound": 1, "answered": 2,
+         "transfers": 0, "talk_min": 2.0, "talk_time": 2.0, "leads_with_calls": 2, "called": 1},
     ]
 
 
@@ -49,7 +51,10 @@ def test_calls_without_a_matched_lead_still_count_toward_calls_and_talk():
 
     rows = _compute_daily_call_series(calls)
 
-    assert rows == [{"date": "2026-07-01", "calls": 1, "inbound": 0, "talk_min": 1.0, "called": 0}]
+    assert rows == [{
+        "date": "2026-07-01", "calls": 1, "inbound": 0, "outbound": 1, "answered": 1,
+        "transfers": 0, "talk_min": 1.0, "talk_time": 1.0, "leads_with_calls": 0, "called": 0,
+    }]
 
 
 def test_calls_without_a_timestamp_are_skipped():

@@ -33,8 +33,8 @@
 - `meta_impressions` — Meta Impressions [integer, higher is better] by: client, day
 - `meta_clicks` — Meta Clicks [integer, higher is better] by: client, day
 - `meta_reach` — Meta Reach [integer, higher is better] by: client
-- `meta_results` — Meta Results [integer, higher is better] by: client
-- `meta_leads` — Meta Leads [integer, higher is better] by: client
+- `meta_results` — Meta Results [integer, higher is better] by: client, day
+- `meta_leads` — Meta Leads [integer, higher is better] by: client, day
 - `meta_ctr` — Meta CTR [percentage, higher is better] by: client
 - `meta_cpc` — Meta CPC [currency, lower is better] by: client
 - `meta_cpm` — Meta CPM [currency, lower is better] by: client
@@ -42,32 +42,32 @@
 - `impressions` — Impressions [integer, higher is better] by: client, day
 - `clicks` — Clicks [integer, higher is better] by: client, day
 - `reach` — Reach [integer, higher is better] by: client
-- `results` — Results [integer, higher is better] by: client
-- `leads` — Leads [integer, higher is better] by: client
+- `results` — Results [integer, higher is better] by: client, day
+- `leads` — Leads [integer, higher is better] by: client, day
 - `ctr` — CTR [percentage, higher is better] by: client
 - `cpc` — CPC [currency, lower is better] by: client
 - `cpm` — CPM [currency, lower is better] by: client
 - `cpl` — CPL [currency, lower is better] by: client
 - `cost_per_result` — Cost Per Result [currency, lower is better] by: client
 - `frequency` — Frequency [decimal, higher is better] by: client
-- `ghl_won_opps` — GHL Won Opps [integer, higher is better] by: client
-- `ghl_lost_opps` — GHL Lost Opps [integer, lower is better] by: client
-- `ghl_open_opps` — GHL Open Opps [integer, higher is better] by: client
-- `ghl_abandoned_opps` — GHL Abandoned Opps [integer, lower is better] by: client
-- `ghl_total_opps` — GHL Total Opps [integer, higher is better] by: client
-- `ghl_revenue` — GHL Revenue [currency, higher is better] by: client
+- `ghl_won_opps` — GHL Won Opps [integer, higher is better] by: client, day
+- `ghl_lost_opps` — GHL Lost Opps [integer, lower is better] by: client, day
+- `ghl_open_opps` — GHL Open Opps [integer, higher is better] by: client, day
+- `ghl_abandoned_opps` — GHL Abandoned Opps [integer, lower is better] by: client, day
+- `ghl_total_opps` — GHL Total Opps [integer, higher is better] by: client, day
+- `ghl_revenue` — GHL Revenue [currency, higher is better] by: client, day
 - `ghl_conversion` — GHL Conversion [percentage, higher is better] by: client
 - `ghl_contacts` — GHL Contacts [integer, higher is better] by: client, day
 - `ghl_leads` — GHL Leads [integer, higher is better] by: client, day
 - `total_tags` — Total Tags [integer, higher is better] by: client
 - `hp_leads` — HP Leads [integer, higher is better] by: client
 - `hp_total_calls` — HP Total Calls [integer, higher is better] by: client, day
-- `hp_inbound` — HP Inbound [integer, higher is better] by: client
-- `hp_outbound` — HP Outbound [integer, higher is better] by: client
-- `hp_transfers` — HP Transfers [integer, higher is better] by: client
-- `hp_leads_with_calls` — HP Leads With Calls [integer, higher is better] by: client
-- `hp_answered_calls` — HP Answered Calls [integer, higher is better] by: client
-- `hp_talk_time` — HP Talk Time [decimal, higher is better] by: client
+- `hp_inbound` — HP Inbound [integer, higher is better] by: client, day
+- `hp_outbound` — HP Outbound [integer, higher is better] by: client, day
+- `hp_transfers` — HP Transfers [integer, higher is better] by: client, day
+- `hp_leads_with_calls` — HP Leads With Calls [integer, higher is better] by: client, day
+- `hp_answered_calls` — HP Answered Calls [integer, higher is better] by: client, day
+- `hp_talk_time` — HP Talk Time [decimal, higher is better] by: client, day
 - `hp_connect_rate` — HP Connect Rate [percentage, higher is better] by: client
 - `hp_answer_rate` — HP Answer Rate [percentage, higher is better] by: client
 - `conversion_rate` — Conversion Rate [percentage, higher is better] by: client

@@ -24,6 +24,15 @@ Stored on the client group as `meta_daily_spend`:
 
 sorted by date, one entry per day the account spent anything.
 
+`results` and `leads` are the lead count for the day, read from Meta's `actions`
+with core.utils.get_result_value(..., "lead") -- the same action-type mapping
+the preset insights use (services/meta_service.py), so a window summed from
+these rows agrees with the preset headline. Both hold the same number, matching
+the `results` and `leads` metrics, which read the same Meta field. Meta omits
+`actions` on a day with none, so a row with no actions stores 0. `reach` is
+deliberately not requested: it is a unique count and cannot be summed per day,
+so `reach`, `meta_reach` and `frequency` have no daily history.
+
 `impressions` and `clicks` are present only when Meta reported them. Rows
 written before they were requested carry neither, and the Impressions chart
 falls back to scaling the spend curve onto the period's real total for those —
@@ -53,6 +62,7 @@ from typing import Dict, List, Optional
 
 import httpx
 
+from core.utils import get_result_value
 from integrations.facebook_utils._api_helpers import api_get_with_backoff
 from services.meta_campaign_scope import campaign_filter, scope_guard
 
@@ -188,7 +198,8 @@ async def fetch_account_daily_spend(
         # onto the period's real impression total, so the shape was inferred
         # from spend while the headline was a measurement. That fallback stays
         # for dates before this shipped, but it should not be the only path.
-        "fields": "spend,impressions,clicks,date_start",
+        # `actions` carries the lead count (see the module docstring). No reach.
+        "fields": "spend,impressions,clicks,actions,date_start",
         "limit": PAGE_LIMIT,
     }
     scope = campaign_filter(campaign_ids)
@@ -226,6 +237,11 @@ async def fetch_account_daily_spend(
                     entry["impressions"] = int(_num(row.get("impressions")))
                 if row.get("clicks") is not None:
                     entry["clicks"] = int(_num(row.get("clicks")))
+                # Same extraction the preset insights use. Meta leaves `actions`
+                # off a day with none, so this is a real zero, not a gap.
+                lead_count = get_result_value([row], "lead")
+                entry["results"] = lead_count
+                entry["leads"] = lead_count
                 rows.append(entry)
 
             next_url = (data.get("paging") or {}).get("next")

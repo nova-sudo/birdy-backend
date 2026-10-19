@@ -125,6 +125,13 @@ def _compute_daily_call_series(calls):
     (see compute_cohort_funnel's "recent end under-reports" note). The
     Overview tile's leads_with_calls figure is unaffected — it's still the
     correct per-window count from _compute_call_stats_all_presets above.
+
+    `leads_with_calls` is different: the number of distinct leads dialled that
+    day, so a lead called on three days counts on each. Summed over a window it
+    therefore exceeds the preset's distinct count, which is the price of being
+    bucketable by day. There is no daily `hp_leads`: HotProspector leads carry
+    no creation date to bucket on, and the preset's hp_leads is a lifetime
+    count.
     """
     days: dict = {}
     first_call: dict = {}
@@ -134,11 +141,27 @@ def _compute_daily_call_series(calls):
         if not iso:
             continue
         day = iso[:10]
-        row = days.setdefault(day, {"calls": 0, "inbound": 0, "talk_seconds": 0.0})
+        row = days.setdefault(day, {
+            "calls": 0, "inbound": 0, "outbound": 0, "answered": 0, "transfers": 0,
+            "talk_seconds": 0.0, "leads": set(),
+        })
         row["calls"] += 1
-        if c.get("call_status") == "inbound":
+        cs = c.get("call_status")
+        if cs == "inbound":
             row["inbound"] += 1
-        row["talk_seconds"] += _dur_seconds(c)
+        elif cs == "outbound":
+            row["outbound"] += 1
+        if c.get("transfer"):
+            row["transfers"] += 1
+        dur = _dur_seconds(c)
+        if dur > 0:
+            row["answered"] += 1
+        row["talk_seconds"] += dur
+        # Distinct leads dialled this day, by the same id rule as the preset
+        # stats' leads_with_calls (_compute_call_stats_all_presets).
+        day_lid = c.get("lead_id") or c.get("matched_lead_id")
+        if day_lid is not None and str(day_lid).strip():
+            row["leads"].add(str(day_lid))
 
         lid = c.get("matched_lead_id") or c.get("lead_id")
         if lid is not None:
@@ -153,7 +176,13 @@ def _compute_daily_call_series(calls):
             "date": day,
             "calls": row["calls"],
             "inbound": row["inbound"],
+            "outbound": row["outbound"],
+            "answered": row["answered"],
+            "transfers": row["transfers"],
             "talk_min": round(row["talk_seconds"] / 60, 1),
+            # Same figure as talk_min, under the hp_talk_time metric's name.
+            "talk_time": round(row["talk_seconds"] / 60, 1),
+            "leads_with_calls": len(row["leads"]),
             "called": called_by_day.get(day, 0),
         }
         for day, row in sorted(days.items())

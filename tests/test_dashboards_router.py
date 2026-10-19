@@ -213,9 +213,11 @@ def test_catalog_lists_spend_with_dimensions_client_and_day(client):
     assert spend["format"] == "currency"
     assert spend["aggregation"] == "sum"
     assert spend["label"] == "Spend"
-    # leads / meta_leads read Meta results, which have no daily series.
-    assert _metric(r.json(), "meta_leads")["dimensions"] == ["client"]
-    assert _metric(r.json(), "leads")["dimensions"] == ["client"]
+    # leads / meta_leads read Meta results, which the daily rows carry too.
+    assert _metric(r.json(), "meta_leads")["dimensions"] == ["client", "day"]
+    assert _metric(r.json(), "leads")["dimensions"] == ["client", "day"]
+    # reach is a unique count: no daily series.
+    assert _metric(r.json(), "reach")["dimensions"] == ["client"]
 
 
 def test_catalog_day_dimension_for_daily_backed_metrics(client):
@@ -291,7 +293,7 @@ def test_catalog_validates_against_dashkit_catalog_schema_shape(client):
     for m in cat["metrics"]:
         assert {"key", "label", "format", "dimensions"} <= set(m)
         assert set(m) <= {"key", "label", "unit", "format", "dimensions",
-                          "description", "aggregation", "polarity"}
+                          "description", "aggregation", "polarity", "over", "additive"}
         assert m["format"] in _FORMATS
         assert m["aggregation"] in _AGGREGATIONS
         assert m["polarity"] in _POLARITIES

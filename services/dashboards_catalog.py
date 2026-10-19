@@ -6,28 +6,53 @@ The metric catalog served to dashkit: what a dashboard widget may bind to.
 Built from METRIC_REGISTRY (the orchestrator's metric definitions) so the
 dashboard builder and the existing hubs can never disagree about what a metric
 is. v1 splits only by `client` and `day`; `day` exists only for metrics with a
-daily source (the fields /api/client-groups/daily serves).
+daily source (the fields /api/client-groups/daily serves). `over` says whether a
+metric can be bucketed over time (day / week / month) and `additive` whether its
+parts add up to a whole (so a donut means something); see DAILY_SOURCES.
 """
 
 from core.constants import PRESET_ALIAS
 from services.metric_orchestrator import METRIC_REGISTRY
 
 # metric key -> where its daily series lives: the client-group field holding the
-# rows (the fields /api/client-groups/daily serves) and the per-row key. Only
-# metrics whose daily rows measure the same thing as the metric's value source
-# are listed: `leads` / `meta_leads` read Meta `results`, which has no daily
-# series, so they are not here.
+# rows and the per-row key. Every additive metric whose daily rows measure the
+# same thing as its value source is listed, so a dashboard can chart it over
+# day / week / month by summing rows. Not listed, because they cannot be
+# bucketed by day: `reach` / `meta_reach` (unique counts, cannot be summed),
+# `hp_leads` (HotProspector leads carry no date; the preset value is a lifetime
+# count) and `total_tags` (a snapshot of the tag list). The ratios are not listed
+# either: they are recomputed from their components' rows (see `over` below).
 DAILY_SOURCES: dict[str, dict[str, str]] = {
-    "spend":            {"field": "meta_daily_spend", "key": "spend"},
-    "meta_spend":       {"field": "meta_daily_spend", "key": "spend"},
-    "impressions":      {"field": "meta_daily_spend", "key": "impressions"},
-    "meta_impressions": {"field": "meta_daily_spend", "key": "impressions"},
-    "clicks":           {"field": "meta_daily_spend", "key": "clicks"},
-    "meta_clicks":      {"field": "meta_daily_spend", "key": "clicks"},
-    "ghl_leads":        {"field": "ghl_daily_leads",  "key": "leads"},
-    "ghl_contacts":     {"field": "ghl_daily_leads",  "key": "leads"},
-    "hp_total_calls":   {"field": "hp_daily_calls",   "key": "calls"},
+    "spend":              {"field": "meta_daily_spend", "key": "spend"},
+    "meta_spend":         {"field": "meta_daily_spend", "key": "spend"},
+    "impressions":        {"field": "meta_daily_spend", "key": "impressions"},
+    "meta_impressions":   {"field": "meta_daily_spend", "key": "impressions"},
+    "clicks":             {"field": "meta_daily_spend", "key": "clicks"},
+    "meta_clicks":        {"field": "meta_daily_spend", "key": "clicks"},
+    "results":            {"field": "meta_daily_spend", "key": "results"},
+    "meta_results":       {"field": "meta_daily_spend", "key": "results"},
+    "leads":              {"field": "meta_daily_spend", "key": "leads"},
+    "meta_leads":         {"field": "meta_daily_spend", "key": "leads"},
+    "ghl_leads":          {"field": "ghl_daily_leads",  "key": "leads"},
+    "ghl_contacts":       {"field": "ghl_daily_leads",  "key": "leads"},
+    "ghl_won_opps":       {"field": "ghl_daily_leads",  "key": "opps_won"},
+    "ghl_lost_opps":      {"field": "ghl_daily_leads",  "key": "opps_lost"},
+    "ghl_open_opps":      {"field": "ghl_daily_leads",  "key": "opps_open"},
+    "ghl_abandoned_opps": {"field": "ghl_daily_leads",  "key": "opps_abandoned"},
+    "ghl_total_opps":     {"field": "ghl_daily_leads",  "key": "opps_total"},
+    "ghl_revenue":        {"field": "ghl_daily_leads",  "key": "revenue"},
+    "hp_total_calls":      {"field": "hp_daily_calls",  "key": "calls"},
+    "hp_inbound":          {"field": "hp_daily_calls",  "key": "inbound"},
+    "hp_outbound":         {"field": "hp_daily_calls",  "key": "outbound"},
+    "hp_answered_calls":   {"field": "hp_daily_calls",  "key": "answered"},
+    "hp_transfers":        {"field": "hp_daily_calls",  "key": "transfers"},
+    "hp_talk_time":        {"field": "hp_daily_calls",  "key": "talk_time"},
+    "hp_leads_with_calls": {"field": "hp_daily_calls",  "key": "leads_with_calls"},
 }
+
+# Sum-aggregated metrics whose parts do not add up to a whole: unique counts
+# (a person reached by two campaigns is one person) and a count of distinct tags.
+_NON_ADDITIVE_KEYS = {"reach", "meta_reach", "total_tags"}
 
 _DIMENSIONS = [
     {"key": "client", "label": "Client"},
@@ -76,6 +101,15 @@ def _polarity(key: str) -> str:
     return "higher_is_better"
 
 
+def _supports_over(key: str) -> bool:
+    """Whether a metric can be bucketed over time: it has daily rows, or it is a
+    ratio whose numerator and denominator both can (Σnum ÷ Σden per bucket)."""
+    spec = METRIC_REGISTRY[key]
+    if spec.get("aggregation") == "recompute":
+        return all(_supports_over(part) for part in spec["components"])
+    return key in DAILY_SOURCES
+
+
 def build_catalog() -> dict:
     """Metrics, dimensions and windows in dashkit's Catalog shape. Pure and deterministic."""
     metrics = []
@@ -90,6 +124,8 @@ def build_catalog() -> dict:
             "dimensions": ["client", "day"] if key in DAILY_SOURCES else ["client"],
             "aggregation": "avg" if spec.get("aggregation") == "recompute" else "sum",
             "polarity": _polarity(key),
+            "over": _supports_over(key),
+            "additive": spec.get("aggregation") != "recompute" and key not in _NON_ADDITIVE_KEYS,
         })
 
     # Several PRESET_ALIAS keys name the same cached window (data_maximum ->

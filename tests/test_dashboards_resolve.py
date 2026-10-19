@@ -401,8 +401,9 @@ def test_compare_on_meta_metric_ignores_the_legacy_flat_fallback(client, mock_db
     assert "previous" not in slot
 
 
-def test_meta_leads_by_day_is_unavailable(client):
-    out = _resolve(client, [_b("leads", by="day"), _b("meta_leads", by="day")])
+def test_unique_counts_by_day_are_unavailable(client):
+    # reach is a unique count: it cannot be summed per day, so it has no daily series.
+    out = _resolve(client, [_b("reach", by="day"), _b("meta_reach", by="day")])
     assert out["slots"] == [None, None]
     assert [e["code"] for e in out["errors"]] == ["DAY_SERIES_UNAVAILABLE"] * 2
 

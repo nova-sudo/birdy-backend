@@ -59,8 +59,8 @@ async def test_returns_one_row_per_day(patch_client):
     rows = await fetch_account_daily_spend("act_1", "T", "2026-08-15", "2026-08-16")
 
     assert rows == [
-        {"date": "2026-08-15", "spend": 310.5},
-        {"date": "2026-08-16", "spend": 718.52},
+        {"date": "2026-08-15", "spend": 310.5, "results": 0, "leads": 0},
+        {"date": "2026-08-16", "spend": 718.52, "results": 0, "leads": 0},
     ]
 
 
@@ -183,7 +183,7 @@ async def test_a_successful_fetch_replaces_the_window(patch_client):
     assert written == 1
     _filt, update = groups.updates[0]
     assert update["$set"]["meta_daily_spend"] == [{
-        "date": "2026-08-16", "spend": 718.52,
+        "date": "2026-08-16", "spend": 718.52, "results": 0, "leads": 0,
         "currency": "GBP", "source_currency": "GBP", "fx_rate": 1.0,
     }]
 
@@ -222,7 +222,9 @@ async def test_an_unknown_account_currency_leaves_rows_unstamped(patch_client):
 
     assert written == 1
     _filt, update = groups.updates[0]
-    assert update["$set"]["meta_daily_spend"] == [{"date": "2026-08-16", "spend": 718.52}]
+    assert update["$set"]["meta_daily_spend"] == [
+        {"date": "2026-08-16", "spend": 718.52, "results": 0, "leads": 0}
+    ]
 
 
 @pytest.mark.asyncio
@@ -239,6 +241,7 @@ async def test_impressions_and_clicks_are_carried_when_meta_reports_them(patch_c
 
     assert rows == [{
         "date": "2026-08-16", "spend": 718.52, "impressions": 41233, "clicks": 812,
+        "results": 0, "leads": 0,
     }]
 
 
@@ -253,7 +256,7 @@ async def test_a_missing_impression_count_is_omitted_not_zeroed(patch_client):
 
     rows = await fetch_account_daily_spend("act_1", "T", "2026-08-16", "2026-08-16")
 
-    assert rows == [{"date": "2026-08-16", "spend": 718.52}]
+    assert rows == [{"date": "2026-08-16", "spend": 718.52, "results": 0, "leads": 0}]
     assert "impressions" not in rows[0]
 
 

@@ -1,6 +1,11 @@
 """
 Backfill script — populates hp_daily_calls for every HotProspector client group.
 
+Rows carry calls, inbound, outbound, answered, transfers, talk time and
+distinct leads dialled per day, so running this is what gives existing history
+the keys the dashboards query engine sums. It writes through
+cache_hp_daily_calls_from_stored.
+
 Makes **no HotProspector API calls**. The daily series is derived entirely
 from call logs already stored in hotprospector_leads (see
 services.hp_service.cache_hp_daily_calls_from_stored), so it's safe to re-run

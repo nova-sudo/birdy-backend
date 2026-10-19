@@ -4,6 +4,11 @@ Backfill script — populates measured per-day ad spend for every client group.
 The refresh keeps this current from now on, but only forward. This fills in the
 history so the chart has a real curve for ranges that predate the change.
 
+Rows carry spend, impressions, clicks and the lead count (`results` / `leads`,
+read from Meta's `actions`), so running this is also what gives existing
+history the keys the dashboards query engine sums. It writes through
+cache_account_daily_spend; nothing here needs to change when a row key is added.
+
 Cheap: one paginated Meta call per group (not per ad, not per campaign), and
 one small array written per group. Safe to re-run — each run rewrites the
 window rather than appending, and a failed fetch leaves the existing cache
