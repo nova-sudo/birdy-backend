@@ -59,12 +59,7 @@ class FakeMongo:
         return self._db
 
 
-EMPTY_ROW = {
-    "new_leads": 0, "new_contacts": 0, "open": 0, "won": 0, "lost": 0, "abandoned": 0,
-    # opportunity events by status-change day (tests/test_daily_history.py)
-    "opps_won": 0, "opps_lost": 0, "opps_open": 0, "opps_abandoned": 0, "opps_total": 0,
-    "revenue": 0.0,
-}
+EMPTY_ROW = {"new_leads": 0, "new_contacts": 0, "open": 0, "won": 0, "lost": 0, "abandoned": 0}
 
 
 @pytest.mark.asyncio
@@ -138,13 +133,6 @@ async def test_splits_leads_from_contacts_and_snapshots_opportunity_status():
         "won": 1,
         "lost": 1,
         "abandoned": 0,
-        # undated opportunities fall back to their contact's dateAdded
-        "opps_open": 1,
-        "opps_won": 1,
-        "opps_lost": 1,
-        "opps_abandoned": 0,
-        "opps_total": 3,
-        "revenue": 0.0,
     }]
 
 

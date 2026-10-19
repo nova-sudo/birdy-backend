@@ -13,10 +13,12 @@ database: Meta is served by an httpx mock transport, Mongo by mongomock.
 import httpx
 import pytest
 
-from core.database import DB_NAME
+from datetime import date, timedelta
+
+from core.constants import ghl_date_bounds
 from integrations.facebook_utils.meta_daily_spend import fetch_account_daily_spend
+from integrations.gohighlevel import compute_daily_opp_rows, compute_opp_stats
 from services.dashboards_catalog import DAILY_SOURCES, build_catalog
-from services.ghl_daily_leads import compute_daily_leads
 from services.hp_service import _compute_daily_call_series
 from services.metric_orchestrator import METRIC_REGISTRY
 
@@ -76,59 +78,118 @@ async def test_meta_daily_rows_carry_results_and_leads_from_actions(patch_meta):
 
 # --- GHL -----------------------------------------------------------------------
 
-def _contact(added, opps=None, lead_type="contact"):
-    data = {"dateAdded": added}
-    if opps is not None:
-        data["opportunities"] = opps
-    return {"user_id": "u1", "location_id": "loc1", "lead_type": lead_type, "contact_data": data}
+def _ago(n):
+    return (date.today() - timedelta(days=n)).isoformat()
 
 
-async def _daily(mock_mongo_client, contacts):
-    await mock_mongo_client[DB_NAME]["ghl_contacts"].insert_many(contacts)
-    return {r["date"]: r for r in await compute_daily_leads("u1", "loc1", mock_mongo_client)}
+def _days(rows):
+    return {r["date"]: r for r in rows}
 
 
-async def test_ghl_daily_rows_bucket_won_on_status_change_date_with_fallback(mock_mongo_client):
-    rows = await _daily(mock_mongo_client, [
-        _contact("2026-07-01T09:00:00.000Z", lead_type="lead", opps=[
-            # Won on the 20th, however long ago the contact was added.
-            {"status": "won", "monetaryValue": 1500, "lastStatusChangeAt": "2026-07-20T10:00:00Z",
-             "updatedAt": "2026-07-25T10:00:00Z"},
-            # No lastStatusChangeAt: falls back to updatedAt.
-            {"status": "won", "monetaryValue": "500", "updatedAt": "2026-07-22T10:00:00Z"},
-            # Neither: falls back to the opportunity's dateAdded.
-            {"status": "lost", "dateAdded": "2026-07-23T10:00:00Z"},
-            {"status": "abandoned", "lastStatusChangeAt": "2026-07-20T11:00:00Z"},
-            {"status": "open", "lastStatusChangeAt": "2026-07-20T12:00:00Z"},
-        ]),
-        # No date on the opportunity at all: lands on the contact's dateAdded.
-        _contact("2026-07-24T08:00:00.000Z", opps=[{"status": "won", "monetaryValue": 100}]),
-    ])
+def test_ghl_daily_rows_bucket_won_on_status_change_date_with_fallback():
+    rows = _days(compute_daily_opp_rows([
+        # Won on the 20th, however long ago it was created.
+        {"status": "won", "monetaryValue": 1500, "createdAt": "2026-07-01T09:00:00Z",
+         "lastStatusChangeAt": "2026-07-20T10:00:00Z", "updatedAt": "2026-07-25T10:00:00Z"},
+        # No lastStatusChangeAt: falls back to updatedAt.
+        {"status": "won", "monetaryValue": "500", "createdAt": "2026-07-01T09:00:00Z",
+         "updatedAt": "2026-07-22T10:00:00Z"},
+        # Neither: falls back to createdAt (GHL opps have createdAt, not dateAdded).
+        {"status": "lost", "createdAt": "2026-07-23T10:00:00Z"},
+        {"status": "abandoned", "lastStatusChangeAt": "2026-07-20T11:00:00Z"},
+        # An open opp is counted on its createdAt day, as compute_opp_stats does.
+        {"status": "open", "createdAt": "2026-07-20T12:00:00Z", "lastStatusChangeAt": "2026-07-28T12:00:00Z"},
+        # No date at all: nothing to bucket on.
+        {"status": "won", "monetaryValue": 9999},
+    ]))
 
-    d20, d22, d23, d24 = (rows[d] for d in ("2026-07-20", "2026-07-22", "2026-07-23", "2026-07-24"))
+    d20 = rows["2026-07-20"]
     assert (d20["opps_won"], d20["opps_lost"], d20["opps_abandoned"], d20["opps_open"]) == (1, 0, 1, 1)
-    assert d20["opps_total"] == 3
-    assert d20["revenue"] == 1500.0
-    assert (d22["opps_won"], d22["revenue"]) == (1, 500.0)
-    assert d23["opps_lost"] == 1
-    assert (d24["opps_won"], d24["revenue"]) == (1, 100.0)
-    # revenue counts won opportunities only.
-    assert rows["2026-07-23"]["revenue"] == 0.0
+    assert d20["opps_total"] == 3 and d20["revenue"] == 1500.0
+    assert (rows["2026-07-22"]["opps_won"], rows["2026-07-22"]["revenue"]) == (1, 500.0)
+    assert rows["2026-07-23"]["opps_lost"] == 1 and rows["2026-07-23"]["revenue"] == 0.0
+    assert "2026-07-28" not in rows
+    assert sum(r["opps_total"] for r in rows.values()) == 5
 
 
-async def test_ghl_existing_cohort_keys_are_unchanged(mock_mongo_client):
-    """open/won/lost/abandoned keep their lead-day cohort meaning (Leads Hub and
-    report blocks read them); the status-change counts live under opps_*."""
-    rows = await _daily(mock_mongo_client, [
-        _contact("2026-07-01T09:00:00.000Z", lead_type="lead", opps=[
-            {"status": "won", "lastStatusChangeAt": "2026-07-20T10:00:00Z"},
-        ]),
-    ])
+@pytest.mark.parametrize("preset", ["last_7d", "last_30d", "this_month", "maximum"])
+def test_ghl_daily_opp_rows_sum_to_the_preset_tile(preset):
+    """Summing a window's days must equal compute_opp_stats for that window."""
+    opps = []
+    for n in range(0, 45):
+        stamp = f"{_ago(n)}T{(n * 7) % 24:02d}:15:00Z"
+        opps += [
+            {"status": "won", "monetaryValue": 100 + n, "lastStatusChangeAt": stamp, "createdAt": stamp},
+            {"status": "lost", "lastStatusChangeAt": stamp, "createdAt": stamp},
+            {"status": "open", "createdAt": stamp, "lastStatusChangeAt": f"{_ago(0)}T01:00:00Z"},
+        ]
+        if n % 3 == 0:
+            opps.append({"status": "abandoned", "lastStatusChangeAt": stamp})
+    opps.append({"status": "won", "monetaryValue": 50, "lastStatusChangeAt": "2020-01-01T00:00:00Z"})
+    opps.append({"status": "Won", "monetaryValue": 25, "lastStatusChangeAt": f"{_ago(2)}T23:30:00Z"})
+    opps.append({"status": "weird", "lastStatusChangeAt": f"{_ago(2)}T10:00:00Z"})
 
-    assert rows["2026-07-01"]["won"] == 1 and rows["2026-07-01"]["new_leads"] == 1
-    assert rows["2026-07-01"]["opps_won"] == 0
-    assert rows["2026-07-20"]["leads"] == 0 and rows["2026-07-20"]["won"] == 0
-    assert rows["2026-07-20"]["opps_won"] == 1
+    start, end = ghl_date_bounds(preset)
+    tile = compute_opp_stats(opps, start, end)
+    rows = [r for r in compute_daily_opp_rows(opps)
+            if (start is None or r["date"] >= start) and (end is None or r["date"] <= end)]
+
+    for status in ("won", "lost", "open", "abandoned"):
+        assert sum(r[f"opps_{status}"] for r in rows) == tile[status], (preset, status)
+    assert sum(r["opps_total"] for r in rows) == tile["total_opportunities"]
+    assert sum(r["revenue"] for r in rows) == pytest.approx(tile["won_revenue"], abs=0.01)
+
+
+def test_ghl_daily_opp_days_use_the_same_string_slice_as_compute_opp_stats():
+    """No timezone conversion: the day is the first ten characters, so a 23:30Z
+    stamp and a +01:00 offset stamp land where compute_opp_stats windows them."""
+    opps = [
+        {"status": "won", "monetaryValue": 10, "lastStatusChangeAt": "2026-07-20T23:30:00Z"},
+        {"status": "won", "monetaryValue": 20, "lastStatusChangeAt": "2026-07-21T00:30:00+01:00"},
+        {"status": "lost", "lastStatusChangeAt": "2026-07-20T23:59:59.999+01:00"},
+    ]
+
+    rows = _days(compute_daily_opp_rows(opps))
+
+    assert rows["2026-07-20"]["opps_won"] == 1 and rows["2026-07-20"]["opps_lost"] == 1
+    assert rows["2026-07-21"]["opps_won"] == 1
+    for day in ("2026-07-20", "2026-07-21"):
+        tile = compute_opp_stats(opps, day, day)
+        assert (tile["won"], tile["lost"]) == (rows[day]["opps_won"], rows[day]["opps_lost"])
+
+
+class _FixedDate(date):
+    @classmethod
+    def today(cls):
+        return cls(2026, 9, 30)
+
+
+async def test_refresh_stores_daily_opps_next_to_the_preset_stats(mock_mongo_client, mock_db, monkeypatch):
+    import services.ghl_service as ghl_service
+
+    opps = [
+        {"status": "won", "monetaryValue": 300, "lastStatusChangeAt": "2026-09-10T10:00:00Z"},
+        {"status": "open", "createdAt": "2026-09-11T10:00:00Z"},
+    ]
+
+    async def fake_fetch(location_id, token):
+        return True, opps
+
+    monkeypatch.setattr(ghl_service.ghl_integration, "fetch_all_opportunities", fake_fetch)
+    monkeypatch.setattr(ghl_service, "date", _FixedDate)
+    await mock_db["client_groups"].insert_one({"id": "g1"})
+
+    await ghl_service.cache_ghl_opp_stats_all_presets("g1", "loc", "tok", mock_mongo_client)
+
+    stored = await mock_db["client_groups"].find_one({"id": "g1"})
+    assert stored["ghl_daily_opps"] == [
+        {"date": "2026-09-10", "opps_won": 1, "opps_lost": 0, "opps_open": 0,
+         "opps_abandoned": 0, "opps_total": 1, "revenue": 300.0},
+        {"date": "2026-09-11", "opps_won": 0, "opps_lost": 0, "opps_open": 1,
+         "opps_abandoned": 0, "opps_total": 1, "revenue": 0.0},
+    ]
+    # ghl_daily_leads is the Leads Hub's sparse series and gains no opp-only rows
+    assert "ghl_daily_leads" not in stored
 
 
 # --- HotProspector -------------------------------------------------------------
@@ -136,6 +197,15 @@ async def test_ghl_existing_cohort_keys_are_unchanged(mock_mongo_client):
 def _call(iso, status="outbound", duration=60, lead_id="l1", transfer=False):
     return {"call_time_iso": iso, "call_status": status, "duration": duration,
             "lead_id": lead_id, "transfer": transfer}
+
+
+def test_hp_talk_time_is_unrounded_so_days_sum_to_the_total():
+    # 70 s per day rounds to 1.2 min a day (36.0 over 30 days) but is 35.0 min really.
+    calls = [_call(f"2026-07-{d:02d}T09:00:00", duration=70) for d in range(1, 31)]
+    rows = _compute_daily_call_series(calls)
+
+    assert sum(r["talk_time"] for r in rows) == pytest.approx(30 * 70 / 60)
+    assert rows[0]["talk_min"] == 1.2          # the Sales Hub figure stays rounded
 
 
 def test_hp_daily_rows_split_inbound_outbound_answered():
@@ -199,13 +269,18 @@ def test_catalog_additive_marks_sums_that_add_up_to_a_whole():
     assert cat["total_tags"]["additive"] is False
 
 
-def test_catalog_every_daily_source_names_a_key_a_writer_produces():
+async def test_catalog_every_daily_source_names_a_key_a_writer_produces(patch_meta):
+    """The produced keys come from what the three writers actually emit."""
+    patch_meta({"data": [{"date_start": "2026-08-15", "spend": "1", "impressions": "2", "clicks": "1"}]})
+    meta_row = (await fetch_account_daily_spend("act_1", "T", "2026-08-15", "2026-08-15"))[0]
+    opp_row = compute_daily_opp_rows([{"status": "won", "lastStatusChangeAt": "2026-08-15T00:00:00Z"}])[0]
+    call_row = _compute_daily_call_series([_call("2026-08-15T09:00:00")])[0]
+    # ghl_daily_leads keeps its pre-T14 shape; its contact count key is `leads`.
     produced = {
-        "meta_daily_spend": {"spend", "impressions", "clicks", "results", "leads"},
-        "ghl_daily_leads": {"leads", "opps_won", "opps_lost", "opps_open", "opps_abandoned",
-                            "opps_total", "revenue"},
-        "hp_daily_calls": {"calls", "inbound", "outbound", "answered", "transfers",
-                           "talk_time", "leads_with_calls"},  # leads_with_calls: stored, not summable
+        "meta_daily_spend": set(meta_row),
+        "ghl_daily_opps": set(opp_row),
+        "ghl_daily_leads": {"leads"},
+        "hp_daily_calls": set(call_row),
     }
     for metric, src in DAILY_SOURCES.items():
         assert src["key"] in produced[src["field"]], metric

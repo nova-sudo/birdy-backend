@@ -181,8 +181,10 @@ def _compute_daily_call_series(calls):
             "answered": row["answered"],
             "transfers": row["transfers"],
             "talk_min": round(row["talk_seconds"] / 60, 1),
-            # Same figure as talk_min, under the hp_talk_time metric's name.
-            "talk_time": round(row["talk_seconds"] / 60, 1),
+            # Unrounded minutes under the hp_talk_time metric's name, so a window
+            # summed from days matches total_talk_min instead of accumulating
+            # per-day rounding (talk_min stays rounded for the Sales Hub).
+            "talk_time": row["talk_seconds"] / 60,
             "leads_with_calls": len(row["leads"]),
             "called": called_by_day.get(day, 0),
         }

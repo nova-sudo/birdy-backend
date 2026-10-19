@@ -141,6 +141,60 @@ def compute_opp_stats(
     return stats
 
 
+def _first_day(*stamps) -> Optional[str]:
+    """yyyy-mm-dd of the first non-empty timestamp, sliced from the string as
+    _in_window does (no timezone conversion), or None."""
+    for stamp in stamps:
+        if stamp:
+            return stamp[:10]
+    return None
+
+
+def compute_daily_opp_rows(opps: List[Dict]) -> List[Dict]:
+    """
+    One row per day an opportunity event happened, built from the same opp list
+    and the same rules as compute_opp_stats in windowed mode, so summing the
+    rows of a window equals that window's preset stats:
+
+      won / lost / abandoned → counted on lastStatusChangeAt's day
+      open                   → counted on createdAt's day
+      revenue                → monetaryValue of the won opps, on their won day
+
+    compute_opp_stats counts nothing for an opp missing the date it windows on
+    (it only shows in lifetime totals). Rather than lose those from history,
+    the day falls back: closed → updatedAt → createdAt; open → lastStatusChangeAt
+    → updatedAt. An opp with no date at all is skipped. GHL opps carry
+    `createdAt`, not `dateAdded`.
+
+    Row: {date, opps_won, opps_lost, opps_open, opps_abandoned, opps_total, revenue}
+    """
+    by_day: Dict[str, Dict] = {}
+    for opp in opps:
+        status = (opp.get("status") or "open").lower()
+        if status not in ("won", "lost", "open", "abandoned"):
+            continue
+        last_change, updated, created = opp.get("lastStatusChangeAt"), opp.get("updatedAt"), opp.get("createdAt")
+        if status == "open":
+            day = _first_day(created, last_change, updated)
+        else:
+            day = _first_day(last_change, updated, created)
+        if not day:
+            continue
+        row = by_day.setdefault(day, {
+            "date": day, "opps_won": 0, "opps_lost": 0, "opps_open": 0,
+            "opps_abandoned": 0, "opps_total": 0, "revenue": 0.0,
+        })
+        row[f"opps_{status}"] += 1
+        row["opps_total"] += 1
+        if status == "won":
+            row["revenue"] += _opp_monetary_value(opp)
+
+    rows = [by_day[d] for d in sorted(by_day)]
+    for row in rows:
+        row["revenue"] = round(row["revenue"], 2)
+    return rows
+
+
 def compute_cohort_funnel(
     contacts: List[Dict],
     called_keys: Optional[set] = None,

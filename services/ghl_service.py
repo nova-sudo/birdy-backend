@@ -46,7 +46,7 @@ async def cache_ghl_opp_stats_all_presets(
         non-empty, we also skip writes (safety against intermittent API issues).
     """
     from core.constants import META_CACHE_PRESETS, ghl_date_bounds
-    from integrations.gohighlevel import compute_opp_stats
+    from integrations.gohighlevel import compute_daily_opp_rows, compute_opp_stats
 
     db = mongo_client[DB_NAME]
     groups_col = db["client_groups"]
@@ -80,6 +80,11 @@ async def cache_ghl_opp_stats_all_presets(
     # wouldn't clobber the whole subdocument — belt-and-braces.
     update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
     update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
+
+    # Daily opportunity history for the dashboards query engine, from the same
+    # opp list and rules as the presets above (see compute_daily_opp_rows).
+    update_fields["ghl_daily_opps"] = compute_daily_opp_rows(opps)
+    update_fields["ghl_daily_opps_updated_at"] = datetime.utcnow().isoformat()
 
     # Closes over exactly the window the weekly health rule measures (first of
     # the month → previous Sunday), so health does not compare expected closes

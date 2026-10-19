@@ -7,7 +7,9 @@ For each group:
      integrations.gohighlevel.compute_opp_stats (by lastStatusChangeAt /
      createdAt rather than the GHL API's creation-date filter, which was
      returning zeros for long-cycle pipelines).
-  3. Write every preset to ghl_opp_cache.<preset> and mirror "maximum" into
+  3. Build the daily opportunity rows (ghl_daily_opps, which the dashboards
+     query engine sums) from the same list with compute_daily_opp_rows.
+  4. Write every preset to ghl_opp_cache.<preset> and mirror "maximum" into
      the legacy gohighlevel_cache.metrics.opportunity_stats for backward compat.
 
 Run with:  python -m scripts.backfill_opportunity_stats
@@ -32,6 +34,7 @@ from integrations.gohighlevel import (
     ghl_integration,
     get_subaccount_tokens,
     compute_opp_stats,
+    compute_daily_opp_rows,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -126,6 +129,8 @@ async def backfill():
             # Write via dot-notation
             update_fields = {f"ghl_opp_cache.{preset}": stats for preset, stats in opp_cache.items()}
             update_fields["ghl_opp_cache.updated_at"] = datetime.utcnow().isoformat()
+            update_fields["ghl_daily_opps"] = compute_daily_opp_rows(opps)
+            update_fields["ghl_daily_opps_updated_at"] = datetime.utcnow().isoformat()
 
             await groups_col.update_one(
                 {"id": group_id},

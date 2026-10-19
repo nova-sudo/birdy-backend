@@ -18,8 +18,7 @@ Stored on the client group as `ghl_daily_leads`:
     [{"date": "2026-08-16", "leads": 4, "new_leads": 3, "new_contacts": 1,
       "open": 2, "won": 1, "lost": 0, "abandoned": 0}, ...]
 
-sorted by date, one entry per day the location gained a contact or had an
-opportunity change status (see the end of this docstring). `leads` is
+sorted by date, one entry per day the location gained a contact. `leads` is
 the total (kept for back-compat with anything already reading it); the rest
 split that same day's contacts by the Lead Hub's data model:
 
@@ -39,67 +38,24 @@ split that same day's contacts by the Lead Hub's data model:
         can plot without a real event log, and matching the live endpoint's
         counting rule keeps the chart and the KPI tiles it feeds in
         agreement with what get_unified_leads reports.
-
-Those keys are the Leads Hub's (and report_blocks') and keep that meaning. The
-dashboards query engine needs the other reading, "what happened on this day",
-so every row also carries opportunity *events*, bucketed by the day the
-opportunity's status last changed:
-
-    opps_won / opps_lost / opps_abandoned / opps_open — one count per
-        opportunity of any contact, on its lastStatusChangeAt day, falling back
-        to updatedAt, then the opportunity's dateAdded, then its contact's
-        dateAdded so an undated opportunity still lands somewhere.
-    opps_total — the four above (the ghl_total_opps metric, and the
-        denominator of ghl_conversion).
-    revenue — the monetaryValue of the opportunities counted in opps_won, on
-        that same day (the ghl_revenue metric).
-
-A day can therefore have opportunity events and no new contacts: such a row has
-`leads: 0`. Summing a window of these rows approximates the preset stats in
-ghl_opp_cache, which are built from the opportunity search instead (and count
-an open opportunity on its createdAt day, not its status-change day).
 """
 
 import logging
+from collections import Counter
 from datetime import datetime
 
 from core.database import DB_NAME
-from integrations.gohighlevel import _opp_monetary_value
 
 logger = logging.getLogger(__name__)
 
 _OPP_STATUSES = ("open", "won", "lost", "abandoned")
 
 
-_OPP_EVENT_KEYS = {"won": "opps_won", "lost": "opps_lost", "abandoned": "opps_abandoned", "open": "opps_open"}
-
-
-def _blank_row() -> dict:
-    return {
-        "leads": 0, "new_leads": 0, "new_contacts": 0,
-        "open": 0, "won": 0, "lost": 0, "abandoned": 0,
-        "opps_won": 0, "opps_lost": 0, "opps_open": 0, "opps_abandoned": 0,
-        "opps_total": 0, "revenue": 0.0,
-    }
-
-
-def _opp_event_day(opp: dict, contact: dict):
-    """The day an opportunity's status last changed, falling back through
-    updatedAt and dateAdded (its own, then its contact's). None if undated."""
-    for value in (
-        opp.get("lastStatusChangeAt"), opp.get("updatedAt"),
-        opp.get("dateAdded"), contact.get("dateAdded"),
-    ):
-        if isinstance(value, str) and len(value) >= 10:
-            return value[:10]
-    return None
-
-
 async def compute_daily_leads(user_id: str, ghl_location_id: str, mongo_client) -> list:
-    """One row per day a contact was added or an opportunity changed status,
-    counted from the already-synced ghl_contacts collection — a local read, no
-    GHL API call."""
+    """One row per day a contact was added, counted from the already-synced
+    ghl_contacts collection — a local read, no GHL API call."""
     db = mongo_client[DB_NAME]
+    counts = Counter()
     by_day = {}
 
     cursor = db["ghl_contacts"].find(
@@ -108,38 +64,27 @@ async def compute_daily_leads(user_id: str, ghl_location_id: str, mongo_client) 
     )
     async for doc in cursor:
         contact = doc.get("contact_data") or {}
-        opps = contact.get("opportunities") or []
-
         added = contact.get("dateAdded")
-        if added:
-            row = by_day.setdefault(added[:10], _blank_row())
-            row["leads"] += 1
-            if doc.get("lead_type") == "lead":
-                row["new_leads"] += 1
-                for opp in opps:
-                    status = (opp.get("status") or "").strip().lower()
-                    if status in _OPP_STATUSES:
-                        row[status] += 1
-            else:
-                row["new_contacts"] += 1
+        if not added:
+            continue
+        day = added[:10]
+        counts[day] += 1
 
-        # Opportunity events, on the day each one changed status. Unlike the
-        # cohort counts above these include every contact, as ghl_opp_cache does.
-        for opp in opps:
-            status = (opp.get("status") or "open").strip().lower()
-            key = _OPP_EVENT_KEYS.get(status)
-            day = _opp_event_day(opp, contact)
-            if not key or not day:
-                continue
-            row = by_day.setdefault(day, _blank_row())
-            row[key] += 1
-            row["opps_total"] += 1
-            if status == "won":
-                row["revenue"] += _opp_monetary_value(opp)
+        row = by_day.setdefault(
+            day, {"new_leads": 0, "new_contacts": 0, "open": 0, "won": 0, "lost": 0, "abandoned": 0}
+        )
+        if doc.get("lead_type") == "lead":
+            row["new_leads"] += 1
+            for opp in (contact.get("opportunities") or []):
+                status = (opp.get("status") or "").strip().lower()
+                if status in _OPP_STATUSES:
+                    row[status] += 1
+        else:
+            row["new_contacts"] += 1
 
     return [
-        {"date": day, **{k: (round(v, 2) if k == "revenue" else v) for k, v in row.items()}}
-        for day, row in sorted(by_day.items())
+        {"date": day, "leads": n, **by_day[day]}
+        for day, n in sorted(counts.items())
     ]
 
 

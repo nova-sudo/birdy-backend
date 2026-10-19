@@ -5,11 +5,6 @@ The refresh keeps this current from now on, but only forward. This fills in
 the history so the Leads page chart has a real curve without waiting for the
 next GHL cron pass to touch every location.
 
-Rows carry the Leads Hub cohort counts and the opportunity events the
-dashboards query engine sums (opps_won / opps_lost / opps_open / opps_abandoned
-/ opps_total / revenue, bucketed by status-change day), so running this is what
-gives existing history those keys. It writes through cache_ghl_daily_leads.
-
 Cheap and safe to re-run: no GHL API calls at all — ghl_contacts is already
 fully synced, this just re-buckets what's already on disk. Each run rewrites
 the whole series, and an empty read leaves a non-empty existing cache alone.

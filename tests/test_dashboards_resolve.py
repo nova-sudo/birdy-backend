@@ -408,6 +408,32 @@ def test_unique_counts_by_day_are_unavailable(client):
     assert [e["code"] for e in out["errors"]] == ["DAY_SERIES_UNAVAILABLE"] * 2
 
 
+def test_meta_leads_by_day_reads_the_leads_key(client, mock_db):
+    asyncio.run(mock_db["client_groups"].insert_one(_group(
+        "g9", "Leady", maximum=_insights(1, 1, 1, 1),
+        daily=[{"date": "2020-02-01", "spend": 5, "leads": 3, "results": 3},
+               {"date": "2020-02-02", "spend": 6, "leads": 4, "results": 4}],
+    )))
+    out = _resolve(client, [_b("leads", by="day", filters={"client": ["g9"]}),
+                            _b("meta_results", by="day", filters={"client": ["g9"]})])
+    assert out["errors"] == []
+    assert out["slots"][0]["points"] == [{"label": "2020-02-01", "value": 3.0}, {"label": "2020-02-02", "value": 4.0}]
+    assert out["slots"][1]["points"] == out["slots"][0]["points"]
+
+
+def test_ghl_won_opps_by_day_reads_ghl_daily_opps(client, mock_db):
+    asyncio.run(mock_db["client_groups"].insert_one(_group(
+        "g8", "Closer", maximum=_insights(1, 1, 1, 1),
+        ghl_daily_opps=[{"date": "2020-03-01", "opps_won": 2, "revenue": 900.0},
+                        {"date": "2020-03-02", "opps_won": 1, "revenue": 100.0}],
+    )))
+    out = _resolve(client, [_b("ghl_won_opps", by="day", filters={"client": ["g8"]}),
+                            _b("ghl_revenue", by="day", filters={"client": ["g8"]})])
+    assert out["errors"] == []
+    assert [p["value"] for p in out["slots"][0]["points"]] == [2.0, 1.0]
+    assert [p["value"] for p in out["slots"][1]["points"]] == [900.0, 100.0]
+
+
 def test_ghl_leads_by_day_reads_ghl_daily_leads(client):
     slot = _resolve(client, [_b("ghl_leads", by="day")])["slots"][0]
     # Beta has no ghl_daily_leads field at all; "abc" counts as 0.
