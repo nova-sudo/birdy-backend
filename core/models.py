@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 
 
@@ -273,6 +273,18 @@ class SlackChannelsResponse(BaseModel):
 class SetSlackChannelRequest(BaseModel):
     channel_id: Optional[str] = None  # null clears the selection (stops posting)
     channel_name: Optional[str] = None
+
+
+MAX_DASHBOARD_QUERIES = 50
+
+
+class QueryBody(BaseModel):
+    """
+    POST /api/dashboards/query: dashkit queries, at most 50 (hosts chunk).
+    Only the envelope is checked here; each query's shape is checked on its own
+    by services/dashboards_query, so one bad query is a null frame, not a 422.
+    """
+    queries: List[dict] = Field(..., max_length=MAX_DASHBOARD_QUERIES)
 
 
 class ResolveBody(BaseModel):

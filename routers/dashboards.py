@@ -17,9 +17,10 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Body, Depends, HTTPException, Response
 
 from core.database import DB_NAME
-from core.models import ResolveBody
+from core.models import QueryBody, ResolveBody
 from dependencies import get_mongo_client, get_current_user
 from services.dashboards_catalog import build_catalog
+from services.dashboards_query import run_queries
 from services.dashboards_resolve import MAX_BINDINGS, resolve_bindings
 from services.dashboards_schema import schema_has_meta_updated_at, validate_doc
 
@@ -90,7 +91,21 @@ async def resolve(body: ResolveBody, current_user: str = Depends(get_current_use
             raise HTTPException(status_code=500, detail="Failed to resolve dashboard data")
 
 
-# --- fixed-path routes (/catalog, /resolve) go above this line; /{id} must stay last ---
+@router.post("/api/dashboards/query")
+async def query(body: QueryBody, current_user: str = Depends(get_current_user)):
+    """dashkit Frames for a board's widgets: one per query, in order, null where a query failed on its own."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            return {"frames": await run_queries(db, current_user, body.queries)}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error running dashboard queries for {current_user}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to load dashboard data")
+
+
+# --- fixed-path routes (/catalog, /resolve, /query) go above this line; /{id} must stay last ---
 
 
 @router.get("/api/dashboards/{dashboard_id}")

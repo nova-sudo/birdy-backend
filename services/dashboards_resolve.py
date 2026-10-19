@@ -26,7 +26,7 @@ reaches back that far. By-day series never carry `previous`.
 import logging
 import math
 from datetime import date, timedelta
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from core.constants import PRESET_ALIAS, ghl_date_bounds, previous_preset
 from services.dashboards_catalog import DAILY_SOURCES, build_catalog
@@ -64,11 +64,22 @@ class BindingError(Exception):
         self.message = message
 
 
-async def load_groups(db, user_id: str) -> list[dict]:
-    """The caller's client groups that are not Inactive."""
+_DAILY_FIELDS = {src["field"] for src in DAILY_SOURCES.values()}
+
+
+async def load_groups(db, user_id: str, daily_fields: Optional[Iterable[str]] = None) -> list[dict]:
+    """
+    The caller's client groups that are not Inactive. `daily_fields` narrows the
+    daily series read to those fields (None reads them all); the preset caches
+    are always read.
+    """
+    projection = _GROUP_PROJECTION
+    if daily_fields is not None:
+        projection = {k: v for k, v in _GROUP_PROJECTION.items() if k not in _DAILY_FIELDS}
+        projection.update({field: 1 for field in daily_fields})
     return await db["client_groups"].find(
         {"user_id": user_id, "client_status": {"$ne": "Inactive"}},
-        _GROUP_PROJECTION,
+        projection,
     ).to_list(length=None)
 
 

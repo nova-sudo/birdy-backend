@@ -92,6 +92,115 @@ def previous_preset(preset: str):
     return target if target in PRESET_ALIAS else None
 
 
+# ---------------------------------------------------------------------------
+# dashkit query windows (POST /api/dashboards/query)
+# ---------------------------------------------------------------------------
+# Inclusive date ranges for a dashkit window, matching dashkit's reference
+# calendar (adapters/mock-calendar.ts): last_Nd is the N days ending today,
+# this_* runs from the period's first day to today, last_* is the whole
+# preceding period. `maximum` has no start of its own (the query engine reads
+# it from the data) and no previous period.
+from datetime import date as _date, timedelta  # noqa: E402 (also imported below for the GHL helpers)
+
+_ROLLING_DAYS = {"last_7d": 7, "last_14d": 14, "last_30d": 30}
+_PERIOD_MONTHS = {"month": 1, "quarter": 3, "year": 12}
+
+
+def _period_start(day: _date, period: str) -> _date:
+    if period == "week":
+        return day - timedelta(days=day.weekday())
+    if period == "month":
+        return day.replace(day=1)
+    if period == "quarter":
+        return day.replace(month=((day.month - 1) // 3) * 3 + 1, day=1)
+    return day.replace(month=1, day=1)
+
+
+def _period_before(start: _date, period: str) -> _date:
+    """First day of the calendar period before the one starting on `start`."""
+    if period == "week":
+        return start - timedelta(days=7)
+    index = start.year * 12 + (start.month - 1) - _PERIOD_MONTHS[period]
+    return _date(index // 12, index % 12 + 1, 1)
+
+
+_CALENDAR_PRESETS = {
+    "this_week_mon_today": ("this", "week"),
+    "this_month": ("this", "month"),
+    "this_quarter": ("this", "quarter"),
+    "this_year": ("this", "year"),
+    "last_month": ("last", "month"),
+    "last_quarter": ("last", "quarter"),
+    "last_year": ("last", "year"),
+}
+
+
+def _parse_day(value) -> _date:
+    if not isinstance(value, str) or len(value) != 10:
+        raise ValueError(f"Not a YYYY-MM-DD date: {value!r}")
+    return _date.fromisoformat(value)
+
+
+def window_range(window: dict, today: _date = None):
+    """
+    (from, to) inclusive dates for a dashkit window ({preset} or {from, to}).
+    `from` is None for `maximum`. Raises ValueError for an unknown preset or a
+    malformed / reversed custom range.
+    """
+    today = today or _date.today()
+    if "preset" not in window:
+        start, end = _parse_day(window.get("from")), _parse_day(window.get("to"))
+        if start > end:
+            raise ValueError(f"Window from {start} is after to {end}")
+        return start, end
+    preset = PRESET_ALIAS.get(window["preset"])
+    if preset is None:
+        raise ValueError(f"Unknown window preset {window['preset']!r}")
+    if preset == "maximum":
+        return None, today
+    if preset == "today":
+        return today, today
+    if preset == "yesterday":
+        day = today - timedelta(days=1)
+        return day, day
+    if preset in _ROLLING_DAYS:
+        return today - timedelta(days=_ROLLING_DAYS[preset] - 1), today
+    kind, period = _CALENDAR_PRESETS[preset]
+    start = _period_start(today, period)
+    if kind == "this":
+        return start, today
+    prev = _period_before(start, period)
+    return prev, start - timedelta(days=1)
+
+
+def previous_window(window: dict, today: _date = None):
+    """
+    The period before a dashkit window, as inclusive (from, to) dates, or None
+    for `maximum`:
+      this_*      -> the preceding calendar period cut to the same elapsed
+                     length, clamped to that period's last day (31 Mar's
+                     this_month compares with 1-28 Feb, not 1 Feb-3 Mar);
+      last_*      -> the preceding calendar period;
+      everything else (today, yesterday, last_Nd, custom) -> the same number of
+                     days immediately before.
+    """
+    today = today or _date.today()
+    start, end = window_range(window, today)
+    if start is None:
+        return None
+    preset = PRESET_ALIAS.get(window["preset"]) if "preset" in window else None
+    if preset in _CALENDAR_PRESETS:
+        kind, period = _CALENDAR_PRESETS[preset]
+        prev_start = _period_before(start, period)
+        prev_last = start - timedelta(days=1)
+        if kind == "last":
+            return prev_start, prev_last
+        elapsed = (end - start).days
+        return prev_start, min(prev_start + timedelta(days=elapsed), prev_last)
+    length = (end - start).days + 1
+    return start - timedelta(days=length), start - timedelta(days=1)
+
+
 GHL_PRESET_DATE_RANGE = {
     "maximum":             None,
     "today":               (0, 0),
