@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://dashkit.dev/schema/dashboard-v1.json",
+  "type": "object",
+  "properties": {
+    "id": {
+      "type": "string"
+    },
+    "version": {
+      "type": "number",
+      "const": 1
+    },
+    "title": {
+      "type": "string"
+    },
+    "description": {
+      "type": "string"
+    },
+    "sections": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "description": {
+            "type": "string"
+          },
+          "collapsed": {
+            "type": "boolean"
+          },
+          "level": {
+            "type": "number",
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          },
+          "widgets": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "id": {
+                  "type": "string"
+                },
+                "type": {
+                  "type": "string"
+                },
+                "version": {
+                  "type": "number"
+                },
+                "title": {
+                  "type": "string"
+                },
+                "span": {
+                  "type": "object",
+                  "properties": {
+                    "cols": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 12
+                    },
+                    "rows": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 4
+                    }
+                  },
+                  "required": [
+                    "cols",
+                    "rows"
+                  ],
+                  "additionalProperties": false
+                },
+                "data": {},
+                "bindings": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "object",
+                    "properties": {
+                      "metric": {
+                        "type": "string"
+                      },
+                      "by": {
+                        "type": "string"
+                      },
+                      "window": {
+                        "anyOf": [
+                          {
+                            "type": "object",
+                            "properties": {
+                              "preset": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "preset"
+                            ],
+                            "additionalProperties": false
+                          },
+                          {
+                            "type": "object",
+                            "properties": {
+                              "from": {
+                                "type": "string"
+                              },
+                              "to": {
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "from",
+                              "to"
+                            ],
+                            "additionalProperties": false
+                          }
+                        ]
+                      },
+                      "filters": {
+                        "type": "object",
+                        "additionalProperties": {
+                          "type": "array",
+                          "items": {
+                            "type": "string"
+                          }
+                        }
+                      },
+                      "compare": {
+                        "type": "string",
+                        "enum": [
+                          "previous",
+                          "none"
+                        ]
+                      },
+                      "limit": {
+                        "type": "number"
+                      },
+                      "sort": {
+                        "type": "string",
+                        "enum": [
+                          "asc",
+                          "desc"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "metric",
+                      "window"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "hidden": {
+                  "type": "boolean"
+                },
+                "locked": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "id",
+                "type",
+                "version",
+                "span"
+              ],
+              "additionalProperties": false
+            }
+          }
+        },
+        "required": [
+          "id",
+          "widgets"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "theme": {
+      "type": "object",
+      "properties": {
+        "density": {
+          "type": "string",
+          "enum": [
+            "comfortable",
+            "compact"
+          ]
+        }
+      },
+      "required": [
+        "density"
+      ],
+      "additionalProperties": false
+    },
+    "meta": {
+      "type": "object",
+      "properties": {
+        "createdAt": {
+          "type": "string"
+        },
+        "updatedAt": {
+          "type": "string"
+        },
+        "lastAuthor": {
+          "type": "string",
+          "enum": [
+            "user",
+            "ai",
+            "code"
+          ]
+        }
+      },
+      "required": [
+        "createdAt",
+        "updatedAt",
+        "lastAuthor"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "id",
+    "version",
+    "title",
+    "sections",
+    "meta"
+  ],
+  "additionalProperties": false,
+  "title": "Dashboard"
+}

@@ -105,13 +105,62 @@ def _v1_doc(dash_id="d1"):
     }
 
 
-def test_router_rejects_v1_on_save(client):
+# Transitional (dashkit 0.3.0 rollout, final review I1): a v1 doc still saves, validated
+# against the frozen 0.2 schema, so tabs running the 0.2 frontend keep working across the
+# deploy. When v1 acceptance is removed, restore the v1-rejection test: PUT _v1_doc() is a
+# 422 with a "/version: " error and a "/: " error naming "widgets", and nothing is stored.
+def test_router_accepts_v1_on_save_during_the_transition(client):
     r = client.put("/api/dashboards/d1", json=_v1_doc())
+    assert r.status_code == 200
+
+    stored = client.get("/api/dashboards/d1").json()
+    assert stored["meta"]["updatedAt"] != "2026-10-01T00:00:00Z"
+    expected = _v1_doc()
+    expected["meta"]["updatedAt"] = stored["meta"]["updatedAt"]
+    assert stored == expected  # stored as v1, not rewritten
+
+
+def test_router_rejects_a_malformed_v1_doc(client):
+    bad = _v1_doc()
+    bad["sections"][0]["widgets"][0]["span"]["cols"] = 13
+    del bad["title"]
+    r = client.put("/api/dashboards/d1", json=bad)
     assert r.status_code == 422
     errors = r.json()["detail"]["errors"]
-    assert any(e.startswith("/version: ") for e in errors)
-    assert any(e.startswith("/: ") and "widgets" in e for e in errors)
+    assert any(e.startswith("/sections/0/widgets/0/span/cols: ") for e in errors)
+    assert any(e.startswith("/: ") and "title" in e for e in errors)
     assert client.get("/api/dashboards/d1").status_code == 404
+
+
+def test_router_rejects_a_v1_numbered_doc_shaped_as_v2(client):
+    # version 1 picks the v1 schema, which requires sections.
+    doc = _doc()
+    doc["version"] = 1
+    r = client.put("/api/dashboards/d1", json=doc)
+    assert r.status_code == 422
+    assert any(e.startswith("/: ") and "sections" in e for e in r.json()["detail"]["errors"])
+
+
+def test_a_v2_doc_is_still_validated_against_v2(client):
+    doc = _doc()
+    doc["sections"] = []  # v1-only field: v2 forbids extra keys
+    r = client.put("/api/dashboards/d1", json=doc)
+    assert r.status_code == 422
+
+
+async def test_a_v1_doc_saved_in_the_transition_works_with_the_ai_tools(client, mock_db):
+    from ai.tools.dashboard_tools import dashboard_apply, dashboard_describe, summarize_doc
+
+    assert client.put("/api/dashboards/d1", json=_v1_doc()).status_code == 200
+    stored = client.get("/api/dashboards/d1").json()
+
+    described = await dashboard_describe(mock_db, "alice@example.com", dashboard_id="d1")
+    assert described == {"summary": summarize_doc(stored)}
+    assert "[w1] kpi" in described["summary"] and "[s1] heading" in described["summary"]
+
+    applied = await dashboard_apply(mock_db, "alice@example.com", dashboard_id="d1",
+                                    ops=[{"op": "moveWidget", "widgetId": "w1", "to": {"x": 3, "y": 1}}])
+    assert applied["ok"] is True
 
 
 async def test_get_returns_a_stored_v1_doc_unchanged(client, mock_db):
@@ -123,9 +172,11 @@ async def test_get_returns_a_stored_v1_doc_unchanged(client, mock_db):
 
 
 def test_schema_is_dashkit_v2():
-    from services.dashboards_schema import _VALIDATOR, validate_doc
+    from services.dashboards_schema import _VALIDATOR, _V1_VALIDATOR, validate_doc
 
     assert _VALIDATOR.schema["$id"].endswith("/dashboard-v2.json")
+    assert _V1_VALIDATOR.schema["$id"].endswith("/dashboard-v1.json")
+    assert validate_doc(_v1_doc()) == []
     assert validate_doc(_doc()) == []
     overflowing = _doc()
     overflowing["widgets"][0]["layout"] = {"x": 6, "y": 0, "w": 12, "h": 1}
