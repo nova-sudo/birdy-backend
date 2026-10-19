@@ -65,7 +65,7 @@
 - `hp_inbound` — HP Inbound [integer, higher is better] by: client, day
 - `hp_outbound` — HP Outbound [integer, higher is better] by: client, day
 - `hp_transfers` — HP Transfers [integer, higher is better] by: client, day
-- `hp_leads_with_calls` — HP Leads With Calls [integer, higher is better] by: client, day
+- `hp_leads_with_calls` — HP Leads With Calls [integer, higher is better] by: client
 - `hp_answered_calls` — HP Answered Calls [integer, higher is better] by: client, day
 - `hp_talk_time` — HP Talk Time [decimal, higher is better] by: client, day
 - `hp_connect_rate` — HP Connect Rate [percentage, higher is better] by: client

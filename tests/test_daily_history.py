@@ -167,8 +167,10 @@ def test_catalog_every_metric_with_a_daily_source_has_over_true_and_reach_has_ov
     cat = _catalog()
     for key in DAILY_SOURCES:
         assert cat[key]["over"] is True, key
-    for key in ("reach", "meta_reach", "frequency"):
+    # unique / distinct counts cannot be summed per day
+    for key in ("reach", "meta_reach", "frequency", "hp_leads_with_calls", "hp_connect_rate"):
         assert cat[key]["over"] is False and cat[key]["additive"] is False, key
+    assert "hp_leads_with_calls" not in DAILY_SOURCES
     # general GHL metrics that are not windowed, and lifetime HP leads (no created date)
     assert cat["total_tags"]["over"] is False
     assert cat["hp_leads"]["over"] is False
@@ -186,7 +188,7 @@ def test_catalog_ratios_have_over_only_when_both_components_do():
     for key in ("ctr", "cpc", "cpm", "cpl", "cost_per_result", "cost_per_lead", "ghl_conversion",
                 "conversion_rate", "engagement_rate", "hp_answer_rate"):
         assert cat[key]["over"] is True, key
-    for key in ("frequency", "hp_connect_rate"):
+    for key in ("frequency", "hp_connect_rate"):  # reach / hp_leads / hp_leads_with_calls lack daily sums
         assert cat[key]["over"] is False, key
 
 
@@ -203,7 +205,7 @@ def test_catalog_every_daily_source_names_a_key_a_writer_produces():
         "ghl_daily_leads": {"leads", "opps_won", "opps_lost", "opps_open", "opps_abandoned",
                             "opps_total", "revenue"},
         "hp_daily_calls": {"calls", "inbound", "outbound", "answered", "transfers",
-                           "talk_time", "leads_with_calls"},
+                           "talk_time", "leads_with_calls"},  # leads_with_calls: stored, not summable
     }
     for metric, src in DAILY_SOURCES.items():
         assert src["key"] in produced[src["field"]], metric

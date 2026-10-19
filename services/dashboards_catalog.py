@@ -18,7 +18,9 @@ from services.metric_orchestrator import METRIC_REGISTRY
 # rows and the per-row key. Every additive metric whose daily rows measure the
 # same thing as its value source is listed, so a dashboard can chart it over
 # day / week / month by summing rows. Not listed, because they cannot be
-# bucketed by day: `reach` / `meta_reach` (unique counts, cannot be summed),
+# bucketed by day: `reach` / `meta_reach` and `hp_leads_with_calls` (distinct
+# counts: a day's distinct leads summed over days counts a repeat caller once
+# per day; hp_daily_calls still stores the per-day figure as `leads_with_calls`),
 # `hp_leads` (HotProspector leads carry no date; the preset value is a lifetime
 # count) and `total_tags` (a snapshot of the tag list). The ratios are not listed
 # either: they are recomputed from their components' rows (see `over` below).
@@ -47,12 +49,12 @@ DAILY_SOURCES: dict[str, dict[str, str]] = {
     "hp_answered_calls":   {"field": "hp_daily_calls",  "key": "answered"},
     "hp_transfers":        {"field": "hp_daily_calls",  "key": "transfers"},
     "hp_talk_time":        {"field": "hp_daily_calls",  "key": "talk_time"},
-    "hp_leads_with_calls": {"field": "hp_daily_calls",  "key": "leads_with_calls"},
 }
 
 # Sum-aggregated metrics whose parts do not add up to a whole: unique counts
-# (a person reached by two campaigns is one person) and a count of distinct tags.
-_NON_ADDITIVE_KEYS = {"reach", "meta_reach", "total_tags"}
+# (a person reached by two campaigns is one person; a lead dialled on two days is
+# one lead) and a count of distinct tags.
+_NON_ADDITIVE_KEYS = {"reach", "meta_reach", "hp_leads_with_calls", "total_tags"}
 
 _DIMENSIONS = [
     {"key": "client", "label": "Client"},

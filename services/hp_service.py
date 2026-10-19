@@ -128,8 +128,9 @@ def _compute_daily_call_series(calls):
 
     `leads_with_calls` is different: the number of distinct leads dialled that
     day, so a lead called on three days counts on each. Summed over a window it
-    therefore exceeds the preset's distinct count, which is the price of being
-    bucketable by day. There is no daily `hp_leads`: HotProspector leads carry
+    would exceed the preset's distinct count, so the dashboards catalog does not
+    treat it as summable (hp_leads_with_calls is over:false, additive:false);
+    the figure is stored for per-day reading only. There is no daily `hp_leads`: HotProspector leads carry
     no creation date to bucket on, and the preset's hp_leads is a lifetime
     count.
     """
