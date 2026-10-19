@@ -25,6 +25,7 @@ from ai.tools.dashboard_tools import (
 )
 from ai.tools.registry import ToolRegistry
 from core.models import ChatRequest, ChatResponse
+from services.dashboards_catalog import build_catalog
 
 USER = "alice@example.com"
 
@@ -334,6 +335,48 @@ async def test_markdown_in_a_proposed_widget_title_is_title_plain_text(mock_db):
     assert result["error"]["path"] == "/title"
 
 
+def _markdownish_doc():
+    """A dashboard whose own titles carry markdown markers, as people type them in the editor."""
+    doc = _doc()
+    doc["title"] = "Client #1"
+    doc["sections"][0]["title"] = "CTR_7d"
+    doc["sections"][0]["widgets"][0]["title"] = "**Spend**"
+    return doc
+
+
+async def test_unchanged_markdownish_titles_pass(mock_db):
+    ops = [{"op": "setTitle", "title": "Client #1", "description": "Weekly numbers"},
+           {"op": "updateSection", "sectionId": "s1", "patch": {"title": "CTR_7d", "level": 1}},
+           {"op": "updateWidget", "widgetId": "w1", "patch": {"title": "**Spend**", "hidden": True}}]
+    from_summary = await dashboard_apply(mock_db, USER, summary=summarize_doc(_markdownish_doc()), ops=ops)
+    assert from_summary["ok"] is True
+    await _store(mock_db, _markdownish_doc())
+    from_doc = await dashboard_apply(mock_db, USER, dashboard_id="d1", ops=ops)
+    assert from_doc["ok"] is True
+
+
+@pytest.mark.parametrize("op, path", [
+    ({"op": "setTitle", "title": "Client #2"}, "/ops/0/title"),
+    ({"op": "updateSection", "sectionId": "s1", "patch": {"title": "CTR_30d"}}, "/ops/0/patch/title"),
+    ({"op": "updateWidget", "widgetId": "w1", "patch": {"title": "*Spend*"}}, "/ops/0/patch/title"),
+    # w2 has no title, so "**Spend**" is a change for it, not the title of w1.
+    ({"op": "updateWidget", "widgetId": "w2", "patch": {"title": "**Spend**"}}, "/ops/0/patch/title"),
+])
+async def test_changed_markdownish_titles_are_still_rejected(mock_db, op, path):
+    result = await dashboard_apply(mock_db, USER, summary=summarize_doc(_markdownish_doc()), ops=[op])
+    assert result["ok"] is False
+    assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
+    assert result["error"]["path"] == path
+
+
+async def test_a_title_changed_earlier_in_the_call_is_the_current_one(mock_db):
+    ops = [{"op": "setTitle", "title": "Clients"},
+           {"op": "setTitle", "title": "Client #1", "description": "back to the old name"}]
+    result = await dashboard_apply(mock_db, USER, summary=summarize_doc(_markdownish_doc()), ops=ops)
+    assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
+    assert result["error"]["path"] == "/ops/1/title"
+
+
 async def test_plain_titles_with_punctuation_are_ok(mock_db):
     ops = [{"op": "setTitle", "title": "Q4 growth: spend & leads (EU) - v2!"},
            {"op": "updateSection", "sectionId": "s1", "patch": {"title": "Overview / 30 days"}}]
@@ -404,6 +447,19 @@ async def test_describe_summarizes_a_stored_doc(mock_db):
         '- [w2] trend "" 6x2  series→spend by day 2026-09-01..2026-09-30 (hidden) (locked)',
         "## (untitled) [s2] (0 widgets)",
     ])}
+
+
+async def test_by_day_refusal_lists_at_most_six_daily_metrics_untruncated(mock_db):
+    daily = [m["key"] for m in build_catalog()["metrics"] if "day" in m["dimensions"]]
+    assert len(daily) > 6  # the cap is exercised by the real catalog
+    binding = {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "setBinding", "widgetId": "w2", "slot": "series", "binding": binding}])
+    message = result["error"]["message"]
+    assert message.count("`") == 2 * 6
+    assert all(f"`{key}`" in message for key in daily[:6])
+    assert message.endswith(f" and {len(daily) - 6} more")
+    assert len(message) <= 300
 
 
 def test_summarize_marks_section_levels_other_than_the_default():

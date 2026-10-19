@@ -60,13 +60,17 @@ _SEARCH_LIMIT = 20
 _MESSAGE_LIMIT = 300
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 # dashkit's summarize appends " (h1)" / " (h3)" when a section's level is not the default 2.
-_SECTION_LINE = re.compile(r"^## .* \[([^\]]+)\] \(\d+ widgets\)(?: \(h\d\))?$")
+_SECTION_LINE = re.compile(r"^## (.*) \[([^\]]+)\] \(\d+ widgets\)(?: \(h\d\))?$")
+_TITLE_LINE = re.compile(r"^# (.*) \(\d+ sections, \d+ widgets\)$")
 # Markdown markers a title may not carry: titles render as plain text.
 _TITLE_MARKDOWN = re.compile(r"[#*_`]")
 _TITLE_MESSAGE = ("Titles are plain text; remove the markdown (#, *, _ or backticks). To make a section heading "
                   "larger or smaller use updateSection with `level` (1 large, 2 default, 3 small); "
                   "for prose add a `text` widget.")
 _WIDGET_LINE = re.compile(r"^- \[([^\]]+)\] ")
+_WIDGET_TITLE = re.compile(r'^- \[[^\]]+\] \S+ "(.*)" \d+x\d+')
+# How many daily-capable metrics a by-day refusal names (keeps it under _MESSAGE_LIMIT).
+_DAILY_LIST_LIMIT = 6
 
 
 def widget_manifest() -> list[dict]:
@@ -126,26 +130,36 @@ def _title_error(title, path: str) -> Optional[dict]:
     return None
 
 
-def _op_titles(op: dict, at: str):
-    """(title, path) for every title an op sets: dashboard, section and widget titles."""
+def _op_titles(op: dict, at: str, layout: "_Layout"):
+    """(title, path, current title or None) for every title an op sets: dashboard, section and widget titles."""
     name = op["op"]
     if name == "setTitle":
-        yield op.get("title"), f"{at}/title"
-    elif name in ("updateSection", "updateWidget"):
-        yield (op.get("patch") or {}).get("title"), f"{at}/patch/title"
+        yield op.get("title"), f"{at}/title", layout.title
+    elif name == "updateSection":
+        yield (op.get("patch") or {}).get("title"), f"{at}/patch/title", layout.section_titles.get(op["sectionId"])
+    elif name == "updateWidget":
+        yield (op.get("patch") or {}).get("title"), f"{at}/patch/title", layout.widget_titles.get(op["widgetId"])
     elif name == "addWidget":
-        yield (op.get("widget") or {}).get("title"), f"{at}/widget/title"
+        yield (op.get("widget") or {}).get("title"), f"{at}/widget/title", None
     elif name == "addSection":
         section = op.get("section") or {}
-        yield section.get("title"), f"{at}/section/title"
+        yield section.get("title"), f"{at}/section/title", None
         for j, w in enumerate(section.get("widgets") or []):
             if isinstance(w, dict):
-                yield w.get("title"), f"{at}/section/widgets/{j}/title"
+                yield w.get("title"), f"{at}/section/widgets/{j}/title", None
+
+
+def _op_title_error(op: dict, at: str, layout: "_Layout") -> Optional[dict]:
+    """TITLE_PLAIN_TEXT for a title the op sets, unless it equals the current one: titles people
+    typed themselves ("Client #1") must not block an op that only changes something else."""
+    return next((e for title, path, current in _op_titles(op, at, layout)
+                 if title != current and (e := _title_error(title, path))), None)
 
 
 def _ops_error(ops) -> Optional[dict]:
     """Per-op check against that op's own schema, for precise paths and messages,
-    plus the rules the schema cannot express (unknown widget type, markdown in titles)."""
+    plus the unknown-widget-type rule the schema cannot express. (Markdown in
+    titles is checked against the layout in dashboard_apply.)"""
     if not isinstance(ops, list):
         return None
     for i, op in enumerate(ops):
@@ -164,9 +178,6 @@ def _ops_error(ops) -> Optional[dict]:
         found = _schema_error(member, op, at)
         if found:
             return found
-        found = next((e for title, path in _op_titles(op, at) if (e := _title_error(title, path))), None)
-        if found:
-            return found
     return None
 
 
@@ -178,8 +189,12 @@ def _binding_error(binding: dict, at: str, metrics: dict, dimensions: set) -> Op
         message = f'Metric "{metric["key"]}" cannot be split by "{by}"'
         if by == "day":
             daily = [f'`{key}`' for key, m in metrics.items() if "day" in m.get("dimensions", [])]
-            message += ("; metrics with a daily series: " + ", ".join(daily)) if daily else \
-                "; no metric has a daily series"
+            if not daily:
+                message += "; no metric has a daily series"
+            else:
+                listed = ", ".join(daily[:_DAILY_LIST_LIMIT])
+                more = len(daily) - _DAILY_LIST_LIMIT
+                message += f"; metrics with a daily series: {listed}" + (f" and {more} more" if more > 0 else "")
         return _fail("DIMENSION_NOT_ALLOWED", f"{at}/by", message)
     for dim in (binding.get("filters") or {}):
         if dim not in dimensions:
@@ -253,26 +268,41 @@ class _Layout:
     Built from the editor's summary when one was sent (it is authoritative:
     it includes unsaved edits), else from the stored doc, then advanced by the
     ops already returned this turn and, within one call, by each accepted op.
-    Mirrors only the id bookkeeping of dashkit's applyAll.
+    Mirrors only the id bookkeeping of dashkit's applyAll, plus the current
+    dashboard, section and widget titles (so an op that keeps a title as it is
+    is not rejected for markdown the user typed themselves).
     """
 
-    def __init__(self, sections: list[tuple[str, list[str]]]):
+    def __init__(self, sections: list[tuple[str, list[str]]], title: Optional[str] = None,
+                 section_titles: Optional[dict] = None, widget_titles: Optional[dict] = None):
         self.sections: list[list] = [[sid, list(widgets)] for sid, widgets in sections]
+        self.title = title
+        self.section_titles: dict = dict(section_titles or {})
+        self.widget_titles: dict = dict(widget_titles or {})
 
     @classmethod
     def from_summary(cls, summary: str) -> "_Layout":
         sections: list[tuple[str, list[str]]] = []
+        title, section_titles, widget_titles = None, {}, {}
         for line in summary.splitlines():
-            if m := _SECTION_LINE.match(line):
-                sections.append((m.group(1), []))
+            if title is None and (m := _TITLE_LINE.match(line)):
+                title = m.group(1)
+            elif m := _SECTION_LINE.match(line):
+                sections.append((m.group(2), []))
+                section_titles[m.group(2)] = m.group(1)
             elif (m := _WIDGET_LINE.match(line)) and sections:
                 sections[-1][1].append(m.group(1))
-        return cls(sections)
+                if t := _WIDGET_TITLE.match(line):
+                    widget_titles[m.group(1)] = t.group(1)
+        return cls(sections, title, section_titles, widget_titles)
 
     @classmethod
     def from_doc(cls, doc: Optional[dict]) -> "_Layout":
-        return cls([(s.get("id"), [w.get("id") for w in s.get("widgets") or []])
-                    for s in (doc or {}).get("sections") or []])
+        sections = (doc or {}).get("sections") or []
+        return cls([(s.get("id"), [w.get("id") for w in s.get("widgets") or []]) for s in sections],
+                   (doc or {}).get("title"),
+                   {s.get("id"): s.get("title") for s in sections},
+                   {w.get("id"): w.get("title") for s in sections for w in s.get("widgets") or []})
 
     def first_section(self) -> Optional[str]:
         return self.sections[0][0] if self.sections else None
@@ -310,7 +340,13 @@ class _Layout:
 
     def apply(self, op: dict) -> None:
         name = op.get("op")
-        if name == "addSection":
+        if name == "setTitle":
+            self.title = op.get("title")
+        elif name == "updateSection" and "title" in (op.get("patch") or {}):
+            self.section_titles[op["sectionId"]] = op["patch"]["title"]
+        elif name == "updateWidget" and "title" in (op.get("patch") or {}):
+            self.widget_titles[op["widgetId"]] = op["patch"]["title"]
+        elif name == "addSection":
             section = op.get("section") or {}
             if section.get("id") is None:
                 return  # dashkit generates the id; no later op can name it
@@ -392,7 +428,7 @@ async def dashboard_apply(db, user_id, dashboard_id=None, summary=None, dashboar
             return found
     layout = await _layout(db, user_id, dashboard_id, summary, dashboard_ops_sink)
     for i, op in enumerate(ops):
-        found = layout.check(op, f"/ops/{i}")
+        found = layout.check(op, f"/ops/{i}") or _op_title_error(op, f"/ops/{i}", layout)
         if found:
             return found
         layout.apply(op)
