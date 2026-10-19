@@ -15,11 +15,13 @@ from main import app
 
 
 def _doc(dash_id="d1", title="My dashboard"):
+    """A dashkit v2 doc: one heading widget on the grid."""
     return {
         "id": dash_id,
-        "version": 1,
+        "version": 2,
         "title": title,
-        "sections": [{"id": "s1", "title": "Overview", "widgets": []}],
+        "widgets": [{"id": "s1", "type": "heading", "version": 1, "title": "Overview",
+                     "layout": {"x": 0, "y": 0, "w": 12, "h": 1}, "data": {}}],
         "meta": {
             "createdAt": "2026-10-01T00:00:00Z",
             "updatedAt": "2026-10-01T00:00:00Z",
@@ -48,7 +50,7 @@ def test_put_then_get_round_trips(client):
     assert got.status_code == 200
     body = got.json()
     assert body["title"] == "My dashboard"
-    assert body["sections"] == _doc()["sections"]
+    assert body["widgets"] == _doc()["widgets"]
     assert "_id" not in body
 
 
@@ -79,15 +81,64 @@ def test_list_returns_title_and_updated_at_newest_first(client):
 def test_invalid_doc_is_422_with_errors(client):
     bad = _doc()
     del bad["title"]
-    bad["sections"][0]["widgets"] = "nope"
+    bad["widgets"][0]["layout"]["x"] = 11
 
     r = client.put("/api/dashboards/d1", json=bad)
     assert r.status_code == 422
     errors = r.json()["detail"]["errors"]
     assert isinstance(errors, list) and errors
-    assert any(e.startswith("/sections/0/widgets: ") for e in errors)
+    assert any(e.startswith("/widgets/0/layout") for e in errors)
     assert any(e.startswith("/: ") and "title" in e for e in errors)
     assert client.get("/api/dashboards/d1").status_code == 404
+
+
+def _v1_doc(dash_id="d1"):
+    """A dashboard as stored before dashkit 0.3.0: sections with spans."""
+    return {
+        "id": dash_id,
+        "version": 1,
+        "title": "Old",
+        "sections": [{"id": "s1", "title": "Overview", "widgets": [
+            {"id": "w1", "type": "kpi", "version": 1, "span": {"cols": 3, "rows": 1}, "data": {}},
+        ]}],
+        "meta": {"createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z", "lastAuthor": "user"},
+    }
+
+
+def test_router_rejects_v1_on_save(client):
+    r = client.put("/api/dashboards/d1", json=_v1_doc())
+    assert r.status_code == 422
+    errors = r.json()["detail"]["errors"]
+    assert any(e.startswith("/version: ") for e in errors)
+    assert any(e.startswith("/: ") and "widgets" in e for e in errors)
+    assert client.get("/api/dashboards/d1").status_code == 404
+
+
+async def test_get_returns_a_stored_v1_doc_unchanged(client, mock_db):
+    # The editor migrates v1 docs on load; the server neither rejects nor rewrites them.
+    await mock_db["dashboards"].insert_one({"id": "d1", "user_id": "alice@example.com", "doc": _v1_doc()})
+    r = client.get("/api/dashboards/d1")
+    assert r.status_code == 200
+    assert r.json() == _v1_doc()
+
+
+def test_schema_is_dashkit_v2():
+    from services.dashboards_schema import _VALIDATOR, validate_doc
+
+    assert _VALIDATOR.schema["$id"].endswith("/dashboard-v2.json")
+    assert validate_doc(_doc()) == []
+    overflowing = _doc()
+    overflowing["widgets"][0]["layout"] = {"x": 6, "y": 0, "w": 12, "h": 1}
+    # dashkit's LayoutSchema refines x + w <= 12, which its JSON Schema cannot carry.
+    assert validate_doc(overflowing) == ["/widgets/0/layout/w: x + w must be at most 12"]
+
+
+def test_save_rejects_a_widget_past_the_right_edge(client):
+    doc = _doc()
+    doc["widgets"][0]["layout"] = {"x": 3, "y": 0, "w": 12, "h": 1}
+    r = client.put("/api/dashboards/d1", json=doc)
+    assert r.status_code == 422
+    assert r.json()["detail"]["errors"] == ["/widgets/0/layout/w: x + w must be at most 12"]
 
 
 def test_another_users_dashboard_is_404(client):

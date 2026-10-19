@@ -1,7 +1,7 @@
 [
   {
     "name": "dashboard_describe",
-    "description": "Return a compact outline of the current dashboard: sections and widgets with their ids, types, spans and bindings. Call this first whenever you edit an existing dashboard.",
+    "description": "Return a compact outline of the current dashboard: one line per widget in reading order (top to bottom, left to right) with its id, type, title, size w×h, grid position @x,y and bindings; `heading` widgets title the groups below them. Call this first whenever you edit an existing dashboard.",
     "parameters": {
       "type": "object",
       "properties": {},
@@ -10,7 +10,7 @@
   },
   {
     "name": "dashboard_apply",
-    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addSection, removeSection, moveSection, updateSection, addWidget, removeWidget, moveWidget, changeWidgetType, resizeWidget, updateWidget, updateWidgetData, setWidgetValue, setBinding, clearBinding, setTitle. Use ids from dashboard_describe.",
+    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addWidget, removeWidget, moveWidget, resizeWidget, setLayout, changeWidgetType, updateWidget, updateWidgetData, setWidgetValue, setBinding, clearBinding, setTitle. Use ids from dashboard_describe.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -23,262 +23,7 @@
                 "properties": {
                   "op": {
                     "type": "string",
-                    "const": "addSection"
-                  },
-                  "section": {
-                    "type": "object",
-                    "properties": {
-                      "id": {
-                        "type": "string"
-                      },
-                      "title": {
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "collapsed": {
-                        "type": "boolean"
-                      },
-                      "level": {
-                        "type": "number",
-                        "enum": [
-                          1,
-                          2,
-                          3
-                        ]
-                      },
-                      "widgets": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "properties": {
-                            "id": {
-                              "type": "string"
-                            },
-                            "type": {
-                              "type": "string"
-                            },
-                            "version": {
-                              "type": "number"
-                            },
-                            "title": {
-                              "type": "string"
-                            },
-                            "span": {
-                              "type": "object",
-                              "properties": {
-                                "cols": {
-                                  "type": "integer",
-                                  "minimum": 1,
-                                  "maximum": 12
-                                },
-                                "rows": {
-                                  "type": "integer",
-                                  "minimum": 1,
-                                  "maximum": 4
-                                }
-                              },
-                              "required": [
-                                "cols",
-                                "rows"
-                              ],
-                              "additionalProperties": false
-                            },
-                            "data": {},
-                            "bindings": {
-                              "type": "object",
-                              "additionalProperties": {
-                                "type": "object",
-                                "properties": {
-                                  "metric": {
-                                    "type": "string"
-                                  },
-                                  "by": {
-                                    "type": "string"
-                                  },
-                                  "window": {
-                                    "anyOf": [
-                                      {
-                                        "type": "object",
-                                        "properties": {
-                                          "preset": {
-                                            "type": "string"
-                                          }
-                                        },
-                                        "required": [
-                                          "preset"
-                                        ],
-                                        "additionalProperties": false
-                                      },
-                                      {
-                                        "type": "object",
-                                        "properties": {
-                                          "from": {
-                                            "type": "string"
-                                          },
-                                          "to": {
-                                            "type": "string"
-                                          }
-                                        },
-                                        "required": [
-                                          "from",
-                                          "to"
-                                        ],
-                                        "additionalProperties": false
-                                      }
-                                    ]
-                                  },
-                                  "filters": {
-                                    "type": "object",
-                                    "additionalProperties": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "string"
-                                      }
-                                    }
-                                  },
-                                  "compare": {
-                                    "type": "string",
-                                    "enum": [
-                                      "previous",
-                                      "none"
-                                    ]
-                                  },
-                                  "limit": {
-                                    "type": "number"
-                                  },
-                                  "sort": {
-                                    "type": "string",
-                                    "enum": [
-                                      "asc",
-                                      "desc"
-                                    ]
-                                  }
-                                },
-                                "required": [
-                                  "metric",
-                                  "window"
-                                ],
-                                "additionalProperties": false
-                              }
-                            },
-                            "hidden": {
-                              "type": "boolean"
-                            },
-                            "locked": {
-                              "type": "boolean"
-                            }
-                          },
-                          "required": [
-                            "id",
-                            "type",
-                            "version",
-                            "span"
-                          ],
-                          "additionalProperties": false
-                        }
-                      }
-                    },
-                    "additionalProperties": false
-                  },
-                  "index": {
-                    "type": "integer"
-                  }
-                },
-                "required": [
-                  "op"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "op": {
-                    "type": "string",
-                    "const": "removeSection"
-                  },
-                  "sectionId": {
-                    "type": "string"
-                  }
-                },
-                "required": [
-                  "op",
-                  "sectionId"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "op": {
-                    "type": "string",
-                    "const": "moveSection"
-                  },
-                  "sectionId": {
-                    "type": "string"
-                  },
-                  "toIndex": {
-                    "type": "integer"
-                  }
-                },
-                "required": [
-                  "op",
-                  "sectionId",
-                  "toIndex"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "op": {
-                    "type": "string",
-                    "const": "updateSection"
-                  },
-                  "sectionId": {
-                    "type": "string"
-                  },
-                  "patch": {
-                    "type": "object",
-                    "properties": {
-                      "title": {
-                        "type": "string"
-                      },
-                      "description": {
-                        "type": "string"
-                      },
-                      "collapsed": {
-                        "type": "boolean"
-                      },
-                      "level": {
-                        "type": "number",
-                        "enum": [
-                          1,
-                          2,
-                          3
-                        ]
-                      }
-                    },
-                    "additionalProperties": false
-                  }
-                },
-                "required": [
-                  "op",
-                  "sectionId",
-                  "patch"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "op": {
-                    "type": "string",
                     "const": "addWidget"
-                  },
-                  "sectionId": {
-                    "type": "string"
                   },
                   "widget": {
                     "type": "object",
@@ -286,6 +31,7 @@
                       "type": {
                         "type": "string",
                         "enum": [
+                          "heading",
                           "kpi",
                           "kpi-strip",
                           "text",
@@ -305,28 +51,46 @@
                       "title": {
                         "type": "string"
                       },
-                      "span": {
+                      "size": {
                         "type": "object",
                         "properties": {
-                          "cols": {
+                          "w": {
                             "type": "integer",
                             "minimum": 1,
                             "maximum": 12
                           },
-                          "rows": {
+                          "h": {
                             "type": "integer",
                             "minimum": 1,
-                            "maximum": 4
+                            "maximum": 24
                           }
                         },
                         "required": [
-                          "cols",
-                          "rows"
+                          "w",
+                          "h"
                         ],
                         "additionalProperties": false
                       },
                       "data": {
                         "anyOf": [
+                          {
+                            "description": "data for \"heading\"",
+                            "type": "object",
+                            "properties": {
+                              "level": {
+                                "type": "number",
+                                "enum": [
+                                  1,
+                                  2,
+                                  3
+                                ]
+                              },
+                              "description": {
+                                "type": "string"
+                              }
+                            },
+                            "additionalProperties": false
+                          },
                           {
                             "description": "data for \"kpi\"",
                             "type": "object",
@@ -450,15 +214,20 @@
                             "description": "data for \"trend\"",
                             "type": "object",
                             "properties": {
-                              "area": {
-                                "type": "boolean"
+                              "chart": {
+                                "type": "string",
+                                "enum": [
+                                  "area",
+                                  "line",
+                                  "bar"
+                                ]
                               },
                               "showPrevious": {
                                 "type": "boolean"
                               }
                             },
                             "required": [
-                              "area",
+                              "chart",
                               "showPrevious"
                             ],
                             "additionalProperties": false
@@ -721,13 +490,32 @@
                     ],
                     "additionalProperties": false
                   },
-                  "index": {
-                    "type": "integer"
+                  "at": {
+                    "type": "object",
+                    "properties": {
+                      "x": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 11
+                      },
+                      "y": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 999
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "after": {
+                    "type": "string"
                   }
                 },
                 "required": [
                   "op",
-                  "sectionId",
                   "widget"
                 ],
                 "additionalProperties": false
@@ -759,18 +547,122 @@
                   "widgetId": {
                     "type": "string"
                   },
-                  "toSectionId": {
-                    "type": "string"
-                  },
-                  "toIndex": {
-                    "type": "integer"
+                  "to": {
+                    "type": "object",
+                    "properties": {
+                      "x": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 11
+                      },
+                      "y": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 999
+                      }
+                    },
+                    "required": [
+                      "x",
+                      "y"
+                    ],
+                    "additionalProperties": false
                   }
                 },
                 "required": [
                   "op",
                   "widgetId",
-                  "toSectionId",
-                  "toIndex"
+                  "to"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "op": {
+                    "type": "string",
+                    "const": "resizeWidget"
+                  },
+                  "widgetId": {
+                    "type": "string"
+                  },
+                  "size": {
+                    "type": "object",
+                    "properties": {
+                      "w": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 12
+                      },
+                      "h": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 24
+                      }
+                    },
+                    "required": [
+                      "w",
+                      "h"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "required": [
+                  "op",
+                  "widgetId",
+                  "size"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "op": {
+                    "type": "string",
+                    "const": "setLayout"
+                  },
+                  "items": {
+                    "type": "array",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "widgetId": {
+                          "type": "string"
+                        },
+                        "x": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 11
+                        },
+                        "y": {
+                          "type": "integer",
+                          "minimum": 0,
+                          "maximum": 999
+                        },
+                        "w": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 12
+                        },
+                        "h": {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 24
+                        }
+                      },
+                      "required": [
+                        "widgetId",
+                        "x",
+                        "y",
+                        "w",
+                        "h"
+                      ],
+                      "additionalProperties": false
+                    }
+                  }
+                },
+                "required": [
+                  "op",
+                  "items"
                 ],
                 "additionalProperties": false
               },
@@ -787,6 +679,7 @@
                   "type": {
                     "type": "string",
                     "enum": [
+                      "heading",
                       "kpi",
                       "kpi-strip",
                       "text",
@@ -805,44 +698,6 @@
                   "op",
                   "widgetId",
                   "type"
-                ],
-                "additionalProperties": false
-              },
-              {
-                "type": "object",
-                "properties": {
-                  "op": {
-                    "type": "string",
-                    "const": "resizeWidget"
-                  },
-                  "widgetId": {
-                    "type": "string"
-                  },
-                  "span": {
-                    "type": "object",
-                    "properties": {
-                      "cols": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 12
-                      },
-                      "rows": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "maximum": 4
-                      }
-                    },
-                    "required": [
-                      "cols",
-                      "rows"
-                    ],
-                    "additionalProperties": false
-                  }
-                },
-                "required": [
-                  "op",
-                  "widgetId",
-                  "span"
                 ],
                 "additionalProperties": false
               },
@@ -1137,17 +992,14 @@
   },
   {
     "name": "dashboard_propose_widget",
-    "description": "Add one new widget bound to catalog metrics; the widget id is generated for you. Slots per type: kpi: value (value, required); kpi-strip: a (value, required), b (value, required), c (value, optional), d (value, optional); text: none; briefing: none; trend: series (series, required); bar: series (series, required); donut: series (series, required); comparison: a (series, required), b (series, required); funnel: series (series, required); leaderboard: rows (table, required); table: rows (table, required).",
+    "description": "Add one new widget bound to catalog metrics, or a `heading` to start a new group; the widget id is generated for you and returned as `widgetId`. Use `after` to place it under a heading or next to a widget. Slots per type: heading: none; kpi: value (value, required), spark (series, optional); kpi-strip: a (value, required), b (value, required), c (value, optional), d (value, optional); text: none; briefing: none; trend: series (series, required); bar: series (series, required); donut: series (series, required); comparison: a (series, required), b (series, required); funnel: series (series, required); leaderboard: rows (table, required); table: rows (table, required).",
     "parameters": {
       "type": "object",
       "properties": {
-        "sectionId": {
-          "type": "string",
-          "description": "Target section id; defaults to the first section."
-        },
         "type": {
           "type": "string",
           "enum": [
+            "heading",
             "kpi",
             "kpi-strip",
             "text",
@@ -1162,28 +1014,33 @@
           ]
         },
         "title": {
-          "type": "string"
+          "type": "string",
+          "description": "Plain text; for a heading this is the heading text."
         },
-        "span": {
+        "size": {
           "type": "object",
           "properties": {
-            "cols": {
+            "w": {
               "type": "integer",
               "minimum": 1,
               "maximum": 12
             },
-            "rows": {
+            "h": {
               "type": "integer",
               "minimum": 1,
-              "maximum": 4
+              "maximum": 24
             }
           },
           "required": [
-            "cols",
-            "rows"
+            "w",
+            "h"
           ],
           "additionalProperties": false,
-          "description": "Grid size; omit to use the type default."
+          "description": "Grid size: w columns (of 12) by h rows (48px each); omit to use the type default."
+        },
+        "after": {
+          "type": "string",
+          "description": "Id of an existing widget: the new one goes right of it if it fits, else on the row below it. Pass a heading id to add a widget under that heading. Omit to add at the bottom."
         },
         "bindings": {
           "type": "object",
@@ -1327,30 +1184,359 @@
             ],
             "additionalProperties": false
           }
+        },
+        "data": {
+          "description": "The widget's data; omit to use the type defaults.",
+          "anyOf": [
+            {
+              "description": "data for \"heading\"",
+              "type": "object",
+              "properties": {
+                "level": {
+                  "type": "number",
+                  "enum": [
+                    1,
+                    2,
+                    3
+                  ]
+                },
+                "description": {
+                  "type": "string"
+                }
+              },
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"kpi\"",
+              "type": "object",
+              "properties": {
+                "showDelta": {
+                  "type": "boolean"
+                },
+                "emphasis": {
+                  "type": "string",
+                  "enum": [
+                    "normal",
+                    "large"
+                  ]
+                }
+              },
+              "required": [
+                "showDelta",
+                "emphasis"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"kpi-strip\"",
+              "type": "object",
+              "properties": {
+                "showDelta": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "showDelta"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"text\"",
+              "type": "object",
+              "properties": {
+                "markdown": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "markdown"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"briefing\"",
+              "type": "object",
+              "properties": {
+                "parts": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "text": {
+                        "type": "string"
+                      },
+                      "strong": {
+                        "type": "boolean"
+                      }
+                    },
+                    "required": [
+                      "text"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "findings": {
+                  "type": "array",
+                  "items": {
+                    "type": "object",
+                    "properties": {
+                      "tone": {
+                        "type": "string",
+                        "enum": [
+                          "positive",
+                          "negative",
+                          "neutral",
+                          "warning"
+                        ]
+                      },
+                      "parts": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "text": {
+                              "type": "string"
+                            },
+                            "strong": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "text"
+                          ],
+                          "additionalProperties": false
+                        }
+                      }
+                    },
+                    "required": [
+                      "tone",
+                      "parts"
+                    ],
+                    "additionalProperties": false
+                  }
+                },
+                "prompt": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "parts",
+                "findings"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"trend\"",
+              "type": "object",
+              "properties": {
+                "chart": {
+                  "type": "string",
+                  "enum": [
+                    "area",
+                    "line",
+                    "bar"
+                  ]
+                },
+                "showPrevious": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "chart",
+                "showPrevious"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"bar\"",
+              "type": "object",
+              "properties": {
+                "orientation": {
+                  "type": "string",
+                  "enum": [
+                    "vertical",
+                    "horizontal"
+                  ]
+                },
+                "sort": {
+                  "type": "string",
+                  "enum": [
+                    "none",
+                    "asc",
+                    "desc"
+                  ]
+                }
+              },
+              "required": [
+                "orientation",
+                "sort"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"donut\"",
+              "type": "object",
+              "properties": {
+                "showLegend": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "showLegend"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"comparison\"",
+              "type": "object",
+              "properties": {
+                "labelA": {
+                  "type": "string"
+                },
+                "labelB": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "labelA",
+                "labelB"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"funnel\"",
+              "type": "object",
+              "properties": {
+                "showConversion": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "showConversion"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"leaderboard\"",
+              "type": "object",
+              "properties": {
+                "limit": {
+                  "type": "integer",
+                  "minimum": 1,
+                  "maximum": 50
+                },
+                "showRank": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "limit",
+                "showRank"
+              ],
+              "additionalProperties": false
+            },
+            {
+              "description": "data for \"table\"",
+              "type": "object",
+              "properties": {
+                "columns": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "dense": {
+                  "type": "boolean"
+                }
+              },
+              "required": [
+                "columns",
+                "dense"
+              ],
+              "additionalProperties": false
+            }
+          ]
         }
       },
       "required": [
-        "type",
-        "bindings"
+        "type"
       ],
       "additionalProperties": false
     },
     "x-dashkit-widgets": [
       {
+        "type": "heading",
+        "label": "Heading",
+        "aiHint": "Use to start a group of related widgets; headings replace sections. The widget title is the heading text and must be plain text. Usually full width (12 columns) and 1 row tall, or 2 rows with a description. Set `level` to 1 for a large page-level heading, 3 for a small one, or leave it out for the default size; add a short `description` to explain the group. Place the group's widgets after it with `after`. It has no data slots, so do not bind anything.",
+        "slots": [],
+        "defaultSize": {
+          "w": 12,
+          "h": 1
+        },
+        "minSize": {
+          "w": 3,
+          "h": 1
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 3
+        },
+        "fields": [
+          {
+            "key": "level",
+            "label": "Size",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": 1,
+                "label": "Large"
+              },
+              {
+                "value": 2,
+                "label": "Default"
+              },
+              {
+                "value": 3,
+                "label": "Small"
+              }
+            ]
+          },
+          {
+            "key": "description",
+            "label": "Description",
+            "kind": "textarea"
+          }
+        ]
+      },
+      {
         "type": "kpi",
         "label": "KPI",
-        "aiHint": "Use for one headline number the reader should see first, such as revenue, signups or error rate. Bind the single `value` slot to one metric; set compare to \"previous\" on the binding so a change versus the previous period appears, and leave showDelta on. Use emphasis \"large\" for the single most important number on the dashboard. For two to four related numbers side by side prefer kpi-strip.",
+        "aiHint": "Use for one headline number the reader should see first, such as revenue, signups or error rate. Bind the `value` slot to one metric; set compare to \"previous\" on the binding so a change versus the previous period appears, and leave showDelta on. Optionally bind `spark` to the same metric grouped by day to draw a small sparkline beside the change. Use emphasis \"large\" for the single most important number on the dashboard. For two to four related numbers side by side prefer kpi-strip.",
         "slots": [
           {
             "name": "value",
             "label": "Value",
             "shape": "value",
             "required": true
+          },
+          {
+            "name": "spark",
+            "label": "Sparkline",
+            "shape": "series",
+            "required": false
           }
         ],
-        "defaultSpan": {
-          "cols": 3,
-          "rows": 1
+        "defaultSize": {
+          "w": 3,
+          "h": 3
+        },
+        "minSize": {
+          "w": 2,
+          "h": 2
+        },
+        "maxSize": {
+          "w": 6,
+          "h": 4
         },
         "fields": [
           {
@@ -1373,15 +1559,7 @@
               }
             ]
           }
-        ],
-        "minSpan": {
-          "cols": 2,
-          "rows": 1
-        },
-        "maxSpan": {
-          "cols": 6,
-          "rows": 2
-        }
+        ]
       },
       {
         "type": "kpi-strip",
@@ -1413,9 +1591,17 @@
             "required": false
           }
         ],
-        "defaultSpan": {
-          "cols": 12,
-          "rows": 1
+        "defaultSize": {
+          "w": 12,
+          "h": 3
+        },
+        "minSize": {
+          "w": 8,
+          "h": 2
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 4
         },
         "fields": [
           {
@@ -1423,24 +1609,24 @@
             "label": "Show change vs previous period",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 8,
-          "rows": 1
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 1
-        }
+        ]
       },
       {
         "type": "text",
         "label": "Text",
         "aiHint": "Use for static written context: a short explanation of a section, a caveat about the data, or a note for readers. Write the content in `markdown`; it has no data slots, so do not bind anything. For findings generated from the data use briefing instead.",
         "slots": [],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 1
+        "defaultSize": {
+          "w": 6,
+          "h": 3
+        },
+        "minSize": {
+          "w": 3,
+          "h": 2
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 12
         },
         "fields": [
           {
@@ -1448,24 +1634,24 @@
             "label": "Markdown",
             "kind": "textarea"
           }
-        ],
-        "minSpan": {
-          "cols": 3,
-          "rows": 1
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "briefing",
         "label": "Briefing",
         "aiHint": "Use at the top of a dashboard or section to say in plain language what the data shows. Write `parts` as the lead sentence (mark key figures with strong) and `findings` as two to five short bullets, each with a tone: positive for good news, negative for problems, warning for things to watch, neutral otherwise. Base every number on the bound data of the other widgets. Optionally set `prompt` to a follow-up question; when the host handles asks it becomes an \"Ask about this\" button. It has no data slots.",
         "slots": [],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 5
+        },
+        "minSize": {
+          "w": 4,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 10
         },
         "fields": [
           {
@@ -1473,20 +1659,12 @@
             "label": "Ask prompt",
             "kind": "text"
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "trend",
         "label": "Trend",
-        "aiHint": "Use to show how one metric moves over time, such as daily revenue or weekly signups. Bind the `series` slot to a metric grouped by a time dimension (day, week or month) so labels are dates; ISO dates are shown as \"Oct 5\" on the axis. Set compare to \"previous\" on the binding and turn showPrevious on to draw the previous period as a dashed line for context. Turn area on for volume-like metrics where the filled shape helps; leave it off when comparing against the previous line. For category breakdowns use bar or donut instead.",
+        "aiHint": "Use to show how one metric moves over time, such as daily revenue or weekly signups. Bind the `series` slot to a metric grouped by a time dimension (day, week or month) so labels are dates; ISO dates are shown as \"Oct 5\" on the axis. `chart` picks the drawing: \"area\" (default) for volume-like metrics, \"line\" for rates and averages or when comparing against the previous period, \"bar\" for a few discrete periods. Set compare to \"previous\" on the binding and turn showPrevious on to draw the previous period as a second, grey series for context. For category breakdowns use bar or donut instead.",
         "slots": [
           {
             "name": "series",
@@ -1495,30 +1673,44 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 6
+        },
+        "minSize": {
+          "w": 4,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 12
         },
         "fields": [
           {
-            "key": "area",
-            "label": "Fill area under the line",
-            "kind": "toggle"
+            "key": "chart",
+            "label": "Chart",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": "area",
+                "label": "Area"
+              },
+              {
+                "value": "line",
+                "label": "Line"
+              },
+              {
+                "value": "bar",
+                "label": "Bar"
+              }
+            ]
           },
           {
             "key": "showPrevious",
             "label": "Show previous period",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "bar",
@@ -1532,9 +1724,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 6
+        },
+        "minSize": {
+          "w": 4,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 12
         },
         "fields": [
           {
@@ -1571,15 +1771,7 @@
               }
             ]
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "donut",
@@ -1593,9 +1785,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 4,
-          "rows": 2
+        "defaultSize": {
+          "w": 4,
+          "h": 6
+        },
+        "minSize": {
+          "w": 3,
+          "h": 5
+        },
+        "maxSize": {
+          "w": 6,
+          "h": 10
         },
         "fields": [
           {
@@ -1603,15 +1803,7 @@
             "label": "Show legend",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 3,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 6,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "comparison",
@@ -1631,9 +1823,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 6
+        },
+        "minSize": {
+          "w": 4,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 12
         },
         "fields": [
           {
@@ -1646,15 +1846,7 @@
             "label": "Name for series B",
             "kind": "text"
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "funnel",
@@ -1668,9 +1860,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 6
+        },
+        "minSize": {
+          "w": 4,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 10
         },
         "fields": [
           {
@@ -1678,15 +1878,7 @@
             "label": "Show conversion between steps",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "leaderboard",
@@ -1700,9 +1892,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 6,
-          "rows": 2
+        "defaultSize": {
+          "w": 6,
+          "h": 6
+        },
+        "minSize": {
+          "w": 3,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 12
         },
         "fields": [
           {
@@ -1715,15 +1915,7 @@
             "label": "Show rank numbers",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 4,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       },
       {
         "type": "table",
@@ -1737,9 +1929,17 @@
             "required": true
           }
         ],
-        "defaultSpan": {
-          "cols": 12,
-          "rows": 2
+        "defaultSize": {
+          "w": 12,
+          "h": 6
+        },
+        "minSize": {
+          "w": 6,
+          "h": 4
+        },
+        "maxSize": {
+          "w": 12,
+          "h": 16
         },
         "fields": [
           {
@@ -1752,15 +1952,7 @@
             "label": "Compact rows",
             "kind": "toggle"
           }
-        ],
-        "minSpan": {
-          "cols": 6,
-          "rows": 2
-        },
-        "maxSpan": {
-          "cols": 12,
-          "rows": 4
-        }
+        ]
       }
     ]
   },

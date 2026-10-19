@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dashkit.dev/schema/dashboard-v1.json",
+  "$id": "https://dashkit.dev/schema/dashboard-v2.json",
   "type": "object",
   "properties": {
     "id": {
@@ -8,7 +8,7 @@
     },
     "version": {
       "type": "number",
-      "const": 1
+      "const": 2
     },
     "title": {
       "type": "string"
@@ -16,7 +16,7 @@
     "description": {
       "type": "string"
     },
-    "sections": {
+    "widgets": {
       "type": "array",
       "items": {
         "type": "object",
@@ -24,158 +24,137 @@
           "id": {
             "type": "string"
           },
+          "type": {
+            "type": "string"
+          },
+          "version": {
+            "type": "number"
+          },
           "title": {
             "type": "string"
           },
-          "description": {
-            "type": "string"
+          "layout": {
+            "type": "object",
+            "properties": {
+              "x": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 11
+              },
+              "y": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 999
+              },
+              "w": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 12
+              },
+              "h": {
+                "type": "integer",
+                "minimum": 1,
+                "maximum": 24
+              }
+            },
+            "required": [
+              "x",
+              "y",
+              "w",
+              "h"
+            ],
+            "additionalProperties": false
           },
-          "collapsed": {
-            "type": "boolean"
-          },
-          "level": {
-            "type": "number",
-            "enum": [
-              1,
-              2,
-              3
-            ]
-          },
-          "widgets": {
-            "type": "array",
-            "items": {
+          "data": {},
+          "bindings": {
+            "type": "object",
+            "additionalProperties": {
               "type": "object",
               "properties": {
-                "id": {
+                "metric": {
                   "type": "string"
                 },
-                "type": {
+                "by": {
                   "type": "string"
                 },
-                "version": {
-                  "type": "number"
-                },
-                "title": {
-                  "type": "string"
-                },
-                "span": {
-                  "type": "object",
-                  "properties": {
-                    "cols": {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 12
-                    },
-                    "rows": {
-                      "type": "integer",
-                      "minimum": 1,
-                      "maximum": 4
-                    }
-                  },
-                  "required": [
-                    "cols",
-                    "rows"
-                  ],
-                  "additionalProperties": false
-                },
-                "data": {},
-                "bindings": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "object",
-                    "properties": {
-                      "metric": {
-                        "type": "string"
-                      },
-                      "by": {
-                        "type": "string"
-                      },
-                      "window": {
-                        "anyOf": [
-                          {
-                            "type": "object",
-                            "properties": {
-                              "preset": {
-                                "type": "string"
-                              }
-                            },
-                            "required": [
-                              "preset"
-                            ],
-                            "additionalProperties": false
-                          },
-                          {
-                            "type": "object",
-                            "properties": {
-                              "from": {
-                                "type": "string"
-                              },
-                              "to": {
-                                "type": "string"
-                              }
-                            },
-                            "required": [
-                              "from",
-                              "to"
-                            ],
-                            "additionalProperties": false
-                          }
-                        ]
-                      },
-                      "filters": {
-                        "type": "object",
-                        "additionalProperties": {
-                          "type": "array",
-                          "items": {
-                            "type": "string"
-                          }
+                "window": {
+                  "anyOf": [
+                    {
+                      "type": "object",
+                      "properties": {
+                        "preset": {
+                          "type": "string"
                         }
                       },
-                      "compare": {
-                        "type": "string",
-                        "enum": [
-                          "previous",
-                          "none"
-                        ]
-                      },
-                      "limit": {
-                        "type": "number"
-                      },
-                      "sort": {
-                        "type": "string",
-                        "enum": [
-                          "asc",
-                          "desc"
-                        ]
-                      }
+                      "required": [
+                        "preset"
+                      ],
+                      "additionalProperties": false
                     },
-                    "required": [
-                      "metric",
-                      "window"
-                    ],
-                    "additionalProperties": false
+                    {
+                      "type": "object",
+                      "properties": {
+                        "from": {
+                          "type": "string"
+                        },
+                        "to": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "from",
+                        "to"
+                      ],
+                      "additionalProperties": false
+                    }
+                  ]
+                },
+                "filters": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "array",
+                    "items": {
+                      "type": "string"
+                    }
                   }
                 },
-                "hidden": {
-                  "type": "boolean"
+                "compare": {
+                  "type": "string",
+                  "enum": [
+                    "previous",
+                    "none"
+                  ]
                 },
-                "locked": {
-                  "type": "boolean"
+                "limit": {
+                  "type": "number"
+                },
+                "sort": {
+                  "type": "string",
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ]
                 }
               },
               "required": [
-                "id",
-                "type",
-                "version",
-                "span"
+                "metric",
+                "window"
               ],
               "additionalProperties": false
             }
+          },
+          "hidden": {
+            "type": "boolean"
+          },
+          "locked": {
+            "type": "boolean"
           }
         },
         "required": [
           "id",
-          "widgets"
+          "type",
+          "version",
+          "layout"
         ],
         "additionalProperties": false
       }
@@ -226,7 +205,7 @@
     "id",
     "version",
     "title",
-    "sections",
+    "widgets",
     "meta"
   ],
   "additionalProperties": false,

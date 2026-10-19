@@ -37,8 +37,7 @@ DASHKIT_CATALOG = Path(
 def _binding_schemas(node):
     """
     Every catalog-constrained binding schema in the tools JSON: an object with
-    `metric` and `window` properties whose metric carries an enum. (addSection's
-    nested widgets use dashkit's generic binding schema without catalog enums.)
+    `metric` and `window` properties whose metric carries an enum.
     """
     if isinstance(node, dict):
         props = node.get("properties")
@@ -102,6 +101,20 @@ def test_dashkit_catalog_snapshot_equals_build_catalog(catalog):
     assert json.loads(DASHKIT_CATALOG.read_text()) == catalog
 
 
-def test_prompt_fragment_matches_dashkit_fragment():
+def test_tools_are_dashkit_v2_grid_ops():
+    tools = {t["name"]: t for t in json.loads(TOOLS_JSON.read_text())}
+    ops = [m["properties"]["op"]["const"]
+           for m in tools["dashboard_apply"]["parameters"]["properties"]["ops"]["items"]["anyOf"]]
+    assert "setLayout" in ops
+    assert not {"addSection", "removeSection", "moveSection", "updateSection", "replaceDashboard"} & set(ops)
+    propose = tools["dashboard_propose_widget"]
+    assert {"after", "size"} <= set(propose["parameters"]["properties"])
+    assert not {"sectionId", "span"} & set(propose["parameters"]["properties"])
+    for widget in propose["x-dashkit-widgets"]:
+        assert {"defaultSize", "minSize", "maxSize"} <= set(widget), widget["type"]
+    assert "heading" in [w["type"] for w in propose["x-dashkit-widgets"]]
+
+
+def test_prompt_fragment_matches_dashkit():
     golden = PROMPT_FRAGMENT.read_text(encoding="utf-8")
     assert prompt_fragment() == golden
