@@ -33,6 +33,14 @@
           "collapsed": {
             "type": "boolean"
           },
+          "level": {
+            "type": "number",
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          },
           "widgets": {
             "type": "array",
             "items": {

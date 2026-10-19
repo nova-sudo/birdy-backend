@@ -10,7 +10,7 @@
   },
   {
     "name": "dashboard_apply",
-    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addSection, removeSection, moveSection, updateSection, addWidget, removeWidget, moveWidget, resizeWidget, updateWidget, updateWidgetData, setWidgetValue, setBinding, clearBinding, setTitle. Use ids from dashboard_describe.",
+    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addSection, removeSection, moveSection, updateSection, addWidget, removeWidget, moveWidget, changeWidgetType, resizeWidget, updateWidget, updateWidgetData, setWidgetValue, setBinding, clearBinding, setTitle. Use ids from dashboard_describe.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -39,6 +39,14 @@
                       },
                       "collapsed": {
                         "type": "boolean"
+                      },
+                      "level": {
+                        "type": "number",
+                        "enum": [
+                          1,
+                          2,
+                          3
+                        ]
                       },
                       "widgets": {
                         "type": "array",
@@ -242,6 +250,14 @@
                       },
                       "collapsed": {
                         "type": "boolean"
+                      },
+                      "level": {
+                        "type": "number",
+                        "enum": [
+                          1,
+                          2,
+                          3
+                        ]
                       }
                     },
                     "additionalProperties": false
@@ -755,6 +771,40 @@
                   "widgetId",
                   "toSectionId",
                   "toIndex"
+                ],
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "op": {
+                    "type": "string",
+                    "const": "changeWidgetType"
+                  },
+                  "widgetId": {
+                    "type": "string"
+                  },
+                  "type": {
+                    "type": "string",
+                    "enum": [
+                      "kpi",
+                      "kpi-strip",
+                      "text",
+                      "briefing",
+                      "trend",
+                      "bar",
+                      "donut",
+                      "comparison",
+                      "funnel",
+                      "leaderboard",
+                      "table"
+                    ]
+                  }
+                },
+                "required": [
+                  "op",
+                  "widgetId",
+                  "type"
                 ],
                 "additionalProperties": false
               },
@@ -1302,6 +1352,28 @@
           "cols": 3,
           "rows": 1
         },
+        "fields": [
+          {
+            "key": "showDelta",
+            "label": "Show change vs previous period",
+            "kind": "toggle"
+          },
+          {
+            "key": "emphasis",
+            "label": "Size",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": "normal",
+                "label": "Normal"
+              },
+              {
+                "value": "large",
+                "label": "Large"
+              }
+            ]
+          }
+        ],
         "minSpan": {
           "cols": 2,
           "rows": 1
@@ -1345,6 +1417,13 @@
           "cols": 12,
           "rows": 1
         },
+        "fields": [
+          {
+            "key": "showDelta",
+            "label": "Show change vs previous period",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 8,
           "rows": 1
@@ -1363,6 +1442,13 @@
           "cols": 6,
           "rows": 1
         },
+        "fields": [
+          {
+            "key": "markdown",
+            "label": "Markdown",
+            "kind": "textarea"
+          }
+        ],
         "minSpan": {
           "cols": 3,
           "rows": 1
@@ -1381,6 +1467,13 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "prompt",
+            "label": "Ask prompt",
+            "kind": "text"
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1406,6 +1499,18 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "area",
+            "label": "Fill area under the line",
+            "kind": "toggle"
+          },
+          {
+            "key": "showPrevious",
+            "label": "Show previous period",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1431,6 +1536,42 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "orientation",
+            "label": "Bars",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": "vertical",
+                "label": "Vertical"
+              },
+              {
+                "value": "horizontal",
+                "label": "Horizontal"
+              }
+            ]
+          },
+          {
+            "key": "sort",
+            "label": "Sort",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": "none",
+                "label": "As is"
+              },
+              {
+                "value": "desc",
+                "label": "Largest first"
+              },
+              {
+                "value": "asc",
+                "label": "Smallest first"
+              }
+            ]
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1456,6 +1597,13 @@
           "cols": 4,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "showLegend",
+            "label": "Show legend",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 3,
           "rows": 2
@@ -1487,6 +1635,18 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "labelA",
+            "label": "Name for series A",
+            "kind": "text"
+          },
+          {
+            "key": "labelB",
+            "label": "Name for series B",
+            "kind": "text"
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1512,6 +1672,13 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "showConversion",
+            "label": "Show conversion between steps",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1537,6 +1704,18 @@
           "cols": 6,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "limit",
+            "label": "Rows to show",
+            "kind": "number"
+          },
+          {
+            "key": "showRank",
+            "label": "Show rank numbers",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 4,
           "rows": 2
@@ -1562,6 +1741,18 @@
           "cols": 12,
           "rows": 2
         },
+        "fields": [
+          {
+            "key": "columns",
+            "label": "Columns",
+            "kind": "array"
+          },
+          {
+            "key": "dense",
+            "label": "Compact rows",
+            "kind": "toggle"
+          }
+        ],
         "minSpan": {
           "cols": 6,
           "rows": 2

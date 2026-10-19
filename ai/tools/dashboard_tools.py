@@ -59,7 +59,13 @@ _APPLIED_NOTE = "Applied in the user's editor."
 _SEARCH_LIMIT = 20
 _MESSAGE_LIMIT = 300
 _ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_SECTION_LINE = re.compile(r"^## .* \[([^\]]+)\] \(\d+ widgets\)$")
+# dashkit's summarize appends " (h1)" / " (h3)" when a section's level is not the default 2.
+_SECTION_LINE = re.compile(r"^## .* \[([^\]]+)\] \(\d+ widgets\)(?: \(h\d\))?$")
+# Markdown markers a title may not carry: titles render as plain text.
+_TITLE_MARKDOWN = re.compile(r"[#*_`]")
+_TITLE_MESSAGE = ("Titles are plain text; remove the markdown (#, *, _ or backticks). To make a section heading "
+                  "larger or smaller use updateSection with `level` (1 large, 2 default, 3 small); "
+                  "for prose add a `text` widget.")
 _WIDGET_LINE = re.compile(r"^- \[([^\]]+)\] ")
 
 
@@ -70,6 +76,10 @@ def widget_manifest() -> list[dict]:
 
 def _manifest_entry(widget_type: str) -> Optional[dict]:
     return next((w for w in widget_manifest() if w["type"] == widget_type), None)
+
+
+def _widget_types() -> list[str]:
+    return [w["type"] for w in widget_manifest()]
 
 
 # ── results ──────────────────────────────────────────────────────────────────
@@ -110,8 +120,32 @@ def _schema_error(validator: Draft202012Validator, instance, prefix: str = "") -
     return _fail("ARGS_INVALID", prefix + (_pointer(path) if path else ""), error.message)
 
 
+def _title_error(title, path: str) -> Optional[dict]:
+    if isinstance(title, str) and _TITLE_MARKDOWN.search(title):
+        return _fail("TITLE_PLAIN_TEXT", path, _TITLE_MESSAGE)
+    return None
+
+
+def _op_titles(op: dict, at: str):
+    """(title, path) for every title an op sets: dashboard, section and widget titles."""
+    name = op["op"]
+    if name == "setTitle":
+        yield op.get("title"), f"{at}/title"
+    elif name in ("updateSection", "updateWidget"):
+        yield (op.get("patch") or {}).get("title"), f"{at}/patch/title"
+    elif name == "addWidget":
+        yield (op.get("widget") or {}).get("title"), f"{at}/widget/title"
+    elif name == "addSection":
+        section = op.get("section") or {}
+        yield section.get("title"), f"{at}/section/title"
+        for j, w in enumerate(section.get("widgets") or []):
+            if isinstance(w, dict):
+                yield w.get("title"), f"{at}/section/widgets/{j}/title"
+
+
 def _ops_error(ops) -> Optional[dict]:
-    """Per-op check against that op's own schema, for precise paths and messages."""
+    """Per-op check against that op's own schema, for precise paths and messages,
+    plus the rules the schema cannot express (unknown widget type, markdown in titles)."""
     if not isinstance(ops, list):
         return None
     for i, op in enumerate(ops):
@@ -124,7 +158,13 @@ def _ops_error(ops) -> Optional[dict]:
         member = _OP_MEMBERS.get(name)
         if member is None:
             return _fail("ARGS_INVALID", f"{at}/op", f'Unknown op "{name}"; use one of {", ".join(_OP_MEMBERS)}')
+        if name == "changeWidgetType" and isinstance(op.get("type"), str) and op["type"] not in _widget_types():
+            return _fail("WIDGET_TYPE_UNKNOWN", f"{at}/type",
+                         f'Unknown widget type "{op["type"]}"; use one of {", ".join(_widget_types())}')
         found = _schema_error(member, op, at)
+        if found:
+            return found
+        found = next((e for title, path in _op_titles(op, at) if (e := _title_error(title, path))), None)
         if found:
             return found
     return None
@@ -135,7 +175,12 @@ def _binding_error(binding: dict, at: str, metrics: dict, dimensions: set) -> Op
     metric = metrics.get(binding.get("metric"))
     by = binding.get("by")
     if metric is not None and by is not None and by not in metric.get("dimensions", []):
-        return _fail("DIMENSION_NOT_ALLOWED", f"{at}/by", f'Metric "{metric["key"]}" cannot be split by "{by}"')
+        message = f'Metric "{metric["key"]}" cannot be split by "{by}"'
+        if by == "day":
+            daily = [f'`{key}`' for key, m in metrics.items() if "day" in m.get("dimensions", [])]
+            message += ("; metrics with a daily series: " + ", ".join(daily)) if daily else \
+                "; no metric has a daily series"
+        return _fail("DIMENSION_NOT_ALLOWED", f"{at}/by", message)
     for dim in (binding.get("filters") or {}):
         if dim not in dimensions:
             return _fail("FILTER_DIMENSION_UNKNOWN", f"{at}/filters/{dim}", f'Unknown filter dimension "{dim}"')
@@ -177,7 +222,9 @@ def summarize_doc(doc: dict) -> str:
     lines = [f'# {doc.get("title", "")} ({len(sections)} sections, {total} widgets)']
     for section in sections:
         widgets = section.get("widgets") or []
-        lines.append(f'## {section.get("title") or "(untitled)"} [{section.get("id")}] ({len(widgets)} widgets)')
+        level = section.get("level")
+        suffix = f" (h{level})" if level is not None and level != 2 else ""
+        lines.append(f'## {section.get("title") or "(untitled)"} [{section.get("id")}] ({len(widgets)} widgets){suffix}')
         for w in widgets:
             span = w.get("span") or {}
             title = w.get("title")
@@ -354,7 +401,7 @@ async def dashboard_apply(db, user_id, dashboard_id=None, summary=None, dashboar
 
 async def dashboard_propose_widget(db, user_id, dashboard_id=None, summary=None, dashboard_ops_sink=None,
                                    mongo_client=None, **args):
-    error = _schema_error(_VALIDATORS["dashboard_propose_widget"], args)
+    error = _schema_error(_VALIDATORS["dashboard_propose_widget"], args) or _title_error(args.get("title"), "/title")
     if error:
         return error
 

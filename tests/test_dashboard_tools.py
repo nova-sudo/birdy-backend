@@ -301,6 +301,96 @@ async def test_apply_without_ops_is_invalid(mock_db):
     assert result["error"]["code"] == "ARGS_INVALID"
 
 
+@pytest.mark.parametrize("op, path", [
+    ({"op": "updateSection", "sectionId": "s1", "patch": {"title": "## Overview"}}, "/ops/0/patch/title"),
+    ({"op": "setTitle", "title": "**Growth**"}, "/ops/0/title"),
+    ({"op": "updateWidget", "widgetId": "w1", "patch": {"title": "`spend`"}}, "/ops/0/patch/title"),
+    ({"op": "addWidget", "sectionId": "s1", "widget": {"id": "w9", "type": "kpi", "title": "_Spend_"}},
+     "/ops/0/widget/title"),
+    ({"op": "addSection", "section": {"id": "s9", "title": "# Big"}}, "/ops/0/section/title"),
+])
+async def test_markdown_in_a_title_is_title_plain_text(mock_db, op, path):
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[op])
+    assert result["ok"] is False
+    assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
+    assert result["error"]["path"] == path
+    message = result["error"]["message"]
+    assert "updateSection" in message and "level" in message and "`text`" in message
+
+
+async def test_markdown_in_a_section_title_is_title_plain_text(mock_db):
+    ops = [{"op": "updateSection", "sectionId": "s1", "patch": {"title": "# Overview"}}]
+    sink = []
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops, dashboard_ops_sink=sink)
+    assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
+    assert sink == []
+
+
+async def test_markdown_in_a_proposed_widget_title_is_title_plain_text(mock_db):
+    result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="kpi",
+                                            title="**Spend**", bindings={"value": KPI_BINDING})
+    assert result["ok"] is False
+    assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
+    assert result["error"]["path"] == "/title"
+
+
+async def test_plain_titles_with_punctuation_are_ok(mock_db):
+    ops = [{"op": "setTitle", "title": "Q4 growth: spend & leads (EU) - v2!"},
+           {"op": "updateSection", "sectionId": "s1", "patch": {"title": "Overview / 30 days"}}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["ok"] is True
+
+
+async def test_change_widget_type_with_unknown_type_is_widget_type_unknown(mock_db):
+    ops = [{"op": "changeWidgetType", "widgetId": "w1", "type": "sparkle"}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["ok"] is False
+    assert result["error"]["code"] == "WIDGET_TYPE_UNKNOWN"
+    assert result["error"]["path"] == "/ops/0/type"
+    assert "trend" in result["error"]["message"]
+
+
+async def test_change_widget_type_with_known_id_and_type_is_ok(mock_db):
+    ops = [{"op": "changeWidgetType", "widgetId": "w2", "type": "bar"},
+           {"op": "setBinding", "widgetId": "w2", "slot": "series",
+            "binding": {"metric": "spend", "by": "client", "window": {"preset": "last_30d"}}}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result == {"ok": True, "ops": ops, "note": "Applied in the user's editor."}
+
+
+async def test_change_widget_type_with_unknown_widget_is_widget_not_found(mock_db):
+    ops = [{"op": "changeWidgetType", "widgetId": "ghost", "type": "bar"}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["error"]["code"] == "WIDGET_NOT_FOUND"
+    assert result["error"]["path"] == "/ops/0/widgetId"
+
+
+@pytest.mark.parametrize("level", [1, 2, 3])
+async def test_update_section_level_is_ok(mock_db, level):
+    ops = [{"op": "updateSection", "sectionId": "s1", "patch": {"level": level}}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["ok"] is True
+
+
+async def test_update_section_level_out_of_range_is_invalid(mock_db):
+    ops = [{"op": "updateSection", "sectionId": "s1", "patch": {"level": 4}}]
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
+    assert result["error"]["code"] == "ARGS_INVALID"
+
+
+async def test_by_day_on_ctr_names_metrics_with_daily_series(mock_db):
+    binding = {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}
+    proposed = await dashboard_propose_widget(mock_db, USER, summary=_summary(), sectionId="s1", type="trend",
+                                              bindings={"series": binding})
+    applied = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "setBinding", "widgetId": "w2", "slot": "series", "binding": binding}])
+    for result in (proposed, applied):
+        assert result["error"]["code"] == "DIMENSION_NOT_ALLOWED"
+        message = result["error"]["message"]
+        assert "meta_ctr" in message and "`spend`" in message
+        assert "`meta_ctr`" not in message  # only metrics that do have a daily series
+
+
 # ── describe / search ──────────────────────────────────────────────────────
 
 
@@ -314,6 +404,30 @@ async def test_describe_summarizes_a_stored_doc(mock_db):
         '- [w2] trend "" 6x2  series→spend by day 2026-09-01..2026-09-30 (hidden) (locked)',
         "## (untitled) [s2] (0 widgets)",
     ])}
+
+
+def test_summarize_marks_section_levels_other_than_the_default():
+    doc = _doc()
+    doc["sections"][0]["level"] = 1
+    doc["sections"][1]["level"] = 2
+    lines = summarize_doc(doc).splitlines()
+    assert lines[1] == "## Overview [s1] (2 widgets) (h1)"
+    assert lines[-1] == "## (untitled) [s2] (0 widgets)"
+    doc["sections"][1]["level"] = 3
+    assert summarize_doc(doc).splitlines()[-1] == "## (untitled) [s2] (0 widgets) (h3)"
+
+
+async def test_ids_are_read_from_summary_sections_with_a_level(mock_db):
+    doc = _doc()
+    doc["sections"][0]["level"] = 1
+    doc["sections"][1]["level"] = 3
+    summary = summarize_doc(doc)
+    ops = [{"op": "moveWidget", "widgetId": "w1", "toSectionId": "s2", "toIndex": 0}]
+    result = await dashboard_apply(mock_db, USER, summary=summary, ops=ops)
+    assert result["ok"] is True
+    proposed = await dashboard_propose_widget(mock_db, USER, summary=summary, type="kpi",
+                                              bindings={"value": KPI_BINDING})
+    assert proposed["ops"][0]["sectionId"] == "s1"
 
 
 async def test_describe_returns_the_sent_summary_verbatim(mock_db):

@@ -7,7 +7,9 @@ System prompt for the "My dashboards" chat (page "dashboards").
 (src/ai/prompt.ts): the same markdown, built from the same sources — the widget
 types from `x-dashkit-widgets` in ai/tools/dashkit_tools.json and the catalog
 from services/dashboards_catalog.build_catalog(). Keep it line-for-line in step
-with prompt.ts when dashkit changes it.
+with prompt.ts when dashkit changes it: tests/test_dashkit_tools_json.py asserts
+it equals tests/fixtures/dashkit_prompt_fragment.md (dashkit's own output,
+copied by its scripts/sync_dashkit_schema.sh) byte for byte.
 
 `system_prompt()` is called when a session starts (not at import), so a
 regenerated tools file or catalog reaches new sessions after a restart.
@@ -77,6 +79,14 @@ def prompt_fragment() -> str:
         "- Edits are rejected only if they introduce new validation errors; existing problems do not block "
         "other changes.",
         "- If a tool returns `ok: false`, read its `code` and `path`, fix the call and retry once.",
+        "- Titles are plain text: never put markdown in a title. To make a section heading larger or smaller "
+        "use `updateSection` with `level` (1 large, 2 default, 3 small); the dashboard title's size is fixed.",
+        "- For custom prose, notes or explanations add a `text` widget and write markdown in its `data.markdown`.",
+        "- To change a chart's kind within a type use `updateWidgetData` (e.g. trend `area`, bar `orientation`); "
+        "to turn one widget into another type use `changeWidgetType`, which keeps bindings whose slots still "
+        "exist; bind every required slot of the new type with `setBinding` in the same `dashboard_apply` call.",
+        "- A metric can be split `by: \"day\"` only if its catalog entry lists `day`; when it does not, say so "
+        "and name metrics that do.",
         "",
         "## Widgets",
         "",
@@ -128,6 +138,7 @@ _INTRO = """You are Birdy AI, the marketing analytics assistant inside Birdy. Th
 - Never quote metric values; the widgets show live numbers themselves.
 - To scope a widget to one client, call `get_client_groups` and put that client's id in the binding's `filters.client` list. Leave `filters` out to cover all clients.
 - Keep replies to one or two short sentences about what changed, then offer a sensible next step if there is one.
+- Titles are plain text; headings are sized with `updateSection.level`; for prose add a `text` widget; the dashboard title's size is fixed — say so if asked.
 """
 
 

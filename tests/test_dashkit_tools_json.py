@@ -9,6 +9,9 @@ and the two generated copies of it:
     exactly the catalog's metrics, dimensions and windows.
   - scripts/birdy-catalog.json in the dashkit repo: the snapshot those schemas
     are generated from; it must equal build_catalog().
+  - tests/fixtures/dashkit_prompt_fragment.md: dashkit's systemPromptFragment
+    for the same widgets and catalog (written by dashkit's export-tools); the
+    Python port ai.prompts.dashboards.prompt_fragment() must equal it byte for byte.
 
 When either fails, re-run dashkit's scripts/sync_dashkit_schema.sh and commit
 the regenerated files in both repos.
@@ -20,10 +23,12 @@ from pathlib import Path
 
 import pytest
 
+from ai.prompts.dashboards import prompt_fragment
 from services.dashboards_catalog import build_catalog
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOLS_JSON = ROOT / "ai" / "tools" / "dashkit_tools.json"
+PROMPT_FRAGMENT = ROOT / "tests" / "fixtures" / "dashkit_prompt_fragment.md"
 DASHKIT_CATALOG = Path(
     os.environ.get("DASHKIT_DIR", str(ROOT.parent.parent / "dashkit"))
 ) / "scripts" / "birdy-catalog.json"
@@ -95,3 +100,8 @@ def test_dashkit_catalog_snapshot_equals_build_catalog(catalog):
     if not DASHKIT_CATALOG.exists():
         pytest.skip(f"dashkit catalog snapshot not found at {DASHKIT_CATALOG} (set DASHKIT_DIR to the dashkit repo)")
     assert json.loads(DASHKIT_CATALOG.read_text()) == catalog
+
+
+def test_prompt_fragment_matches_dashkit_fragment():
+    golden = PROMPT_FRAGMENT.read_text(encoding="utf-8")
+    assert prompt_fragment() == golden
