@@ -190,7 +190,7 @@ def test_summarize_doc_v1_is_flattened():
     assert summarize_doc(_v1_doc()) == "\n".join([
         "# Growth (3 widgets)",
         '- [s1] heading "Overview" 12×1 @0,0',
-        '- [w1] kpi "Spend" 3×2 @0,1  value→meta_spend last_30d',
+        '- [w1] kpi "Spend" 3×3 @0,1  value→meta_spend last_30d',
         '- [w2] trend "" 6×4 @3,1 hidden locked  series→spend by day 2026-09-01..2026-09-30',
     ])
 
@@ -217,10 +217,10 @@ def test_summarize_doc_v1_flattening_matches_dashkit_migrate():
     assert summarize_doc(doc) == "\n".join([
         "# Mixed (11 widgets)",
         '- [top-heading] heading "Top" 12×2 @0,0 (h1)',
-        '- [k1] kpi "A" 3×2 @0,2',
+        '- [k1] kpi "A" 3×3 @0,2',
         '- [t1] trend "B" 6×4 @3,2',
-        '- [k2] kpi "C" 3×2 @9,2',
-        '- [k3] kpi "D" 3×2 @0,4',
+        '- [k2] kpi "C" 3×3 @9,2',
+        '- [k3] kpi "D" 3×3 @0,5',
         '- [top] text "Note" 6×2 @3,6',
         '- [tb] table "" 12×8 @0,8',
         '- [zz] mystery "" 5×6 @0,16',
@@ -269,7 +269,8 @@ async def test_propose_widget_passes_size_and_data(mock_db):
                                           "data": {"level": 1, "description": "What we pay"}}
 
 
-@pytest.mark.parametrize("size, path", [({"w": 1, "h": 3}, "/size/w"), ({"w": 3, "h": 5}, "/size/h")])
+@pytest.mark.parametrize("size, path", [({"w": 1, "h": 3}, "/size/w"), ({"w": 3, "h": 2}, "/size/h"),
+                                        ({"w": 3, "h": 5}, "/size/h")])
 async def test_propose_widget_size_outside_the_type_range_is_rejected(mock_db, size, path):
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi", size=size,
                                             bindings={"value": KPI_BINDING})
@@ -717,7 +718,7 @@ def test_prompt_fragment_lists_widgets_metrics_and_windows():
     assert text.startswith("## Dashboard tools\n")
     assert "- `heading` — Heading: " in text
     assert "- `kpi` — KPI: " in text
-    assert "(slots: value (value, required), spark (series, optional); default 3×3, min 2×2, max 6×4)" in text
+    assert "(slots: value (value, required), spark (series, optional); default 3×3, min 2×3, max 6×4)" in text
     assert "- `meta_spend` — Meta Spend [currency, higher is better] by: client, day" in text
     assert "- `meta_cpc` — Meta CPC [currency, lower is better] by: client" in text
     assert "- `day` — Day" in text
