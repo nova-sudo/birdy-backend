@@ -15,10 +15,10 @@ from main import app
 
 
 def _doc(dash_id="d1", title="My dashboard"):
-    """A dashkit v2 doc: one heading widget on the grid."""
+    """A dashkit v3 doc: one heading widget on the grid."""
     return {
         "id": dash_id,
-        "version": 2,
+        "version": 3,
         "title": title,
         "widgets": [{"id": "s1", "type": "heading", "version": 1, "title": "Overview",
                      "layout": {"x": 0, "y": 0, "w": 12, "h": 1}, "data": {}}],
@@ -27,6 +27,30 @@ def _doc(dash_id="d1", title="My dashboard"):
             "updatedAt": "2026-10-01T00:00:00Z",
             "lastAuthor": "user",
         },
+    }
+
+
+def _query(**extra):
+    return {"metrics": [{"metric": "spend"}], "window": {"preset": "last_30d"}, **extra}
+
+
+def _with_widget(doc, widget_type, query, widget_id="w1"):
+    """`doc` plus one widget of `widget_type` holding `query`, below the heading."""
+    doc["widgets"].append({"id": widget_id, "type": widget_type, "version": 1,
+                           "layout": {"x": 0, "y": 1, "w": 6, "h": 6}, "data": {},
+                           "bindings": {"query": query}})
+    return doc
+
+
+def _v2_doc(dash_id="d1"):
+    """A dashkit v2 doc (bindings per slot), as saved by editors still on dashkit 0.3.x."""
+    return {
+        "id": dash_id,
+        "version": 2,
+        "title": "Old",
+        "widgets": [{"id": "w1", "type": "kpi", "version": 1, "layout": {"x": 0, "y": 0, "w": 3, "h": 3},
+                     "data": {}, "bindings": {"value": {"metric": "spend", "window": {"preset": "last_30d"}}}}],
+        "meta": {"createdAt": "2026-10-01T00:00:00Z", "updatedAt": "2026-10-01T00:00:00Z", "lastAuthor": "user"},
     }
 
 
@@ -105,7 +129,7 @@ def _v1_doc(dash_id="d1"):
     }
 
 
-def test_router_rejects_v1_on_save(client):
+def test_save_rejects_v1(client):
     r = client.put("/api/dashboards/d1", json=_v1_doc())
     assert r.status_code == 422
     errors = r.json()["detail"]["errors"]
@@ -114,9 +138,76 @@ def test_router_rejects_v1_on_save(client):
     assert client.get("/api/dashboards/d1").status_code == 404
 
 
-def test_a_v2_doc_with_v1_fields_is_rejected(client):
+def test_save_accepts_v3(client):
+    doc = _with_widget(_doc(), "trend", _query(over="day", compare="previous", spark=False))
+    r = client.put("/api/dashboards/d1", json=doc)
+    assert r.status_code == 200, r.json()
+    assert client.get("/api/dashboards/d1").json()["widgets"] == doc["widgets"]
+
+
+def test_save_accepts_v2_transitional(client):
+    # Editors still on dashkit 0.3.x save v2 until birdy-beta ships 0.4.0.
+    r = client.put("/api/dashboards/d1", json=_v2_doc())
+    assert r.status_code == 200, r.json()
+    assert client.get("/api/dashboards/d1").json()["version"] == 2
+
+
+def test_save_rejects_query_shape(client):
+    r = client.put("/api/dashboards/d1", json=_with_widget(_doc(), "trend", _query()))
+    assert r.status_code == 422
+    assert r.json()["detail"]["errors"] == ['/widgets/1/bindings/query: QUERY_SHAPE: Needs "over" to be set']
+    assert client.get("/api/dashboards/d1").status_code == 404
+
+
+@pytest.mark.parametrize("widget_type, query, message", [
+    ("kpi", _query(by="client"), 'Does not take "by"'),
+    ("kpi-strip", _query(), "Needs 2..4 metrics, got 1"),
+    ("chart", _query(), 'Needs "by" to be set'),
+    ("table", _query(), 'Needs exactly one of "by" or "over"'),
+    ("table", _query(by="client", over="day"), 'Needs exactly one of "by" or "over"'),
+    ("trend", {**_query(over="day", by="client"), "metrics": [{"metric": "spend"}, {"metric": "leads"}]},
+     "Needs exactly 1 metric when split by a dimension, got 2"),
+    ("trend", _query(over="day", by="client", limit=9),
+     'A query with "over" and "by" shows at most 8 series, got limit 9'),
+    ("heading", _query(), 'Widget type "heading" takes no query'),
+])
+def test_save_rejects_each_query_rule(client, widget_type, query, message):
+    r = client.put("/api/dashboards/d1", json=_with_widget(_doc(), widget_type, query))
+    assert r.status_code == 422
+    assert r.json()["detail"]["errors"] == [f"/widgets/1/bindings/query: QUERY_SHAPE: {message}"]
+
+
+@pytest.mark.parametrize("query, error", [
+    ({**_query(), "metrics": [{"metric": "spend"}, {"metric": "spend"}]},
+     '/widgets/1/bindings/query/metrics/1/metric: Duplicate metric "spend"'),
+    (_query(by="client", sort={"metric": "leads", "dir": "desc"}),
+     '/widgets/1/bindings/query/sort/metric: Sort metric "leads" is not in metrics'),
+])
+def test_save_rejects_query_refinements_the_json_schema_cannot_carry(client, query, error):
+    # dashkit's QuerySchema refines these; a doc breaking them would fail its migrate() on load.
+    r = client.put("/api/dashboards/d1", json=_with_widget(_doc(), "chart", query))
+    assert r.status_code == 422
+    assert r.json()["detail"]["errors"] == [error]
+
+
+def test_save_accepts_a_query_on_a_type_dashkit_does_not_know(client):
+    # A host-registered type has rules this backend cannot see; dashkit reports WIDGET_TYPE_UNKNOWN itself.
+    r = client.put("/api/dashboards/d1", json=_with_widget(_doc(), "mystery", _query()))
+    assert r.status_code == 200
+
+
+def test_v2_and_v3_shapes_do_not_mix(client):
+    v2_with_query = _v2_doc()
+    v2_with_query["widgets"][0]["bindings"] = {"query": _query()}
+    assert client.put("/api/dashboards/d1", json=v2_with_query).status_code == 422
+    v3_with_slot = _doc()
+    v3_with_slot["widgets"][0]["bindings"] = {"value": {"metric": "spend", "window": {"preset": "last_30d"}}}
+    assert client.put("/api/dashboards/d1", json=v3_with_slot).status_code == 422
+
+
+def test_a_v3_doc_with_v1_fields_is_rejected(client):
     doc = _doc()
-    doc["sections"] = []  # v1-only field: v2 forbids extra keys
+    doc["sections"] = []  # v1-only field: v3 forbids extra keys
     r = client.put("/api/dashboards/d1", json=doc)
     assert r.status_code == 422
 
@@ -129,16 +220,19 @@ async def test_get_returns_a_stored_v1_doc_unchanged(client, mock_db):
     assert r.json() == _v1_doc()
 
 
-def test_schema_is_dashkit_v2():
-    from services.dashboards_schema import _VALIDATOR, validate_doc
+def test_schema_is_dashkit_v3_with_a_frozen_v2():
+    from services.dashboards_schema import _VALIDATOR, _V2_VALIDATOR, validate_doc
 
-    assert _VALIDATOR.schema["$id"].endswith("/dashboard-v2.json")
+    assert _VALIDATOR.schema["$id"].endswith("/dashboard-v3.json")
+    assert _V2_VALIDATOR.schema["$id"].endswith("/dashboard-v2.json")
     assert validate_doc(_v1_doc()) != []
     assert validate_doc(_doc()) == []
-    overflowing = _doc()
-    overflowing["widgets"][0]["layout"] = {"x": 6, "y": 0, "w": 12, "h": 1}
-    # dashkit's LayoutSchema refines x + w <= 12, which its JSON Schema cannot carry.
-    assert validate_doc(overflowing) == ["/widgets/0/layout/w: x + w must be at most 12"]
+    assert validate_doc(_v2_doc()) == []
+    for doc in (_doc(), _v2_doc()):
+        overflowing = copy.deepcopy(doc)
+        overflowing["widgets"][0]["layout"] = {"x": 6, "y": 0, "w": 12, "h": 1}
+        # dashkit's LayoutSchema refines x + w <= 12, which its JSON Schema cannot carry.
+        assert validate_doc(overflowing) == ["/widgets/0/layout/w: x + w must be at most 12"]
 
 
 def test_save_rejects_a_widget_past_the_right_edge(client):

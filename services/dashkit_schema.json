@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://dashkit.dev/schema/dashboard-v2.json",
+  "$id": "https://dashkit.dev/schema/dashboard-v3.json",
   "type": "object",
   "properties": {
     "id": {
@@ -8,7 +8,7 @@
     },
     "version": {
       "type": "number",
-      "const": 2
+      "const": 3
     },
     "title": {
       "type": "string"
@@ -68,80 +68,123 @@
           "data": {},
           "bindings": {
             "type": "object",
-            "additionalProperties": {
-              "type": "object",
-              "properties": {
-                "metric": {
-                  "type": "string"
-                },
-                "by": {
-                  "type": "string"
-                },
-                "window": {
-                  "anyOf": [
-                    {
+            "properties": {
+              "query": {
+                "type": "object",
+                "properties": {
+                  "metrics": {
+                    "type": "array",
+                    "items": {
                       "type": "object",
                       "properties": {
-                        "preset": {
+                        "metric": {
+                          "type": "string"
+                        },
+                        "label": {
                           "type": "string"
                         }
                       },
                       "required": [
-                        "preset"
+                        "metric"
                       ],
                       "additionalProperties": false
                     },
-                    {
-                      "type": "object",
-                      "properties": {
-                        "from": {
-                          "type": "string"
+                    "minItems": 1,
+                    "maxItems": 20
+                  },
+                  "by": {
+                    "type": "string"
+                  },
+                  "over": {
+                    "type": "string",
+                    "enum": [
+                      "day",
+                      "week",
+                      "month"
+                    ]
+                  },
+                  "window": {
+                    "anyOf": [
+                      {
+                        "type": "object",
+                        "properties": {
+                          "preset": {
+                            "type": "string"
+                          }
                         },
-                        "to": {
-                          "type": "string"
-                        }
+                        "required": [
+                          "preset"
+                        ],
+                        "additionalProperties": false
                       },
-                      "required": [
-                        "from",
-                        "to"
-                      ],
-                      "additionalProperties": false
+                      {
+                        "type": "object",
+                        "properties": {
+                          "from": {
+                            "type": "string"
+                          },
+                          "to": {
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "from",
+                          "to"
+                        ],
+                        "additionalProperties": false
+                      }
+                    ]
+                  },
+                  "filters": {
+                    "type": "object",
+                    "additionalProperties": {
+                      "type": "array",
+                      "items": {
+                        "type": "string"
+                      }
                     }
-                  ]
-                },
-                "filters": {
-                  "type": "object",
-                  "additionalProperties": {
-                    "type": "array",
-                    "items": {
-                      "type": "string"
-                    }
+                  },
+                  "compare": {
+                    "type": "string",
+                    "const": "previous"
+                  },
+                  "sort": {
+                    "type": "object",
+                    "properties": {
+                      "metric": {
+                        "type": "string"
+                      },
+                      "dir": {
+                        "type": "string",
+                        "enum": [
+                          "asc",
+                          "desc"
+                        ]
+                      }
+                    },
+                    "required": [
+                      "metric",
+                      "dir"
+                    ],
+                    "additionalProperties": false
+                  },
+                  "limit": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 100
+                  },
+                  "spark": {
+                    "type": "boolean"
                   }
                 },
-                "compare": {
-                  "type": "string",
-                  "enum": [
-                    "previous",
-                    "none"
-                  ]
-                },
-                "limit": {
-                  "type": "number"
-                },
-                "sort": {
-                  "type": "string",
-                  "enum": [
-                    "asc",
-                    "desc"
-                  ]
-                }
-              },
-              "required": [
-                "metric",
-                "window"
-              ],
-              "additionalProperties": false
-            }
+                "required": [
+                  "metrics",
+                  "window"
+                ],
+                "additionalProperties": false
+              }
+            },
+            "additionalProperties": false
           },
           "hidden": {
             "type": "boolean"

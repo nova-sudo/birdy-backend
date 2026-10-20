@@ -60,21 +60,21 @@ def _at(x, y, w, h):
 
 
 def _doc():
-    """A dashkit v2 doc: a heading, then a KPI and a hidden, locked trend side by side under it."""
+    """A dashkit v3 doc: a heading, then a KPI and a hidden, locked trend side by side under it."""
     return {
         "id": "d1",
-        "version": 2,
+        "version": 3,
         "title": "Growth",
         "widgets": [
             {"id": "s1", "type": "heading", "version": 1, "title": "Overview", "layout": _at(0, 0, 12, 1), "data": {}},
             {
-                "id": "w1", "type": "kpi", "version": 1, "title": "Spend", "layout": _at(0, 1, 3, 3), "data": {},
-                "bindings": {"value": {"metric": "meta_spend", "window": {"preset": "last_30d"}}},
+                "id": "w1", "type": "kpi", "version": 2, "title": "Spend", "layout": _at(0, 1, 3, 3), "data": {},
+                "bindings": {"query": {"metrics": [{"metric": "meta_spend"}], "window": {"preset": "last_30d"}}},
             },
             {
                 "id": "w2", "type": "trend", "version": 1, "layout": _at(3, 1, 6, 6), "data": {},
-                "bindings": {"series": {"metric": "spend", "by": "day",
-                                        "window": {"from": "2026-09-01", "to": "2026-09-30"}}},
+                "bindings": {"query": {"metrics": [{"metric": "spend"}], "over": "day",
+                                       "window": {"from": "2026-09-01", "to": "2026-09-30"}}},
                 "hidden": True, "locked": True,
             },
         ],
@@ -118,7 +118,12 @@ async def _store(db, doc=None, user=USER):
     await db["dashboards"].insert_one({"id": doc["id"], "user_id": user, "doc": doc})
 
 
-KPI_BINDING = {"metric": "meta_spend", "window": {"preset": "last_30d"}, "compare": "previous"}
+KPI_QUERY = {"metrics": [{"metric": "meta_spend"}], "window": {"preset": "last_30d"}, "compare": "previous"}
+
+
+def _q(*metrics, **extra):
+    """A query over `metrics` (keys) on last_30d, plus `extra` parts."""
+    return {"metrics": [{"metric": m} for m in metrics], "window": {"preset": "last_30d"}, **extra}
 
 
 def _summary():
@@ -135,29 +140,65 @@ def _w(id, type, layout, **extra):
 
 def _dashkit_doc(widgets):
     """dashkit's own test fixture shape (src/core/__tests__/utils.test.ts)."""
-    return {"id": "d1", "version": 2, "title": "Main", "widgets": widgets,
+    return {"id": "d1", "version": 3, "title": "Main", "widgets": widgets,
             "meta": {"createdAt": "a", "updatedAt": "a", "lastAuthor": "user"}}
 
 
-def test_summarize_doc_v2_matches_dashkit():
+def test_summarize_doc_v3_matches_dashkit():
     # dashkit utils.test.ts "summary lists widgets in y,x order with @x,y", verbatim.
     doc = _dashkit_doc([
-        _w("w2", "kpi", _at(0, 1, 3, 3), title="Spend", bindings={
-            "value": {"metric": "spend", "window": {"preset": "last_7d"}},
-            "previous": {"metric": "leads", "by": "client", "window": {"from": "2026-01-01", "to": "2026-01-31"}},
-        }),
+        _w("w2", "kpi", _at(0, 1, 3, 3), title="Spend",
+           bindings={"query": {"metrics": [{"metric": "spend"}], "window": {"preset": "last_7d"}}}),
         _w("w3", "note", _at(6, 1, 6, 3), hidden=True, locked=True),
         _w("h1", "heading", _at(0, 0, 12, 1), title="Overview", data={"level": 1}),
     ])
     assert summarize_doc(doc) == "\n".join([
         "# Main (3 widgets)",
         '- [h1] heading "Overview" 12×1 @0,0 (h1)',
-        '- [w2] kpi "Spend" 3×3 @0,1  value→spend last_7d; previous→leads by client 2026-01-01..2026-01-31',
+        '- [w2] kpi "Spend" 3×3 @0,1',
+        "    query: metrics=spend window=last_7d",
         '- [w3] note "" 6×3 @6,1 hidden locked',
     ])
 
 
-def test_summarize_doc_v2_heading_levels_match_dashkit():
+def test_summarize_doc_prints_every_query_part_like_dashkit():
+    # dashkit utils.test.ts "prints labels, spark (spark / nospark / neither) and filters ...", verbatim.
+    doc = _dashkit_doc([
+        _w("f1", "funnel", _at(0, 0, 6, 6), title="Funnel", bindings={"query": {
+            "metrics": [{"metric": "impressions", "label": "Seen"},
+                        {"metric": "clicks", "label": 'Said "yes", then; left'}, {"metric": "leads"}],
+            "window": {"preset": "last_7d"}}}),
+        _w("t1", "table", _at(6, 0, 6, 6), title="Clients", bindings={"query": {
+            "metrics": [{"metric": "spend"}], "by": "client", "window": {"preset": "last_30d"},
+            "filters": {"region": ["us", "eu"], "client": ["b", "a"]},
+            "sort": {"metric": "spend", "dir": "asc"}, "limit": 5}}),
+        _w("k1", "kpi", _at(0, 6, 3, 3), title="Spend", bindings={"query": {
+            "metrics": [{"metric": "spend"}], "window": {"preset": "last_7d"}, "compare": "previous", "spark": True}}),
+        _w("k2", "kpi", _at(3, 6, 3, 3), title="No spark", bindings={"query": {
+            "metrics": [{"metric": "spend"}], "window": {"preset": "last_7d"}, "spark": False, "filters": {}}}),
+        _w("k3", "kpi", _at(6, 6, 3, 3), title="Spark unset", bindings={"query": {
+            "metrics": [{"metric": "spend"}], "window": {"preset": "last_7d"}}}),
+        _w("tr", "trend", _at(0, 9, 6, 6), title="Spend by client", bindings={"query": {
+            "metrics": [{"metric": "spend", "label": "Cost"}], "by": "client", "over": "day",
+            "window": {"from": "2026-01-01", "to": "2026-01-31"}, "compare": "previous"}}),
+    ])
+    assert summarize_doc(doc).split("\n")[1:] == [
+        '- [f1] funnel "Funnel" 6×6 @0,0',
+        '    query: metrics=impressions:"Seen",clicks:"Said \\"yes\\", then; left",leads window=last_7d',
+        '- [t1] table "Clients" 6×6 @6,0',
+        "    query: metrics=spend by=client window=last_30d sort=spend:asc limit=5 filters=client:b|a;region:us|eu",
+        '- [k1] kpi "Spend" 3×3 @0,6',
+        "    query: metrics=spend window=last_7d compare spark",
+        '- [k2] kpi "No spark" 3×3 @3,6',
+        "    query: metrics=spend window=last_7d nospark",
+        '- [k3] kpi "Spark unset" 3×3 @6,6',
+        "    query: metrics=spend window=last_7d",
+        '- [tr] trend "Spend by client" 6×6 @0,9',
+        '    query: metrics=spend:"Cost" by=client over=day window=2026-01-01..2026-01-31 compare',
+    ]
+
+
+def test_summarize_doc_v3_heading_levels_match_dashkit():
     def heading(id, y, data):
         return _w(id, "heading", _at(0, y, 12, 1), title=id, data=data)
 
@@ -179,24 +220,27 @@ def test_summarize_doc_v2_heading_levels_match_dashkit():
         '- [k] kpi "" 3×3 @0,0'
 
 
-def test_summarize_doc_v2_same_row_x_order_and_empty():
+def test_summarize_doc_v3_same_row_x_order_and_empty():
     doc = _dashkit_doc([_w("r", "note", _at(6, 0, 6, 3)), _w("l", "note", _at(0, 0, 6, 3))])
     assert summarize_doc(doc).split("\n")[1:] == ['- [l] note "" 6×3 @0,0', '- [r] note "" 6×3 @6,0']
     assert summarize_doc(_dashkit_doc([])) == "# Main (0 widgets)"
 
 
-def test_summarize_doc_v1_is_flattened():
+def test_summarize_doc_v1_is_migrated():
     # Expected strings are dashkit's summarize(migrate(doc)) for the same v1 docs.
     assert summarize_doc(_v1_doc()) == "\n".join([
         "# Growth (3 widgets)",
         '- [s1] heading "Overview" 12×1 @0,0',
-        '- [w1] kpi "Spend" 3×3 @0,1  value→meta_spend last_30d',
-        '- [w2] trend "" 6×4 @3,1 hidden locked  series→spend by day 2026-09-01..2026-09-30',
+        '- [w1] kpi "Spend" 3×3 @0,1',
+        "    query: metrics=meta_spend window=last_30d spark",
+        '- [w2] trend "" 6×4 @3,1 hidden locked',
+        "    query: metrics=spend over=day window=2026-09-01..2026-09-30",
     ])
 
 
 def test_summarize_doc_v1_flattening_matches_dashkit_migrate():
-    """Heading ids, levels and descriptions, clamped sizes, shelf wrapping and compaction, as dashkit's migrate."""
+    """Heading ids, levels and descriptions, clamped sizes, shelf wrapping and compaction, as dashkit's migrate
+    (a v1 donut is unregistered when flattened, then becomes a chart clamped to the chart's minimum size)."""
     def w(id, type, cols, rows, title=None, **extra):
         widget = {"id": id, "type": type, "version": 1, "span": {"cols": cols, "rows": rows}, "data": {}, **extra}
         if title is not None:
@@ -225,8 +269,73 @@ def test_summarize_doc_v1_flattening_matches_dashkit_migrate():
         '- [tb] table "" 12×8 @0,8',
         '- [zz] mystery "" 5×6 @0,16',
         '- [small] heading "Small" 12×1 @0,22 (h3)',
-        '- [d1w] donut "" 3×5 @0,23',
-        '- [mid] heading "Mid" 12×1 @0,28',
+        '- [d1w] chart "" 4×4 @0,23',
+        '- [mid] heading "Mid" 12×1 @0,27',
+    ])
+
+
+def _stored_v2_doc():
+    """A v2 doc as stored before dashkit 0.4.0: every v2 type and slot, with the edge cases of the
+    v2 -> v3 migration (repeated metrics, an unparsable binding, data-held sort/limit/labels, sizes
+    the new type does not allow)."""
+    def w(id, type, x, y, cols, rows, bindings=None, **extra):
+        widget = {"id": id, "type": type, "version": 1, "layout": _at(x, y, cols, rows), "data": {}, **extra}
+        if bindings is not None:
+            widget["bindings"] = bindings
+        return widget
+
+    last_30d = {"preset": "last_30d"}
+    return {"id": "d3", "version": 2, "title": "Stored v2", "meta": dict(_META), "widgets": [
+        w("h", "heading", 0, 0, 12, 1, title="Top", data={"level": 1}),
+        w("k", "kpi", 0, 1, 3, 3, title="Spend", data={"showDelta": True}, bindings={"value": {
+            "metric": "spend", "window": {"preset": "last_7d"}, "compare": "previous", "filters": {"client": ["g1"]}}}),
+        w("ks", "kpi-strip", 3, 1, 9, 3, bindings={"a": {"metric": "leads", "window": {"preset": "last_7d"}},
+                                                    "b": {"metric": "leads", "window": last_30d},
+                                                    "c": {"metric": "spend"}}),
+        w("b", "bar", 0, 4, 3, 3, title="By client", data={"sort": "desc", "orientation": "horizontal"},
+          bindings={"series": {"metric": "spend", "window": last_30d, "limit": 3.7}}),
+        w("dn", "donut", 3, 4, 3, 5, bindings={"series": {"metric": "leads", "by": "week", "window": last_30d}}),
+        w("c", "comparison", 6, 4, 6, 4, data={"labelA": "Meta", "labelB": ""}, bindings={
+            "a": {"metric": "meta_spend", "by": "client", "window": {"preset": "this_month"}},
+            "b": {"metric": "spend", "window": {"preset": "last_7d"}, "compare": "previous"}}),
+        w("f", "funnel", 0, 10, 6, 6, bindings={"series": {"metric": "impressions", "window": last_30d,
+                                                           "compare": "previous"}}),
+        w("lb", "leaderboard", 6, 10, 6, 6, data={"limit": 7, "showRank": True},
+          bindings={"rows": {"metric": "leads", "window": last_30d, "sort": "asc", "limit": 250}}),
+        w("tb", "table", 0, 16, 12, 6, bindings={"rows": {"metric": "spend", "by": "week", "window": last_30d,
+                                                          "sort": "desc"}}),
+        w("tr", "trend", 0, 22, 6, 6, data={"area": False},
+          bindings={"series": {"metric": "spend", "by": "client", "window": last_30d, "sort": "asc"}}),
+        w("tx", "text", 6, 22, 6, 3, bindings={"value": {"metric": "spend", "window": last_30d}}),
+        w("bad", "kpi", 6, 25, 3, 3, bindings={"value": {"metric": "spend"}}),
+    ]}
+
+
+def test_summarize_doc_v2_is_migrated_like_dashkit():
+    # Expected: dashkit's summarize(migrate(doc)) for the same doc (no catalog).
+    assert summarize_doc(_stored_v2_doc()) == "\n".join([
+        "# Stored v2 (12 widgets)",
+        '- [h] heading "Top" 12×1 @0,0 (h1)',
+        '- [k] kpi "Spend" 3×3 @0,1',
+        "    query: metrics=spend window=last_7d compare spark filters=client:g1",
+        '- [ks] kpi "" 6×3 @3,1',
+        "    query: metrics=leads window=last_7d spark",
+        '- [b] chart "By client" 4×4 @0,4',
+        "    query: metrics=spend by=client window=last_30d sort=spend:desc limit=3",
+        '- [dn] trend "" 4×5 @3,8',
+        "    query: metrics=leads over=week window=last_30d",
+        '- [f] funnel "" 6×6 @0,13',
+        "    query: metrics=impressions window=last_30d",
+        '- [c] chart "" 6×4 @6,13',
+        '    query: metrics=meta_spend:"Meta",spend by=client window=this_month compare',
+        '- [lb] leaderboard "" 6×6 @6,17',
+        "    query: metrics=leads by=client window=last_30d sort=leads:asc limit=100",
+        '- [tb] table "" 12×6 @0,23',
+        "    query: metrics=spend over=week window=last_30d",
+        '- [tr] chart "" 6×6 @0,29',
+        "    query: metrics=spend by=client window=last_30d sort=spend:asc",
+        '- [tx] text "" 6×3 @6,29',
+        '- [bad] kpi "" 3×3 @6,32',
     ])
 
 
@@ -236,7 +345,7 @@ def test_summarize_doc_v1_flattening_matches_dashkit_migrate():
 async def test_propose_widget_returns_one_add_widget_op_after_the_given_widget(mock_db):
     result = await dashboard_propose_widget(
         mock_db, USER, summary=_summary(), after="s1", type="kpi", title="Spend",
-        bindings={"value": KPI_BINDING},
+        query=KPI_QUERY,
     )
     assert result["ok"] is True
     (add,) = result["ops"]
@@ -244,7 +353,7 @@ async def test_propose_widget_returns_one_add_widget_op_after_the_given_widget(m
     assert len(widget_id) == 12
     assert add == {
         "op": "addWidget",
-        "widget": {"id": widget_id, "type": "kpi", "title": "Spend", "bindings": {"value": KPI_BINDING}},
+        "widget": {"id": widget_id, "type": "kpi", "title": "Spend", "query": KPI_QUERY},
         "after": "s1",
     }
     assert result["widgetId"] == widget_id
@@ -254,7 +363,7 @@ async def test_propose_widget_returns_one_add_widget_op_after_the_given_widget(m
 async def test_propose_widget_without_after_goes_to_the_bottom_even_on_an_empty_dashboard(mock_db):
     for summary in (_summary(), "# Empty (0 widgets)", None):
         result = await dashboard_propose_widget(mock_db, USER, summary=summary, type="kpi",
-                                                bindings={"value": KPI_BINDING})
+                                                query=KPI_QUERY)
         assert result["ok"] is True
         assert "after" not in result["ops"][0]
 
@@ -273,7 +382,7 @@ async def test_propose_widget_passes_size_and_data(mock_db):
                                         ({"w": 3, "h": 5}, "/size/h")])
 async def test_propose_widget_size_outside_the_type_range_is_rejected(mock_db, size, path):
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi", size=size,
-                                            bindings={"value": KPI_BINDING})
+                                            query=KPI_QUERY)
     assert result["ok"] is False
     assert result["error"]["code"] == "SIZE_OUT_OF_RANGE"
     assert result["error"]["path"] == path
@@ -281,7 +390,7 @@ async def test_propose_widget_size_outside_the_type_range_is_rejected(mock_db, s
 
 async def test_propose_widget_after_an_unknown_widget_is_rejected(mock_db):
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), after="nope", type="kpi",
-                                            bindings={"value": KPI_BINDING})
+                                            query=KPI_QUERY)
     assert result["ok"] is False
     assert result["error"] == {"code": "WIDGET_NOT_FOUND", "path": "/after",
                                "message": result["error"]["message"]}
@@ -290,18 +399,18 @@ async def test_propose_widget_after_an_unknown_widget_is_rejected(mock_db):
 async def test_propose_widget_after_ids_fall_back_to_the_stored_doc(mock_db):
     await _store(mock_db)
     result = await dashboard_propose_widget(mock_db, USER, dashboard_id="d1", after="w2", type="kpi",
-                                            bindings={"value": KPI_BINDING})
+                                            query=KPI_QUERY)
     assert result["ok"] is True
     await _store(mock_db, {**_v1_doc(), "id": "old"})
     from_v1 = await dashboard_propose_widget(mock_db, USER, dashboard_id="old", after="s1", type="kpi",
-                                             bindings={"value": KPI_BINDING})
+                                             query=KPI_QUERY)
     assert from_v1["ok"] is True
 
 
 async def test_propose_widget_rejects_section_id_and_span(mock_db):
     for extra in ({"sectionId": "s1"}, {"span": {"cols": 3, "rows": 1}}):
         result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
-                                                bindings={"value": KPI_BINDING}, **extra)
+                                                query=KPI_QUERY, **extra)
         assert result["ok"] is False
         assert result["error"]["code"] == "ARGS_INVALID"
 
@@ -309,9 +418,9 @@ async def test_propose_widget_rejects_section_id_and_span(mock_db):
 async def test_propose_chain_and_move_the_new_widgets_in_the_same_turn(mock_db):
     sink = []
     first = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi", after="s1",
-                                           bindings={"value": KPI_BINDING}, dashboard_ops_sink=sink)
+                                           query=KPI_QUERY, dashboard_ops_sink=sink)
     second = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
-                                            after=first["widgetId"], bindings={"value": KPI_BINDING},
+                                            after=first["widgetId"], query=KPI_QUERY,
                                             dashboard_ops_sink=sink)
     assert second["ok"] is True
     moved = await dashboard_apply(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink, ops=[
@@ -322,52 +431,115 @@ async def test_propose_chain_and_move_the_new_widgets_in_the_same_turn(mock_db):
     assert [o["op"] for o in sink] == ["addWidget", "addWidget", "moveWidget", "resizeWidget"]
 
 
-async def test_propose_widget_requires_required_slots(mock_db):
-    result = await dashboard_propose_widget(mock_db, USER, type="kpi", bindings={})
-    assert result["ok"] is False
-    assert result["error"]["code"] == "SLOT_REQUIRED"
-    assert result["error"]["path"] == "/bindings/value"
+async def test_propose_widget_query_must_fit_the_type(mock_db):
+    result = await dashboard_propose_widget(mock_db, USER, type="trend", query=_q("spend"))
+    assert result == {"ok": False, "error": {"code": "QUERY_SHAPE", "path": "/query",
+                                             "message": 'Needs "over" to be set'}}
+    fits = await dashboard_propose_widget(mock_db, USER, type="trend", query=_q("spend", over="week"))
+    assert fits["ok"] is True
 
 
-async def test_propose_a_heading_needs_no_bindings(mock_db):
+async def test_propose_a_heading_needs_no_query_and_takes_none(mock_db):
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="heading", title="Costs")
     assert result["ok"] is True
     assert result["ops"][0]["widget"] == {"id": result["widgetId"], "type": "heading", "title": "Costs"}
+    with_query = await dashboard_propose_widget(mock_db, USER, type="heading", title="Costs", query=_q("spend"))
+    assert with_query["error"] == {"code": "QUERY_SHAPE", "path": "/query",
+                                   "message": 'Widget type "heading" takes no query'}
 
 
 async def test_propose_widget_rejects_a_dimension_the_metric_lacks(mock_db):
-    binding = {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}
-    result = await dashboard_propose_widget(mock_db, USER, type="trend", bindings={"series": binding})
+    result = await dashboard_propose_widget(mock_db, USER, type="chart", query=_q("meta_ctr", by="day"))
     assert result["ok"] is False
-    assert result["error"]["code"] == "DIMENSION_NOT_ALLOWED"
-    assert result["error"]["path"] == "/bindings/series/by"
+    assert result["error"]["code"] == "DIMENSION_UNSUPPORTED"
+    assert result["error"]["path"] == "/query/by"
+    assert result["error"]["message"].startswith('Metric "meta_ctr" cannot be split by "day"')
 
 
-async def test_custom_window_is_rejected_unless_split_by_day(mock_db):
+async def test_propose_widget_rejects_over_on_a_metric_without_daily_history(mock_db):
+    result = await dashboard_propose_widget(mock_db, USER, type="trend", query=_q("meta_reach", over="day"))
+    assert result["ok"] is False
+    assert result["error"]["code"] == "GRAIN_UNSUPPORTED"
+    assert result["error"]["path"] == "/query/over"
+    assert result["error"]["message"].startswith('Metric "meta_reach" cannot be shown over time')
+
+
+async def test_custom_window_needs_metrics_with_daily_history(mock_db):
     custom = {"from": "2026-09-01", "to": "2026-09-30"}
-    value = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
-                                           bindings={"value": {"metric": "spend", "window": custom}})
-    assert value["ok"] is False
-    assert value["error"]["code"] == "WINDOW_UNSUPPORTED"
-    assert value["error"]["path"] == "/bindings/value/window"
-    assert "by" in value["error"]["message"] and "preset" in value["error"]["message"]
+    daily = await dashboard_propose_widget(mock_db, USER, type="kpi",
+                                           query={"metrics": [{"metric": "spend"}], "window": custom})
+    assert daily["ok"] is True
+    # meta_reach has no daily rows: the query engine can only read it from cached presets.
+    preset_only = await dashboard_propose_widget(mock_db, USER, type="kpi",
+                                                 query={"metrics": [{"metric": "meta_reach"}], "window": custom})
+    assert preset_only["ok"] is False
+    assert preset_only["error"]["code"] == "WINDOW_UNSUPPORTED"
+    assert preset_only["error"]["path"] == "/query/window"
+    assert "meta_reach" in preset_only["error"]["message"] and "preset" in preset_only["error"]["message"]
 
-    ops = [{"op": "setBinding", "widgetId": "w1", "slot": "value",
-            "binding": {"metric": "spend", "by": "client", "window": custom}}]
-    by_client = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
-    assert by_client["ok"] is False
-    assert by_client["error"]["code"] == "WINDOW_UNSUPPORTED"
-    assert by_client["error"]["path"] == "/ops/0/binding/window"
 
-    by_day = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="trend",
-                                            bindings={"series": {"metric": "spend", "by": "day", "window": custom}})
-    assert by_day["ok"] is True
+@pytest.mark.parametrize("window, path", [
+    ({"from": "2026-09-30", "to": "2026-09-01"}, "/query/window/from"),
+    ({"from": "2026-02-30", "to": "2026-03-01"}, "/query/window/from"),
+    ({"from": "2026-09-01", "to": "30/09/2026"}, "/query/window/to"),
+])
+async def test_custom_window_must_be_two_real_dates_in_order(mock_db, window, path):
+    result = await dashboard_propose_widget(mock_db, USER, type="kpi",
+                                            query={"metrics": [{"metric": "spend"}], "window": window})
+    assert result["ok"] is False
+    assert result["error"]["code"] == "WINDOW_RANGE_INVALID"
+    assert result["error"]["path"] == path
+
+
+@pytest.mark.parametrize("query, path, message", [
+    (_q("spend", "spend", by="client"), "/query/metrics/1/metric", 'Duplicate metric "spend"'),
+    (_q("spend", by="client", sort={"metric": "leads", "dir": "desc"}), "/query/sort/metric",
+     'Sort metric "leads" is not in metrics'),
+])
+async def test_propose_widget_query_refinements(mock_db, query, path, message):
+    result = await dashboard_propose_widget(mock_db, USER, type="chart", query=query)
+    assert result == {"ok": False, "error": {"code": "ARGS_INVALID", "path": path, "message": message}}
+
+
+async def test_metrics_on_one_value_axis_must_share_a_format(mock_db):
+    # dashkit's trend and chart `check` (R16): one value axis, so one catalog format.
+    leads_label = next(m["label"] for m in build_catalog()["metrics"] if m["key"] == "leads")
+    for widget_type, extra in (("trend", {"over": "day"}), ("chart", {"by": "client"})):
+        mixed = await dashboard_propose_widget(mock_db, USER, type=widget_type, query=_q("spend", "leads", **extra))
+        assert mixed["error"] == {"code": "QUERY_SHAPE", "path": "/query", "message":
+                                  f'Metrics on one chart must share a format — put "{leads_label}" in its own widget'}
+        labelled = _q("spend", **extra)
+        labelled["metrics"].append({"metric": "leads", "label": "Our leads"})
+        named = await dashboard_propose_widget(mock_db, USER, type=widget_type, query=labelled)
+        assert named["error"]["message"] == \
+            'Metrics on one chart must share a format — put "Our leads" in its own widget'
+        same = await dashboard_propose_widget(mock_db, USER, type=widget_type, query=_q("spend", "meta_spend", **extra))
+        assert same["ok"] is True
+    # Other types show each metric on its own.
+    table = await dashboard_propose_widget(mock_db, USER, type="table", query=_q("spend", "leads", by="client"))
+    assert table["ok"] is True
+
+
+async def test_a_donut_takes_one_additive_metric(mock_db):
+    donut = {"chart": "donut", "orientation": "vertical", "stacked": False}
+    ratio = await dashboard_propose_widget(mock_db, USER, type="chart", data=donut, query=_q("meta_ctr", by="client"))
+    assert ratio["error"] == {"code": "QUERY_SHAPE", "path": "/query",
+                              "message": 'A donut chart needs an additive metric; "meta_ctr" is not'}
+    two = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "addWidget", "widget": {"type": "chart", "data": donut,
+                                       "query": _q("spend", "meta_spend", by="client")}}])
+    assert two["error"] == {"code": "QUERY_SHAPE", "path": "/ops/0/widget/query",
+                            "message": "A donut chart takes exactly 1 metric, got 2"}
+    additive = await dashboard_propose_widget(mock_db, USER, type="chart", data=donut, query=_q("spend", by="client"))
+    assert additive["ok"] is True
+    bars = await dashboard_propose_widget(mock_db, USER, type="chart", query=_q("meta_ctr", by="client"))
+    assert bars["ok"] is True
 
 
 async def test_propose_widget_puts_ops_in_the_sink(mock_db):
     sink = []
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
-                                            bindings={"value": KPI_BINDING}, dashboard_ops_sink=sink)
+                                            query=KPI_QUERY, dashboard_ops_sink=sink)
     assert sink == result["ops"]
 
 
@@ -423,6 +595,17 @@ async def test_section_ops_are_rejected(mock_db, op):
     assert sink == []
 
 
+@pytest.mark.parametrize("op", [
+    {"op": "setBinding", "widgetId": "w1", "slot": "value", "binding": {"metric": "spend"}},
+    {"op": "clearBinding", "widgetId": "w1", "slot": "value"},
+])
+async def test_binding_ops_point_to_set_query(mock_db, op):
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[op])
+    assert result["error"]["code"] == "OP_INVALID"
+    assert result["error"]["path"] == "/ops/0/op"
+    assert "setQuery" in result["error"]["message"]
+
+
 async def test_apply_ids_come_from_the_stored_doc_when_no_summary_is_sent(mock_db):
     await _store(mock_db)
     ok = await dashboard_apply(mock_db, USER, dashboard_id="d1", ops=[{"op": "removeWidget", "widgetId": "w2"}])
@@ -445,8 +628,8 @@ async def test_apply_ops_see_ids_created_and_removed_earlier_in_the_call(mock_db
     created = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
         {"op": "addWidget", "widget": {"id": "h9", "type": "heading", "title": "New"}},
         {"op": "addWidget", "widget": {"id": "w9", "type": "kpi"}, "after": "h9"},
-        {"op": "setBinding", "widgetId": "w9", "slot": "value", "binding": KPI_BINDING},
-        {"op": "addWidget", "widget": {"id": "w10", "type": "kpi", "bindings": {"value": KPI_BINDING}},
+        {"op": "setQuery", "widgetId": "w9", "query": KPI_QUERY},
+        {"op": "addWidget", "widget": {"id": "w10", "type": "kpi", "query": KPI_QUERY},
          "after": "w9"},
     ])
     assert created["ok"] is True
@@ -464,8 +647,7 @@ async def test_apply_ops_see_ids_created_and_removed_earlier_in_the_call(mock_db
 
 
 async def test_apply_with_unknown_metric_returns_ok_false_with_path(mock_db):
-    ops = [{"op": "setBinding", "widgetId": "w1", "slot": "value",
-            "binding": {"metric": "made_up_metric", "window": {"preset": "last_30d"}}}]
+    ops = [{"op": "setQuery", "widgetId": "w1", "query": _q("made_up_metric")}]
     sink = []
     result = await dashboard_apply(mock_db, USER, ops=ops, dashboard_ops_sink=sink)
     assert result["ok"] is False
@@ -483,12 +665,57 @@ async def test_apply_rejects_replace_dashboard(mock_db):
 
 
 async def test_apply_rejects_a_dimension_the_metric_lacks(mock_db):
-    ops = [{"op": "setBinding", "widgetId": "w1", "slot": "value",
-            "binding": {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}}]
+    for op, path in (
+        ({"op": "setQuery", "widgetId": "w2", "query": _q("meta_ctr", over="day", by="day")}, "/ops/0/query/by"),
+        ({"op": "addWidget", "widget": {"type": "chart", "query": _q("meta_ctr", by="day")}},
+         "/ops/0/widget/query/by"),
+    ):
+        result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[op])
+        assert result["ok"] is False
+        assert result["error"]["code"] == "DIMENSION_UNSUPPORTED"
+        assert result["error"]["path"] == path
+
+
+async def test_set_query_must_fit_the_widget_type(mock_db):
+    sink = []
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink, ops=[
+        {"op": "setQuery", "widgetId": "w2", "query": _q("spend", over="day", compare="previous")},
+        {"op": "setQuery", "widgetId": "w1", "query": _q("spend", "leads")},
+    ])
+    assert result == {"ok": False, "error": {"code": "QUERY_SHAPE", "path": "/ops/1/query",
+                                             "message": "Needs exactly 1 metric, got 2"}}
+    assert sink == []
+    heading = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "setQuery", "widgetId": "s1", "query": _q("spend")}])
+    assert heading["error"] == {"code": "QUERY_SHAPE", "path": "/ops/0/query",
+                                "message": 'Widget type "heading" takes no query'}
+    added = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "addWidget", "widget": {"type": "leaderboard", "query": _q("leads")}}])
+    assert added["error"] == {"code": "QUERY_SHAPE", "path": "/ops/0/widget/query",
+                              "message": 'Needs "by" to be set'}
+
+
+async def test_set_query_and_clear_query_return_their_ops(mock_db):
+    ops = [{"op": "setQuery", "widgetId": "w1", "query": _q("spend", compare="previous", spark=False)},
+           {"op": "clearQuery", "widgetId": "w2"}]
     result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
-    assert result["ok"] is False
-    assert result["error"]["code"] == "DIMENSION_NOT_ALLOWED"
-    assert result["error"]["path"] == "/ops/0/binding/by"
+    assert result == {"ok": True, "ops": ops, "note": "Applied in the user's editor."}
+    for op in ({"op": "setQuery", "widgetId": "ghost", "query": _q("spend")},
+               {"op": "clearQuery", "widgetId": "ghost"}):
+        missing = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[op])
+        assert missing["error"]["code"] == "WIDGET_NOT_FOUND"
+        assert missing["error"]["path"] == "/ops/0/widgetId"
+    bad_shape = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "clearQuery", "widgetId": "w2", "query": _q("spend")}])
+    assert bad_shape["error"]["code"] == "ARGS_INVALID"
+
+
+async def test_set_query_on_a_widget_of_an_unknown_type_is_widget_type_unknown(mock_db):
+    summary = '# D (1 widgets)\n- [m] mystery "" 3×3 @0,0'
+    result = await dashboard_apply(mock_db, USER, summary=summary, ops=[
+        {"op": "setQuery", "widgetId": "m", "query": _q("spend")}])
+    assert result["error"] == {"code": "WIDGET_TYPE_UNKNOWN", "path": "/ops/0/widgetId",
+                               "message": 'Unknown widget type "mystery"'}
 
 
 async def test_apply_without_ops_is_invalid(mock_db):
@@ -534,7 +761,7 @@ async def test_heading_title_markdown_is_TITLE_PLAIN_TEXT(mock_db, op, path):
 
 async def test_markdown_in_a_proposed_widget_title_is_title_plain_text(mock_db):
     result = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="kpi",
-                                            title="**Spend**", bindings={"value": KPI_BINDING})
+                                            title="**Spend**", query=KPI_QUERY)
     assert result["ok"] is False
     assert result["error"]["code"] == "TITLE_PLAIN_TEXT"
     assert result["error"]["path"] == "/title"
@@ -600,43 +827,65 @@ async def test_change_widget_type_with_unknown_type_is_widget_type_unknown(mock_
 
 
 async def test_change_widget_type_with_known_id_and_type_is_ok(mock_db):
-    ops = [{"op": "changeWidgetType", "widgetId": "w2", "type": "bar"},
-           {"op": "setBinding", "widgetId": "w2", "slot": "series",
-            "binding": {"metric": "spend", "by": "client", "window": {"preset": "last_30d"}}}]
+    ops = [{"op": "changeWidgetType", "widgetId": "w2", "type": "chart"},
+           {"op": "setQuery", "widgetId": "w2", "query": _q("spend", by="client")}]
     result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
     assert result == {"ok": True, "ops": ops, "note": "Applied in the user's editor."}
 
 
+async def test_set_query_after_a_type_change_fits_the_new_type(mock_db):
+    sink = []
+    changed = await dashboard_apply(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink,
+                                    ops=[{"op": "changeWidgetType", "widgetId": "w2", "type": "chart"}])
+    assert changed["ok"] is True
+    # A later call in the same turn still sees w2 as a chart, so a trend query no longer fits.
+    trend = await dashboard_apply(mock_db, USER, summary=_summary(), dashboard_ops_sink=sink,
+                                  ops=[{"op": "setQuery", "widgetId": "w2", "query": _q("spend", over="day")}])
+    assert trend["error"] == {"code": "QUERY_SHAPE", "path": "/ops/0/query", "message": 'Needs "by" to be set'}
+
+
 async def test_change_widget_type_with_unknown_widget_is_widget_not_found(mock_db):
-    ops = [{"op": "changeWidgetType", "widgetId": "ghost", "type": "bar"}]
+    ops = [{"op": "changeWidgetType", "widgetId": "ghost", "type": "chart"}]
     result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=ops)
     assert result["error"]["code"] == "WIDGET_NOT_FOUND"
     assert result["error"]["path"] == "/ops/0/widgetId"
 
 
-async def test_by_day_on_ctr_names_metrics_with_daily_series(mock_db):
-    binding = {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}
-    proposed = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="trend",
-                                              bindings={"series": binding})
+async def test_by_day_on_ctr_names_metrics_with_a_daily_split(mock_db):
+    proposed = await dashboard_propose_widget(mock_db, USER, summary=_summary(), type="chart",
+                                              query=_q("meta_ctr", by="day"))
     applied = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
-        {"op": "setBinding", "widgetId": "w2", "slot": "series", "binding": binding}])
+        {"op": "addWidget", "widget": {"type": "chart", "query": _q("meta_ctr", by="day")}}])
     for result in (proposed, applied):
-        assert result["error"]["code"] == "DIMENSION_NOT_ALLOWED"
+        assert result["error"]["code"] == "DIMENSION_UNSUPPORTED"
         message = result["error"]["message"]
         assert "meta_ctr" in message and "`spend`" in message
-        assert "`meta_ctr`" not in message  # only metrics that do have a daily series
+        assert "`meta_ctr`" not in message  # only metrics that can be split by day
 
 
-async def test_by_day_refusal_lists_at_most_six_daily_metrics_untruncated(mock_db):
-    daily = [m["key"] for m in build_catalog()["metrics"] if "day" in m["dimensions"]]
-    assert len(daily) > 6  # the cap is exercised by the real catalog
-    binding = {"metric": "meta_ctr", "by": "day", "window": {"preset": "last_30d"}}
+async def test_over_on_reach_names_metrics_over_time(mock_db):
     result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
-        {"op": "setBinding", "widgetId": "w2", "slot": "series", "binding": binding}])
+        {"op": "setQuery", "widgetId": "w2", "query": _q("meta_reach", over="day")}])
+    assert result["error"]["code"] == "GRAIN_UNSUPPORTED"
+    message = result["error"]["message"]
+    assert "`meta_spend`" in message and "`meta_reach`" not in message
+
+
+@pytest.mark.parametrize("query, code, eligible", [
+    (_q("meta_ctr", by="day"), "DIMENSION_UNSUPPORTED", lambda m: "day" in m["dimensions"]),
+    (_q("meta_reach", by="client", over="day"), "GRAIN_UNSUPPORTED", lambda m: m.get("over") is True),
+])
+async def test_refusals_list_at_most_six_metrics_untruncated(mock_db, query, code, eligible):
+    keys = [m["key"] for m in build_catalog()["metrics"] if eligible(m)]
+    assert len(keys) > 6  # the cap is exercised by the real catalog
+    widget_type = "chart" if "over" not in query else "trend"
+    result = await dashboard_apply(mock_db, USER, summary=_summary(), ops=[
+        {"op": "addWidget", "widget": {"type": widget_type, "query": query}}])
+    assert result["error"]["code"] == code
     message = result["error"]["message"]
     assert message.count("`") == 2 * 6
-    assert all(f"`{key}`" in message for key in daily[:6])
-    assert message.endswith(f" and {len(daily) - 6} more")
+    assert all(f"`{key}`" in message for key in keys[:6])
+    assert message.endswith(f" and {len(keys) - 6} more")
     assert len(message) <= 300
 
 
@@ -649,9 +898,18 @@ async def test_describe_summarizes_a_stored_doc(mock_db):
     assert result == {"summary": "\n".join([
         "# Growth (3 widgets)",
         '- [s1] heading "Overview" 12×1 @0,0',
-        '- [w1] kpi "Spend" 3×3 @0,1  value→meta_spend last_30d',
-        '- [w2] trend "" 6×6 @3,1 hidden locked  series→spend by day 2026-09-01..2026-09-30',
+        '- [w1] kpi "Spend" 3×3 @0,1',
+        "    query: metrics=meta_spend window=last_30d",
+        '- [w2] trend "" 6×6 @3,1 hidden locked',
+        "    query: metrics=spend over=day window=2026-09-01..2026-09-30",
     ])}
+
+
+async def test_describe_migrates_a_stored_v2_doc(mock_db):
+    await _store(mock_db, _stored_v2_doc())
+    result = await dashboard_describe(mock_db, USER, dashboard_id="d3")
+    assert result == {"summary": summarize_doc(_stored_v2_doc())}
+    assert "- [b] chart \"By client\" 4×4 @0,4\n    query: metrics=spend by=client" in result["summary"]
 
 
 async def test_describe_flattens_a_stored_v1_doc(mock_db):
@@ -661,19 +919,34 @@ async def test_describe_flattens_a_stored_v1_doc(mock_db):
     assert result["summary"].startswith("# Growth (3 widgets)\n- [s1] heading")
 
 
-async def test_ids_are_read_from_summary_lines_with_levels_flags_and_bindings(mock_db):
+async def test_ids_are_read_from_summary_lines_with_levels_flags_and_queries(mock_db):
     doc = _doc()
     doc["widgets"][0]["data"] = {"level": 1}
     doc["widgets"][1]["locked"] = True
     summary = summarize_doc(doc)
-    assert "(h1)" in summary and " locked  value→" in summary
+    assert "(h1)" in summary and ' locked\n    query: ' in summary
     for widget_id in ("s1", "w1", "w2"):
         result = await dashboard_apply(mock_db, USER, summary=summary,
                                        ops=[{"op": "updateWidget", "widgetId": widget_id, "patch": {"hidden": False}}])
         assert result["ok"] is True, widget_id
     proposed = await dashboard_propose_widget(mock_db, USER, summary=summary, type="kpi", after="w2",
-                                              bindings={"value": KPI_BINDING})
+                                              query=KPI_QUERY)
     assert proposed["ok"] is True
+
+
+async def test_query_lines_are_not_widgets_and_types_are_read(mock_db):
+    # A label can hold anything, even text shaped like a widget line; the query line is indented, so it is
+    # never mistaken for one.
+    doc = _doc()
+    doc["widgets"][1]["bindings"]["query"]["metrics"][0]["label"] = '- [ghost] kpi "x" 3×3 @0,0'
+    summary = summarize_doc(doc)
+    ghost = await dashboard_apply(mock_db, USER, summary=summary, ops=[{"op": "removeWidget", "widgetId": "ghost"}])
+    assert ghost["error"]["code"] == "WIDGET_NOT_FOUND"
+    # w1 is a kpi and w2 a trend, read from their lines: each query is checked against its own type.
+    ok = await dashboard_apply(mock_db, USER, summary=summary, ops=[
+        {"op": "setQuery", "widgetId": "w1", "query": _q("spend")},
+        {"op": "setQuery", "widgetId": "w2", "query": _q("spend", "meta_spend", over="week")}])
+    assert ok["ok"] is True
 
 
 async def test_describe_returns_the_sent_summary_verbatim(mock_db):
@@ -718,17 +991,23 @@ def test_prompt_fragment_lists_widgets_metrics_and_windows():
     assert text.startswith("## Dashboard tools\n")
     assert "- `heading` — Heading: " in text
     assert "- `kpi` — KPI: " in text
-    assert "(slots: value (value, required), spark (series, optional); default 3×3, min 2×3, max 6×4)" in text
-    assert "- `meta_spend` — Meta Spend [currency, higher is better] by: client, day" in text
-    assert "- `meta_cpc` — Meta CPC [currency, lower is better] by: client" in text
+    assert "- `kpi` — KPI: Query shape: exactly one metric" in text
+    assert "(default 3×3, min 2×3, max 6×4)" in text and "slots:" not in text
+    assert "| `trend` | 1..4 | optional | required |" in text
+    assert "- `meta_spend` — Meta Spend [currency, higher is better] by: client, day; over time\n" in text
+    assert "- `meta_cpc` — Meta CPC [currency, lower is better] by: client; over time; not additive\n" in text
+    assert "- `meta_reach` — Meta Reach [integer, higher is better] by: client; not additive\n" in text
+    assert '"op": "setQuery"' in text
     assert "- `day` — Day" in text
     assert "## Examples" in text
     assert "updateSection" not in text and "span" not in text
 
 
-def test_system_prompt_intro_has_no_section_ops():
+def test_system_prompt_intro_has_no_section_or_binding_ops():
     text = system_prompt()
     assert "updateSection" not in text and "addSection" not in text
+    assert "setBinding" not in text and "rebind" not in text
+    assert "the query's `filters.client` list" in text
 
 
 # ── models + run_chat ──────────────────────────────────────────────────────
@@ -760,7 +1039,7 @@ async def test_run_chat_collects_dashboard_ops(mock_db, dash_registry):
         _tool_call_response("dashboard_describe", {}, "tc-1"),
         _tool_call_response("dashboard_apply", {"ops": ops}, "tc-2"),
         _tool_call_response("dashboard_apply", {"ops": [{"op": "bogus"}]}, "tc-3"),
-        _tool_call_response("dashboard_propose_widget", {"type": "kpi", "bindings": {"value": KPI_BINDING}}, "tc-4"),
+        _tool_call_response("dashboard_propose_widget", {"type": "kpi", "query": KPI_QUERY}, "tc-4"),
         ProviderResponse(content="Removed the trend and added a spend KPI."),
     ])
     result = await run_chat(

@@ -15,11 +15,19 @@ validating against them is what rejects an unknown metric. Ops must also name
 ids that exist: the known widgets come from the editor's summary (else the
 stored doc) plus the ops already returned this turn (`_Layout`).
 
-Dashboards are dashkit v2 docs: a flat `widgets` list, each with a grid
-`layout {x, y, w, h}` (12 columns of 48px rows); sections are `heading`
-widgets. Stored docs saved before dashkit 0.3.0 are v1 (sections with spans)
-until the editor next saves them, so `summarize_doc` and the stored-doc
-fallback flatten a v1 doc the way dashkit's `migrate()` does.
+Dashboards are dashkit v3 docs: a flat `widgets` list, each with a grid
+`layout {x, y, w, h}` (12 columns of 48px rows) and, for data widgets, one
+`bindings.query` (metrics, optional `by` / `over`, a window, ...); sections are
+`heading` widgets. A query is checked the way dashkit's `apply` and `validate`
+check it: the widget type's query rules (QUERY_SHAPE, services.dashboards_schema
+QUERY_RULES, plus the trend/chart `check` ported below), then the catalog
+(DIMENSION_UNSUPPORTED, GRAIN_UNSUPPORTED, filters, custom ranges).
+
+Stored docs saved before dashkit 0.4.0 are v2 (bindings per slot), or v1
+(sections with spans) before 0.3.0, until the editor next saves them, so
+`summarize_doc` and the stored-doc fallback migrate them the way dashkit's
+`migrate()` does: v1 is flattened onto the grid, v2 bindings become one query
+per widget, and sizes are clamped to the (possibly new) type's range.
 
 The orchestrator injects three keyword arguments into these tools only:
 `dashboard_id` and `summary` (the editor's `summarize(doc)` of the live doc,
@@ -31,7 +39,9 @@ truncation in ai/tools/result_shaping.py.
 
 import json
 import logging
+import math
 import re
+from datetime import date
 from pathlib import Path
 from typing import Optional
 from uuid import uuid4
@@ -42,6 +52,7 @@ from jsonschema.exceptions import best_match
 from ai.config import MAX_RESULT_CHARS
 from ai.tools.registry import registry
 from services.dashboards_catalog import build_catalog
+from services.dashboards_schema import QUERY_SHAPE, query_refinement_problems, query_type_problem
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +77,10 @@ _SECTION_OPS = ("addSection", "removeSection", "moveSection", "updateSection")
 _SECTION_OPS_MESSAGE = ('Op "{name}" no longer exists: sections are `heading` widgets. Add one with addWidget '
                         '(type "heading"), place widgets under it with `after`, size it with updateWidgetData '
                         '`level`, and move, retitle or remove it like any widget.')
+# dashkit 0.4.0 replaced bindings per slot with one query per widget.
+_BINDING_OPS = ("setBinding", "clearBinding")
+_BINDING_OPS_MESSAGE = ('Op "{name}" no longer exists: each data widget has one `query`. Use setQuery '
+                        '(it replaces the whole query) or clearQuery.')
 
 _APPLIED_NOTE = "Applied in the user's editor."
 _SEARCH_LIMIT = 20
@@ -77,17 +92,22 @@ _TITLE_MARKDOWN = re.compile(r"[#*_`]")
 _TITLE_MESSAGE = ("Titles are plain text; remove the markdown (#, *, _ or backticks). To make a heading "
                   "larger or smaller use updateWidgetData with `level` (1 large, 2 default, 3 small); "
                   "for prose add a `text` widget.")
-# One widget line of dashkit's summarize (src/core/summarize.ts):
-#   - [id] type "title" w×h @x,y[ (h1|h3)][ hidden][ locked][  slot→metric[ by dim] window; ...]
+# dashkit's summarize (src/core/summarize.ts) writes one line per widget, then an indented query line when the
+# widget has a query:
+#   - [id] type "title" w×h @x,y[ (h1|h3)][ hidden][ locked]
+#       query: metrics=<m>[,<m>…][ by=<d>][ over=<g>] window=<w>[ compare][ spark| nospark]
+#              [ sort=<metric>:<dir>][ limit=<N>][ filters=<dim>:<v1>|<v2>[;<dim>:…]]
 _WIDGET_LINE = re.compile(r"^- \[([^\]]+)\] ")
 _WIDGET_DETAIL = re.compile(r'^- \[([^\]]+)\] (\S+) "(.*)" (\d+)×(\d+) @(\d+),(\d+)'
-                            r"(?: \(h\d\))?(?: hidden)?(?: locked)?(?:  .*)?$")
-# How many daily-capable metrics a by-day refusal names (keeps it under _MESSAGE_LIMIT).
-_DAILY_LIST_LIMIT = 6
+                            r"(?: \(h\d\))?(?: hidden)?(?: locked)?$")
+_QUERY_LINE = "    query: "
+# How many eligible metrics a DIMENSION_UNSUPPORTED / GRAIN_UNSUPPORTED refusal names (keeps it under
+# _MESSAGE_LIMIT).
+_ELIGIBLE_LIST_LIMIT = 6
 
 
 def widget_manifest() -> list[dict]:
-    """dashkit's widget types (`x-dashkit-widgets`): type, label, aiHint, slots, default/min/max size."""
+    """dashkit's widget types (`x-dashkit-widgets`): type, label, aiHint, queryRules, default/min/max size."""
     return _TOOL_DEFS["dashboard_propose_widget"].get("x-dashkit-widgets", [])
 
 
@@ -165,7 +185,7 @@ def _op_title_error(op: dict, at: str, layout: "_Layout") -> Optional[dict]:
 def _ops_error(ops) -> Optional[dict]:
     """Per-op check against that op's own schema, for precise paths and messages,
     plus the unknown-widget-type rule the schema cannot express. (Markdown in
-    titles is checked against the layout in dashboard_apply.)"""
+    titles, ids and queries are checked against the layout in dashboard_apply.)"""
     if not isinstance(ops, list):
         return None
     for i, op in enumerate(ops):
@@ -177,6 +197,8 @@ def _ops_error(ops) -> Optional[dict]:
             return _fail("OP_FORBIDDEN", at, f'Op "{name}" is not available to tools')
         if name in _SECTION_OPS:
             return _fail("OP_INVALID", f"{at}/op", _SECTION_OPS_MESSAGE.format(name=name))
+        if name in _BINDING_OPS:
+            return _fail("OP_INVALID", f"{at}/op", _BINDING_OPS_MESSAGE.format(name=name))
         member = _OP_MEMBERS.get(name)
         if member is None:
             return _fail("OP_INVALID", f"{at}/op", f'Unknown op "{name}"; use one of {", ".join(_OP_MEMBERS)}')
@@ -189,37 +211,95 @@ def _ops_error(ops) -> Optional[dict]:
     return None
 
 
-def _binding_error(binding: dict, at: str, metrics: dict, dimensions: set) -> Optional[dict]:
-    """Catalog checks the schema cannot express (dashkit's validateWidget, binding part)."""
-    metric = metrics.get(binding.get("metric"))
-    by = binding.get("by")
-    if metric is not None and by is not None and by not in metric.get("dimensions", []):
-        message = f'Metric "{metric["key"]}" cannot be split by "{by}"'
-        if by == "day":
-            daily = [f'`{key}`' for key, m in metrics.items() if "day" in m.get("dimensions", [])]
-            if not daily:
-                message += "; no metric has a daily series"
-            else:
-                listed = ", ".join(daily[:_DAILY_LIST_LIMIT])
-                more = len(daily) - _DAILY_LIST_LIMIT
-                message += f"; metrics with a daily series: {listed}" + (f" and {more} more" if more > 0 else "")
-        return _fail("DIMENSION_NOT_ALLOWED", f"{at}/by", message)
-    for dim in (binding.get("filters") or {}):
+def _is_iso_date(text) -> bool:
+    """A real calendar date written as YYYY-MM-DD (dashkit's isIsoDate)."""
+    if not isinstance(text, str) or not _ISO_DATE.match(text):
+        return False
+    try:
+        date.fromisoformat(text)
+    except ValueError:
+        return False
+    return True
+
+
+def _eligible(metrics: dict, ok, intro: str, none: str) -> str:
+    """`; <intro> `a`, `b`, … and N more` naming the metrics `ok` accepts, or `; <none>` when there are none."""
+    keys = [f"`{key}`" for key, m in metrics.items() if ok(m)]
+    if not keys:
+        return f"; {none}"
+    more = len(keys) - _ELIGIBLE_LIST_LIMIT
+    return f"; {intro} {', '.join(keys[:_ELIGIBLE_LIST_LIMIT])}" + (f" and {more} more" if more > 0 else "")
+
+
+def _type_check(widget_type, query: dict, data, metrics: dict) -> Optional[str]:
+    """The `check` dashkit's trend and chart add to their QueryRules (src/react/widgets/trend.tsx, chart.tsx):
+    metrics on one value axis share a catalog format (mixedFormatMessage); a donut chart takes one additive
+    metric. `data` is the widget data when the op carries it; a donut is only known from it."""
+    if widget_type not in ("trend", "chart"):
+        return None
+    refs = query["metrics"]
+    first = (metrics.get(refs[0]["metric"]) or {}).get("format")
+    if first is not None:
+        for ref in refs[1:]:
+            metric = metrics.get(ref["metric"])
+            if metric is not None and metric.get("format") != first:
+                return (f'Metrics on one chart must share a format — put "{ref.get("label", metric["label"])}" '
+                        "in its own widget")
+    if widget_type != "chart" or not isinstance(data, dict) or data.get("chart") != "donut":
+        return None
+    if len(refs) != 1:
+        return f"A donut chart takes exactly 1 metric, got {len(refs)}"
+    if (metrics.get(refs[0]["metric"]) or {}).get("additive") is False:
+        return f'A donut chart needs an additive metric; "{refs[0]["metric"]}" is not'
+    return None
+
+
+def _query_error(query: dict, at: str, widget_type, data, metrics: dict, dimensions: set) -> Optional[dict]:
+    """Everything dashkit checks on a query the schema cannot: QuerySchema's refinements, the widget type's
+    rules (QUERY_SHAPE; skipped when the type is unknown), then the catalog (dashkit's catalogQueryProblems),
+    plus Birdy's own: a custom range needs metrics with daily history. `query` passed the schema."""
+    refinements = query_refinement_problems(query)
+    if refinements:
+        path, message = refinements[0]
+        return _fail("ARGS_INVALID", at + _pointer(path), message)
+    problem = query_type_problem(widget_type, query) or _type_check(widget_type, query, data, metrics)
+    if problem:
+        return _fail(QUERY_SHAPE, at, problem)
+
+    by, over = query.get("by"), query.get("over")
+    for ref in query["metrics"]:
+        metric = metrics.get(ref["metric"])
+        if metric is None:
+            continue  # the schema's enum rejects an unknown metric
+        if by is not None and by not in metric.get("dimensions", []):
+            return _fail("DIMENSION_UNSUPPORTED", f"{at}/by", f'Metric "{metric["key"]}" cannot be split by "{by}"'
+                         + _eligible(metrics, lambda m: by in m.get("dimensions", []),
+                                     f'metrics that can be split by "{by}":', f'no metric can be split by "{by}"'))
+        if over is not None and metric.get("over") is not True:
+            return _fail("GRAIN_UNSUPPORTED", f"{at}/over", f'Metric "{metric["key"]}" cannot be shown over time'
+                         + _eligible(metrics, lambda m: m.get("over") is True,
+                                     "metrics shown over time:", "no metric can be shown over time"))
+    for dim in query.get("filters") or {}:
         if dim not in dimensions:
             return _fail("FILTER_DIMENSION_UNKNOWN", f"{at}/filters/{dim}", f'Unknown filter dimension "{dim}"')
-    window = binding.get("window") or {}
-    if "from" in window and by != "day":
-        # The resolver reads value and by-client numbers from cached presets only;
-        # a custom range would render as an error on the widget.
-        return _fail("WINDOW_UNSUPPORTED", f"{at}/window",
-                     'Custom {from, to} windows only work with by: "day"; '
-                     'use a window preset (e.g. last_30d) or split the metric by "day"')
+
+    window = query["window"]
     if "from" in window:
         for edge in ("from", "to"):
-            if not _ISO_DATE.match(str(window.get(edge, ""))):
-                return _fail("WINDOW_RANGE_INVALID", f"{at}/window/{edge}", f'"{edge}" must be YYYY-MM-DD')
+            if not _is_iso_date(window[edge]):
+                return _fail("WINDOW_RANGE_INVALID", f"{at}/window/{edge}",
+                             f'"{edge}" must be YYYY-MM-DD, got "{window[edge]}"')
         if window["from"] > window["to"]:
-            return _fail("WINDOW_RANGE_INVALID", f"{at}/window/from", '"from" is after "to"')
+            return _fail("WINDOW_RANGE_INVALID", f"{at}/window/from",
+                         f'"from" {window["from"]} is after "to" {window["to"]}')
+        preset_only = next((ref["metric"] for ref in query["metrics"]
+                            if (metrics.get(ref["metric"]) or {}).get("over") is not True), None)
+        if preset_only is not None:
+            # The query engine reads a metric without daily rows from cached presets only, so a custom range
+            # would leave the widget empty.
+            return _fail("WINDOW_UNSUPPORTED", f"{at}/window",
+                         f'"{preset_only}" has no daily history, so it only works with a window preset '
+                         "(e.g. last_30d); custom {from, to} windows need metrics marked over time")
     return None
 
 
@@ -235,11 +315,38 @@ _GRID_COLS = 12
 _ROWS_PER_V1_ROW = 2
 
 
-def _binding_text(slot: str, binding: dict) -> str:
-    window = binding.get("window") or {}
+def _js_number(value):
+    """A number as JavaScript prints it: 3.0 is 3."""
+    return int(value) if isinstance(value, float) and value.is_integer() else value
+
+
+def _query_text(q: dict) -> str:
+    """dashkit's queryText (src/core/summarize.ts): one line with every part of the query, so a `setQuery`
+    (which replaces the whole query) never erases what the model could not see."""
+    window = q.get("window") or {}
     when = window["preset"] if "preset" in window else f'{window.get("from")}..{window.get("to")}'
-    by = f' by {binding["by"]}' if binding.get("by") else ""
-    return f'{slot}→{binding.get("metric")}{by} {when}'
+    metrics = [f'{m.get("metric")}:{json.dumps(m["label"], ensure_ascii=False)}' if "label" in m else m.get("metric")
+               for m in q.get("metrics") or []]
+    text = f'metrics={",".join(map(str, metrics))}'
+    if "by" in q:
+        text += f' by={q["by"]}'
+    if "over" in q:
+        text += f' over={q["over"]}'
+    text += f" window={when}"
+    if "compare" in q:
+        text += " compare"
+    if q.get("spark") is True:
+        text += " spark"
+    elif q.get("spark") is False:
+        text += " nospark"
+    if "sort" in q:
+        text += f' sort={q["sort"].get("metric")}:{q["sort"].get("dir")}'
+    if "limit" in q:
+        text += f' limit={_js_number(q["limit"])}'
+    filters = q.get("filters")
+    if isinstance(filters, dict) and filters:
+        text += " filters=" + ";".join(f'{dim}:{"|".join(filters[dim])}' for dim in sorted(filters))
+    return text
 
 
 def _heading_level(widget: dict) -> int:
@@ -259,7 +366,8 @@ def _grid(widget: dict) -> dict:
     return {k: layout.get(k, 0) for k in ("x", "y", "w", "h")}
 
 
-def _widget_line(widget: dict) -> str:
+def _widget_lines(widget: dict) -> list[str]:
+    """The widget's line, then an indented `query:` line when it has a query."""
     g = _grid(widget)
     title = widget.get("title")
     line = (f'- [{widget.get("id")}] {widget.get("type")} "{"" if title is None else title}" '
@@ -271,16 +379,26 @@ def _widget_line(widget: dict) -> str:
         line += " hidden"
     if widget.get("locked"):
         line += " locked"
-    bindings = (widget.get("bindings") or {}).items()
-    if bindings:
-        line += "  " + "; ".join(_binding_text(slot, b) for slot, b in bindings)
-    return line
+    query = _query_of(widget)
+    return [line, f"{_QUERY_LINE}{_query_text(query)}"] if query is not None else [line]
 
 
-# The v1 → v2 flattening is a port of dashkit's migrateV1toV2 (src/core/migrate.ts)
-# and of the vertical compaction in its normalizeLayout (src/core/layout.ts, itself
-# react-grid-layout's verticalCompactor), so a stored v1 doc gets the same ids,
-# sizes and positions here as in the editor after it migrates the doc on load.
+def _query_of(widget: dict) -> Optional[dict]:
+    bindings = widget.get("bindings")
+    query = bindings.get("query") if isinstance(bindings, dict) else None
+    return query if isinstance(query, dict) else None
+
+
+# The migration is a port of dashkit's migrate() (src/core/migrate.ts) for what the
+# summary shows: migrateV1toV2 (sections onto the grid), migrateV2toV3 (bindings per
+# slot into one query, which may change the type), clampSizes, and the vertical
+# compaction in normalizeLayout (src/core/layout.ts, itself react-grid-layout's
+# verticalCompactor). A stored v1 or v2 doc gets the same ids, types, sizes,
+# positions and queries here as in the editor after it migrates the doc on load.
+# Widget `data` is not migrated (the summary shows none of it but a heading's
+# level, and headings do not change), and there is no catalog: the editor's
+# catalog-aware steps (a non-additive donut becomes a bar chart, a chart or trend
+# keeps only the metrics sharing metric 0's format) are not applied.
 
 
 class _Cell:
@@ -288,9 +406,10 @@ class _Cell:
 
     __slots__ = ("index", "x", "y", "w", "h")
 
-    def __init__(self, index: int, layout: dict):
+    def __init__(self, index: int, widget: dict):
         self.index = index
-        self.x, self.y, self.w, self.h = layout["x"], layout["y"], layout["w"], layout["h"]
+        g = _grid(widget)
+        self.x, self.y, self.w, self.h = g["x"], g["y"], g["w"], g["h"]
 
 
 def _collides(a: _Cell, b: _Cell) -> bool:
@@ -310,7 +429,7 @@ def _resolve_compaction_collision(ordered: list, item: _Cell, move_to_y: int) ->
 
 def _compact(widgets: list[dict]) -> list[dict]:
     """dashkit's normalizeLayout with nothing pinned: vertical compaction, then (y, x, input order)."""
-    cells = [_Cell(i, w["layout"]) for i, w in enumerate(widgets)]
+    cells = [_Cell(i, w) for i, w in enumerate(widgets)]
     ordered = sorted(cells, key=lambda c: (c.y, c.x, c.index))
     placed: list[_Cell] = []
     max_y = 0
@@ -329,8 +448,12 @@ def _compact(widgets: list[dict]) -> list[dict]:
     return out
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _number(value, default):
-    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else default
+    return value if _is_number(value) else default
 
 
 def _v1_size(widget: dict) -> tuple:
@@ -389,13 +512,201 @@ def _flatten_v1(doc: dict) -> list[dict]:
     return _compact(widgets)
 
 
+_GRAINS = ("day", "week", "month")
+_BINDING_KEYS = {"metric", "by", "window", "filters", "compare", "limit", "sort"}
+_MAX_QUERY_LIMIT = 100
+
+
+def _is_window(window) -> bool:
+    """dashkit's WindowSchema: exactly `{preset}` or exactly `{from, to}`, all strings."""
+    if not isinstance(window, dict):
+        return False
+    keys = set(window)
+    return (keys == {"preset"} or keys == {"from", "to"}) and all(isinstance(v, str) for v in window.values())
+
+
+def _parse_binding(binding) -> Optional[dict]:
+    """A v2 binding when it passes dashkit's (strict) BindingSchema, else None."""
+    if not isinstance(binding, dict) or not set(binding) <= _BINDING_KEYS:
+        return None
+    filters = binding.get("filters", {})
+    valid = (isinstance(binding.get("metric"), str) and _is_window(binding.get("window"))
+             and isinstance(binding.get("by", ""), str)
+             and isinstance(filters, dict)
+             and all(isinstance(v, list) and all(isinstance(x, str) for x in v) for v in filters.values())
+             and binding.get("compare", "none") in ("previous", "none")
+             and _is_number(binding.get("limit", 0))
+             and binding.get("sort", "asc") in ("asc", "desc"))
+    return binding if valid else None
+
+
+def _slots_of(bindings) -> dict:
+    """The v2 bindings that parse, by slot name."""
+    if not isinstance(bindings, dict):
+        return {}
+    return {slot: b for slot, value in bindings.items() if (b := _parse_binding(value)) is not None}
+
+
+def _is_grain(by) -> bool:
+    return by in _GRAINS
+
+
+def _limit_of(n) -> Optional[int]:
+    """A v2 limit as a valid query limit (truncated, clamped to 1..100), or None."""
+    if not _is_number(n) or not math.isfinite(n):
+        return None
+    return min(max(math.trunc(n), 1), _MAX_QUERY_LIMIT)
+
+
+def _build_query(entries: list, head: dict, by=None, over=None, sort=None, limit=None, spark=False) -> dict:
+    """dashkit's buildQuery: window and filters from `head`, metrics from every (binding, label) entry (a repeated
+    metric keeps its first label), `compare` when any entry compared; a sort is on the first metric."""
+    metrics: list[dict] = []
+    for binding, label in entries:
+        if any(m["metric"] == binding["metric"] for m in metrics):
+            continue
+        metrics.append({"metric": binding["metric"], "label": label} if label else {"metric": binding["metric"]})
+    query = {"metrics": metrics, "window": head["window"]}
+    if by is not None:
+        query["by"] = by
+    if over is not None:
+        query["over"] = over
+    if "filters" in head:
+        query["filters"] = head["filters"]
+    if any(binding.get("compare") == "previous" for binding, _ in entries):
+        query["compare"] = "previous"
+    if sort is not None:
+        query["sort"] = {"metric": metrics[0]["metric"], "dir": sort}
+    if (limit := _limit_of(limit)) is not None:
+        query["limit"] = limit
+    if spark:
+        query["spark"] = True
+    return query
+
+
+def _to_trend(entries: list, head: dict) -> tuple:
+    return "trend", _build_query(entries, head, over=head["by"] if _is_grain(head.get("by")) else "day")
+
+
+def _to_chart(entries: list, head: dict, data_sort=None) -> tuple:
+    """A chart split by a dimension (client when the binding had none). The sort is the widget's own
+    `data.sort` when it held one, else the binding's."""
+    sort = data_sort if data_sort in ("asc", "desc") else head.get("sort")
+    return "chart", _build_query(entries, head, by=head.get("by", "client"), sort=sort, limit=head.get("limit"))
+
+
+def _convert_v2(widget_type, data: dict, slots: dict) -> Optional[tuple]:
+    """dashkit's convert: (new type, query or None) for one v2 widget; None for a type that has no query (it
+    keeps its type and loses any bindings)."""
+    def only(slot):
+        return [(slots[slot], None)] if slot in slots else []
+
+    if widget_type == "kpi":
+        entries = only("value")
+        return "kpi", (_build_query(entries, entries[0][0], spark=True) if entries else None)
+    if widget_type == "kpi-strip":
+        entries = [e for slot in ("a", "b", "c", "d") for e in only(slot)]
+        if not entries:
+            return "kpi-strip", None
+        query = _build_query(entries, entries[0][0])
+        # A strip needs 2..4 metrics; one left after dropping repeats is a plain kpi.
+        return ("kpi", {**query, "spark": True}) if len(query["metrics"]) < 2 else ("kpi-strip", query)
+    if widget_type == "trend":
+        entries = only("series")
+        if not entries:
+            return "trend", None
+        head = entries[0][0]
+        return _to_trend(entries, head) if head.get("by") is None or _is_grain(head["by"]) else \
+            _to_chart(entries, head)
+    if widget_type in ("bar", "donut"):
+        entries = only("series")
+        if not entries:
+            return "chart", None
+        head = entries[0][0]
+        if _is_grain(head.get("by")):
+            return _to_trend(entries, head)
+        return _to_chart(entries, head, data.get("sort") if widget_type == "bar" else None)
+    if widget_type == "comparison":
+        entries = [(slots[slot], label if isinstance(label, str) and label else None)
+                   for slot, label in (("a", data.get("labelA")), ("b", data.get("labelB"))) if slot in slots]
+        if not entries:
+            return "chart", None
+        head = entries[0][0]
+        return _to_trend(entries, head) if _is_grain(head.get("by")) else _to_chart(entries, head)
+    if widget_type == "funnel":
+        head = slots.get("series")
+        if head is None:
+            return "funnel", None
+        query = _build_query([(head, None)], head)
+        query.pop("compare", None)
+        return "funnel", query
+    if widget_type == "leaderboard":
+        head = slots.get("rows")
+        if head is None:
+            return "leaderboard", None
+        limit = head["limit"] if "limit" in head else (data.get("limit") if _is_number(data.get("limit")) else None)
+        return "leaderboard", _build_query([(head, None)], head, by=head.get("by", "client"), sort=head.get("sort"),
+                                           limit=limit)
+    if widget_type == "table":
+        head = slots.get("rows")
+        if head is None:
+            return "table", None
+        if _is_grain(head.get("by")):
+            return "table", _build_query([(head, None)], head, over=head["by"])
+        return "table", _build_query([(head, None)], head, by=head.get("by", "client"), sort=head.get("sort"),
+                                     limit=head.get("limit"))
+    return None
+
+
+def _migrate_widget_v2(widget: dict) -> dict:
+    """A v2 widget as a v3 one: one `bindings.query`, possibly a new type. Data is kept as is."""
+    rest = {k: v for k, v in widget.items() if k != "bindings"}
+    data = widget.get("data") if isinstance(widget.get("data"), dict) else {}
+    converted = _convert_v2(widget.get("type"), data, _slots_of(widget.get("bindings")))
+    if converted is None:
+        return rest
+    widget_type, query = converted
+    out = {**rest, "type": widget_type}
+    if query is not None:
+        out["bindings"] = {"query": query}
+    return out
+
+
+def _clamp_sizes(widgets: list[dict]) -> list[dict]:
+    """dashkit's clampSizes: each known type's w/h clamped into its range, x shifted so x + w <= 12; when
+    anything changed the layout is compacted again."""
+    changed, out = False, []
+    for widget in widgets:
+        entry = _manifest_entry(widget.get("type"))
+        if not entry:
+            out.append(widget)
+            continue
+        g = _grid(widget)
+        lo, hi = entry["minSize"], entry["maxSize"]
+        w, h = min(max(g["w"], lo["w"]), hi["w"]), min(max(g["h"], lo["h"]), hi["h"])
+        x = min(g["x"], _GRID_COLS - w)
+        if (x, w, h) == (g["x"], g["w"], g["h"]):
+            out.append(widget)
+            continue
+        changed = True
+        out.append({**widget, "layout": {"x": x, "y": g["y"], "w": w, "h": h}})
+    return _compact(out) if changed else out
+
+
+def _is_older_than_v3(version) -> bool:
+    return _is_number(version) and version < 3
+
+
 def _doc_widgets(doc: Optional[dict]) -> list[dict]:
-    """The doc's widgets in dashkit's summary order, (y, x, stored order); a v1 doc is flattened first."""
+    """The doc's widgets in dashkit's summary order, (y, x, stored order). A v1 doc (sections) is flattened and
+    a v1/v2 doc's widgets migrated to v3, as dashkit's migrate() does."""
     doc = doc or {}
     if isinstance(doc.get("widgets"), list):
         widgets = [w for w in doc["widgets"] if isinstance(w, dict)]
+        if _is_older_than_v3(doc.get("version")):
+            widgets = _clamp_sizes([_migrate_widget_v2(w) for w in widgets])
     elif isinstance(doc.get("sections"), list):
-        widgets = _flatten_v1(doc)
+        widgets = _clamp_sizes([_migrate_widget_v2(w) for w in _flatten_v1(doc)])
     else:
         widgets = []
     order = sorted(range(len(widgets)), key=lambda i: (_grid(widgets[i])["y"], _grid(widgets[i])["x"], i))
@@ -403,10 +714,11 @@ def _doc_widgets(doc: Optional[dict]) -> list[dict]:
 
 
 def summarize_doc(doc: dict) -> str:
-    """dashkit's `summarize(doc)`, line for line (src/core/summarize.ts). A v1 doc (sections with spans)
-    is summarized as dashkit's `migrate()` would turn it into v2."""
+    """dashkit's `summarize(doc)`, line for line (src/core/summarize.ts). A v1 or v2 doc is summarized as
+    dashkit's `migrate()` turns it into v3."""
     widgets = _doc_widgets(doc)
-    return "\n".join([f'# {doc.get("title", "")} ({len(widgets)} widgets)', *map(_widget_line, widgets)])
+    lines = [line for widget in widgets for line in _widget_lines(widget)]
+    return "\n".join([f'# {doc.get("title", "")} ({len(widgets)} widgets)', *lines])
 
 
 async def _stored_doc(db, user_id: str, dashboard_id: Optional[str]) -> Optional[dict]:
@@ -425,33 +737,39 @@ class _Layout:
     Mirrors only the id bookkeeping of dashkit's applyAll (positions are left
     to the editor, which places and compacts), plus the current dashboard and
     widget titles (so an op that keeps a title as it is is not rejected for
-    markdown the user typed themselves).
+    markdown the user typed themselves) and each widget's type (a `setQuery`
+    must fit the type the widget has by then).
     """
 
-    def __init__(self, widgets: list[str], title: Optional[str] = None, widget_titles: Optional[dict] = None):
+    def __init__(self, widgets: list[str], title: Optional[str] = None, widget_titles: Optional[dict] = None,
+                 widget_types: Optional[dict] = None):
         self.widgets: list = list(widgets)
         self.title = title
         self.widget_titles: dict = dict(widget_titles or {})
+        self.widget_types: dict = dict(widget_types or {})
 
     @classmethod
     def from_summary(cls, summary: str) -> "_Layout":
         widgets: list[str] = []
-        title, widget_titles = None, {}
+        title, widget_titles, widget_types = None, {}, {}
         for line in summary.splitlines():
+            if line.startswith(_QUERY_LINE):
+                continue  # the query of the widget above; a label in it may look like anything
             if title is None and not widgets and (m := _TITLE_LINE.match(line)):
                 title = m.group(1)
             elif m := _WIDGET_DETAIL.match(line):
                 widgets.append(m.group(1))
+                widget_types[m.group(1)] = m.group(2)
                 widget_titles[m.group(1)] = m.group(3)
             elif m := _WIDGET_LINE.match(line):
                 widgets.append(m.group(1))  # an id is usable even from a line in another format
-        return cls(widgets, title, widget_titles)
+        return cls(widgets, title, widget_titles, widget_types)
 
     @classmethod
     def from_doc(cls, doc: Optional[dict]) -> "_Layout":
         widgets = _doc_widgets(doc)
         return cls([w.get("id") for w in widgets], (doc or {}).get("title"),
-                   {w.get("id"): w.get("title") for w in widgets})
+                   {w.get("id"): w.get("title") for w in widgets}, {w.get("id"): w.get("type") for w in widgets})
 
     def has_widget(self, widget_id) -> bool:
         return widget_id in self.widgets
@@ -490,11 +808,30 @@ class _Layout:
             after = op.get("after")
             index = self.widgets.index(after) + 1 if after in self.widgets else len(self.widgets)
             self.widgets.insert(index, widget["id"])
+            self.widget_types[widget["id"]] = widget.get("type")
             if widget.get("title") is not None:
                 self.widget_titles[widget["id"]] = widget["title"]
+        elif name == "changeWidgetType" and op.get("widgetId") in self.widgets:
+            self.widget_types[op["widgetId"]] = op.get("type")
         elif name == "removeWidget" and op.get("widgetId") in self.widgets:
             self.widgets.remove(op["widgetId"])
             self.widget_titles.pop(op["widgetId"], None)
+            self.widget_types.pop(op["widgetId"], None)
+
+    def query_error(self, op: dict, at: str, metrics: dict, dimensions: set) -> Optional[dict]:
+        """The query a `setQuery` or `addWidget` op sets, checked against the widget's type (as it is by then)
+        and the catalog. A `setQuery` on a type dashkit does not know is WIDGET_TYPE_UNKNOWN, as in its apply."""
+        name = op["op"]
+        if name == "setQuery":
+            widget_type = self.widget_types.get(op["widgetId"])
+            if widget_type is not None and widget_type not in _widget_types():
+                return _fail("WIDGET_TYPE_UNKNOWN", f"{at}/widgetId", f'Unknown widget type "{widget_type}"')
+            return _query_error(op["query"], f"{at}/query", widget_type, None, metrics, dimensions)
+        if name == "addWidget" and "query" in op["widget"]:
+            widget = op["widget"]
+            return _query_error(widget["query"], f"{at}/widget/query", widget["type"], widget.get("data"),
+                                metrics, dimensions)
+        return None
 
 
 async def _layout(db, user_id, dashboard_id, summary, sink) -> _Layout:
@@ -537,20 +874,11 @@ async def dashboard_apply(db, user_id, dashboard_id=None, summary=None, dashboar
         return error
     ops = args["ops"]
     metrics, dimensions = _catalog_index()
-    for i, op in enumerate(ops):
-        at = f"/ops/{i}"
-        if op["op"] == "setBinding":
-            found = _binding_error(op["binding"], f"{at}/binding", metrics, dimensions)
-        elif op["op"] == "addWidget":
-            found = next((e for slot, b in (op["widget"].get("bindings") or {}).items()
-                          if (e := _binding_error(b, f"{at}/widget/bindings/{slot}", metrics, dimensions))), None)
-        else:
-            found = None
-        if found:
-            return found
     layout = await _layout(db, user_id, dashboard_id, summary, dashboard_ops_sink)
     for i, op in enumerate(ops):
-        found = layout.check(op, f"/ops/{i}") or _op_title_error(op, f"/ops/{i}", layout)
+        at = f"/ops/{i}"
+        found = (layout.check(op, at) or _op_title_error(op, at, layout)
+                 or layout.query_error(op, at, metrics, dimensions))
         if found:
             return found
         layout.apply(op)
@@ -559,7 +887,7 @@ async def dashboard_apply(db, user_id, dashboard_id=None, summary=None, dashboar
 
 async def dashboard_propose_widget(db, user_id, dashboard_id=None, summary=None, dashboard_ops_sink=None,
                                    mongo_client=None, **args):
-    """dashkit's proposeTool: one `addWidget` (bindings inside the widget), placed `after` a widget
+    """dashkit's proposeTool: one `addWidget` (the query inside the widget), placed `after` a widget
     when given, else at the bottom; the editor applies the type's default size when `size` is omitted."""
     error = _schema_error(_VALIDATORS["dashboard_propose_widget"], args) or _title_error(args.get("title"), "/title")
     if error:
@@ -575,16 +903,8 @@ async def dashboard_propose_widget(db, user_id, dashboard_id=None, summary=None,
                              f'Size {size["w"]}x{size["h"]} for "{args["type"]}" must be between '
                              f'{lo["w"]}x{lo["h"]} and {hi["w"]}x{hi["h"]}')
 
-    bindings = args.get("bindings") or {}
-    slots = {s["name"]: s for s in entry.get("slots", [])}
-    for name, slot in slots.items():
-        if slot.get("required") and name not in bindings:
-            return _fail("SLOT_REQUIRED", f"/bindings/{name}", f'Slot "{name}" must be bound')
-    metrics, dimensions = _catalog_index()
-    for name, binding in bindings.items():
-        if name not in slots:
-            return _fail("SLOT_UNKNOWN", f"/bindings/{name}", f'"{args["type"]}" has no slot "{name}"')
-        found = _binding_error(binding, f"/bindings/{name}", metrics, dimensions)
+    if "query" in args:
+        found = _query_error(args["query"], "/query", args["type"], args.get("data"), *_catalog_index())
         if found:
             return found
 
@@ -596,11 +916,9 @@ async def dashboard_propose_widget(db, user_id, dashboard_id=None, summary=None,
 
     widget_id = uuid4().hex[:12]
     widget = {"id": widget_id, "type": args["type"]}
-    for key in ("title", "size", "data"):
+    for key in ("title", "size", "data", "query"):
         if key in args:
             widget[key] = args[key]
-    if bindings:
-        widget["bindings"] = bindings
     op = {"op": "addWidget", "widget": widget}
     if after is not None:
         op["after"] = after

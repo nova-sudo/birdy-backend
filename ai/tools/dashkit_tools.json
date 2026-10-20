@@ -1,7 +1,7 @@
 [
   {
     "name": "dashboard_describe",
-    "description": "Return a compact outline of the current dashboard: one line per widget in reading order (top to bottom, left to right) with its id, type, title, size w×h, grid position @x,y and bindings; `heading` widgets title the groups below them. Call this first whenever you edit an existing dashboard.",
+    "description": "Return a compact outline of the current dashboard: one line per widget in reading order (top to bottom, left to right) with its id, type, title, size w×h, grid position @x,y and its query; `heading` widgets title the groups below them. Call this first whenever you edit an existing dashboard.",
     "parameters": {
       "type": "object",
       "properties": {},
@@ -10,7 +10,7 @@
   },
   {
     "name": "dashboard_apply",
-    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addWidget, removeWidget, moveWidget, resizeWidget, setLayout, changeWidgetType, updateWidget, updateWidgetData, setWidgetValue, setBinding, clearBinding, setTitle. Use ids from dashboard_describe.",
+    "description": "Apply a list of edit ops to the dashboard, in order and atomically. If any op fails, or the edit introduces new validation errors, nothing changes and an error with a code and path is returned; validation errors that already existed do not block the edit. Available ops: addWidget, removeWidget, moveWidget, resizeWidget, setLayout, changeWidgetType, updateWidget, updateWidgetData, setWidgetValue, setQuery, clearQuery, setTitle. Use ids from dashboard_describe.",
     "parameters": {
       "type": "object",
       "properties": {
@@ -37,9 +37,7 @@
                           "text",
                           "briefing",
                           "trend",
-                          "bar",
-                          "donut",
-                          "comparison",
+                          "chart",
                           "funnel",
                           "leaderboard",
                           "table"
@@ -95,34 +93,29 @@
                             "description": "data for \"kpi\"",
                             "type": "object",
                             "properties": {
-                              "showDelta": {
-                                "type": "boolean"
-                              },
-                              "emphasis": {
+                              "sparkStyle": {
                                 "type": "string",
                                 "enum": [
-                                  "normal",
-                                  "large"
+                                  "line",
+                                  "bar"
                                 ]
+                              },
+                              "goal": {
+                                "type": "number"
+                              },
+                              "description": {
+                                "type": "string"
                               }
                             },
                             "required": [
-                              "showDelta",
-                              "emphasis"
+                              "sparkStyle"
                             ],
                             "additionalProperties": false
                           },
                           {
                             "description": "data for \"kpi-strip\"",
                             "type": "object",
-                            "properties": {
-                              "showDelta": {
-                                "type": "boolean"
-                              }
-                            },
-                            "required": [
-                              "showDelta"
-                            ],
+                            "properties": {},
                             "additionalProperties": false
                           },
                           {
@@ -142,72 +135,10 @@
                             "description": "data for \"briefing\"",
                             "type": "object",
                             "properties": {
-                              "parts": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "properties": {
-                                    "text": {
-                                      "type": "string"
-                                    },
-                                    "strong": {
-                                      "type": "boolean"
-                                    }
-                                  },
-                                  "required": [
-                                    "text"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              },
-                              "findings": {
-                                "type": "array",
-                                "items": {
-                                  "type": "object",
-                                  "properties": {
-                                    "tone": {
-                                      "type": "string",
-                                      "enum": [
-                                        "positive",
-                                        "negative",
-                                        "neutral",
-                                        "warning"
-                                      ]
-                                    },
-                                    "parts": {
-                                      "type": "array",
-                                      "items": {
-                                        "type": "object",
-                                        "properties": {
-                                          "text": {
-                                            "type": "string"
-                                          },
-                                          "strong": {
-                                            "type": "boolean"
-                                          }
-                                        },
-                                        "required": [
-                                          "text"
-                                        ],
-                                        "additionalProperties": false
-                                      }
-                                    }
-                                  },
-                                  "required": [
-                                    "tone",
-                                    "parts"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              },
-                              "prompt": {
+                              "focus": {
                                 "type": "string"
                               }
                             },
-                            "required": [
-                              "parts",
-                              "findings"
-                            ],
                             "additionalProperties": false
                           },
                           {
@@ -233,9 +164,18 @@
                             "additionalProperties": false
                           },
                           {
-                            "description": "data for \"bar\"",
+                            "description": "data for \"chart\"",
                             "type": "object",
                             "properties": {
+                              "chart": {
+                                "type": "string",
+                                "enum": [
+                                  "bar",
+                                  "line",
+                                  "area",
+                                  "donut"
+                                ]
+                              },
                               "orientation": {
                                 "type": "string",
                                 "enum": [
@@ -243,48 +183,14 @@
                                   "horizontal"
                                 ]
                               },
-                              "sort": {
-                                "type": "string",
-                                "enum": [
-                                  "none",
-                                  "asc",
-                                  "desc"
-                                ]
-                              }
-                            },
-                            "required": [
-                              "orientation",
-                              "sort"
-                            ],
-                            "additionalProperties": false
-                          },
-                          {
-                            "description": "data for \"donut\"",
-                            "type": "object",
-                            "properties": {
-                              "showLegend": {
+                              "stacked": {
                                 "type": "boolean"
                               }
                             },
                             "required": [
-                              "showLegend"
-                            ],
-                            "additionalProperties": false
-                          },
-                          {
-                            "description": "data for \"comparison\"",
-                            "type": "object",
-                            "properties": {
-                              "labelA": {
-                                "type": "string"
-                              },
-                              "labelB": {
-                                "type": "string"
-                              }
-                            },
-                            "required": [
-                              "labelA",
-                              "labelB"
+                              "chart",
+                              "orientation",
+                              "stacked"
                             ],
                             "additionalProperties": false
                           },
@@ -292,12 +198,16 @@
                             "description": "data for \"funnel\"",
                             "type": "object",
                             "properties": {
-                              "showConversion": {
+                              "showPercentOfFirst": {
+                                "type": "boolean"
+                              },
+                              "showPercentOfPrevious": {
                                 "type": "boolean"
                               }
                             },
                             "required": [
-                              "showConversion"
+                              "showPercentOfFirst",
+                              "showPercentOfPrevious"
                             ],
                             "additionalProperties": false
                           },
@@ -305,17 +215,15 @@
                             "description": "data for \"leaderboard\"",
                             "type": "object",
                             "properties": {
-                              "limit": {
-                                "type": "integer",
-                                "minimum": 1,
-                                "maximum": 50
+                              "showChange": {
+                                "type": "boolean"
                               },
                               "showRank": {
                                 "type": "boolean"
                               }
                             },
                             "required": [
-                              "limit",
+                              "showChange",
                               "showRank"
                             ],
                             "additionalProperties": false
@@ -324,165 +232,251 @@
                             "description": "data for \"table\"",
                             "type": "object",
                             "properties": {
-                              "columns": {
-                                "type": "array",
-                                "items": {
-                                  "type": "string"
-                                }
+                              "totals": {
+                                "type": "boolean"
                               },
                               "dense": {
                                 "type": "boolean"
                               }
                             },
                             "required": [
-                              "columns",
+                              "totals",
                               "dense"
                             ],
                             "additionalProperties": false
                           }
                         ]
                       },
-                      "bindings": {
+                      "query": {
                         "type": "object",
-                        "additionalProperties": {
-                          "type": "object",
-                          "properties": {
-                            "metric": {
-                              "type": "string",
-                              "enum": [
-                                "meta_spend",
-                                "meta_impressions",
-                                "meta_clicks",
-                                "meta_reach",
-                                "meta_results",
-                                "meta_leads",
-                                "meta_ctr",
-                                "meta_cpc",
-                                "meta_cpm",
-                                "spend",
-                                "impressions",
-                                "clicks",
-                                "reach",
-                                "results",
-                                "leads",
-                                "ctr",
-                                "cpc",
-                                "cpm",
-                                "cpl",
-                                "cost_per_result",
-                                "frequency",
-                                "ghl_won_opps",
-                                "ghl_lost_opps",
-                                "ghl_open_opps",
-                                "ghl_abandoned_opps",
-                                "ghl_total_opps",
-                                "ghl_revenue",
-                                "ghl_conversion",
-                                "ghl_contacts",
-                                "ghl_leads",
-                                "total_tags",
-                                "hp_leads",
-                                "hp_total_calls",
-                                "hp_inbound",
-                                "hp_outbound",
-                                "hp_transfers",
-                                "hp_leads_with_calls",
-                                "hp_answered_calls",
-                                "hp_talk_time",
-                                "hp_connect_rate",
-                                "hp_answer_rate",
-                                "conversion_rate",
-                                "cost_per_lead",
-                                "engagement_rate"
-                              ]
+                        "properties": {
+                          "metrics": {
+                            "type": "array",
+                            "items": {
+                              "type": "object",
+                              "properties": {
+                                "metric": {
+                                  "type": "string",
+                                  "enum": [
+                                    "meta_spend",
+                                    "meta_impressions",
+                                    "meta_clicks",
+                                    "meta_reach",
+                                    "meta_results",
+                                    "meta_leads",
+                                    "meta_ctr",
+                                    "meta_cpc",
+                                    "meta_cpm",
+                                    "spend",
+                                    "impressions",
+                                    "clicks",
+                                    "reach",
+                                    "results",
+                                    "leads",
+                                    "ctr",
+                                    "cpc",
+                                    "cpm",
+                                    "cpl",
+                                    "cost_per_result",
+                                    "frequency",
+                                    "ghl_won_opps",
+                                    "ghl_lost_opps",
+                                    "ghl_open_opps",
+                                    "ghl_abandoned_opps",
+                                    "ghl_total_opps",
+                                    "ghl_revenue",
+                                    "ghl_conversion",
+                                    "ghl_contacts",
+                                    "ghl_leads",
+                                    "total_tags",
+                                    "hp_leads",
+                                    "hp_total_calls",
+                                    "hp_inbound",
+                                    "hp_outbound",
+                                    "hp_transfers",
+                                    "hp_leads_with_calls",
+                                    "hp_answered_calls",
+                                    "hp_talk_time",
+                                    "hp_connect_rate",
+                                    "hp_answer_rate",
+                                    "conversion_rate",
+                                    "cost_per_lead",
+                                    "engagement_rate"
+                                  ]
+                                },
+                                "label": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "metric"
+                              ],
+                              "additionalProperties": false
                             },
-                            "by": {
-                              "type": "string",
+                            "minItems": 1,
+                            "maxItems": 20
+                          },
+                          "by": {
+                            "type": "string",
+                            "enum": [
+                              "client",
+                              "day"
+                            ]
+                          },
+                          "over": {
+                            "type": "string",
+                            "enum": [
+                              "day",
+                              "week",
+                              "month"
+                            ]
+                          },
+                          "window": {
+                            "anyOf": [
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "preset": {
+                                    "type": "string",
+                                    "enum": [
+                                      "maximum",
+                                      "today",
+                                      "yesterday",
+                                      "this_week",
+                                      "last_7d",
+                                      "last_14d",
+                                      "last_30d",
+                                      "this_month",
+                                      "last_month",
+                                      "this_quarter",
+                                      "last_quarter",
+                                      "this_year",
+                                      "last_year"
+                                    ]
+                                  }
+                                },
+                                "required": [
+                                  "preset"
+                                ],
+                                "additionalProperties": false
+                              },
+                              {
+                                "type": "object",
+                                "properties": {
+                                  "from": {
+                                    "type": "string"
+                                  },
+                                  "to": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "from",
+                                  "to"
+                                ],
+                                "additionalProperties": false
+                              }
+                            ]
+                          },
+                          "filters": {
+                            "type": "object",
+                            "additionalProperties": {
+                              "type": "array",
+                              "items": {
+                                "type": "string"
+                              }
+                            },
+                            "propertyNames": {
                               "enum": [
                                 "client",
                                 "day"
                               ]
-                            },
-                            "window": {
-                              "anyOf": [
-                                {
-                                  "type": "object",
-                                  "properties": {
-                                    "preset": {
-                                      "type": "string",
-                                      "enum": [
-                                        "maximum",
-                                        "today",
-                                        "yesterday",
-                                        "this_week",
-                                        "last_7d",
-                                        "last_14d",
-                                        "last_30d",
-                                        "this_month",
-                                        "last_month",
-                                        "this_quarter",
-                                        "last_quarter",
-                                        "this_year",
-                                        "last_year"
-                                      ]
-                                    }
-                                  },
-                                  "required": [
-                                    "preset"
-                                  ],
-                                  "additionalProperties": false
-                                },
-                                {
-                                  "type": "object",
-                                  "properties": {
-                                    "from": {
-                                      "type": "string"
-                                    },
-                                    "to": {
-                                      "type": "string"
-                                    }
-                                  },
-                                  "required": [
-                                    "from",
-                                    "to"
-                                  ],
-                                  "additionalProperties": false
-                                }
-                              ]
-                            },
-                            "filters": {
-                              "type": "object",
-                              "additionalProperties": {
-                                "type": "array",
-                                "items": {
-                                  "type": "string"
-                                }
-                              }
-                            },
-                            "compare": {
-                              "type": "string",
-                              "enum": [
-                                "previous",
-                                "none"
-                              ]
-                            },
-                            "limit": {
-                              "type": "number"
-                            },
-                            "sort": {
-                              "type": "string",
-                              "enum": [
-                                "asc",
-                                "desc"
-                              ]
                             }
                           },
-                          "required": [
-                            "metric",
-                            "window"
-                          ],
-                          "additionalProperties": false
-                        }
+                          "compare": {
+                            "type": "string",
+                            "const": "previous"
+                          },
+                          "sort": {
+                            "type": "object",
+                            "properties": {
+                              "metric": {
+                                "type": "string",
+                                "enum": [
+                                  "meta_spend",
+                                  "meta_impressions",
+                                  "meta_clicks",
+                                  "meta_reach",
+                                  "meta_results",
+                                  "meta_leads",
+                                  "meta_ctr",
+                                  "meta_cpc",
+                                  "meta_cpm",
+                                  "spend",
+                                  "impressions",
+                                  "clicks",
+                                  "reach",
+                                  "results",
+                                  "leads",
+                                  "ctr",
+                                  "cpc",
+                                  "cpm",
+                                  "cpl",
+                                  "cost_per_result",
+                                  "frequency",
+                                  "ghl_won_opps",
+                                  "ghl_lost_opps",
+                                  "ghl_open_opps",
+                                  "ghl_abandoned_opps",
+                                  "ghl_total_opps",
+                                  "ghl_revenue",
+                                  "ghl_conversion",
+                                  "ghl_contacts",
+                                  "ghl_leads",
+                                  "total_tags",
+                                  "hp_leads",
+                                  "hp_total_calls",
+                                  "hp_inbound",
+                                  "hp_outbound",
+                                  "hp_transfers",
+                                  "hp_leads_with_calls",
+                                  "hp_answered_calls",
+                                  "hp_talk_time",
+                                  "hp_connect_rate",
+                                  "hp_answer_rate",
+                                  "conversion_rate",
+                                  "cost_per_lead",
+                                  "engagement_rate"
+                                ]
+                              },
+                              "dir": {
+                                "type": "string",
+                                "enum": [
+                                  "asc",
+                                  "desc"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "metric",
+                              "dir"
+                            ],
+                            "additionalProperties": false
+                          },
+                          "limit": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 100
+                          },
+                          "spark": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "metrics",
+                          "window"
+                        ],
+                        "additionalProperties": false
                       }
                     },
                     "required": [
@@ -685,9 +679,7 @@
                       "text",
                       "briefing",
                       "trend",
-                      "bar",
-                      "donut",
-                      "comparison",
+                      "chart",
                       "funnel",
                       "leaderboard",
                       "table"
@@ -783,71 +775,93 @@
                 "properties": {
                   "op": {
                     "type": "string",
-                    "const": "setBinding"
+                    "const": "setQuery"
                   },
                   "widgetId": {
                     "type": "string"
                   },
-                  "slot": {
-                    "type": "string"
-                  },
-                  "binding": {
+                  "query": {
                     "type": "object",
                     "properties": {
-                      "metric": {
-                        "type": "string",
-                        "enum": [
-                          "meta_spend",
-                          "meta_impressions",
-                          "meta_clicks",
-                          "meta_reach",
-                          "meta_results",
-                          "meta_leads",
-                          "meta_ctr",
-                          "meta_cpc",
-                          "meta_cpm",
-                          "spend",
-                          "impressions",
-                          "clicks",
-                          "reach",
-                          "results",
-                          "leads",
-                          "ctr",
-                          "cpc",
-                          "cpm",
-                          "cpl",
-                          "cost_per_result",
-                          "frequency",
-                          "ghl_won_opps",
-                          "ghl_lost_opps",
-                          "ghl_open_opps",
-                          "ghl_abandoned_opps",
-                          "ghl_total_opps",
-                          "ghl_revenue",
-                          "ghl_conversion",
-                          "ghl_contacts",
-                          "ghl_leads",
-                          "total_tags",
-                          "hp_leads",
-                          "hp_total_calls",
-                          "hp_inbound",
-                          "hp_outbound",
-                          "hp_transfers",
-                          "hp_leads_with_calls",
-                          "hp_answered_calls",
-                          "hp_talk_time",
-                          "hp_connect_rate",
-                          "hp_answer_rate",
-                          "conversion_rate",
-                          "cost_per_lead",
-                          "engagement_rate"
-                        ]
+                      "metrics": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "properties": {
+                            "metric": {
+                              "type": "string",
+                              "enum": [
+                                "meta_spend",
+                                "meta_impressions",
+                                "meta_clicks",
+                                "meta_reach",
+                                "meta_results",
+                                "meta_leads",
+                                "meta_ctr",
+                                "meta_cpc",
+                                "meta_cpm",
+                                "spend",
+                                "impressions",
+                                "clicks",
+                                "reach",
+                                "results",
+                                "leads",
+                                "ctr",
+                                "cpc",
+                                "cpm",
+                                "cpl",
+                                "cost_per_result",
+                                "frequency",
+                                "ghl_won_opps",
+                                "ghl_lost_opps",
+                                "ghl_open_opps",
+                                "ghl_abandoned_opps",
+                                "ghl_total_opps",
+                                "ghl_revenue",
+                                "ghl_conversion",
+                                "ghl_contacts",
+                                "ghl_leads",
+                                "total_tags",
+                                "hp_leads",
+                                "hp_total_calls",
+                                "hp_inbound",
+                                "hp_outbound",
+                                "hp_transfers",
+                                "hp_leads_with_calls",
+                                "hp_answered_calls",
+                                "hp_talk_time",
+                                "hp_connect_rate",
+                                "hp_answer_rate",
+                                "conversion_rate",
+                                "cost_per_lead",
+                                "engagement_rate"
+                              ]
+                            },
+                            "label": {
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "metric"
+                          ],
+                          "additionalProperties": false
+                        },
+                        "minItems": 1,
+                        "maxItems": 20
                       },
                       "by": {
                         "type": "string",
                         "enum": [
                           "client",
                           "day"
+                        ]
+                      },
+                      "over": {
+                        "type": "string",
+                        "enum": [
+                          "day",
+                          "week",
+                          "month"
                         ]
                       },
                       "window": {
@@ -904,28 +918,95 @@
                           "items": {
                             "type": "string"
                           }
+                        },
+                        "propertyNames": {
+                          "enum": [
+                            "client",
+                            "day"
+                          ]
                         }
                       },
                       "compare": {
                         "type": "string",
-                        "enum": [
-                          "previous",
-                          "none"
-                        ]
-                      },
-                      "limit": {
-                        "type": "number"
+                        "const": "previous"
                       },
                       "sort": {
-                        "type": "string",
-                        "enum": [
-                          "asc",
-                          "desc"
-                        ]
+                        "type": "object",
+                        "properties": {
+                          "metric": {
+                            "type": "string",
+                            "enum": [
+                              "meta_spend",
+                              "meta_impressions",
+                              "meta_clicks",
+                              "meta_reach",
+                              "meta_results",
+                              "meta_leads",
+                              "meta_ctr",
+                              "meta_cpc",
+                              "meta_cpm",
+                              "spend",
+                              "impressions",
+                              "clicks",
+                              "reach",
+                              "results",
+                              "leads",
+                              "ctr",
+                              "cpc",
+                              "cpm",
+                              "cpl",
+                              "cost_per_result",
+                              "frequency",
+                              "ghl_won_opps",
+                              "ghl_lost_opps",
+                              "ghl_open_opps",
+                              "ghl_abandoned_opps",
+                              "ghl_total_opps",
+                              "ghl_revenue",
+                              "ghl_conversion",
+                              "ghl_contacts",
+                              "ghl_leads",
+                              "total_tags",
+                              "hp_leads",
+                              "hp_total_calls",
+                              "hp_inbound",
+                              "hp_outbound",
+                              "hp_transfers",
+                              "hp_leads_with_calls",
+                              "hp_answered_calls",
+                              "hp_talk_time",
+                              "hp_connect_rate",
+                              "hp_answer_rate",
+                              "conversion_rate",
+                              "cost_per_lead",
+                              "engagement_rate"
+                            ]
+                          },
+                          "dir": {
+                            "type": "string",
+                            "enum": [
+                              "asc",
+                              "desc"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "metric",
+                          "dir"
+                        ],
+                        "additionalProperties": false
+                      },
+                      "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100
+                      },
+                      "spark": {
+                        "type": "boolean"
                       }
                     },
                     "required": [
-                      "metric",
+                      "metrics",
                       "window"
                     ],
                     "additionalProperties": false
@@ -934,8 +1015,7 @@
                 "required": [
                   "op",
                   "widgetId",
-                  "slot",
-                  "binding"
+                  "query"
                 ],
                 "additionalProperties": false
               },
@@ -944,19 +1024,15 @@
                 "properties": {
                   "op": {
                     "type": "string",
-                    "const": "clearBinding"
+                    "const": "clearQuery"
                   },
                   "widgetId": {
-                    "type": "string"
-                  },
-                  "slot": {
                     "type": "string"
                   }
                 },
                 "required": [
                   "op",
-                  "widgetId",
-                  "slot"
+                  "widgetId"
                 ],
                 "additionalProperties": false
               },
@@ -992,7 +1068,7 @@
   },
   {
     "name": "dashboard_propose_widget",
-    "description": "Add one new widget bound to catalog metrics, or a `heading` to start a new group; the widget id is generated for you and returned as `widgetId`. Use `after` to place it under a heading or next to a widget. Slots per type: heading: none; kpi: value (value, required), spark (series, optional); kpi-strip: a (value, required), b (value, required), c (value, optional), d (value, optional); text: none; briefing: none; trend: series (series, required); bar: series (series, required); donut: series (series, required); comparison: a (series, required), b (series, required); funnel: series (series, required); leaderboard: rows (table, required); table: rows (table, required).",
+    "description": "Add one new widget with a `query` over catalog metrics, or a `heading` to start a new group; the widget id is generated for you and returned as `widgetId`. Use `after` to place it under a heading or next to a widget. Query rules per type: heading: no query; kpi: exactly 1 metric, no by, no over; kpi-strip: 2..4 metrics, no by, no over; text: no query; briefing: no query; trend: 1..4 metrics, over required, by optional (exactly 1 metric with by); chart: 1..4 metrics, by required, no over; funnel: 1..8 metrics, no by, no over; leaderboard: 1..3 metrics, by required, no over; table: 1..20 metrics, by optional, over optional (exactly one of by / over).",
     "parameters": {
       "type": "object",
       "properties": {
@@ -1005,9 +1081,7 @@
             "text",
             "briefing",
             "trend",
-            "bar",
-            "donut",
-            "comparison",
+            "chart",
             "funnel",
             "leaderboard",
             "table"
@@ -1042,148 +1116,237 @@
           "type": "string",
           "description": "Id of an existing widget: the new one goes right of it if it fits, else on the row below it. Pass a heading id to add a widget under that heading. Omit to add at the bottom."
         },
-        "bindings": {
+        "query": {
           "type": "object",
-          "description": "Slot name → binding. Bind every required slot of the chosen type.",
-          "additionalProperties": {
-            "type": "object",
-            "properties": {
-              "metric": {
-                "type": "string",
-                "enum": [
-                  "meta_spend",
-                  "meta_impressions",
-                  "meta_clicks",
-                  "meta_reach",
-                  "meta_results",
-                  "meta_leads",
-                  "meta_ctr",
-                  "meta_cpc",
-                  "meta_cpm",
-                  "spend",
-                  "impressions",
-                  "clicks",
-                  "reach",
-                  "results",
-                  "leads",
-                  "ctr",
-                  "cpc",
-                  "cpm",
-                  "cpl",
-                  "cost_per_result",
-                  "frequency",
-                  "ghl_won_opps",
-                  "ghl_lost_opps",
-                  "ghl_open_opps",
-                  "ghl_abandoned_opps",
-                  "ghl_total_opps",
-                  "ghl_revenue",
-                  "ghl_conversion",
-                  "ghl_contacts",
-                  "ghl_leads",
-                  "total_tags",
-                  "hp_leads",
-                  "hp_total_calls",
-                  "hp_inbound",
-                  "hp_outbound",
-                  "hp_transfers",
-                  "hp_leads_with_calls",
-                  "hp_answered_calls",
-                  "hp_talk_time",
-                  "hp_connect_rate",
-                  "hp_answer_rate",
-                  "conversion_rate",
-                  "cost_per_lead",
-                  "engagement_rate"
-                ]
+          "properties": {
+            "metrics": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "properties": {
+                  "metric": {
+                    "type": "string",
+                    "enum": [
+                      "meta_spend",
+                      "meta_impressions",
+                      "meta_clicks",
+                      "meta_reach",
+                      "meta_results",
+                      "meta_leads",
+                      "meta_ctr",
+                      "meta_cpc",
+                      "meta_cpm",
+                      "spend",
+                      "impressions",
+                      "clicks",
+                      "reach",
+                      "results",
+                      "leads",
+                      "ctr",
+                      "cpc",
+                      "cpm",
+                      "cpl",
+                      "cost_per_result",
+                      "frequency",
+                      "ghl_won_opps",
+                      "ghl_lost_opps",
+                      "ghl_open_opps",
+                      "ghl_abandoned_opps",
+                      "ghl_total_opps",
+                      "ghl_revenue",
+                      "ghl_conversion",
+                      "ghl_contacts",
+                      "ghl_leads",
+                      "total_tags",
+                      "hp_leads",
+                      "hp_total_calls",
+                      "hp_inbound",
+                      "hp_outbound",
+                      "hp_transfers",
+                      "hp_leads_with_calls",
+                      "hp_answered_calls",
+                      "hp_talk_time",
+                      "hp_connect_rate",
+                      "hp_answer_rate",
+                      "conversion_rate",
+                      "cost_per_lead",
+                      "engagement_rate"
+                    ]
+                  },
+                  "label": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "metric"
+                ],
+                "additionalProperties": false
               },
-              "by": {
-                "type": "string",
+              "minItems": 1,
+              "maxItems": 20
+            },
+            "by": {
+              "type": "string",
+              "enum": [
+                "client",
+                "day"
+              ]
+            },
+            "over": {
+              "type": "string",
+              "enum": [
+                "day",
+                "week",
+                "month"
+              ]
+            },
+            "window": {
+              "anyOf": [
+                {
+                  "type": "object",
+                  "properties": {
+                    "preset": {
+                      "type": "string",
+                      "enum": [
+                        "maximum",
+                        "today",
+                        "yesterday",
+                        "this_week",
+                        "last_7d",
+                        "last_14d",
+                        "last_30d",
+                        "this_month",
+                        "last_month",
+                        "this_quarter",
+                        "last_quarter",
+                        "this_year",
+                        "last_year"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "preset"
+                  ],
+                  "additionalProperties": false
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "from": {
+                      "type": "string"
+                    },
+                    "to": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "from",
+                    "to"
+                  ],
+                  "additionalProperties": false
+                }
+              ]
+            },
+            "filters": {
+              "type": "object",
+              "additionalProperties": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                }
+              },
+              "propertyNames": {
                 "enum": [
                   "client",
                   "day"
                 ]
-              },
-              "window": {
-                "anyOf": [
-                  {
-                    "type": "object",
-                    "properties": {
-                      "preset": {
-                        "type": "string",
-                        "enum": [
-                          "maximum",
-                          "today",
-                          "yesterday",
-                          "this_week",
-                          "last_7d",
-                          "last_14d",
-                          "last_30d",
-                          "this_month",
-                          "last_month",
-                          "this_quarter",
-                          "last_quarter",
-                          "this_year",
-                          "last_year"
-                        ]
-                      }
-                    },
-                    "required": [
-                      "preset"
-                    ],
-                    "additionalProperties": false
-                  },
-                  {
-                    "type": "object",
-                    "properties": {
-                      "from": {
-                        "type": "string"
-                      },
-                      "to": {
-                        "type": "string"
-                      }
-                    },
-                    "required": [
-                      "from",
-                      "to"
-                    ],
-                    "additionalProperties": false
-                  }
-                ]
-              },
-              "filters": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
-                }
-              },
-              "compare": {
-                "type": "string",
-                "enum": [
-                  "previous",
-                  "none"
-                ]
-              },
-              "limit": {
-                "type": "number"
-              },
-              "sort": {
-                "type": "string",
-                "enum": [
-                  "asc",
-                  "desc"
-                ]
               }
             },
-            "required": [
-              "metric",
-              "window"
-            ],
-            "additionalProperties": false
-          }
+            "compare": {
+              "type": "string",
+              "const": "previous"
+            },
+            "sort": {
+              "type": "object",
+              "properties": {
+                "metric": {
+                  "type": "string",
+                  "enum": [
+                    "meta_spend",
+                    "meta_impressions",
+                    "meta_clicks",
+                    "meta_reach",
+                    "meta_results",
+                    "meta_leads",
+                    "meta_ctr",
+                    "meta_cpc",
+                    "meta_cpm",
+                    "spend",
+                    "impressions",
+                    "clicks",
+                    "reach",
+                    "results",
+                    "leads",
+                    "ctr",
+                    "cpc",
+                    "cpm",
+                    "cpl",
+                    "cost_per_result",
+                    "frequency",
+                    "ghl_won_opps",
+                    "ghl_lost_opps",
+                    "ghl_open_opps",
+                    "ghl_abandoned_opps",
+                    "ghl_total_opps",
+                    "ghl_revenue",
+                    "ghl_conversion",
+                    "ghl_contacts",
+                    "ghl_leads",
+                    "total_tags",
+                    "hp_leads",
+                    "hp_total_calls",
+                    "hp_inbound",
+                    "hp_outbound",
+                    "hp_transfers",
+                    "hp_leads_with_calls",
+                    "hp_answered_calls",
+                    "hp_talk_time",
+                    "hp_connect_rate",
+                    "hp_answer_rate",
+                    "conversion_rate",
+                    "cost_per_lead",
+                    "engagement_rate"
+                  ]
+                },
+                "dir": {
+                  "type": "string",
+                  "enum": [
+                    "asc",
+                    "desc"
+                  ]
+                }
+              },
+              "required": [
+                "metric",
+                "dir"
+              ],
+              "additionalProperties": false
+            },
+            "limit": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100
+            },
+            "spark": {
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "metrics",
+            "window"
+          ],
+          "additionalProperties": false,
+          "description": "What the widget shows: ordered metrics, optional by / over, a window. Must fit the type's query rules."
         },
         "data": {
           "description": "The widget's data; omit to use the type defaults.",
@@ -1210,34 +1373,29 @@
               "description": "data for \"kpi\"",
               "type": "object",
               "properties": {
-                "showDelta": {
-                  "type": "boolean"
-                },
-                "emphasis": {
+                "sparkStyle": {
                   "type": "string",
                   "enum": [
-                    "normal",
-                    "large"
+                    "line",
+                    "bar"
                   ]
+                },
+                "goal": {
+                  "type": "number"
+                },
+                "description": {
+                  "type": "string"
                 }
               },
               "required": [
-                "showDelta",
-                "emphasis"
+                "sparkStyle"
               ],
               "additionalProperties": false
             },
             {
               "description": "data for \"kpi-strip\"",
               "type": "object",
-              "properties": {
-                "showDelta": {
-                  "type": "boolean"
-                }
-              },
-              "required": [
-                "showDelta"
-              ],
+              "properties": {},
               "additionalProperties": false
             },
             {
@@ -1257,72 +1415,10 @@
               "description": "data for \"briefing\"",
               "type": "object",
               "properties": {
-                "parts": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "text": {
-                        "type": "string"
-                      },
-                      "strong": {
-                        "type": "boolean"
-                      }
-                    },
-                    "required": [
-                      "text"
-                    ],
-                    "additionalProperties": false
-                  }
-                },
-                "findings": {
-                  "type": "array",
-                  "items": {
-                    "type": "object",
-                    "properties": {
-                      "tone": {
-                        "type": "string",
-                        "enum": [
-                          "positive",
-                          "negative",
-                          "neutral",
-                          "warning"
-                        ]
-                      },
-                      "parts": {
-                        "type": "array",
-                        "items": {
-                          "type": "object",
-                          "properties": {
-                            "text": {
-                              "type": "string"
-                            },
-                            "strong": {
-                              "type": "boolean"
-                            }
-                          },
-                          "required": [
-                            "text"
-                          ],
-                          "additionalProperties": false
-                        }
-                      }
-                    },
-                    "required": [
-                      "tone",
-                      "parts"
-                    ],
-                    "additionalProperties": false
-                  }
-                },
-                "prompt": {
+                "focus": {
                   "type": "string"
                 }
               },
-              "required": [
-                "parts",
-                "findings"
-              ],
               "additionalProperties": false
             },
             {
@@ -1348,9 +1444,18 @@
               "additionalProperties": false
             },
             {
-              "description": "data for \"bar\"",
+              "description": "data for \"chart\"",
               "type": "object",
               "properties": {
+                "chart": {
+                  "type": "string",
+                  "enum": [
+                    "bar",
+                    "line",
+                    "area",
+                    "donut"
+                  ]
+                },
                 "orientation": {
                   "type": "string",
                   "enum": [
@@ -1358,48 +1463,14 @@
                     "horizontal"
                   ]
                 },
-                "sort": {
-                  "type": "string",
-                  "enum": [
-                    "none",
-                    "asc",
-                    "desc"
-                  ]
-                }
-              },
-              "required": [
-                "orientation",
-                "sort"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "description": "data for \"donut\"",
-              "type": "object",
-              "properties": {
-                "showLegend": {
+                "stacked": {
                   "type": "boolean"
                 }
               },
               "required": [
-                "showLegend"
-              ],
-              "additionalProperties": false
-            },
-            {
-              "description": "data for \"comparison\"",
-              "type": "object",
-              "properties": {
-                "labelA": {
-                  "type": "string"
-                },
-                "labelB": {
-                  "type": "string"
-                }
-              },
-              "required": [
-                "labelA",
-                "labelB"
+                "chart",
+                "orientation",
+                "stacked"
               ],
               "additionalProperties": false
             },
@@ -1407,12 +1478,16 @@
               "description": "data for \"funnel\"",
               "type": "object",
               "properties": {
-                "showConversion": {
+                "showPercentOfFirst": {
+                  "type": "boolean"
+                },
+                "showPercentOfPrevious": {
                   "type": "boolean"
                 }
               },
               "required": [
-                "showConversion"
+                "showPercentOfFirst",
+                "showPercentOfPrevious"
               ],
               "additionalProperties": false
             },
@@ -1420,17 +1495,15 @@
               "description": "data for \"leaderboard\"",
               "type": "object",
               "properties": {
-                "limit": {
-                  "type": "integer",
-                  "minimum": 1,
-                  "maximum": 50
+                "showChange": {
+                  "type": "boolean"
                 },
                 "showRank": {
                   "type": "boolean"
                 }
               },
               "required": [
-                "limit",
+                "showChange",
                 "showRank"
               ],
               "additionalProperties": false
@@ -1439,18 +1512,15 @@
               "description": "data for \"table\"",
               "type": "object",
               "properties": {
-                "columns": {
-                  "type": "array",
-                  "items": {
-                    "type": "string"
-                  }
+                "totals": {
+                  "type": "boolean"
                 },
                 "dense": {
                   "type": "boolean"
                 }
               },
               "required": [
-                "columns",
+                "totals",
                 "dense"
               ],
               "additionalProperties": false
@@ -1468,7 +1538,6 @@
         "type": "heading",
         "label": "Heading",
         "aiHint": "Use to start a group of related widgets; headings replace sections. The widget title is the heading text and must be plain text. Usually full width (12 columns) and 1 row tall, or 2 rows with a description. Set `level` to 1 for a large page-level heading, 3 for a small one, or leave it out for the default size; add a short `description` to explain the group. Place the group's widgets after it with `after`. It has no data slots, so do not bind anything.",
-        "slots": [],
         "defaultSize": {
           "w": 12,
           "h": 1
@@ -1511,21 +1580,7 @@
       {
         "type": "kpi",
         "label": "KPI",
-        "aiHint": "Use for one headline number the reader should see first, such as revenue, signups or error rate. Bind the `value` slot to one metric; set compare to \"previous\" on the binding so a change versus the previous period appears, and leave showDelta on. Optionally bind `spark` to the same metric grouped by day to draw a small sparkline beside the change. Use emphasis \"large\" for the single most important number on the dashboard. For two to four related numbers side by side prefer kpi-strip.",
-        "slots": [
-          {
-            "name": "value",
-            "label": "Value",
-            "shape": "value",
-            "required": true
-          },
-          {
-            "name": "spark",
-            "label": "Sparkline",
-            "shape": "series",
-            "required": false
-          }
-        ],
+        "aiHint": "Query shape: exactly one metric, no `by`, no `over`; the sparkline is drawn automatically (`spark` is on by default; set `spark: false` in the query to turn it off). Use for one headline number the reader should see first, such as revenue, signups or error rate. Set `compare: \"previous\"` to show the change versus the previous period; without it the change badge reads \"—\". Optional data: `sparkStyle` \"line\" or \"bar\", `goal` (a target for the whole window; the card says whether the value is on track) and `description` (how the metric is counted, shown as a tooltip on the label). For two to four related numbers side by side prefer kpi-strip.",
         "defaultSize": {
           "w": 3,
           "h": 3
@@ -1540,57 +1595,46 @@
         },
         "fields": [
           {
-            "key": "showDelta",
-            "label": "Show change vs previous period",
-            "kind": "toggle"
-          },
-          {
-            "key": "emphasis",
-            "label": "Size",
+            "key": "sparkStyle",
+            "label": "Sparkline",
             "kind": "segmented",
             "options": [
               {
-                "value": "normal",
-                "label": "Normal"
+                "value": "line",
+                "label": "Line"
               },
               {
-                "value": "large",
-                "label": "Large"
+                "value": "bar",
+                "label": "Bars"
               }
             ]
+          },
+          {
+            "key": "goal",
+            "label": "Goal for the window (optional)",
+            "kind": "number"
+          },
+          {
+            "key": "description",
+            "label": "Explain this metric (optional)",
+            "kind": "textarea"
           }
-        ]
+        ],
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 1
+          },
+          "by": "forbidden",
+          "over": "forbidden",
+          "spark": true,
+          "defaults": {}
+        }
       },
       {
         "type": "kpi-strip",
         "label": "KPI strip",
-        "aiHint": "Use for a compact row of two to four related headline numbers, usually at the top of a section. Bind slots a and b (required) and optionally c and d, each to one metric; each tile is labelled with its metric name. Set compare to \"previous\" on the bindings to show changes. Use kpi instead when a single number deserves emphasis.",
-        "slots": [
-          {
-            "name": "a",
-            "label": "Metric A",
-            "shape": "value",
-            "required": true
-          },
-          {
-            "name": "b",
-            "label": "Metric B",
-            "shape": "value",
-            "required": true
-          },
-          {
-            "name": "c",
-            "label": "Metric C",
-            "shape": "value",
-            "required": false
-          },
-          {
-            "name": "d",
-            "label": "Metric D",
-            "shape": "value",
-            "required": false
-          }
-        ],
+        "aiHint": "Query shape: 2 to 4 metrics, no `by`, no `over`. Use for a compact row of related headline numbers, usually at the top of a section; each tile shows the metric label, its total and, with `compare: \"previous\"`, the change versus the previous period (coloured by the metric's polarity). No sparklines. Use kpi instead when a single number deserves emphasis.",
         "defaultSize": {
           "w": 12,
           "h": 3
@@ -1603,19 +1647,21 @@
           "w": 12,
           "h": 4
         },
-        "fields": [
-          {
-            "key": "showDelta",
-            "label": "Show change vs previous period",
-            "kind": "toggle"
-          }
-        ]
+        "fields": [],
+        "queryRules": {
+          "metrics": {
+            "min": 2,
+            "max": 4
+          },
+          "by": "forbidden",
+          "over": "forbidden",
+          "defaults": {}
+        }
       },
       {
         "type": "text",
         "label": "Text",
         "aiHint": "Use for static written context: a short explanation of a section, a caveat about the data, or a note for readers. Write the content in `markdown`; it has no data slots, so do not bind anything. For findings generated from the data use briefing instead.",
-        "slots": [],
         "defaultSize": {
           "w": 6,
           "h": 3
@@ -1639,8 +1685,7 @@
       {
         "type": "briefing",
         "label": "Briefing",
-        "aiHint": "Use at the top of a dashboard or section to say in plain language what the data shows. Write `parts` as the lead sentence (mark key figures with strong) and `findings` as two to five short bullets, each with a tone: positive for good news, negative for problems, warning for things to watch, neutral otherwise. Base every number on the bound data of the other widgets. Optionally set `prompt` to a follow-up question; when the host handles asks it becomes an \"Ask about this\" button. It has no data slots.",
-        "slots": [],
+        "aiHint": "Use at the top of a dashboard or section for a plain-language summary of what the board shows. It has no query and no content to write: the host generates the summary from the numbers on the board, caches it for a few hours and shows an \"Updated\" time with a Refresh button. Optionally set `focus` to a short phrase such as \"lead quality\" or \"ad spend\" to steer what the summary concentrates on; leave it out for a general summary.",
         "defaultSize": {
           "w": 6,
           "h": 5
@@ -1655,8 +1700,8 @@
         },
         "fields": [
           {
-            "key": "prompt",
-            "label": "Ask prompt",
+            "key": "focus",
+            "label": "Focus",
             "kind": "text"
           }
         ]
@@ -1664,15 +1709,7 @@
       {
         "type": "trend",
         "label": "Trend",
-        "aiHint": "Use to show how one metric moves over time, such as daily revenue or weekly signups. Bind the `series` slot to a metric grouped by a time dimension (day, week or month) so labels are dates; ISO dates are shown as \"Oct 5\" on the axis. `chart` picks the drawing: \"area\" (default) for volume-like metrics, \"line\" for rates and averages or when comparing against the previous period, \"bar\" for a few discrete periods. Set compare to \"previous\" on the binding and turn showPrevious on to draw the previous period as a second, grey series for context. For category breakdowns use bar or donut instead.",
-        "slots": [
-          {
-            "name": "series",
-            "label": "Series",
-            "shape": "series",
-            "required": true
-          }
-        ],
+        "aiHint": "Query shape: trend runs only over time, so `over` (\"day\", \"week\" or \"month\") is required (it defaults to \"day\"); 1 to 4 metrics, or exactly one metric with `by` set to a dimension such as client to draw one series per top client (5 by default, at most 8 via `limit`). The window sets how far back it goes. Use it to show how metrics move, such as daily revenue or weekly signups. `chart` picks the drawing: \"area\" (default) for volume-like metrics, \"line\" for rates and averages or several series, \"bar\" for a few discrete periods. Set `compare: \"previous\"` on the query and turn `showPrevious` on to draw the previous period as a dashed series of the same colour; this only works with one metric and no `by`. All metrics on one trend must share a format (all money, all counts or all percentages) because they share one value axis; with a catalog the query is rejected otherwise, so put a metric of another format in its own widget. To compare categories at one point in time (no `over`), use chart instead.",
         "defaultSize": {
           "w": 6,
           "h": 6
@@ -1707,23 +1744,27 @@
           },
           {
             "key": "showPrevious",
-            "label": "Show previous period",
+            "label": "Show previous period (one metric, no split)",
             "kind": "toggle"
           }
-        ]
+        ],
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 4
+          },
+          "by": "optional",
+          "over": "required",
+          "maxMetricsWithBy": 1,
+          "defaults": {
+            "over": "day"
+          }
+        }
       },
       {
-        "type": "bar",
-        "label": "Bar chart",
-        "aiHint": "Use to compare one metric across categories, such as revenue by plan, orders by country or tickets by priority. Bind the `series` slot to a metric grouped by a categorical dimension. Set sort to \"desc\" for rankings so the biggest category comes first, or keep \"none\" when the categories have a natural order (sizes, stages, weekdays). Use orientation \"horizontal\" when category names are long or there are more than about eight of them. For a share of a whole with few categories prefer donut; for change over time prefer trend.",
-        "slots": [
-          {
-            "name": "series",
-            "label": "Series",
-            "shape": "series",
-            "required": true
-          }
-        ],
+        "type": "chart",
+        "label": "Chart",
+        "aiHint": "Query shape: 1 to 4 metrics, `by` required (the dimension to compare, such as \"client\"), no `over`; rows are the dimension values and each metric is a series. Use it to compare categories at one point in time, such as spend by client, or for parts of a whole as a donut. `chart` picks the drawing: \"bar\" (default) for comparing amounts, \"line\" or \"area\" for ordered categories, \"donut\" for shares. A donut takes exactly one metric and it must be additive (counts, sums, money; never rates, ratios or averages, which the catalog marks \"not additive\"), otherwise the query is rejected: use bar for those. A donut shows its four largest categories and folds the rest into \"Other\". All metrics on one chart must share a format (all money, all counts or all percentages) because they share one value axis; with a catalog the query is rejected otherwise, so put a metric of another format in its own widget. `orientation` \"horizontal\" lays bars sideways, good for long names; `stacked` stacks bar and area series. Set `sort` and `limit` on the query to rank the categories. For change over time use trend instead.",
         "defaultSize": {
           "w": 6,
           "h": 6
@@ -1737,6 +1778,29 @@
           "h": 12
         },
         "fields": [
+          {
+            "key": "chart",
+            "label": "Chart",
+            "kind": "segmented",
+            "options": [
+              {
+                "value": "bar",
+                "label": "Bar"
+              },
+              {
+                "value": "line",
+                "label": "Line"
+              },
+              {
+                "value": "area",
+                "label": "Area"
+              },
+              {
+                "value": "donut",
+                "label": "Donut"
+              }
+            ]
+          },
           {
             "key": "orientation",
             "label": "Bars",
@@ -1753,113 +1817,27 @@
             ]
           },
           {
-            "key": "sort",
-            "label": "Sort",
-            "kind": "segmented",
-            "options": [
-              {
-                "value": "none",
-                "label": "As is"
-              },
-              {
-                "value": "desc",
-                "label": "Largest first"
-              },
-              {
-                "value": "asc",
-                "label": "Smallest first"
-              }
-            ]
-          }
-        ]
-      },
-      {
-        "type": "donut",
-        "label": "Donut",
-        "aiHint": "Use to show how a total splits into parts, such as traffic by source or revenue by plan, when there are about two to six categories. Bind the `series` slot to an additive metric (counts, sums, revenue; never averages or rates) grouped by a categorical dimension; the centre shows the formatted total. Keep showLegend on unless the widget is very small. With more than six categories, or when exact comparison matters more than share, use bar instead.",
-        "slots": [
-          {
-            "name": "series",
-            "label": "Series",
-            "shape": "series",
-            "required": true
-          }
-        ],
-        "defaultSize": {
-          "w": 4,
-          "h": 6
-        },
-        "minSize": {
-          "w": 3,
-          "h": 5
-        },
-        "maxSize": {
-          "w": 6,
-          "h": 10
-        },
-        "fields": [
-          {
-            "key": "showLegend",
-            "label": "Show legend",
+            "key": "stacked",
+            "label": "Stack series (bar and area)",
             "kind": "toggle"
           }
-        ]
-      },
-      {
-        "type": "comparison",
-        "label": "Comparison",
-        "aiHint": "Use to compare two series over the same categories, such as this quarter versus last quarter by region, or two segments by plan. Bind slots `a` and `b` to series with the same format grouped by the same dimension; categories are matched by label and a category missing from one side counts as 0. Set labelA and labelB to short names the reader recognises (for example \"This month\" and \"Last month\"); they appear in the legend and tooltip. For a single metric against its own previous period over time prefer trend with showPrevious.",
-        "slots": [
-          {
-            "name": "a",
-            "label": "Series A",
-            "shape": "series",
-            "required": true
-          },
-          {
-            "name": "b",
-            "label": "Series B",
-            "shape": "series",
-            "required": true
-          }
         ],
-        "defaultSize": {
-          "w": 6,
-          "h": 6
-        },
-        "minSize": {
-          "w": 4,
-          "h": 4
-        },
-        "maxSize": {
-          "w": 12,
-          "h": 12
-        },
-        "fields": [
-          {
-            "key": "labelA",
-            "label": "Name for series A",
-            "kind": "text"
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 4
           },
-          {
-            "key": "labelB",
-            "label": "Name for series B",
-            "kind": "text"
+          "by": "required",
+          "over": "forbidden",
+          "defaults": {
+            "by": "client"
           }
-        ]
+        }
       },
       {
         "type": "funnel",
         "label": "Funnel",
-        "aiHint": "Use for a sequence of steps where each one is a subset of the one before, such as visited, signed up, activated, paid. Bind the `series` slot to points in step order, first step first; each bar is drawn relative to the first step. Keep showConversion on so the percentage that made it from each step to the next appears between steps, which is usually the number the reader cares about. Do not use for categories without an order; use bar instead.",
-        "slots": [
-          {
-            "name": "series",
-            "label": "Steps",
-            "shape": "series",
-            "required": true
-          }
-        ],
+        "aiHint": "Query shape: 1 to 8 metrics, no `by`, no `over`. Each metric is one step of the funnel, in order, first step first, and its `label` names the step. Steps typically narrow, such as impressions → clicks → leads → appointments; a step larger than the one before still draws, but check the order. Each step shows its value, its share of the first step (`showPercentOfFirst`) and its share of the previous step (`showPercentOfPrevious`); both are on by default. One metric is valid but only shows \"Add at least 2 steps\", so use two or more. Do not use for categories without an order; use chart instead.",
         "defaultSize": {
           "w": 6,
           "h": 6
@@ -1874,24 +1852,30 @@
         },
         "fields": [
           {
-            "key": "showConversion",
-            "label": "Show conversion between steps",
+            "key": "showPercentOfFirst",
+            "label": "Show % of first step",
+            "kind": "toggle"
+          },
+          {
+            "key": "showPercentOfPrevious",
+            "label": "Show % of previous step",
             "kind": "toggle"
           }
-        ]
+        ],
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 8
+          },
+          "by": "forbidden",
+          "over": "forbidden",
+          "defaults": {}
+        }
       },
       {
         "type": "leaderboard",
         "label": "Leaderboard",
-        "aiHint": "Use for a ranked list of one metric by a dimension, such as top customers by revenue, busiest endpoints or most active users. Bind the `rows` slot to a metric with `by` set to the dimension and `sort: \"desc\"` so the biggest item comes first (rows render in the order the data source returns them), and set `limit` on both the binding and the widget to the number of rows wanted. Each row shows the label, the formatted value and a bar scaled to the largest value. For a full multi-column listing prefer table; for a visual comparison of many categories prefer bar.",
-        "slots": [
-          {
-            "name": "rows",
-            "label": "Rows",
-            "shape": "table",
-            "required": true
-          }
-        ],
+        "aiHint": "Query shape: 1 to 3 metrics, `by` required (the dimension to rank), no `over`. Rows are ranked by metric 0, which draws the bar; metrics 1 and 2 are optional extra values shown after it (for example revenue as the bar, then orders and conversion rate). Set the ranking in the query: `sort: { metric: <metric 0>, dir: \"desc\" }` and `limit` for how many rows to show. Without a `sort` the widget ranks by metric 0, biggest first, and without a `limit` it shows 10 rows; with a `sort` the rows render in the order the data source returns them. With extra metrics or a change, a muted heading names each column. `showRank` numbers the rows from 1; `showChange`, with `compare: \"previous\"`, adds each row's change in metric 0 versus the previous period, coloured by that metric's polarity. For a full multi-column listing prefer table; for a visual comparison of many categories prefer chart.",
         "defaultSize": {
           "w": 6,
           "h": 6
@@ -1906,29 +1890,32 @@
         },
         "fields": [
           {
-            "key": "limit",
-            "label": "Rows to show",
-            "kind": "number"
-          },
-          {
             "key": "showRank",
             "label": "Show rank numbers",
             "kind": "toggle"
+          },
+          {
+            "key": "showChange",
+            "label": "Show change vs previous period",
+            "kind": "toggle"
           }
-        ]
+        ],
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 3
+          },
+          "by": "required",
+          "over": "forbidden",
+          "defaults": {
+            "by": "client"
+          }
+        }
       },
       {
         "type": "table",
         "label": "Table",
-        "aiHint": "Use when the reader needs exact values for many rows, such as a per-customer breakdown or a list of recent records. Bind the `rows` slot to a metric with `by` set to the dimension; the data source decides which columns exist. Leave `columns` empty to show every column, or list column keys in the order they should appear. Turn on dense for long lists. For a ranking of one metric prefer leaderboard; for a visual comparison prefer bar.",
-        "slots": [
-          {
-            "name": "rows",
-            "label": "Rows",
-            "shape": "table",
-            "required": true
-          }
-        ],
+        "aiHint": "Query shape: 1 to 20 metrics, and exactly one of `by` or `over`. Each metric is a column, in query order, after a label column that stays in view while the table scrolls sideways. `by: \"<dimension>\"` gives one row per dimension value (use `sort` and `limit` in the query to order and cap them); `over: \"day\" | \"week\" | \"month\"` gives one row per time bucket. Use it when the reader needs exact values for many rows or many metrics at once, such as a per-client breakdown with spend, leads and cost per lead. `totals` adds a last row from the whole-window totals (ratios are recomputed, never summed), and `dense` tightens the rows for long lists. Readers can re-sort by clicking a column header. For a ranking of one metric prefer leaderboard; for a visual comparison prefer chart.",
         "defaultSize": {
           "w": 12,
           "h": 6
@@ -1943,16 +1930,28 @@
         },
         "fields": [
           {
-            "key": "columns",
-            "label": "Columns",
-            "kind": "array"
+            "key": "totals",
+            "label": "Show a totals row",
+            "kind": "toggle"
           },
           {
             "key": "dense",
             "label": "Compact rows",
             "kind": "toggle"
           }
-        ]
+        ],
+        "queryRules": {
+          "metrics": {
+            "min": 1,
+            "max": 20
+          },
+          "by": "optional",
+          "over": "optional",
+          "exactlyOneOfByOver": true,
+          "defaults": {
+            "by": "client"
+          }
+        }
       }
     ]
   },
