@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Dict, Optional, List
 
 
 class RegisterRequest(BaseModel):
@@ -285,6 +285,17 @@ class QueryBody(BaseModel):
     by services/dashboards_query, so one bad query is a null frame, not a 422.
     """
     queries: List[dict] = Field(..., max_length=MAX_DASHBOARD_QUERIES)
+
+
+class BriefingBody(BaseModel):
+    """
+    POST /api/dashboards/{id}/briefing. dashkit sends `focus` and `refresh`; `window` and
+    `filters` are optional and, when given, replace each widget query's own.
+    """
+    window: Optional[dict] = None
+    filters: Optional[Dict[str, List[str]]] = None
+    focus: Optional[str] = Field(default=None, max_length=500)
+    refresh: bool = False
 
 
 class ResolveBody(BaseModel):

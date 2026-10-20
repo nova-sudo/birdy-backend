@@ -17,8 +17,9 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Body, Depends, HTTPException, Response
 
 from core.database import DB_NAME
-from core.models import QueryBody, ResolveBody
+from core.models import BriefingBody, QueryBody, ResolveBody
 from dependencies import get_mongo_client, get_current_user
+from services.dashboards_briefing import generate_briefing
 from services.dashboards_catalog import build_catalog
 from services.dashboards_query import run_queries
 from services.dashboards_resolve import MAX_BINDINGS, resolve_bindings
@@ -103,6 +104,22 @@ async def query(body: QueryBody, current_user: str = Depends(get_current_user)):
         except Exception as e:
             logger.error(f"Error running dashboard queries for {current_user}: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to load dashboard data")
+
+
+@router.post("/api/dashboards/{dashboard_id}/briefing")
+async def briefing(dashboard_id: str, body: BriefingBody = Body(default_factory=BriefingBody),
+                   current_user: str = Depends(get_current_user)):
+    """A short AI briefing of the dashboard's live numbers, every figure checked against the data."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            db = mongo_client[DB_NAME]
+            return await generate_briefing(db, current_user, dashboard_id, window=body.window,
+                                           filters=body.filters, focus=body.focus, refresh=body.refresh)
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error writing briefing for dashboard {dashboard_id}: {e}", exc_info=True)
+            raise HTTPException(status_code=500, detail="Failed to write briefing")
 
 
 # --- fixed-path routes (/catalog, /resolve, /query) go above this line; /{id} must stay last ---
