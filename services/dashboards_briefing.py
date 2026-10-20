@@ -14,15 +14,18 @@ Visible data widgets: the widgets that carry `bindings.query`. Text, markdown,
 heading and briefing widgets carry none and are skipped. A window or filters in
 the request body replace each query's own.
 
-Grounding: the model is told to use only the numbers it is given, and then every
-number in its answer is checked. A number is grounded when it is within 1%
-(relative) of a frame value (totals, rows, previous values), or of a percentage
-change between two values of the same frame column, or when it equals the value
-rounded to the precision it is shown at ("$1.2k" matches 1234). Years, dates and
-durations ("Oct 20", "2026", "last 30 days") are not numbers to ground, and
-neither are digits inside the board's own names ("Campaign 2"). A finding with
-an ungrounded number is dropped; a lead with one is replaced by a fixed
+Grounding (services/dashboards_grounding.py): the model is told to use only the
+numbers it is given, and then every figure in its answer is checked against the
+cells it was shown (value, previous value, column format). Percentages must be a
+percentage column's value or the signed change of one cell; "3x", "40pp" and
+"30 days" have their own rules. A finding with an ungrounded figure, or with no
+grounded figure at all, is dropped; a lead like that is replaced by a fixed
 sentence.
+
+Prompt safety: dashboard, widget, column and row names are sanitised (control
+characters and angle brackets removed, whitespace collapsed, 80 characters) and
+the facts go to the model as one JSON document inside a delimited block that the
+system prompt declares to be data.
 
 `parts`: the lead split into runs on `**bold**` markers; text between markers
 is `{text}`, text inside them is `{text, bold: true}`.
@@ -37,7 +40,9 @@ per rolling hour.
 import hashlib
 import json
 import logging
+import math
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -45,6 +50,7 @@ from fastapi import HTTPException
 
 from ai.prompts.dashboard_briefing import TONES, build_messages
 from core.database import DB_NAME
+from services.dashboards_grounding import Cell, Grounding
 from services.dashboards_query import run_queries
 
 logger = logging.getLogger(__name__)
@@ -60,7 +66,8 @@ MAX_REFRESHES_PER_HOUR = 10
 MAX_QUERIES = 50       # same cap as POST /api/dashboards/query
 MAX_FACT_ROWS = 12     # rows of a frame shown to the model; totals are always shown
 MAX_FINDINGS = 5
-MAX_PAIR_POOL = 24     # values per frame column considered for derived percentage changes
+MAX_FACT_CELLS = 800   # cells in the facts block, so a large board cannot flood the prompt
+MAX_NAME = 80
 
 NO_DATA_LEAD = "There is no data on this board to brief yet."
 
@@ -95,133 +102,50 @@ def collect_queries(doc: dict, window: Optional[dict], filters: Optional[dict]) 
     return out
 
 
-def _number(value) -> str:
-    """A frame value as the model reads it: whole numbers plain, others to 2 decimals (4 for tiny ones)."""
-    if value is None:
-        return "no data"
-    if float(value) == int(value):
-        return str(int(value))
-    return f"{value:.4f}".rstrip("0") if abs(value) < 0.01 else f"{value:.2f}"
+def clean_name(value) -> str:
+    """A name safe to put in the prompt: no control characters, newlines or angle brackets; one-spaced; 80 chars."""
+    text = "".join(" " if unicodedata.category(c).startswith(("C", "Z")) or c in "<>" else c for c in str(value or ""))
+    return " ".join(text.split())[:MAX_NAME]
 
 
-def build_facts(titled_frames: list[tuple[str, dict]]) -> str:
-    """`widget title → column label: value (previous: value)`, one line per number the model may use."""
-    lines = []
+def _num(value):
+    """A frame value for the facts: None for missing / NaN / inf, an int when whole, else rounded to 4 places."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        return None
+    value = round(float(value), 4)
+    return int(value) if value == int(value) else value
+
+
+def build_facts(titled_frames: list[tuple[str, dict]], window_label: str):
+    """(facts JSON text, cells for grounding, row counts, windows) for the frames, using the same cells in both."""
+    widgets, cells, counts, windows = [], [], [], []
+    budget = MAX_FACT_CELLS
     for title, frame in titled_frames:
-        columns = frame.get("columns") or []
+        columns = [c for c in frame.get("columns") or [] if isinstance(c, dict) and c.get("key")]
         previous_ok = frame.get("previousAvailable", True)
-
-        def line(prefix: str, entry: dict, column: dict):
-            key = column["key"]
-            value = (entry.get("values") or {}).get(key)
-            text = f"{title} → {prefix}{column['label']}: {_number(value)}"
-            prev = (entry.get("previous") or {}).get(key) if previous_ok else None
-            if prev is not None:
-                text += f" (previous: {_number(prev)})"
-            lines.append(text)
-
-        for column in columns:
-            line("", frame.get("totals") or {}, column)
-        for row in (frame.get("rows") or [])[:MAX_FACT_ROWS]:
+        rows = (frame.get("rows") or [])
+        entries = [(None, frame.get("totals") or {})] + [
+            (clean_name(r.get("label") or r.get("key")), r) for r in rows[:MAX_FACT_ROWS]]
+        out = []
+        for row_label, entry in entries:
             for column in columns:
-                line(f"{row.get('label') or row.get('key')} / ", row, column)
-    return "\n".join(lines)
-
-
-# --- grounding -------------------------------------------------------------------
-
-_MONTHS = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
-           r"sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
-
-# Spans that look like numbers but are dates, years or durations; blanked before extraction.
-_NOT_NUMBERS = [re.compile(p, re.IGNORECASE) for p in (
-    r"\b\d{4}-\d{2}-\d{2}\b",                                    # 2026-10-20
-    r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",                         # 10/20, 10/20/2026
-    r"\b\d{1,2}-\d{1,2}-\d{2,4}\b",                              # 20-10-2026
-    rf"\b{_MONTHS}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?\b(?:,?\s+\d{{4}})?",   # Oct 20, October 20th, 2026
-    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b(?:,?\s+\d{{4}})?",  # 20 Oct, 20th of October
-    r"(?<![\w.,$])(?:19|20)\d{2}(?![\w%]|[.,]\d)",               # a bare 4-digit year
-    r"\b\d+(?:\.\d+)?[\s-]*(?:day|week|month|quarter|year|hour|minute)s?\b",  # 30 days, 7-day
-)]
-
-_NUMBER = re.compile(
-    r"(?<![\w.])[$€£]?(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)(?P<suf>[kKmMbB]|%)?(?![A-Za-z0-9])"
-)
-_MULTIPLIER = {"k": 1e3, "m": 1e6, "b": 1e9}
-REL_TOL = 0.01
-
-
-def _blank_names(text: str, names: set[str]) -> str:
-    """Remove the board's own names, longest first: the digits in "Campaign 2" are a name, not a figure."""
-    for name in sorted((n for n in names if n), key=len, reverse=True):
-        text = re.sub(re.escape(name), " ", text, flags=re.IGNORECASE)
-    return text
-
-
-def extract_numbers(text: str, names: frozenset | set = frozenset()) -> list[tuple[float, float, bool]]:
-    """(value, rounding half-width, is_percent) per figure in `text`.
-
-    The value has its k/m/b suffix applied; the half-width is half a unit of the
-    last shown digit, so "1.2k" is 1200 ± 50 and "12" is 12 ± 0.5.
-    """
-    text = _blank_names(text, set(names))
-    for pattern in _NOT_NUMBERS:
-        text = pattern.sub(" ", text)
-    found = []
-    for m in _NUMBER.finditer(text):
-        digits = m.group("num").replace(",", "")
-        decimals = len(digits.split(".")[1]) if "." in digits else 0
-        suffix = (m.group("suf") or "").lower()
-        mult = _MULTIPLIER.get(suffix, 1.0)
-        found.append((float(digits) * mult, 0.5 * 10 ** -decimals * mult, suffix == "%"))
-    return found
-
-
-def _close(n: float, ref: float, half_width: float) -> bool:
-    return abs(n - ref) <= max(REL_TOL * abs(ref), half_width) + 1e-9
-
-
-class Grounding:
-    """What a number in the model's answer may equal: the frames' values and changes between them."""
-
-    def __init__(self, frames: list[dict]):
-        self.values: list[float] = []
-        self._pools: list[list[float]] = []   # per frame column: every value of it, current and previous
-        for frame in frames:
-            entries = [frame.get("totals") or {}] + list(frame.get("rows") or [])
-            # a row count is a figure the model may cite ("3 clients")
-            self.values.append(float(len(frame.get("rows") or [])))
-            keys = {c["key"] for c in frame.get("columns") or []}
-            for key in keys:
-                pool = []
-                for entry in entries:
-                    for side in ("values", "previous"):
-                        v = (entry.get(side) or {}).get(key)
-                        if isinstance(v, (int, float)) and not isinstance(v, bool):
-                            pool.append(float(v))
-                self.values.extend(pool)
-                self._pools.append(sorted(set(pool), key=abs, reverse=True)[:MAX_PAIR_POOL])
-
-    def _is_change(self, n: float, half_width: float) -> bool:
-        for pool in self._pools:
-            for a in pool:
-                for b in pool:
-                    if a != b and b != 0 and _close(n, abs((a - b) / b) * 100, half_width):
-                        return True
-        return False
-
-    def holds(self, n: float, half_width: float, percent: bool) -> bool:
-        n = abs(n)
-        for v in self.values:
-            if _close(n, abs(v), half_width):
-                return True
-            if percent and _close(n, abs(v) * 100, half_width):  # a fraction-scale ratio shown as a percent
-                return True
-        return percent and self._is_change(n, half_width)
-
-
-def is_grounded(text: str, grounding: Grounding, names: set[str]) -> bool:
-    return all(grounding.holds(n, hw, pct) for n, hw, pct in extract_numbers(text, names))
+                if budget <= 0:
+                    break
+                budget -= 1
+                key = column["key"]
+                value = _num((entry.get("values") or {}).get(key))
+                previous = _num((entry.get("previous") or {}).get(key)) if previous_ok else None
+                fmt = str(column.get("format") or "")
+                out.append({"row": row_label, "column": clean_name(column.get("label") or key), "format": fmt,
+                            "value": value, "previous": previous})
+                cells.append(Cell(value, previous, fmt))
+        widgets.append({"widget": clean_name(title), "row_count": len(rows), "cells": out})
+        counts.append(len(rows))
+        window = frame.get("window") or {}
+        if window.get("from") and window.get("to"):
+            windows.append((window["from"], window["to"]))
+    text = json.dumps({"period": clean_name(window_label), "widgets": widgets}, ensure_ascii=False)
+    return text, cells, counts, windows
 
 
 # --- the model's answer ------------------------------------------------------------
@@ -255,7 +179,7 @@ def ground_answer(data: dict, grounding: Grounding, names: set[str], window_labe
     lead = data.get("lead")
     lead = lead.strip() if isinstance(lead, str) else ""
     plain_lead = lead.replace("**", "")
-    if not plain_lead or not is_grounded(plain_lead, grounding, names):
+    if not plain_lead or not grounding.is_grounded(plain_lead, names):
         if plain_lead:
             logger.info("briefing: dropped an ungrounded lead")
         parts = [{"text": f"Here's how this board looks for {window_label}."}]
@@ -269,7 +193,7 @@ def ground_answer(data: dict, grounding: Grounding, names: set[str], window_labe
         text = text.replace("**", "").strip() if isinstance(text, str) else ""
         if not text:
             continue
-        if not is_grounded(text, grounding, names):
+        if not grounding.is_grounded(text, names):
             logger.info("briefing: dropped an ungrounded finding")
             continue
         tone = item.get("tone")
@@ -333,6 +257,8 @@ async def generate_briefing(db, mongo_client, user_id: str, dashboard_id: str, *
                             filters: Optional[dict] = None, focus: Optional[str] = None,
                             refresh: bool = False) -> dict:
     """`{parts, findings, generated_at, cached}` for one of the caller's dashboards."""
+    focus = focus.strip() if isinstance(focus, str) else None
+    focus = focus or None
     row = await db[_DASHBOARDS].find_one({"id": dashboard_id, "user_id": user_id}, {"_id": 0, "doc": 1})
     if not row:
         raise HTTPException(status_code=404, detail="Dashboard not found")
@@ -357,17 +283,17 @@ async def generate_briefing(db, mongo_client, user_id: str, dashboard_id: str, *
     await check_credits(user_id, mongo_client)
 
     window_label = next((f["window"]["label"] for _, f in titled if (f.get("window") or {}).get("label")), "this period")
-    data = await _ask_model(db, user_id, build_messages(build_facts(titled), window_label, focus))
+    facts, cells, counts, windows = build_facts(titled, window_label)
+    data = await _ask_model(db, user_id, build_messages(facts, clean_name(window_label), focus))
 
-    names = {doc.get("title"), window_label}
+    names = {clean_name(doc.get("title"))}
     for title, frame in titled:
-        names.add(title)
-        names.add((frame.get("window") or {}).get("label"))
-        names.update(c.get("label") for c in frame.get("columns") or [])
-        names.update(r.get("label") for r in frame.get("rows") or [])
-    names = {str(n) for n in names if n}
+        names.add(clean_name(title))
+        names.update(clean_name(c.get("label")) for c in frame.get("columns") or [] if isinstance(c, dict))
+        names.update(clean_name(r.get("label")) for r in frame.get("rows") or [])
+    names.discard("")
 
-    parts, findings = ground_answer(data, Grounding([f for _, f in titled]), names, window_label)
+    parts, findings = ground_answer(data, Grounding(cells, counts, windows), names, clean_name(window_label))
     now = _now()
     entry = {"parts": parts, "findings": findings, "generated_at": _iso(now)}
     await db[_CACHE].replace_one({"_id": key}, {**entry, "_id": key, "user_id": user_id, "created_at": now}, upsert=True)
