@@ -148,6 +148,9 @@ _PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES)
 # recordings — the prompt-level "always pass this group" rule is guidance, this
 # is the guarantee.
 _CLIENT_PINNED_GROUP_TOOLS = {"get_call_recordings_summary", "analyze_call_recordings"}
+# The same guarantee for tools that take a group_ids list: omitting it means
+# "every client", which on a client page would chart other clients' numbers.
+_CLIENT_PINNED_GROUP_IDS_TOOLS = {"get_daily_metrics"}
 
 # ── Alerts page system prompt ─────────────────────────────────────────────────
 
@@ -772,6 +775,13 @@ async def run_chat(
                             f"(model passed {args.get('group_id')!r})"
                         )
                     args["group_id"] = client_group_id
+                if client_group_id and tc.name in _CLIENT_PINNED_GROUP_IDS_TOOLS:
+                    if args.get("group_ids") != [client_group_id]:
+                        logger.info(
+                            f"Pinning {tc.name} group_ids to page client {client_group_id} "
+                            f"(model passed {args.get('group_ids')!r})"
+                        )
+                    args["group_ids"] = [client_group_id]
 
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))

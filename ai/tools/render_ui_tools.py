@@ -23,7 +23,7 @@ RENDER_UI_TOOL_NAME = "render_ui"
 CHART_KINDS = ("line", "area", "bar", "combo", "donut")
 KINDS = ("kpi", "kpi_row") + CHART_KINDS + ("table",)
 FORMATS = ("integer", "currency", "percentage", "decimal", "compact", "multiplier")
-POLARITIES = ("higher_is_better", "lower_is_better")
+POLARITIES = ("higher_is_better", "lower_is_better", "neutral")
 
 MAX_COMPONENTS_PER_CALL = 4
 MAX_COMPONENTS_PER_TURN = 6
@@ -89,8 +89,15 @@ def _fmt(value, where: str) -> str:
     return value
 
 
+# Tool results carry the ad account's ISO code; the renderers print a symbol.
+_CURRENCY_SYMBOLS = {"GBP": "£", "USD": "$", "EUR": "€", "AUD": "A$", "CAD": "C$", "NZD": "NZ$", "INR": "₹", "JPY": "¥"}
+
+
 def _currency(value) -> str | None:
-    return _text(value, "currency", limit=4)
+    s = _text(value, "currency", limit=8)
+    if s is None:
+        return None
+    return _CURRENCY_SYMBOLS.get(s.upper(), s)
 
 
 def _fmt_for(spec: dict, where: str) -> str:
@@ -105,7 +112,7 @@ def _polarity(value, where: str) -> str | None:
         return None
     if value not in POLARITIES:
         raise SpecError(f"{where} must be one of {', '.join(POLARITIES)}")
-    return "lower" if value == "lower_is_better" else "higher"
+    return {"lower_is_better": "lower", "higher_is_better": "higher", "neutral": "neutral"}[value]
 
 
 def _drop_none(d: dict) -> dict:
@@ -115,15 +122,20 @@ def _drop_none(d: dict) -> dict:
 # ── Components → canonical blocks ───────────────────────────────────────────
 
 def _kpi_fields(spec: dict, where: str) -> dict:
-    return _drop_none({
+    if "value" not in spec:
+        raise SpecError(f"{where}.value is missing (pass null if it isn't known)")
+    fields = _drop_none({
         "label": _text(spec.get("label"), f"{where}.label", required=True),
-        "value": _num(spec.get("value"), f"{where}.value"),
+        # null = not known (e.g. CPL with no leads); the card prints "–" rather
+        # than the model filling in a 0 that reads as a real figure.
+        "value": _num(spec.get("value"), f"{where}.value", allow_none=True),
         "format": _fmt_for(spec, where),
         "currency": _currency(spec.get("currency")),
         "deltaPct": _num(spec.get("delta_pct"), f"{where}.delta_pct", allow_none=True),
         "deltaLabel": _text(spec.get("delta_label"), f"{where}.delta_label", limit=40),
         "polarity": _polarity(spec.get("polarity"), f"{where}.polarity"),
     })
+    return {"label": fields.pop("label"), "value": fields.pop("value", None), **fields}
 
 
 def _kpi(spec: dict, where: str) -> tuple[str, object]:
@@ -218,7 +230,11 @@ def _chart(spec: dict, where: str, kind: str) -> tuple[str, object]:
         s_type = s.get("type") or ("bar" if kind == "bar" else "area" if kind == "area" else "line")
         if s_type not in ("line", "bar", "area"):
             raise SpecError(f"{where}.series[{i}].type must be line, bar or area")
-        axis = s.get("axis") or ("right" if kind == "combo" and i > 0 else "left")
+        s_fmt_raw = s.get("format") or fmt
+        # A second unit (leads beside £ spend) gets its own axis unless told
+        # otherwise; on one axis the smaller unit flattens to nothing.
+        differs = i > 0 and s_fmt_raw != (series_in[0].get("format") or fmt)
+        axis = s.get("axis") or ("right" if i > 0 and (kind == "combo" or differs) else "left")
         if axis not in ("left", "right"):
             raise SpecError(f"{where}.series[{i}].axis must be left or right")
         s_fmt = _fmt(s.get("format") or fmt, f"{where}.series[{i}].format")
@@ -355,8 +371,10 @@ async def render_ui(db=None, user_id=None, components=None, ui_blocks_sink=None,
         "ok": True,
         "placeholders": placeholders,
         "note": ("Rendered. Put each placeholder on its own line in your reply where the visual "
-                 "should appear, with a one-line lead-in. Don't repeat the visual's numbers as a "
-                 "list or table."),
+                 "should appear, with a one-line lead-in. After it, one or two sentences on what the "
+                 "data shows, with real figures from the tool results (the trend, the best and worst "
+                 "day, start vs end) — never a line like 'the chart shows how X varied'. Don't repeat "
+                 "the visual's numbers as a list or table."),
     }
 
 
@@ -393,12 +411,12 @@ _FORMAT_PROP = {"type": "string", "enum": list(FORMATS),
                 "description": "How to print values. Default integer."}
 _KPI_PROPS = {
     "label": {"type": "string", "description": "What the number is, e.g. 'Cost per lead'."},
-    "value": {"type": "number"},
+    "value": {"type": ["number", "null"], "description": "null when it can't be computed (e.g. CPL with no leads). Never 0 for unknown."},
     "format": _FORMAT_PROP,
     "currency": {"type": "string", "description": "Currency symbol from the data, e.g. '£'."},
     "delta_pct": {"type": "number", "description": "Percent change vs the comparison period: -12.5 means down 12.5%. Omit if you didn't fetch a comparison."},
     "delta_label": {"type": "string", "description": "What the delta compares to, e.g. 'vs previous 7 days'."},
-    "polarity": {"type": "string", "enum": list(POLARITIES), "description": "lower_is_better for costs (CPL, CPA, CPC, cost per booking); default higher_is_better."},
+    "polarity": {"type": "string", "enum": list(POLARITIES), "description": "lower_is_better for costs (CPL, CPA, CPC, cost per booking); neutral for spend and other volumes that aren't good or bad by themselves; default higher_is_better."},
 }
 
 RENDER_UI_SCHEMA = {
@@ -414,8 +432,10 @@ RENDER_UI_SCHEMA = {
                 "properties": {
                     "kind": {"type": "string", "enum": list(KINDS), "description": (
                         "kpi: one headline number card. kpi_row: 2-4 related numbers. "
-                        "line/area: a metric over time. bar: compare clients/campaigns/periods. "
-                        "combo: two metrics on one time axis (e.g. spend bars + CPL line on a right axis). "
+                        "line/area: one or more metrics over time as lines; a 'line chart of X vs Y' is kind "
+                        "line with two series, the second on axis right. bar: compare clients/campaigns/periods. "
+                        "combo: bars plus a line on one time axis (spend bars + CPL line), only when the user "
+                        "didn't ask for a line chart. "
                         "donut: share of a total (max 12 slices). table: a compact ranked table.")},
                     "title": {"type": "string"},
                     "subtitle": {"type": "string", "description": "Period and scope, e.g. 'Aura · last 30 days'."},

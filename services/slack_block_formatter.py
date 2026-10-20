@@ -52,6 +52,8 @@ _MAX_VIZ_BLOCKS_PER_MESSAGE = 2
 
 
 def _format_value(value, fmt: str | None, currency: str = "$") -> str:
+    if value is None:
+        return "–"  # render_ui's "not known", e.g. CPL with no leads
     try:
         num = float(value)
     except (TypeError, ValueError):

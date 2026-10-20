@@ -42,6 +42,16 @@ def test_kpi_becomes_metric_block_with_percent_delta_and_polarity():
     }
 
 
+def test_neutral_polarity_for_spend():
+    _, p = _payload(build_block({"kind": "kpi", "label": "Spend", "value": 10, "delta_pct": -3, "polarity": "neutral"}))
+    assert p["polarity"] == "neutral"
+
+
+def test_kpi_value_can_be_unknown():
+    _, p = _payload(build_block({"kind": "kpi", "label": "CPL", "value": None, "format": "currency", "currency": "£"}))
+    assert p["value"] is None and p["label"] == "CPL"
+
+
 def test_kpi_row_becomes_stats_block():
     kind, p = _payload(build_block({"kind": "kpi_row", "items": [
         {"label": "Spend", "value": 4210, "format": "currency", "currency": "£"},
@@ -80,6 +90,18 @@ def test_combo_puts_second_series_on_right_axis():
     assert p["data"][1] == {"label": "Oct 2", "spend": 98, "cpl": None}
 
 
+def test_iso_currency_codes_become_symbols():
+    _, p = _payload(build_block({"kind": "kpi", "label": "Spend", "value": 10, "currency": "GBP"}))
+    assert p["currency"] == "£" and p["format"] == "currency"
+
+
+def test_a_second_unit_gets_the_right_axis():
+    _, p = _payload(build_block({"kind": "bar", "data": [{"label": "Aura", "spend": 4238.6, "leads": 294}],
+                                 "series": [{"key": "spend", "name": "Spend", "format": "currency", "currency": "£"},
+                                            {"key": "leads", "name": "Leads", "format": "integer"}]}))
+    assert [s["axis"] for s in p["series"]] == ["left", "right"]
+
+
 def test_table_is_a_gfm_table():
     out = build_block({
         "kind": "table", "title": "Top campaigns", "currency": "£",
@@ -98,6 +120,7 @@ def test_table_is_a_gfm_table():
 @pytest.mark.parametrize("spec, msg", [
     ({"kind": "pie"}, "kind must be one of"),
     ({"kind": "kpi", "label": "Spend", "value": "lots"}, "value must be a number"),
+    ({"kind": "kpi", "label": "Spend"}, "value is missing"),
     ({"kind": "kpi", "value": 3}, "label is required"),
     ({"kind": "combo", "data": [{"label": "a", "x": 1}], "series": [{"key": "x", "name": "X"}]}, "at least two series"),
     ({"kind": "bar", "data": [{"label": str(i), "value": i} for i in range(121)]}, "at most 120"),
@@ -124,9 +147,9 @@ async def test_render_ui_returns_placeholders_and_fills_the_sink():
 
 async def test_render_ui_errors_render_nothing():
     sink = []
-    out = await render_ui(components=[{"kind": "kpi", "label": "ok", "value": 1}, {"kind": "kpi", "label": "bad"}],
+    out = await render_ui(components=[{"kind": "kpi", "label": "ok", "value": 1}, {"kind": "kpi", "label": "bad", "value": "x"}],
                           ui_blocks_sink=sink)
-    assert "components[1].value is missing" in out["error"]
+    assert "components[1].value must be a number" in out["error"]
     assert sink == []
 
 
@@ -210,3 +233,9 @@ def test_render_ui_blocks_render_natively_in_slack():
     assert [d["label"] for d in viz[0]["chart"]["series"][0]["data"]] == ["Oct 1", "Oct 2"]
     context = [b for b in blocks if b["type"] == "context"]
     assert any("▼ 12.5% vs last week" in b["elements"][0]["text"] for b in context)
+
+
+def test_unknown_kpi_value_prints_a_dash_in_slack():
+    kpi = build_block({"kind": "kpi", "label": "CPL", "value": None, "format": "currency", "currency": "£"})
+    blocks, _, _ = build_blocks_from_reply(kpi, iid_prefix="s")
+    assert blocks[0]["text"]["text"] == "–"

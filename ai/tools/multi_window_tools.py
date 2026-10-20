@@ -344,6 +344,46 @@ def _daily_series(daily_rows: list[dict], since_iso: str, until_iso: str) -> lis
     return out
 
 
+def _totals(days: list[dict]) -> dict:
+    spend = round(sum(d["spend"] for d in days), 2)
+    leads = sum(d["leads"] for d in days)
+    clicks = sum(d["clicks"] for d in days)
+    impressions = sum(d["impressions"] for d in days)
+    return {
+        "from": days[0]["date"] if days else None,
+        "to": days[-1]["date"] if days else None,
+        "spend": spend, "leads": leads, "clicks": clicks, "impressions": impressions,
+        "cpl": _safe_div(spend, leads),
+        "ctr": round(clicks / impressions * 100, 2) if impressions else None,
+    }
+
+
+def _pct_change(new, old):
+    if new is None or old in (None, 0):
+        return None
+    return round((new - old) / old * 100, 1)
+
+
+def _summarize(days: list[dict], previous_days: list[dict]) -> dict:
+    """Totals the model would otherwise add up itself — and get wrong: summing
+    14 daily rows in its head is where KPI cards went off by 10-15%. Compared
+    with the same number of days just before, so "last 7 days" always comes
+    with "vs the previous 7 days" and never with a slice of its own range."""
+    total, previous = _totals(days), _totals(previous_days)
+    return {
+        "total": total,
+        "previous_period": previous,
+        "change_pct": {k: _pct_change(total[k], previous[k]) for k in ("spend", "leads", "cpl", "ctr")},
+    }
+
+
+def _split_series(rows: list[dict], prev_since_iso: str, since_iso: str, until_iso: str):
+    """The requested range and the equal range before it, from one fetch."""
+    full = _daily_series(rows, prev_since_iso, until_iso)
+    i = next(n for n, d in enumerate(full) if d["date"] == since_iso)
+    return full[i:], full[:i]
+
+
 async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=None, **kwargs):
     """
     Meta spend, leads, clicks, impressions, CPL and CTR per calendar day for the
@@ -371,6 +411,7 @@ async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=N
     today = date.today()
     until_iso = (today - timedelta(days=1)).isoformat()  # today is still filling in
     since_iso = (today - timedelta(days=days)).isoformat()
+    prev_since_iso = (today - timedelta(days=2 * days)).isoformat()  # for summary.previous_period
 
     meta_token = None
     if any(g.get("meta_ad_account_id") for g in groups):
@@ -389,11 +430,12 @@ async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=N
         if not meta_token:
             res["meta_error"] = "No Meta token found. Please connect your Meta account first."
             return res, []
-        data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, since_iso, until_iso, campaign_ids)
+        data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, prev_since_iso, until_iso, campaign_ids)
         if "error" in data:
             res["meta_error"] = data["error"]
             return res, []
-        res["days"] = _daily_series(data["days"], since_iso, until_iso)
+        res["days"], previous = _split_series(data["days"], prev_since_iso, since_iso, until_iso)
+        res["summary"] = _summarize(res["days"], previous)
         return res, data["days"]
 
     results = await asyncio.gather(*(_one(g) for g in groups))
@@ -408,7 +450,8 @@ async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=N
     }
     # A combined series only when every client with data shares one currency.
     if len([r for r in per_group if r.get("days")]) > 1 and len(currencies) == 1:
-        out["combined"] = {"currency": next(iter(currencies)), "days": _daily_series(all_rows, since_iso, until_iso)}
+        combined, previous = _split_series(all_rows, prev_since_iso, since_iso, until_iso)
+        out["combined"] = {"currency": next(iter(currencies)), "days": combined, "summary": _summarize(combined, previous)}
     return out
 
 
@@ -455,7 +498,11 @@ def register_multi_window_tools():
             "Meta ad spend, leads, clicks, impressions, CPL and CTR per calendar day for the last N days "
             "(up to 90, ending yesterday), per client plus a combined series across clients. Use this for "
             "any trend or over-time chart (e.g. 'ad spend vs CPL over the last 30 days'), then draw it with "
-            "render_ui. A day with spend but no leads has cpl null: leave it null, don't fill it."
+            "render_ui. Each series comes with a `summary`: `total` for the N days, `previous_period` for the N days "
+            "before them, and `change_pct` between the two. So 'last 7 days vs the previous 7' is days=7: use "
+            "summary.total, summary.previous_period and summary.change_pct, and label the delta 'vs previous 7 days'. "
+            "Use those totals; don't add up the daily rows yourself. "
+            "A day with spend but no leads has cpl null: leave it null, don't fill it."
         ),
         parameters={
             "type": "object",
