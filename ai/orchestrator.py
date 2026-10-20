@@ -10,6 +10,8 @@ from ai.prompts.birdy import get_system_prompt
 from ai.prompts.media_buying import get_media_buying_module
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
+from ai.prompts.rich_output import with_rich_output
+from ai.tools.render_ui_tools import RENDER_UI_TOOL_NAME, materialize as materialize_ui
 from ai import mcp_client
 from ai import session_store
 from ai import conversation_log
@@ -37,6 +39,7 @@ _PAGE_TOOLS = {
         "get_campaign_insights",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "render_ui",
     ],
     "campaigns": [
         "get_client_groups",
@@ -47,6 +50,7 @@ _PAGE_TOOLS = {
         "compare_periods",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "render_ui",
     ],
     "leads": [
         "get_client_groups",
@@ -56,6 +60,7 @@ _PAGE_TOOLS = {
         "get_unified_leads",
         "get_unified_lead_stats",
         "get_call_center_stats",
+        "render_ui",
     ],
     "opportunities": [
         "get_client_groups",
@@ -67,6 +72,7 @@ _PAGE_TOOLS = {
         "compare_periods",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "render_ui",
     ],
     "custom_metrics": [
         "get_client_groups",
@@ -82,6 +88,7 @@ _PAGE_TOOLS = {
         "get_call_center_stats",
         "get_call_recordings_summary",
         "analyze_call_recordings",
+        "render_ui",
     ],
     "report_designer": [
         "list_report_clients",
@@ -114,6 +121,7 @@ _PAGE_TOOLS = {
         "get_call_center_stats",
         "get_call_recordings_summary",
         "analyze_call_recordings",
+        "render_ui",
     ],
 }
 
@@ -121,7 +129,9 @@ _PAGE_TOOLS = {
 # whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
 # cut off mid-JSON — which parsed as no arguments at all.
 _PAGE_MAX_TOKENS = {"report_designer": 8000}
-DEFAULT_MAX_TOKENS = 2048
+# render_ui specs are tool arguments too: a 90-day, two-series chart is ~2k
+# tokens of JSON on its own, which the old 2,048 budget cut off mid-spec.
+DEFAULT_MAX_TOKENS = 4096
 
 # Tools offered only on a page that lists them. The general chat (no or unknown
 # page) gets every registered tool otherwise; the dashboard tools would only add
@@ -304,6 +314,7 @@ You have a bird's-eye view of the user's entire marketing operation. Your job is
 - Break down lead stats and pipeline (call `get_unified_lead_stats`, `get_ghl_opp_stats_windowed`)
 - Show top/bottom performing campaigns (call `get_campaign_insights`)
 - List clients and their status (call `get_client_groups`)
+- Draw charts, KPI cards and tables of any of the above (call `render_ui`)
 
 ## Tone and style
 - Be concise, direct, and data-focused.
@@ -404,8 +415,8 @@ Two or three short sentences. Never quote figures yourself; the preview shows th
 _PAGE_SYSTEM_PROMPTS = {
     "alerts": _ALERTS_SYSTEM_PROMPT,
     "custom_metrics": _CUSTOM_METRICS_SYSTEM_PROMPT,
-    "dashboard": _DASHBOARD_SYSTEM_PROMPT,
-    "call_center": _CALL_CENTER_SYSTEM_PROMPT,
+    "dashboard": with_rich_output(_DASHBOARD_SYSTEM_PROMPT),
+    "call_center": with_rich_output(_CALL_CENTER_SYSTEM_PROMPT),
     "report_designer": _REPORT_DESIGNER_SYSTEM_PROMPT,
     # Built when a session starts (a callable), so it reads the current catalog.
     "dashboards": dashboards_prompt.system_prompt,
@@ -419,7 +430,7 @@ _MEDIA_BUYING_PAGES = {None, "campaigns", "dashboard", "client_detail", "opportu
 
 
 def _build_client_detail_prompt(client_name: str, client_group_id: str) -> str:
-    return f"""You are Birdy AI, a marketing analyst assistant scoped exclusively to the client "{client_name}" (group ID: {client_group_id}).
+    prompt = f"""You are Birdy AI, a marketing analyst assistant scoped exclusively to the client "{client_name}" (group ID: {client_group_id}).
 
 ## Strict scope
 You ONLY answer questions about {client_name}. You have no knowledge of and must not discuss any other client.
@@ -440,7 +451,9 @@ If the user asks about a different client, another account, or anything outside 
 - Be concise and data-focused. Lead with the key number or insight, then context.
 - If data is unavailable for a requested period, say so clearly.
 - Never invent numbers. Only report what the tools return.
+- `render_ui` takes no group id; it draws the {client_name} data you already fetched.
 """
+    return with_rich_output(prompt)
 
 
 _GROUP_ARG_KEYS = ("group_id", "group_ids", "groups", "client_group_id")
@@ -564,6 +577,9 @@ async def run_chat(
     # append to this list themselves (see ai/tools/dashboard_tools.py), so the
     # ops survive even when the model-facing result is truncated.
     dashboard_ops: list = []
+    # Rendered visuals from render_ui, in order; the final reply's [[viz:N]]
+    # placeholders are swapped for these (see ai/tools/render_ui_tools.py).
+    ui_blocks: list = []
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -690,6 +706,7 @@ async def run_chat(
             if not response.tool_calls:
                 reply = response.content or "I wasn't able to generate a response."
                 reply = reply.strip() or "I wasn't able to generate a response."
+                reply = materialize_ui(reply, ui_blocks)
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 history.append({"role": "assistant", "content": reply})
                 await session_store.save_messages(db, session_id, history)
@@ -770,6 +787,8 @@ async def run_chat(
                         # list. Overrides anything the model passed under these names.
                         call_args = {**args, "dashboard_id": dashboard_id,
                                      "summary": dashboard_summary, "dashboard_ops_sink": dashboard_ops}
+                    elif tc.name == RENDER_UI_TOOL_NAME:
+                        call_args = {**args, "ui_blocks_sink": ui_blocks}
                     result = await tool_registry.execute(
                         tc.name,
                         db=db,

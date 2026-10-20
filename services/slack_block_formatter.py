@@ -185,7 +185,14 @@ def _metric_block(payload: dict, idx: int) -> list[dict]:
 
     sub_line = f"{icon} *{label}*".strip()
     delta = payload.get("delta")
-    if delta is not None:
+    delta_pct = payload.get("deltaPct")
+    if delta_pct is not None:
+        # render_ui's percent change; polarity says whether down is good, but
+        # Slack text has no colour to spend on it, so the arrow is the signal.
+        arrow = "▲" if delta_pct > 0 else ("▼" if delta_pct < 0 else "→")
+        delta_label = payload.get("deltaLabel", "")
+        sub_line += f"   {arrow} {abs(delta_pct):g}%{f' {delta_label}' if delta_label else ''}"
+    elif delta is not None:
         arrow = "▲" if delta > 0 else ("▼" if delta < 0 else "→")
         delta_str = _format_value(abs(delta), payload.get("format"), payload.get("currency", "$"))
         delta_label = payload.get("deltaLabel", "")
@@ -370,7 +377,7 @@ def _chart_block(payload: dict, idx: int, viz_budget: int) -> tuple[list[dict], 
                 s_title = f"{title} — {s_name}" if title else s_name
                 block_id = f"chart_{idx}_{s_idx}"
                 if viz_budget - used > 0:
-                    native_type = "line" if s.get("type") == "line" else "bar"
+                    native_type = s.get("type") if s.get("type") in ("line", "area") else "bar"
                     s_y_label = f"{s_name} ({s_currency})" if s_currency else None
                     block = _native_series_chart(native_type, s_title, data, key, sort, s_name, s_y_label)
                     block["block_id"] = block_id
@@ -382,7 +389,7 @@ def _chart_block(payload: dict, idx: int, viz_budget: int) -> tuple[list[dict], 
 
         if viz_budget <= 0:
             return [_fallback_series_block(title, data, "value", currency, sort, f"chart_{idx}")], 0
-        native_type = "line" if chart_type == "line" else "bar"
+        native_type = chart_type if chart_type in ("line", "area") else "bar"
         block = _native_series_chart(native_type, title, data, "value", sort, title, y_label)
         block["block_id"] = f"chart_{idx}"
         return [block], 1
