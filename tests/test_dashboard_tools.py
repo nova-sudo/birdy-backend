@@ -339,6 +339,64 @@ def test_summarize_doc_v2_is_migrated_like_dashkit():
     ])
 
 
+def _mixed_formats_v2_doc():
+    """A stored v2 doc whose comparisons migrate to charts and trends mixing catalog formats."""
+    def comparison(id, x, y, a, b, **data):
+        return {"id": id, "type": "comparison", "version": 1, "layout": _at(x, y, 6, 4), "data": data,
+                "bindings": {"a": a, "b": b}}
+
+    return {"id": "d4", "version": 2, "title": "Mixed formats", "meta": dict(_META), "widgets": [
+        comparison("c1", 0, 0, {"metric": "spend", "by": "client", "window": {"preset": "last_30d"}, "sort": "desc"},
+                   {"metric": "leads", "window": {"preset": "last_30d"}}),
+        comparison("c2", 6, 0, {"metric": "cost_per_lead", "by": "week", "window": {"preset": "last_30d"}},
+                   {"metric": "meta_ctr", "window": {"preset": "last_30d"}}, labelA="CPL"),
+        comparison("c3", 0, 4, {"metric": "meta_ctr", "by": "client", "window": {"preset": "maximum"},
+                                "compare": "previous"},
+                   {"metric": "conversion_rate", "window": {"preset": "maximum"}}, labelB="Clicks"),
+        comparison("c4", 6, 4, {"metric": "not_in_catalog", "by": "client", "window": {"preset": "last_7d"}},
+                   {"metric": "spend", "window": {"preset": "last_7d"}}),
+        {"id": "ks", "type": "kpi-strip", "version": 1, "layout": _at(0, 8, 12, 3), "data": {},
+         "bindings": {"a": {"metric": "spend", "window": {"preset": "last_7d"}},
+                      "b": {"metric": "leads", "window": {"preset": "last_7d"}}}},
+        {"id": "dn", "type": "donut", "version": 1, "layout": _at(0, 11, 6, 6), "data": {},
+         "bindings": {"series": {"metric": "meta_ctr", "by": "client", "window": {"preset": "last_7d"}}}},
+    ]}
+
+
+# dashkit's summarize(migrate(doc, {registry, catalog})) for _mixed_formats_v2_doc(), with the catalog snapshot
+# scripts/birdy-catalog.json (equal to build_catalog()): a chart or trend keeps only the metrics sharing metric 0's
+# format (a metric the catalog does not know is kept); a kpi-strip shows each metric on its own and keeps both.
+_MIXED_FORMATS_WITH_CATALOG = "\n".join([
+    "# Mixed formats (6 widgets)",
+    '- [c1] chart "" 6×4 @0,0',
+    "    query: metrics=spend by=client window=last_30d sort=spend:desc",
+    '- [c2] trend "" 6×4 @6,0',
+    '    query: metrics=cost_per_lead:"CPL" over=week window=last_30d',
+    '- [c3] chart "" 6×4 @0,4',
+    '    query: metrics=meta_ctr,conversion_rate:"Clicks" by=client window=maximum compare',
+    '- [c4] chart "" 6×4 @6,4',
+    "    query: metrics=not_in_catalog,spend by=client window=last_7d",
+    '- [ks] kpi-strip "" 12×3 @0,8',
+    "    query: metrics=spend,leads window=last_7d",
+    '- [dn] chart "" 6×6 @0,11',
+    "    query: metrics=meta_ctr by=client window=last_7d",
+])
+
+
+def test_summarize_doc_v2_with_the_catalog_matches_dashkit():
+    assert summarize_doc(_mixed_formats_v2_doc(), build_catalog()) == _MIXED_FORMATS_WITH_CATALOG
+    # Without a catalog (the parity fixture's case) every metric stays, as in dashkit's migrate(doc, {registry}).
+    plain = summarize_doc(_mixed_formats_v2_doc()).split("\n")
+    assert plain[2] == "    query: metrics=spend,leads by=client window=last_30d sort=spend:desc"
+    assert plain[4] == '    query: metrics=cost_per_lead:"CPL",meta_ctr over=week window=last_30d'
+
+
+async def test_describe_migrates_a_stored_doc_with_the_catalog(mock_db):
+    await _store(mock_db, _mixed_formats_v2_doc())
+    result = await dashboard_describe(mock_db, USER, dashboard_id="d4")
+    assert result == {"summary": _MIXED_FORMATS_WITH_CATALOG}
+
+
 # ── propose ────────────────────────────────────────────────────────────────
 
 
@@ -534,6 +592,59 @@ async def test_a_donut_takes_one_additive_metric(mock_db):
     assert additive["ok"] is True
     bars = await dashboard_propose_widget(mock_db, USER, type="chart", query=_q("meta_ctr", by="client"))
     assert bars["ok"] is True
+
+
+def _donut_doc():
+    """A v3 doc with a donut chart and a bar chart, as the editor saved it."""
+    def chart(id, x, kind):
+        return {"id": id, "type": "chart", "version": 1, "layout": _at(x, 0, 6, 6),
+                "data": {"chart": kind, "orientation": "vertical", "stacked": False},
+                "bindings": {"query": _q("spend", by="client")}}
+
+    return {"id": "d5", "version": 3, "title": "Shares", "meta": dict(_META),
+            "widgets": [chart("dn", 0, "donut"), chart("br", 6, "bar")]}
+
+
+async def test_set_query_on_an_existing_donut_is_checked(mock_db):
+    await _store(mock_db, _donut_doc())
+    # Ids from the stored doc, or from the editor's summary (which has no chart kind) plus the stored doc.
+    for summary in (None, summarize_doc(_donut_doc())):
+        two = await dashboard_apply(mock_db, USER, dashboard_id="d5", summary=summary, ops=[
+            {"op": "setQuery", "widgetId": "dn", "query": _q("spend", "meta_spend", by="client")}])
+        assert two["error"] == {"code": "QUERY_SHAPE", "path": "/ops/0/query",
+                                "message": "A donut chart takes exactly 1 metric, got 2"}
+        ratio = await dashboard_apply(mock_db, USER, dashboard_id="d5", summary=summary, ops=[
+            {"op": "setQuery", "widgetId": "dn", "query": _q("meta_ctr", by="client")}])
+        assert ratio["error"]["message"] == 'A donut chart needs an additive metric; "meta_ctr" is not'
+        bar = await dashboard_apply(mock_db, USER, dashboard_id="d5", summary=summary, ops=[
+            {"op": "setQuery", "widgetId": "br", "query": _q("meta_ctr", by="client")}])
+        assert bar["ok"] is True
+
+
+async def test_chart_kind_follows_the_ops_of_the_turn(mock_db):
+    await _store(mock_db, _donut_doc())
+    two = {"op": "setQuery", "widgetId": "br", "query": _q("spend", "meta_spend", by="client")}
+    made_donut = await dashboard_apply(mock_db, USER, dashboard_id="d5", ops=[
+        {"op": "updateWidgetData", "widgetId": "br", "patch": {"chart": "donut"}}, two])
+    assert made_donut["error"]["message"] == "A donut chart takes exactly 1 metric, got 2"
+    via_pointer = await dashboard_apply(mock_db, USER, dashboard_id="d5", ops=[
+        {"op": "setWidgetValue", "widgetId": "br", "path": "/chart", "value": "donut"}, two])
+    assert via_pointer["error"]["code"] == "QUERY_SHAPE"
+    # A type change resets the data to the type's defaults: a chart becomes a bar chart.
+    sink = []
+    reset = await dashboard_apply(mock_db, USER, dashboard_id="d5", dashboard_ops_sink=sink, ops=[
+        {"op": "changeWidgetType", "widgetId": "dn", "type": "table"},
+        {"op": "changeWidgetType", "widgetId": "dn", "type": "chart"},
+        {**two, "widgetId": "dn"}])
+    assert reset["ok"] is True
+    # A donut added earlier in the turn is known by later calls.
+    added = await dashboard_apply(mock_db, USER, dashboard_id="d5", dashboard_ops_sink=sink, ops=[
+        {"op": "addWidget", "widget": {"id": "new", "type": "chart", "query": _q("spend", by="client"),
+                                       "data": {"chart": "donut", "orientation": "vertical", "stacked": False}}}])
+    assert added["ok"] is True
+    later = await dashboard_apply(mock_db, USER, dashboard_id="d5", dashboard_ops_sink=sink,
+                                  ops=[{**two, "widgetId": "new"}])
+    assert later["error"]["message"] == "A donut chart takes exactly 1 metric, got 2"
 
 
 async def test_propose_widget_puts_ops_in_the_sink(mock_db):

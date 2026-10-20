@@ -25,9 +25,11 @@ QUERY_RULES, plus the trend/chart `check` ported below), then the catalog
 
 Stored docs saved before dashkit 0.4.0 are v2 (bindings per slot), or v1
 (sections with spans) before 0.3.0, until the editor next saves them, so
-`summarize_doc` and the stored-doc fallback migrate them the way dashkit's
-`migrate()` does: v1 is flattened onto the grid, v2 bindings become one query
-per widget, and sizes are clamped to the (possibly new) type's range.
+`summarize_doc` and the stored-doc fallback migrate them the way the editor's
+`migrate(doc, {registry, catalog})` does: v1 is flattened onto the grid, v2
+bindings become one query per widget (a chart or trend keeps only the metrics
+sharing metric 0's catalog format), and sizes are clamped to the (possibly new)
+type's range.
 
 The orchestrator injects three keyword arguments into these tools only:
 `dashboard_id` and `summary` (the editor's `summarize(doc)` of the live doc,
@@ -395,10 +397,11 @@ def _query_of(widget: dict) -> Optional[dict]:
 # compaction in normalizeLayout (src/core/layout.ts, itself react-grid-layout's
 # verticalCompactor). A stored v1 or v2 doc gets the same ids, types, sizes,
 # positions and queries here as in the editor after it migrates the doc on load.
-# Widget `data` is not migrated (the summary shows none of it but a heading's
-# level, and headings do not change), and there is no catalog: the editor's
-# catalog-aware steps (a non-additive donut becomes a bar chart, a chart or trend
-# keeps only the metrics sharing metric 0's format) are not applied.
+# A converted widget's `data` is only what dashkit carries over (the new type's
+# defaults are left out; the summary shows none of it, and the chart kind is what
+# the donut check reads). With a catalog the editor's catalog-aware steps apply too:
+# a non-additive donut becomes a bar chart, and a chart or trend keeps only the
+# metrics sharing metric 0's format (sameFormatMetrics).
 
 
 class _Cell:
@@ -584,89 +587,134 @@ def _build_query(entries: list, head: dict, by=None, over=None, sort=None, limit
     return query
 
 
-def _to_trend(entries: list, head: dict) -> tuple:
-    return "trend", _build_query(entries, head, over=head["by"] if _is_grain(head.get("by")) else "day")
+_TREND_CHARTS = ("area", "line", "bar")
+# dashkit's chart defaultData kind.
+_DEFAULT_CHART = "bar"
 
 
-def _to_chart(entries: list, head: dict, data_sort=None) -> tuple:
+def _to_trend(entries: list, head: dict, carry: dict) -> tuple:
+    return "trend", carry, _build_query(entries, head, over=head["by"] if _is_grain(head.get("by")) else "day")
+
+
+def _to_chart(entries: list, head: dict, carry: dict, data_sort=None) -> tuple:
     """A chart split by a dimension (client when the binding had none). The sort is the widget's own
     `data.sort` when it held one, else the binding's."""
     sort = data_sort if data_sort in ("asc", "desc") else head.get("sort")
-    return "chart", _build_query(entries, head, by=head.get("by", "client"), sort=sort, limit=head.get("limit"))
+    return "chart", carry, _build_query(entries, head, by=head.get("by", "client"), sort=sort, limit=head.get("limit"))
 
 
-def _convert_v2(widget_type, data: dict, slots: dict) -> Optional[tuple]:
-    """dashkit's convert: (new type, query or None) for one v2 widget; None for a type that has no query (it
-    keeps its type and loses any bindings)."""
+def _trend_chart_of(data: dict) -> Optional[str]:
+    """A v2 trend's `chart`; a v1 trend not migrated yet carries `area: boolean` instead."""
+    if data.get("chart") in _TREND_CHARTS:
+        return data["chart"]
+    return ("area" if data["area"] else "line") if isinstance(data.get("area"), bool) else None
+
+
+def _convert_v2(widget_type, data: dict, slots: dict, metrics: Optional[dict]) -> Optional[tuple]:
+    """dashkit's convert: (new type, carried data fields, query or None) for one v2 widget; None for a type that
+    has no query (it keeps its type and data and loses any bindings). `metrics` is the catalog by key, or None."""
     def only(slot):
         return [(slots[slot], None)] if slot in slots else []
 
     if widget_type == "kpi":
         entries = only("value")
-        return "kpi", (_build_query(entries, entries[0][0], spark=True) if entries else None)
+        return "kpi", {}, (_build_query(entries, entries[0][0], spark=True) if entries else None)
     if widget_type == "kpi-strip":
         entries = [e for slot in ("a", "b", "c", "d") for e in only(slot)]
         if not entries:
-            return "kpi-strip", None
+            return "kpi-strip", {}, None
         query = _build_query(entries, entries[0][0])
         # A strip needs 2..4 metrics; one left after dropping repeats is a plain kpi.
-        return ("kpi", {**query, "spark": True}) if len(query["metrics"]) < 2 else ("kpi-strip", query)
+        return ("kpi", {}, {**query, "spark": True}) if len(query["metrics"]) < 2 else ("kpi-strip", {}, query)
     if widget_type == "trend":
         entries = only("series")
+        chart = _trend_chart_of(data)
+        carry = {"chart": chart} if chart else {}
+        if isinstance(data.get("showPrevious"), bool):
+            carry["showPrevious"] = data["showPrevious"]
         if not entries:
-            return "trend", None
+            return "trend", carry, None
         head = entries[0][0]
-        return _to_trend(entries, head) if head.get("by") is None or _is_grain(head["by"]) else \
-            _to_chart(entries, head)
+        if head.get("by") is None or _is_grain(head["by"]):
+            return _to_trend(entries, head, carry)
+        return _to_chart(entries, head, {"chart": chart or "area"})
     if widget_type in ("bar", "donut"):
         entries = only("series")
+        bar = widget_type == "bar"
+        # A donut shows parts of a whole: a metric the catalog says is not additive becomes a bar chart.
+        head_metric = entries[0][0]["metric"] if entries else None
+        additive = ((metrics or {}).get(head_metric) or {}).get("additive")
+        carry = {"chart": "bar" if bar or additive is False else "donut"}
+        if bar and data.get("orientation") in ("vertical", "horizontal"):
+            carry["orientation"] = data["orientation"]
         if not entries:
-            return "chart", None
+            return "chart", carry, None
         head = entries[0][0]
         if _is_grain(head.get("by")):
-            return _to_trend(entries, head)
-        return _to_chart(entries, head, data.get("sort") if widget_type == "bar" else None)
+            return _to_trend(entries, head, {"chart": "bar"} if bar else {})
+        return _to_chart(entries, head, carry, data.get("sort") if bar else None)
     if widget_type == "comparison":
         entries = [(slots[slot], label if isinstance(label, str) and label else None)
                    for slot, label in (("a", data.get("labelA")), ("b", data.get("labelB"))) if slot in slots]
         if not entries:
-            return "chart", None
+            return "chart", {"chart": "bar"}, None
         head = entries[0][0]
-        return _to_trend(entries, head) if _is_grain(head.get("by")) else _to_chart(entries, head)
+        if _is_grain(head.get("by")):
+            return _to_trend(entries, head, {"chart": "bar"})
+        return _to_chart(entries, head, {"chart": "bar"})
     if widget_type == "funnel":
         head = slots.get("series")
         if head is None:
-            return "funnel", None
+            return "funnel", {}, None
         query = _build_query([(head, None)], head)
         query.pop("compare", None)
-        return "funnel", query
+        return "funnel", {}, query
     if widget_type == "leaderboard":
         head = slots.get("rows")
+        carry = {"showRank": data["showRank"]} if isinstance(data.get("showRank"), bool) else {}
         if head is None:
-            return "leaderboard", None
+            return "leaderboard", carry, None
         limit = head["limit"] if "limit" in head else (data.get("limit") if _is_number(data.get("limit")) else None)
-        return "leaderboard", _build_query([(head, None)], head, by=head.get("by", "client"), sort=head.get("sort"),
-                                           limit=limit)
+        return "leaderboard", carry, _build_query([(head, None)], head, by=head.get("by", "client"),
+                                                  sort=head.get("sort"), limit=limit)
     if widget_type == "table":
         head = slots.get("rows")
+        carry = {"dense": data["dense"]} if isinstance(data.get("dense"), bool) else {}
         if head is None:
-            return "table", None
+            return "table", carry, None
         if _is_grain(head.get("by")):
-            return "table", _build_query([(head, None)], head, over=head["by"])
-        return "table", _build_query([(head, None)], head, by=head.get("by", "client"), sort=head.get("sort"),
-                                     limit=head.get("limit"))
+            return "table", carry, _build_query([(head, None)], head, over=head["by"])
+        return "table", carry, _build_query([(head, None)], head, by=head.get("by", "client"),
+                                            sort=head.get("sort"), limit=head.get("limit"))
     return None
 
 
-def _migrate_widget_v2(widget: dict) -> dict:
-    """A v2 widget as a v3 one: one `bindings.query`, possibly a new type. Data is kept as is."""
+def _same_format_metrics(query: dict, metrics: dict) -> dict:
+    """dashkit's sameFormatMetrics: a chart or trend draws all its metrics on one value axis, so with a catalog it
+    keeps only the metrics that share metric 0's format (a metric the catalog does not know is kept)."""
+    def format_of(key):
+        return (metrics.get(key) or {}).get("format")
+
+    first = format_of(query["metrics"][0]["metric"])
+    if first is None:
+        return query
+    kept = [m for m in query["metrics"] if format_of(m["metric"]) in (None, first)]
+    return query if len(kept) == len(query["metrics"]) else {**query, "metrics": kept}
+
+
+def _migrate_widget_v2(widget: dict, metrics: Optional[dict] = None) -> dict:
+    """A v2 widget as a v3 one: one `bindings.query`, possibly a new type. A converted widget's data is the
+    fields dashkit carries over (without the new type's defaults, which dashkit adds from its registry).
+    `metrics` (the catalog by key) enables dashkit's catalog-aware steps."""
     rest = {k: v for k, v in widget.items() if k != "bindings"}
     data = widget.get("data") if isinstance(widget.get("data"), dict) else {}
-    converted = _convert_v2(widget.get("type"), data, _slots_of(widget.get("bindings")))
+    converted = _convert_v2(widget.get("type"), data, _slots_of(widget.get("bindings")), metrics)
     if converted is None:
         return rest
-    widget_type, query = converted
-    out = {**rest, "type": widget_type}
+    widget_type, carry, query = converted
+    if query is not None and widget_type in ("chart", "trend") and metrics is not None:
+        query = _same_format_metrics(query, metrics)
+    out = {**rest, "type": widget_type, "data": carry}
     if query is not None:
         out["bindings"] = {"query": query}
     return out
@@ -697,26 +745,33 @@ def _is_older_than_v3(version) -> bool:
     return _is_number(version) and version < 3
 
 
-def _doc_widgets(doc: Optional[dict]) -> list[dict]:
+def _metrics_by_key(catalog: Optional[dict]) -> Optional[dict]:
+    return None if catalog is None else {m["key"]: m for m in catalog["metrics"]}
+
+
+def _doc_widgets(doc: Optional[dict], catalog: Optional[dict] = None) -> list[dict]:
     """The doc's widgets in dashkit's summary order, (y, x, stored order). A v1 doc (sections) is flattened and
-    a v1/v2 doc's widgets migrated to v3, as dashkit's migrate() does."""
+    a v1/v2 doc's widgets migrated to v3, as dashkit's migrate() does (with `catalog`, as the editor does)."""
     doc = doc or {}
+    metrics = _metrics_by_key(catalog)
     if isinstance(doc.get("widgets"), list):
         widgets = [w for w in doc["widgets"] if isinstance(w, dict)]
         if _is_older_than_v3(doc.get("version")):
-            widgets = _clamp_sizes([_migrate_widget_v2(w) for w in widgets])
+            widgets = _clamp_sizes([_migrate_widget_v2(w, metrics) for w in widgets])
     elif isinstance(doc.get("sections"), list):
-        widgets = _clamp_sizes([_migrate_widget_v2(w) for w in _flatten_v1(doc)])
+        widgets = _clamp_sizes([_migrate_widget_v2(w, metrics) for w in _flatten_v1(doc)])
     else:
         widgets = []
     order = sorted(range(len(widgets)), key=lambda i: (_grid(widgets[i])["y"], _grid(widgets[i])["x"], i))
     return [widgets[i] for i in order]
 
 
-def summarize_doc(doc: dict) -> str:
+def summarize_doc(doc: dict, catalog: Optional[dict] = None) -> str:
     """dashkit's `summarize(doc)`, line for line (src/core/summarize.ts). A v1 or v2 doc is summarized as
-    dashkit's `migrate()` turns it into v3."""
-    widgets = _doc_widgets(doc)
+    dashkit's `migrate(doc, {registry, catalog})` turns it into v3; pass the catalog (build_catalog()) to match
+    the editor, which migrates with it. Without one the catalog-aware steps are skipped, as in the parity
+    fixture."""
+    widgets = _doc_widgets(doc, catalog)
     lines = [line for widget in widgets for line in _widget_lines(widget)]
     return "\n".join([f'# {doc.get("title", "")} ({len(widgets)} widgets)', *lines])
 
@@ -737,16 +792,20 @@ class _Layout:
     Mirrors only the id bookkeeping of dashkit's applyAll (positions are left
     to the editor, which places and compacts), plus the current dashboard and
     widget titles (so an op that keeps a title as it is is not rejected for
-    markdown the user typed themselves) and each widget's type (a `setQuery`
-    must fit the type the widget has by then).
+    markdown the user typed themselves), each widget's type (a `setQuery`
+    must fit the type the widget has by then) and each chart's kind
+    (`data.chart`, so a `setQuery` on a donut gets the donut check). The
+    summary carries no chart kind: it comes from the stored doc, for the
+    widgets whose type there matches.
     """
 
     def __init__(self, widgets: list[str], title: Optional[str] = None, widget_titles: Optional[dict] = None,
-                 widget_types: Optional[dict] = None):
+                 widget_types: Optional[dict] = None, widget_charts: Optional[dict] = None):
         self.widgets: list = list(widgets)
         self.title = title
         self.widget_titles: dict = dict(widget_titles or {})
         self.widget_types: dict = dict(widget_types or {})
+        self.widget_charts: dict = dict(widget_charts or {})
 
     @classmethod
     def from_summary(cls, summary: str) -> "_Layout":
@@ -766,10 +825,19 @@ class _Layout:
         return cls(widgets, title, widget_titles, widget_types)
 
     @classmethod
-    def from_doc(cls, doc: Optional[dict]) -> "_Layout":
-        widgets = _doc_widgets(doc)
+    def from_doc(cls, doc: Optional[dict], catalog: Optional[dict] = None) -> "_Layout":
+        widgets = _doc_widgets(doc, catalog)
+        charts = {w.get("id"): w["data"]["chart"] for w in widgets
+                  if w.get("type") == "chart" and isinstance(w.get("data"), dict) and "chart" in w["data"]}
         return cls([w.get("id") for w in widgets], (doc or {}).get("title"),
-                   {w.get("id"): w.get("title") for w in widgets}, {w.get("id"): w.get("type") for w in widgets})
+                   {w.get("id"): w.get("title") for w in widgets}, {w.get("id"): w.get("type") for w in widgets},
+                   charts)
+
+    def take_charts(self, stored: "_Layout") -> None:
+        """Chart kinds from the stored doc, for the widgets that are charts in both."""
+        for widget_id, chart in stored.widget_charts.items():
+            if self.widget_types.get(widget_id) == "chart" and stored.widget_types.get(widget_id) == "chart":
+                self.widget_charts.setdefault(widget_id, chart)
 
     def has_widget(self, widget_id) -> bool:
         return widget_id in self.widgets
@@ -809,14 +877,31 @@ class _Layout:
             index = self.widgets.index(after) + 1 if after in self.widgets else len(self.widgets)
             self.widgets.insert(index, widget["id"])
             self.widget_types[widget["id"]] = widget.get("type")
+            data = widget.get("data")
+            self._set_chart(widget["id"], data.get("chart") if isinstance(data, dict) else _DEFAULT_CHART)
             if widget.get("title") is not None:
                 self.widget_titles[widget["id"]] = widget["title"]
         elif name == "changeWidgetType" and op.get("widgetId") in self.widgets:
+            # dashkit resets the data to the new type's defaults.
             self.widget_types[op["widgetId"]] = op.get("type")
+            self._set_chart(op["widgetId"], _DEFAULT_CHART)
+        elif name == "updateWidgetData" and "chart" in (op.get("patch") or {}):
+            self._set_chart(op["widgetId"], op["patch"]["chart"])
+        elif name == "setWidgetValue" and op.get("path") in ("/chart", ""):
+            value = op.get("value")
+            self._set_chart(op["widgetId"], value if op["path"] else
+                            (value.get("chart") if isinstance(value, dict) else None))
         elif name == "removeWidget" and op.get("widgetId") in self.widgets:
             self.widgets.remove(op["widgetId"])
             self.widget_titles.pop(op["widgetId"], None)
             self.widget_types.pop(op["widgetId"], None)
+            self.widget_charts.pop(op["widgetId"], None)
+
+    def _set_chart(self, widget_id, chart) -> None:
+        if self.widget_types.get(widget_id) == "chart" and chart is not None:
+            self.widget_charts[widget_id] = chart
+        else:
+            self.widget_charts.pop(widget_id, None)
 
     def query_error(self, op: dict, at: str, metrics: dict, dimensions: set) -> Optional[dict]:
         """The query a `setQuery` or `addWidget` op sets, checked against the widget's type (as it is by then)
@@ -826,7 +911,9 @@ class _Layout:
             widget_type = self.widget_types.get(op["widgetId"])
             if widget_type is not None and widget_type not in _widget_types():
                 return _fail("WIDGET_TYPE_UNKNOWN", f"{at}/widgetId", f'Unknown widget type "{widget_type}"')
-            return _query_error(op["query"], f"{at}/query", widget_type, None, metrics, dimensions)
+            chart = self.widget_charts.get(op["widgetId"])
+            return _query_error(op["query"], f"{at}/query", widget_type, None if chart is None else {"chart": chart},
+                                metrics, dimensions)
         if name == "addWidget" and "query" in op["widget"]:
             widget = op["widget"]
             return _query_error(widget["query"], f"{at}/widget/query", widget["type"], widget.get("data"),
@@ -835,10 +922,12 @@ class _Layout:
 
 
 async def _layout(db, user_id, dashboard_id, summary, sink) -> _Layout:
+    stored = _Layout.from_doc(await _stored_doc(db, user_id, dashboard_id), build_catalog())
     if isinstance(summary, str) and summary.strip():
         layout = _Layout.from_summary(summary)
+        layout.take_charts(stored)
     else:
-        layout = _Layout.from_doc(await _stored_doc(db, user_id, dashboard_id))
+        layout = stored
     for op in sink or []:
         layout.apply(op)
     return layout
@@ -854,7 +943,7 @@ async def dashboard_describe(db, user_id, dashboard_id=None, summary=None, dashb
         doc = await _stored_doc(db, user_id, dashboard_id)
         if doc is None:
             return _fail("NOT_FOUND", "", "No dashboard is open in the editor.")
-        text = summarize_doc(doc)
+        text = summarize_doc(doc, build_catalog())
     result = {"summary": text}
     if dashboard_ops_sink:
         result["note"] = (f"This outline was taken before the {len(dashboard_ops_sink)} op(s) returned earlier "
