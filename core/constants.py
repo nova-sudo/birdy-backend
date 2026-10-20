@@ -1,3 +1,5 @@
+from datetime import date as _date, datetime as _datetime, timedelta
+
 # ---------------------------------------------------------------------------
 # Meta preset taxonomy
 # ---------------------------------------------------------------------------
@@ -100,7 +102,6 @@ def previous_preset(preset: str):
 # this_* runs from the period's first day to today, last_* is the whole
 # preceding period. `maximum` has no start of its own (the query engine reads
 # it from the data) and no previous period.
-from datetime import date as _date, timedelta  # noqa: E402 (also imported below for the GHL helpers)
 
 _ROLLING_DAYS = {"last_7d": 7, "last_14d": 14, "last_30d": 30}
 _PERIOD_MONTHS = {"month": 1, "quarter": 3, "year": 12}
@@ -136,9 +137,19 @@ _CALENDAR_PRESETS = {
 
 
 def _parse_day(value) -> _date:
+    """A strict YYYY-MM-DD date (no ISO week dates or other forms fromisoformat allows)."""
     if not isinstance(value, str) or len(value) != 10:
         raise ValueError(f"Not a YYYY-MM-DD date: {value!r}")
-    return _date.fromisoformat(value)
+    return _datetime.strptime(value, "%Y-%m-%d").date()
+
+
+def bucket_spans_window(preset: str) -> bool:
+    """
+    Whether the cached bucket of canonical `preset` covers the same days as
+    window_range: calendar windows, today and yesterday. Not maximum (no start)
+    and not last_Nd (Meta's buckets end yesterday, GHL's span N+1 days).
+    """
+    return preset in _CALENDAR_PRESETS or preset in ("today", "yesterday")
 
 
 def window_range(window: dict, today: _date = None):
@@ -221,7 +232,6 @@ GHL_PRESET_DATE_RANGE = {
 # ---------------------------------------------------------------------------
 # GHL date-bound helpers (shared by router + caching service)
 # ---------------------------------------------------------------------------
-from datetime import date as _date, timedelta
 
 
 def ghl_date_bounds(preset_key: str):

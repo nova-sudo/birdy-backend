@@ -16,7 +16,17 @@ Where a number comes from:
     aggregate_metric); they have no value for a custom range or a bucket.
   - `maximum` totals and rows read the cached `maximum` bucket for every
     metric: daily history is capped (Meta keeps ~400 days), the bucket is all
-    time. Its buckets and sparkline still come from the daily rows.
+    time. Its buckets and sparkline still come from the daily rows (R27).
+  - The same goes for any window whose cached bucket covers exactly its days
+    (calendar windows, today, yesterday): a group whose daily history starts
+    after the window's first day has its totals and rows read from that
+    bucket when it holds one (R28; e.g. last_year against ~400 days of Meta
+    rows). Without a bucket (custom ranges, last_Nd, a client that is simply
+    new) the daily sum stands. Buckets and sparklines stay daily.
+  - Spans differ on last_Nd: the frame's window is the N days ending today
+    (dashkit's calendar) and daily metrics sum exactly that, but a preset-only
+    metric reads the cached bucket, which for Meta is the N days ending
+    yesterday and for GHL N+1 days ending today.
   - Ratios (METRIC_REGISTRY aggregation `recompute`) are scale × Σnum ÷ Σden at
     every level (total, row, bucket, previous, spark day); a zero denominator
     is None, never 0 or an average of ratios.
@@ -46,7 +56,7 @@ from typing import Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
-from core.constants import PRESET_ALIAS, previous_preset, previous_window, window_range
+from core.constants import PRESET_ALIAS, bucket_spans_window, previous_preset, previous_window, window_range
 from services.dashboards_catalog import DAILY_SOURCES, build_catalog
 from services.dashboards_resolve import (
     _covers,
@@ -152,6 +162,10 @@ class _Period:
     maximum: bool = False
     current_preset: Optional[str] = None  # the window's own preset, for a previous period
     only_days: Optional[set] = None
+    bucket_spans: bool = False  # the current window's cached `preset` bucket covers exactly start..end
+
+
+_ALL_DAILY_FIELDS = {src["field"] for src in DAILY_SOURCES.values()}
 
 
 def _metric_daily_fields(metric: str) -> set:
@@ -256,6 +270,11 @@ class _Engine:
     def _daily_part(self, group: dict, key: str, source: dict, period: _Period) -> Optional[float]:
         field, row_key = source["field"], source["key"]
         if not period.previous:
+            if period.bucket_spans and period.only_days is None:
+                days = self.field_days(group, field)
+                if (not days or days[0] > period.start) and _covers(group, _metric_sources(key), period.preset):
+                    # history starts inside the window (capped rows, or not written yet): the bucket has it all
+                    return _finite(get_metric_value(key, group, period.preset))
             return self.series(group, field, row_key).total(period.start, period.end, period.only_days)
         if not self.field_days(group, field):
             return 0.0  # never had this series: contributes nothing to either period
@@ -266,7 +285,8 @@ class _Engine:
         return None
 
     def earliest_day(self, groups: List[dict], metrics: List[str]) -> Optional[str]:
-        fields = set().union(*(_metric_daily_fields(m) for m in metrics))
+        """The first daily row of the metrics' series; of any series when the metrics have none."""
+        fields = set().union(*(_metric_daily_fields(m) for m in metrics)) or _ALL_DAILY_FIELDS
         firsts = [self.field_days(g, f)[0] for g in groups for f in fields if self.field_days(g, f)]
         return min(firsts) if firsts else None
 
@@ -309,7 +329,8 @@ class _Engine:
         if maximum:
             first = self.earliest_day(groups, keys)
             start = date.fromisoformat(first) if first else end
-        current = _Period(start.isoformat(), end.isoformat(), preset=preset, maximum=maximum, only_days=only_days)
+        current = _Period(start.isoformat(), end.isoformat(), preset=preset, maximum=maximum, only_days=only_days,
+                          bucket_spans=preset is not None and bucket_spans_window(preset))
 
         previous: Optional[_Period] = None
         if q.compare == "previous" and prev_range is not None:
@@ -471,14 +492,26 @@ def _buckets(start: date, end: date, grain: str) -> List[tuple]:
 
 
 def _daily_fields_for(queries: List) -> set:
-    """The daily series the request's metrics read (metrics without daily history read none)."""
+    """
+    The daily series the request's metrics read (metrics without daily history
+    read none), plus every series for a `maximum` query that has none, whose
+    window starts at the group's first daily row of any kind.
+    """
     fields: set = set()
     for q in queries:
-        metrics = q.get("metrics") if isinstance(q, dict) else None
+        if not isinstance(q, dict):
+            continue
+        metrics = q.get("metrics")
+        own: set = set()
         for ref in metrics if isinstance(metrics, list) else []:
             metric = ref.get("metric") if isinstance(ref, dict) else None
             if isinstance(metric, str):
-                fields |= _metric_daily_fields(metric)
+                own |= _metric_daily_fields(metric)
+        window = q.get("window")
+        preset = window.get("preset") if isinstance(window, dict) else None
+        if not own and isinstance(preset, str) and PRESET_ALIAS.get(preset) == "maximum":
+            own = _ALL_DAILY_FIELDS
+        fields |= own
     return fields
 
 

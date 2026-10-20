@@ -387,6 +387,54 @@ async def test_previous_falls_back_to_the_previous_preset_bucket(db):
     assert rows["g1"]["previous"] == {"spend": _spend("g1", date(2026, 9, 1), date(2026, 9, 20))}
 
 
+async def test_window_older_than_the_daily_history_reads_the_cached_bucket(db):
+    # R28: Echo's Meta rows start mid-2025 (Meta keeps ~400 days), so last_year's
+    # daily sum would cover half the year; the cached last_year bucket has all of it.
+    # Echo also has a GHL bucket but no daily opportunity rows yet.
+    await db["client_groups"].insert_one(_group(
+        "g7", "Echo",
+        [{"date": _iso(d), "spend": 2, "results": 1} for d in _days(date(2025, 7, 1), TODAY)],
+        {"last_year": _insights(spend=900, results=30)},
+        ghl_opp_cache={"last_year": {"won": 5}},
+    ))
+    echo = {"client": ["g7"]}
+    frame = await _one(db, _q("spend", "cpl", "ghl_won_opps", preset="last_year", by="client", filters=echo))
+    assert frame["totals"]["values"] == {"spend": 900.0, "cpl": 30.0, "ghl_won_opps": 5.0}
+    assert frame["rows"][0]["values"] == {"spend": 900.0, "cpl": 30.0, "ghl_won_opps": 5.0}
+
+    # buckets stay daily
+    months = await _one(db, _q("spend", preset="last_year", over="month", filters=echo))
+    assert [r["values"]["spend"] for r in months["rows"]][5:7] == [0.0, 62.0]
+    assert months["totals"]["values"] == {"spend": 900.0}
+
+    # no bucket for a custom range: the daily sum stands
+    custom = await _one(db, _q("spend", window={"from": "2025-01-01", "to": "2025-12-31"}, filters=echo))
+    assert custom["totals"]["values"] == {"spend": 2.0 * 184}
+    # a client that is simply new, with no bucket for the window, keeps its daily sum
+    cobalt = await _one(db, _q("spend", preset="last_month", filters={"client": ["g3"]}))
+    assert cobalt["totals"]["values"] == {"spend": 0.0}
+
+
+async def test_maximum_with_only_preset_metrics_starts_at_the_first_daily_row(db):
+    frame = await _one(db, _q("reach", preset="maximum"))
+    assert frame["window"] == {"label": "All time", "from": "2024-01-01", "to": "2026-10-20"}
+    assert frame["totals"]["values"] == {"reach": 600.0}
+
+
+async def test_empty_client_filter_is_no_filter(db):
+    assert (await _one(db, _q("spend", filters={"client": []})))["totals"]["values"] == {"spend": 825}
+
+
+async def test_client_filter_cannot_reach_other_users_or_inactive_groups(db):
+    frame = await _one(db, _q("spend", by="client", filters={"client": ["g4", "g5"]}))
+    assert frame["rows"] == []
+    assert frame["totals"]["values"] == {"spend": None}
+
+
+async def test_custom_window_dates_must_be_yyyy_mm_dd(db):
+    assert await _run(db, _q("spend", window={"from": "2026-W40-1", "to": "2026-10-20"})) == [None]
+
+
 async def test_short_history_without_a_bucket_gives_null_previous(db):
     # Cobalt's rows start on 1 Oct, so the previous 7 days before 1-10 Oct are not on record.
     frame = await _one(db, _q("spend", window={"from": "2026-10-01", "to": "2026-10-10"}, compare="previous"))
