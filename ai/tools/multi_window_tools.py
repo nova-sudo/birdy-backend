@@ -306,6 +306,112 @@ async def get_metrics_by_day_windows(db, user_id, windows_days, group_ids=None, 
     return {"groups": results[:MAX_RESULT_ITEMS], "total_groups": len(results), "windows_days": windows_days}
 
 
+# ── Day-by-day series (for charts) ──────────────────────────────────────────
+
+MAX_SERIES_DAYS = 90
+
+
+def _daily_series(daily_rows: list[dict], since_iso: str, until_iso: str) -> list[dict]:
+    """One row per calendar day in [since, until], zero-filled, with CPL and
+    CTR derived here rather than by the model. Pure, no I/O."""
+    by_day: dict[str, dict] = {}
+    for row in daily_rows:
+        d = row.get("date_start")
+        if not d:
+            continue
+        acc = by_day.setdefault(d, {"spend": 0.0, "impressions": 0, "clicks": 0, "leads": 0})
+        acc["spend"] += row.get("spend", 0) or 0
+        acc["impressions"] += row.get("impressions", 0) or 0
+        acc["clicks"] += row.get("clicks", 0) or 0
+        acc["leads"] += row.get("results", row.get("leads", 0)) or 0
+    out = []
+    day = date.fromisoformat(since_iso)
+    end = date.fromisoformat(until_iso)
+    while day <= end:
+        iso = day.isoformat()
+        acc = by_day.get(iso, {"spend": 0.0, "impressions": 0, "clicks": 0, "leads": 0})
+        spend = round(acc["spend"], 2)
+        out.append({
+            "date": iso,
+            "spend": spend,
+            "leads": acc["leads"],
+            "clicks": acc["clicks"],
+            "impressions": acc["impressions"],
+            "cpl": _safe_div(spend, acc["leads"]),
+            "ctr": round(acc["clicks"] / acc["impressions"] * 100, 2) if acc["impressions"] else None,
+        })
+        day += timedelta(days=1)
+    return out
+
+
+async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=None, **kwargs):
+    """
+    Meta spend, leads, clicks, impressions, CPL and CTR per calendar day for the
+    last `days` days, per client and summed across them. The one tool that
+    returns a time series, so the chat can chart a trend from real numbers
+    instead of window totals.
+    """
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return {"error": "days must be a whole number of days, e.g. 30"}
+    if days < 2 or days > MAX_SERIES_DAYS:
+        return {"error": f"days must be between 2 and {MAX_SERIES_DAYS}"}
+
+    query = {"user_id": user_id}
+    if group_ids:
+        query["id"] = {"$in": group_ids}
+    groups = await db["client_groups"].find(
+        query,
+        {"id": 1, "name": 1, "meta_ad_account_id": 1, "ad_account_currency": 1, "meta_campaign_ids": 1, "_id": 0},
+    ).to_list(None)
+    if not groups:
+        return {"error": "No matching client groups found."}
+
+    today = date.today()
+    until_iso = (today - timedelta(days=1)).isoformat()  # today is still filling in
+    since_iso = (today - timedelta(days=days)).isoformat()
+
+    meta_token = None
+    if any(g.get("meta_ad_account_id") for g in groups):
+        token_doc = await get_facebook_token(user_id, db.client)
+        meta_token = (token_doc or {}).get("access_token")
+
+    async def _one(g):
+        res = {"group_id": g.get("id"), "group_name": g.get("name"), "currency": g.get("ad_account_currency")}
+        campaign_ids = g.get("meta_campaign_ids")
+        if not g.get("meta_ad_account_id"):
+            res["meta_error"] = "Meta is not connected for this client."
+            return res, []
+        if campaign_ids is not None and len(campaign_ids) == 0:
+            res["meta_note"] = NO_CAMPAIGNS_NOTE
+            return res, []
+        if not meta_token:
+            res["meta_error"] = "No Meta token found. Please connect your Meta account first."
+            return res, []
+        data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, since_iso, until_iso, campaign_ids)
+        if "error" in data:
+            res["meta_error"] = data["error"]
+            return res, []
+        res["days"] = _daily_series(data["days"], since_iso, until_iso)
+        return res, data["days"]
+
+    results = await asyncio.gather(*(_one(g) for g in groups))
+    per_group = [r for r, _ in results]
+    all_rows = [row for _, rows in results for row in rows]
+    currencies = {r.get("currency") for r in per_group if r.get("days")}
+    out = {
+        "since": since_iso,
+        "until": until_iso,
+        "groups": per_group[:MAX_RESULT_ITEMS],
+        "total_groups": len(per_group),
+    }
+    # A combined series only when every client with data shares one currency.
+    if len([r for r in per_group if r.get("days")]) > 1 and len(currencies) == 1:
+        out["combined"] = {"currency": next(iter(currencies)), "days": _daily_series(all_rows, since_iso, until_iso)}
+    return out
+
+
 # ── Registration ─────────────────────────────────────────────────────────────
 
 def register_multi_window_tools():
@@ -342,4 +448,26 @@ def register_multi_window_tools():
             "required": ["windows_days"],
         },
         executor=get_metrics_by_day_windows,
+    )
+    registry.register(
+        name="get_daily_metrics",
+        description=(
+            "Meta ad spend, leads, clicks, impressions, CPL and CTR per calendar day for the last N days "
+            "(up to 90, ending yesterday), per client plus a combined series across clients. Use this for "
+            "any trend or over-time chart (e.g. 'ad spend vs CPL over the last 30 days'), then draw it with "
+            "render_ui. A day with spend but no leads has cpl null: leave it null, don't fill it."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": "How many days back, 2-90. Default 30."},
+                "group_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Filter to specific group IDs (resolve names via get_client_groups first). Omit for all groups.",
+                },
+            },
+            "required": [],
+        },
+        executor=get_daily_metrics,
     )

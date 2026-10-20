@@ -90,8 +90,14 @@ def _fmt(value, where: str) -> str:
 
 
 def _currency(value) -> str | None:
-    s = _text(value, "currency", limit=4)
-    return s
+    return _text(value, "currency", limit=4)
+
+
+def _fmt_for(spec: dict, where: str) -> str:
+    # A currency symbol with no format means money, not a bare count.
+    if spec.get("format") is None and _currency(spec.get("currency")):
+        return "currency"
+    return _fmt(spec.get("format"), f"{where}.format")
 
 
 def _polarity(value, where: str) -> str | None:
@@ -112,7 +118,7 @@ def _kpi_fields(spec: dict, where: str) -> dict:
     return _drop_none({
         "label": _text(spec.get("label"), f"{where}.label", required=True),
         "value": _num(spec.get("value"), f"{where}.value"),
-        "format": _fmt(spec.get("format"), f"{where}.format"),
+        "format": _fmt_for(spec, where),
         "currency": _currency(spec.get("currency")),
         "deltaPct": _num(spec.get("delta_pct"), f"{where}.delta_pct", allow_none=True),
         "deltaLabel": _text(spec.get("delta_label"), f"{where}.delta_label", limit=40),
@@ -153,7 +159,7 @@ def _chart(spec: dict, where: str, kind: str) -> tuple[str, object]:
     if len(data) > limit:
         raise SpecError(f"{where}.data has {len(data)} rows; at most {limit} for a {kind} chart")
 
-    fmt = _fmt(spec.get("format"), f"{where}.format")
+    fmt = _fmt_for(spec, where)
     currency = _currency(spec.get("currency"))
     series_in = spec.get("series")
 

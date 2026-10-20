@@ -39,6 +39,7 @@ _PAGE_TOOLS = {
         "get_campaign_insights",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "get_daily_metrics",
         "render_ui",
     ],
     "campaigns": [
@@ -50,6 +51,7 @@ _PAGE_TOOLS = {
         "compare_periods",
         "get_metrics_by_day_windows",
         "get_call_center_stats",
+        "get_daily_metrics",
         "render_ui",
     ],
     "leads": [
@@ -121,6 +123,7 @@ _PAGE_TOOLS = {
         "get_call_center_stats",
         "get_call_recordings_summary",
         "analyze_call_recordings",
+        "get_daily_metrics",
         "render_ui",
     ],
 }
@@ -314,6 +317,7 @@ You have a bird's-eye view of the user's entire marketing operation. Your job is
 - Break down lead stats and pipeline (call `get_unified_lead_stats`, `get_ghl_opp_stats_windowed`)
 - Show top/bottom performing campaigns (call `get_campaign_insights`)
 - List clients and their status (call `get_client_groups`)
+- Day-by-day spend, leads and CPL for trend charts (call `get_daily_metrics`)
 - Draw charts, KPI cards and tables of any of the above (call `render_ui`)
 
 ## Tone and style
@@ -444,6 +448,7 @@ If the user asks about a different client, another account, or anything outside 
 - Period comparison: call compare_periods — always pass group_ids=["{client_group_id}"]
 - Active alerts: call get_alerts and filter by this client
 - Live Meta data: call get_meta_insights_live — always pass group_ids=["{client_group_id}"]
+- Day-by-day spend, leads, CPL and CTR (for trend charts): call get_daily_metrics — always pass group_ids=["{client_group_id}"]
 - Call recordings: call get_call_recordings_summary then analyze_call_recordings — always pass group_id="{client_group_id}" (the server enforces this scope regardless). Follow the confirm-first flow: report how many recorded calls/minutes exist, ask how many to analyze with a :::ui radio block (max 15 per run), and only call analyze_call_recordings with confirmed=true after the user explicitly confirms. Never claim to know what was said on a call you did not analyze.
 
 ## Rules

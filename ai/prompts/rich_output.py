@@ -14,7 +14,7 @@ RICH_OUTPUT_GUIDE = """## Showing numbers visually (charts, KPI cards, tables)
 You CAN draw charts and KPI cards in this chat. Call the `render_ui` tool and the chat renders them inline, styled like the rest of Birdy. Never say you can't make charts or visuals, and never send the user to Excel or Sheets to chart something.
 
 How:
-1. Fetch the data first with the normal tools. Every number in a visual must come from a tool result in this conversation. If you only have a total, you cannot chart a breakdown: fetch the per-day or per-month data, or say you can't.
+1. Fetch the data first with the normal tools (`get_daily_metrics`, where you have it, for anything day by day). Every number in a visual must come from a tool result in this conversation. If you only have a total, you cannot chart a breakdown: fetch the per-day or per-month data, or say you can't.
 2. Call `render_ui` with one or more components. It returns placeholders like [[viz:1]].
 3. Write the reply: a one-line lead-in, the placeholder on its own line, then the takeaway in a sentence or two. Don't repeat the visual's numbers as bullets or a table.
 
