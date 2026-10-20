@@ -268,6 +268,38 @@ def test_percent_must_be_the_same_cells_change_with_matching_direction():
     assert not _ok(g, "Spend up 100%")                 # Acme's 800 over Beta's previous 400 is not a change
 
 
+def test_percent_words_are_checked_like_the_percent_sign():
+    g = _grounding(_frame())
+    assert [(f.kind, f.value) for f in extract_figures("30 percent, 25 per cent, 12 pct, 7percent")] == [
+        ("percent", 30.0), ("percent", 25.0), ("percent", 12.0), ("percent", 7.0)]
+    assert not _ok(g, "Spend rose 30 percent")      # 30 is only a lead count
+    assert _ok(g, "Leads grew 25 per cent")         # 40 -> 50
+    assert not _ok(g, "Leads grew 37 per cent")
+    assert _ok(g, "Spend rose 12 pct")              # 1100 -> 1234.5
+    assert not _ok(g, "Spend fell 12 pct")          # wrong direction
+    assert extract_figures("5 percentage points")[0].kind == "points"
+
+
+def test_a_number_after_a_month_is_a_date_only_when_it_is_a_day():
+    assert [f.value for f in extract_figures("In October 99 new leads came in")] == [99.0]
+    assert [f.value for f in extract_figures("In October 40 clicks")] == [40.0]       # not a day
+    assert [f.value for f in extract_figures("On Oct 20 spend was $1.2k")] == [1200.0]  # a day
+    assert [f.value for f in extract_figures("Oct 20 leads grew 25%")] == [20.0, 25.0]  # a count: leads
+    assert [f.value for f in extract_figures("Up 12% since Oct 20.")] == [12.0]
+    assert [f.value for f in extract_figures("From 3 Oct to 20th of October")] == []
+    assert [f.value for f in extract_figures("Oct 20%")] == [20.0]
+
+
+def test_leading_dot_figures_and_more_direction_words():
+    assert [(f.kind, f.value) for f in extract_figures("up .5pp and .9x and $.75")] == [
+        ("points", 0.5), ("multiple", 0.9), ("plain", 0.75)]
+    g = _grounding(_frame())
+    assert _ok(g, "Leads are 25% above the previous period") and _ok(g, "Leads 25% more than before")
+    assert not _ok(g, "Leads are 25% below the previous period") and not _ok(g, "Leads 25% less than before")
+    assert not _ok(g, "Spend cut 12%") and _ok(g, "Spend gain of 12%")
+    assert _ok(g, "Spend drop of 12%") is False
+
+
 def test_percent_of_a_percentage_column_is_its_value():
     frame = _frame()
     frame["columns"].append({"key": "ctr", "label": "CTR", "format": "percentage"})

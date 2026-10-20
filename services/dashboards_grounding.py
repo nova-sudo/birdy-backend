@@ -42,13 +42,19 @@ REL_TOL = 0.01
 _MONTHS = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
            r"sept?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
 
+# A day of the month (1-31). A number after a month name is blanked only when it is one, and not when a noun
+# shows it counts something ("In October 99 new leads", "Oct 20 leads grew").
+_DAY = r"(?:0?[1-9]|[12]\d|3[01])"
+_COUNTED = (r"(?!\s*%)(?!\s+(?:new\s+|total\s+)?(?:leads?|clicks?|results?|impressions?|calls?|opps?|opportunities|"
+            r"contacts?|clients?|campaigns?|ads?|sales|customers?|conversions?|visitors?|sessions?|orders?)\b)")
+
 # Dates, blanked before figures are extracted (months before the plain-day forms so "Oct 2026" is a year).
 _DATE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
     r"\b\d{4}-\d{2}-\d{2}\b",                                              # 2026-10-20
     rf"\b{_MONTHS}\.?,?\s+(?:19|20)\d{{2}}\b",                             # Oct 2026
     rf"\b(?:19|20)\d{{2}}\s+{_MONTHS}\b",                                  # 2026 Oct
-    rf"\b{_MONTHS}\.?\s+\d{{1,2}}(?:st|nd|rd|th)?\b(?:,?\s+(?:19|20)\d{{2}}\b)?",   # Oct 20, October 20th, 2026
-    rf"\b\d{{1,2}}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b(?:,?\s+(?:19|20)\d{{2}}\b)?",  # 20 Oct, 20th of October
+    rf"\b{_MONTHS}\.?\s+{_DAY}(?:st|nd|rd|th)?\b{_COUNTED}(?:,?\s+(?:19|20)\d{{2}}\b)?",   # Oct 20, October 20th, 2026
+    rf"\b{_DAY}(?:st|nd|rd|th)?\s+(?:of\s+)?{_MONTHS}\b(?:,?\s+(?:19|20)\d{{2}}\b)?",  # 20 Oct, 20th of October
     r"\b\d{1,2}/\d{1,2}(?:/\d{2,4})?\b",                                   # 10/20, 10/20/2026
     r"\b\d{1,2}-\d{1,2}-\d{2,4}\b",                                        # 20-10-2026
 )]
@@ -56,11 +62,11 @@ _DATE_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
 _DURATION = re.compile(r"(?<![\w.])(?P<n>\d+(?:\.\d+)?)[\s-]*(?P<unit>day|week|month)s?\b", re.IGNORECASE)
 
 _NUMBER = re.compile(
-    r"(?<![\w.])(?P<cur>[$€£])?(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?)"
+    r"(?<![\w.])(?P<cur>[$€£])?(?P<num>\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d+(?:\.\d+)?|\.\d+)"
     r"(?:"
     r"(?P<word>\s?(?:thousand|million|billion)\b)"
     r"|(?P<suf>bn|mm|[kmb])(?![A-Za-z])"
-    r"|(?P<pct>\s?%)"
+    r"|(?P<pct>\s?%|\s?(?:percent|per\s?cent|pct)\b)"
     r"|(?P<pts>\s?(?:percentage\s+points?|pp|pts?|points?)\b)"
     r"|(?P<mul>[x×])(?![A-Za-z])"
     r"|(?P<ord>st|nd|rd|th)\b"
@@ -70,9 +76,9 @@ _NUMBER = re.compile(
 _MULTIPLIER = {"k": 1e3, "thousand": 1e3, "m": 1e6, "mm": 1e6, "million": 1e6, "b": 1e9, "bn": 1e9, "billion": 1e9}
 
 _UP = r"up|rose|rise|rises|rising|risen|grew|grow|grows|growing|growth|increase|increased|increases|increasing|" \
-      r"climbed|jumped|gained|surged|higher|improved|gain"
+      r"climbed|jumped|gained|surged|higher|improved|gain|above|more"
 _DOWN = r"down|fell|fall|falls|falling|fallen|drop|dropped|drops|decrease|decreased|decreases|decreasing|decline|" \
-        r"declined|declines|lower|slid|dipped|shrank|shrunk|slumped|plunged|reduced|lost"
+        r"declined|declines|lower|slid|dipped|shrank|shrunk|slumped|plunged|reduced|lost|below|less|cut"
 _DIRECTION = re.compile(rf"\b(?:(?P<up>{_UP})|(?P<down>{_DOWN}))\b", re.IGNORECASE)
 
 
