@@ -228,17 +228,24 @@ def _served(entry: dict, cached: bool) -> dict:
 # --- entry point -----------------------------------------------------------------
 
 async def _ask_model(db, user_id: str, messages: list[dict]) -> Optional[dict]:
-    """The model's JSON answer from Claude Sonnet via AnthropicProvider; raises 502 on any failure."""
-    from ai.config import ANTHROPIC_MODEL
+    """The model's JSON answer; raises 502 on any failure.
+
+    Claude Sonnet on Birdy's own Anthropic key when the server has one. Without it, the
+    provider the rest of Birdy's AI uses for this user (their stored key, else Birdy's
+    OpenAI account), so the briefing works wherever chat does.
+    """
+    import ai.config as ai_config
+    from ai.provider_factory import get_provider_for_user
     from ai.providers.anthropic_provider import AnthropicProvider
     from credits import record_usage
     try:
-        # Birdy's own Anthropic key (the provider reads it from the environment); it raises
-        # ValueError when none is configured, which is a 502 like any other LLM failure.
-        provider = AnthropicProvider(model=ANTHROPIC_MODEL)
+        if ai_config.ANTHROPIC_API_KEY:
+            provider = AnthropicProvider(model=ai_config.ANTHROPIC_MODEL)
+        else:
+            provider = await get_provider_for_user(user_id, db)
         response = await provider.chat_completion(messages=messages, tools=None, temperature=0.2, max_tokens=700)
     except Exception as e:
-        logger.warning("briefing: LLM call failed for %s: %s", user_id, e)
+        logger.warning("briefing: LLM call failed for %s: %s: %s", user_id, type(e).__name__, e)
         raise HTTPException(status_code=502, detail="Couldn't write the briefing right now.")
     await record_usage(
         db, user_id, model=getattr(provider, "model", None),

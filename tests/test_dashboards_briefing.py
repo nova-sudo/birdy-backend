@@ -98,6 +98,7 @@ def provider(monkeypatch):
         return fake
 
     monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", build)
+    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", "sk-ant-test")
     fake.built_with = built
 
     async def no_billing(*a, **k):
@@ -562,11 +563,41 @@ async def test_uses_anthropic_sonnet_model(client, board, provider):
 
 
 @pytest.mark.asyncio
-async def test_no_anthropic_key_502(client, board, monkeypatch):
-    def no_key(api_key=None, model=None):
-        raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+async def test_without_anthropic_key_uses_the_users_chat_provider(client, board, monkeypatch):
+    # Production has no ANTHROPIC_API_KEY: the briefing must not 502 there, it uses the
+    # provider chat uses (the user's stored key, else Birdy's OpenAI account).
+    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", None)
 
-    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", no_key)
+    def no_anthropic(api_key=None, model=None):
+        raise AssertionError("Anthropic must not be built without a server key")
+
+    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", no_anthropic)
+    fallback = FakeProvider()
+    asked = []
+
+    async def for_user(user_id, db):
+        asked.append(user_id)
+        return fallback
+
+    monkeypatch.setattr("ai.provider_factory.get_provider_for_user", for_user)
+
+    async def no_billing(*a, **k):
+        return 0.0
+
+    monkeypatch.setattr("credits.record_usage", no_billing)
+    res = _post(client)
+    assert res.status_code == 200, res.text
+    assert len(asked) == 1 and len(fallback.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_no_provider_at_all_502(client, board, monkeypatch):
+    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", None)
+
+    async def none_configured(user_id, db):
+        raise RuntimeError("OPENAI_API_KEY is not set")
+
+    monkeypatch.setattr("ai.provider_factory.get_provider_for_user", none_configured)
     assert _post(client).status_code == 502
 
 
