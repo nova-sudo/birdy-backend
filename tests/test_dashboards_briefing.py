@@ -90,16 +90,32 @@ class FakeProvider:
 def provider(monkeypatch):
     fake = FakeProvider()
 
-    async def get_provider(user_id, db):
+    built = []
+
+    def build(api_key=None, model=None):
+        built.append(model)
         return fake
 
-    monkeypatch.setattr("ai.provider_factory.get_provider_for_user", get_provider)
+    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", build)
+    fake.built_with = built
 
     async def no_billing(*a, **k):
         return 0.0
 
     monkeypatch.setattr("credits.record_usage", no_billing)
     return fake
+
+
+@pytest.fixture(autouse=True)
+def credits_ok(monkeypatch):
+    """check_credits passes by default; tests that need it to fail replace it."""
+    calls = []
+
+    async def ok(user_id, mongo_client):
+        calls.append(user_id)
+
+    monkeypatch.setattr("credits_middleware.check_credits", ok)
+    return calls
 
 
 @pytest.fixture
@@ -372,3 +388,45 @@ async def test_ttl_indexes(mock_mongo_client, mock_db):
 @pytest.mark.asyncio
 async def test_body_is_optional(client, board):
     assert client.post("/api/dashboards/d1/briefing").status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_uses_anthropic_sonnet_model(client, board, provider):
+    from ai.config import ANTHROPIC_MODEL
+    _post(client)
+    assert provider.built_with == [ANTHROPIC_MODEL]
+
+
+@pytest.mark.asyncio
+async def test_no_anthropic_key_502(client, board, monkeypatch):
+    def no_key(api_key=None, model=None):
+        raise ValueError("ANTHROPIC_API_KEY environment variable is not set")
+
+    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", no_key)
+    assert _post(client).status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_out_of_credits_error_and_no_llm_call(client, board, provider, monkeypatch):
+    from fastapi import HTTPException
+
+    async def broke(user_id, mongo_client):
+        raise HTTPException(status_code=402, detail={"code": "OUT_OF_CREDITS"})
+
+    monkeypatch.setattr("credits_middleware.check_credits", broke)
+    r = _post(client)
+    assert r.status_code == 402 and r.json()["detail"]["code"] == "OUT_OF_CREDITS"
+    assert provider.calls == []
+    assert _post(client, {"refresh": True}).status_code == 402
+
+
+@pytest.mark.asyncio
+async def test_cache_hit_skips_credit_check(client, board, credits_ok, monkeypatch):
+    _post(client)
+    assert credits_ok == [USER]
+
+    async def broke(user_id, mongo_client):
+        raise AssertionError("a cache hit must not check credits")
+
+    monkeypatch.setattr("credits_middleware.check_credits", broke)
+    assert _post(client).json()["cached"] is True

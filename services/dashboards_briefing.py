@@ -4,8 +4,9 @@ services/dashboards_briefing.py
 The live briefing behind dashkit's `briefing` widget: POST /api/dashboards/{id}/briefing.
 
 Flow: load the caller's dashboard (404 if it is not theirs) -> serve a cached
-briefing unless the reader pressed Refresh -> run the queries of the board's
-visible data widgets through `run_queries` -> ask the model for
+briefing unless the reader pressed Refresh -> check the user's credits -> run the queries of the board's
+visible data widgets through `run_queries` -> ask Claude Sonnet
+(AnthropicProvider, Birdy's server key, `ai.config.ANTHROPIC_MODEL`) for
 `{lead, findings:[{text,tone}]}` over those numbers -> keep only what is grounded
 in them -> cache and return.
 
@@ -303,11 +304,14 @@ def _served(entry: dict, cached: bool) -> dict:
 # --- entry point -----------------------------------------------------------------
 
 async def _ask_model(db, user_id: str, messages: list[dict]) -> Optional[dict]:
-    """The model's JSON answer through the shared provider layer; raises 502 on any failure."""
-    from ai.provider_factory import get_provider_for_user
+    """The model's JSON answer from Claude Sonnet via AnthropicProvider; raises 502 on any failure."""
+    from ai.config import ANTHROPIC_MODEL
+    from ai.providers.anthropic_provider import AnthropicProvider
     from credits import record_usage
     try:
-        provider = await get_provider_for_user(user_id, db)
+        # Birdy's own Anthropic key (the provider reads it from the environment); it raises
+        # ValueError when none is configured, which is a 502 like any other LLM failure.
+        provider = AnthropicProvider(model=ANTHROPIC_MODEL)
         response = await provider.chat_completion(messages=messages, tools=None, temperature=0.2, max_tokens=700)
     except Exception as e:
         logger.warning("briefing: LLM call failed for %s: %s", user_id, e)
@@ -325,7 +329,7 @@ async def _ask_model(db, user_id: str, messages: list[dict]) -> Optional[dict]:
     return data
 
 
-async def generate_briefing(db, user_id: str, dashboard_id: str, *, window: Optional[dict] = None,
+async def generate_briefing(db, mongo_client, user_id: str, dashboard_id: str, *, window: Optional[dict] = None,
                             filters: Optional[dict] = None, focus: Optional[str] = None,
                             refresh: bool = False) -> dict:
     """`{parts, findings, generated_at, cached}` for one of the caller's dashboards."""
@@ -347,6 +351,10 @@ async def generate_briefing(db, user_id: str, dashboard_id: str, *, window: Opti
     titled = [(title, frame) for (title, _), frame in zip(queries, frames) if frame]
     if not titled:
         return {"parts": [{"text": NO_DATA_LEAD}], "findings": [], "generated_at": _iso(_now()), "cached": False}
+
+    # A cache miss costs tokens: stop an out-of-credits user here (402 from check_credits).
+    from credits_middleware import check_credits
+    await check_credits(user_id, mongo_client)
 
     window_label = next((f["window"]["label"] for _, f in titled if (f.get("window") or {}).get("label")), "this period")
     data = await _ask_model(db, user_id, build_messages(build_facts(titled), window_label, focus))

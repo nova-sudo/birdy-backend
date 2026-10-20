@@ -113,7 +113,7 @@ async def briefing(dashboard_id: str, body: BriefingBody = Body(default_factory=
     async with get_mongo_client() as mongo_client:
         try:
             db = mongo_client[DB_NAME]
-            return await generate_briefing(db, current_user, dashboard_id, window=body.window,
+            return await generate_briefing(db, mongo_client, current_user, dashboard_id, window=body.window,
                                            filters=body.filters, focus=body.focus, refresh=body.refresh)
         except HTTPException:
             raise
