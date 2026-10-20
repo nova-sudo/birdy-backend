@@ -5,8 +5,8 @@ The live briefing behind dashkit's `briefing` widget: POST /api/dashboards/{id}/
 
 Flow: load the caller's dashboard (404 if it is not theirs) -> serve a cached
 briefing unless the reader pressed Refresh -> check the user's credits -> run the queries of the board's
-visible data widgets through `run_queries` -> ask Claude Sonnet
-(AnthropicProvider, Birdy's server key, `ai.config.ANTHROPIC_MODEL`) for
+visible data widgets through `run_queries` -> ask the model Birdy's chat uses
+for this user (`get_provider_for_user`) for
 `{lead, findings:[{text,tone}]}` over those numbers -> keep only what is grounded
 in them -> cache and return.
 
@@ -228,21 +228,12 @@ def _served(entry: dict, cached: bool) -> dict:
 # --- entry point -----------------------------------------------------------------
 
 async def _ask_model(db, user_id: str, messages: list[dict]) -> Optional[dict]:
-    """The model's JSON answer; raises 502 on any failure.
-
-    Claude Sonnet on Birdy's own Anthropic key when the server has one. Without it, the
-    provider the rest of Birdy's AI uses for this user (their stored key, else Birdy's
-    OpenAI account), so the briefing works wherever chat does.
-    """
-    import ai.config as ai_config
+    """The model's JSON answer from the provider Birdy's chat uses for this user (their stored
+    key, else Birdy's OpenAI account); raises 502 on any failure."""
     from ai.provider_factory import get_provider_for_user
-    from ai.providers.anthropic_provider import AnthropicProvider
     from credits import record_usage
     try:
-        if ai_config.ANTHROPIC_API_KEY:
-            provider = AnthropicProvider(model=ai_config.ANTHROPIC_MODEL)
-        else:
-            provider = await get_provider_for_user(user_id, db)
+        provider = await get_provider_for_user(user_id, db)
         response = await provider.chat_completion(messages=messages, tools=None, temperature=0.2, max_tokens=700)
     except Exception as e:
         logger.warning("briefing: LLM call failed for %s: %s: %s", user_id, type(e).__name__, e)

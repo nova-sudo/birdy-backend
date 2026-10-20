@@ -2,7 +2,7 @@
 tests/test_dashboards_briefing.py
 ---------------------------------
 POST /api/dashboards/{id}/briefing: the live briefing for dashkit's `briefing`
-widget. The LLM is a fake AnthropicProvider (no network) and
+widget. The LLM is a fake chat provider (no network) and
 the frames come from a stubbed run_queries, so these tests pin the endpoint's
 own rules: grounding, caching, the refresh rate limit and the error codes.
 """
@@ -91,15 +91,14 @@ class FakeProvider:
 def provider(monkeypatch):
     fake = FakeProvider()
 
-    built = []
+    asked = []
 
-    def build(api_key=None, model=None):
-        built.append(model)
+    async def for_user(user_id, db):
+        asked.append(user_id)
         return fake
 
-    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", build)
-    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", "sk-ant-test")
-    fake.built_with = built
+    monkeypatch.setattr("ai.provider_factory.get_provider_for_user", for_user)
+    fake.asked_for = asked
 
     async def no_billing(*a, **k):
         return 0.0
@@ -556,44 +555,15 @@ async def test_body_is_optional(client, board):
 
 
 @pytest.mark.asyncio
-async def test_uses_anthropic_sonnet_model(client, board, provider):
-    from ai.config import ANTHROPIC_MODEL
+async def test_uses_the_users_chat_provider(client, board, provider):
+    # No separate model or key: the briefing runs on the AI Birdy's chat already uses.
     _post(client)
-    assert provider.built_with == [ANTHROPIC_MODEL]
-
-
-@pytest.mark.asyncio
-async def test_without_anthropic_key_uses_the_users_chat_provider(client, board, monkeypatch):
-    # Production has no ANTHROPIC_API_KEY: the briefing must not 502 there, it uses the
-    # provider chat uses (the user's stored key, else Birdy's OpenAI account).
-    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", None)
-
-    def no_anthropic(api_key=None, model=None):
-        raise AssertionError("Anthropic must not be built without a server key")
-
-    monkeypatch.setattr("ai.providers.anthropic_provider.AnthropicProvider", no_anthropic)
-    fallback = FakeProvider()
-    asked = []
-
-    async def for_user(user_id, db):
-        asked.append(user_id)
-        return fallback
-
-    monkeypatch.setattr("ai.provider_factory.get_provider_for_user", for_user)
-
-    async def no_billing(*a, **k):
-        return 0.0
-
-    monkeypatch.setattr("credits.record_usage", no_billing)
-    res = _post(client)
-    assert res.status_code == 200, res.text
-    assert len(asked) == 1 and len(fallback.calls) == 1
+    assert provider.asked_for == [USER]
+    assert len(provider.calls) == 1
 
 
 @pytest.mark.asyncio
 async def test_no_provider_at_all_502(client, board, monkeypatch):
-    monkeypatch.setattr("ai.config.ANTHROPIC_API_KEY", None)
-
     async def none_configured(user_id, db):
         raise RuntimeError("OPENAI_API_KEY is not set")
 
