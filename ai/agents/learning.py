@@ -30,6 +30,7 @@ Offer shapes (GET /api/agents/{id}/offers):
    "undos", "at", "choices": [keep_asking]}
 """
 
+import asyncio
 import copy
 import json
 import logging
@@ -84,6 +85,8 @@ RULE_LABELS = {
 }
 
 NOTE_MAX = 1000
+LLM_TIMEOUT_S = 8
+MIN_AD_NAME_MATCH = 3      # shorter ad-name matches would exclude almost everything
 MEMORY_TEXT_MAX = 280
 
 
@@ -93,6 +96,10 @@ class NoOffer(Exception):
 
 class ProposalNotFound(Exception):
     pass
+
+
+class RuleChanged(Exception):
+    """The rule was edited after the proposal was made; the proposal is out of date."""
 
 
 class ProposalClosed(Exception):
@@ -126,16 +133,19 @@ async def record_decision(db, agent_id: str, rule_id: str, decision: str, *,
     now = now or _now()
     out: dict = {"rule": None, "memory": None, "brake": False}
 
+    # A broken streak starts over: the next offer comes after OFFER_AFTER in a
+    # row again, however many times "keep asking" raised the bar before.
     if decision == "approved":
         update = {"$inc": {"stats.streak": 1, "stats.approved": 1},
                   "$push": {"stats.last10": _push_last("ok")}}
     elif decision == "denied":
-        update = {"$set": {"stats.streak": 0}, "$inc": {"stats.denied": 1},
+        update = {"$set": {"stats.streak": 0, "stats.offer_after": OFFER_AFTER}, "$inc": {"stats.denied": 1},
                   "$push": {"stats.last10": _push_last("no")}}
     elif decision == "undone_user":
-        update = {"$set": {"stats.streak": 0}, "$push": {"stats.last10": _push_last("undo")}}
+        update = {"$set": {"stats.streak": 0, "stats.offer_after": OFFER_AFTER},
+                  "$push": {"stats.last10": _push_last("undo")}}
     else:
-        update = {"$set": {"stats.streak": 0},
+        update = {"$set": {"stats.streak": 0, "stats.offer_after": OFFER_AFTER},
                   "$push": {"stats.last10": _push_last("undo"),
                             "stats.undone_auto": {"$each": [now], "$slice": -UNDONE_AUTO_KEEP}}}
 
@@ -156,7 +166,12 @@ async def record_decision(db, agent_id: str, rule_id: str, decision: str, *,
 
 async def _maybe_brake(db, agent_id: str, rule: dict, now: datetime) -> bool:
     stamps = (rule.get("stats") or {}).get("undone_auto") or []
-    recent = [t for t in stamps if isinstance(t, datetime) and now - BRAKE_WINDOW <= t <= now]
+    # Only undos of this auto-run stint count: older ones (before a re-graduation) don't.
+    since = now - BRAKE_WINDOW
+    auto_since = rule.get("auto_since")
+    if isinstance(auto_since, datetime) and auto_since > since:
+        since = auto_since
+    recent = [t for t in stamps if isinstance(t, datetime) and since <= t <= now]
     if len(recent) < BRAKE_UNDOS:
         return False
     # Only the decision that flips auto -> ask brakes; a concurrent one finds ask.
@@ -295,7 +310,7 @@ def _clean_filter(flt, allowed_gids: set[str]) -> dict | None:
                 return None
             out[key] = val
         elif key == "ad_name_contains":
-            if not isinstance(val, str) or not val.strip():
+            if not isinstance(val, str) or len(val.strip()) < MIN_AD_NAME_MATCH:
                 return None
             out[key] = val.strip()[:100]
         else:  # weekdays
@@ -333,6 +348,20 @@ async def _context(db, agent: dict, note: str, doc: dict) -> tuple[str, set[str]
     return json.dumps(ctx, default=str), set(gids)
 
 
+async def _meter(db, user_id: str, provider, resp) -> None:
+    """Bill the call like the other server-side LLM calls. Never raises."""
+    try:
+        from credits import record_usage
+        usage = getattr(resp, "usage", None)
+        await record_usage(
+            db, user_id, model=getattr(provider, "model", None),
+            prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
+            completion_tokens=getattr(usage, "output_tokens", 0) or 0,
+            source="agents", feature="agent_note_memory")
+    except Exception as e:
+        logger.warning("learning: metering the note call failed for %s: %s", user_id, e)
+
+
 async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
@@ -343,9 +372,10 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
         from ai import provider_factory
         ctx, allowed = await _context(db, agent, note, doc or {})
         provider = await provider_factory.get_provider_for_user(agent["user_id"], db)
-        resp = await provider.chat_completion(
+        resp = await asyncio.wait_for(provider.chat_completion(
             messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": ctx}],
-            temperature=0, max_tokens=300)
+            temperature=0, max_tokens=300), timeout=LLM_TIMEOUT_S)
+        await _meter(db, agent["user_id"], provider, resp)
         parsed = _parse_json(getattr(resp, "content", None))
         if parsed is not None:
             if isinstance(parsed.get("text"), str) and parsed["text"].strip():
@@ -560,13 +590,16 @@ def _change_text(p: dict) -> str:
 async def accept_proposal(db, agent: dict, proposal_id: str, *, now: datetime | None = None) -> tuple[dict, dict]:
     """Apply the proposal through update_rule (a new rule version) and log it.
     Returns (proposal, rule). Raises ProposalNotFound / ProposalClosed /
-    ValueError (the change no longer validates)."""
+    RuleChanged (the rule's version moved since the proposal) / ValueError (the change no longer validates)."""
     now = now or _now()
     agent_id = agent["_id"]
     p = await _proposal(db, agent_id, proposal_id)
     rule = await db[RULES].find_one({"_id": p["rule_id"], "agent_id": agent_id})
     if rule is None:
         raise ProposalNotFound(proposal_id)
+    if p.get("rule_version") is not None and rule.get("version") != p["rule_version"]:
+        # Edited since the proposal was made: its before/after no longer describe the rule.
+        raise RuleChanged(proposal_id)
     changed = apply_change(rule, p)
     kind = rule["kind"]
     if p["kind"] == "client_override":

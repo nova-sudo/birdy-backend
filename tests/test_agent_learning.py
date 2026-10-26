@@ -601,3 +601,143 @@ async def test_tick_scans_proposals_and_survives_failure(mock_db, mock_mongo_cli
     res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=datetime(2026, 10, 26, 12, 0, tzinfo=timezone.utc))
     assert res["ran"] == 1 and res["errors"] == 0 and scanned == [agent["_id"]]
     assert (await mock_db.agents.find_one({"_id": agent["_id"]}))["last_run"]["status"] == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1
+# ---------------------------------------------------------------------------
+
+from tests.test_agent_runner import AS_OF, _seed_client, meta_calls, no_slack  # noqa: E402,F401
+
+
+async def test_broken_streak_resets_offer_after(mock_db):
+    agent, rules = await seed_agent(mock_db)
+    rid = rules["pause_over_target"]["_id"]
+    for _ in range(10):
+        await learning.record_decision(mock_db, agent["_id"], rid, "approved", now=NOW)
+    await learning.graduate(mock_db, agent, rid, "keep_asking", now=NOW)
+    assert (await rule_doc(mock_db, rid))["stats"]["offer_after"] == 20
+
+    await learning.record_decision(mock_db, agent["_id"], rid, "denied", reason_code="other", now=NOW)
+    assert (await rule_doc(mock_db, rid))["stats"]["offer_after"] == 10
+    for _ in range(10):
+        await learning.record_decision(mock_db, agent["_id"], rid, "approved", now=NOW)
+    assert [o["type"] for o in await learning.pending_offers(mock_db, agent)] == ["graduation"]
+
+    for decision in ("undone_user", "undone_auto"):
+        await mock_db[RULES].update_one({"_id": rid}, {"$set": {"stats.offer_after": 30}})
+        await learning.record_decision(mock_db, agent["_id"], rid, decision, now=NOW)
+        assert (await rule_doc(mock_db, rid))["stats"]["offer_after"] == 10
+
+
+async def test_flag_acknowledgement_is_not_an_approval(mock_db, mock_mongo_client, meta):
+    agent, rules = await seed_agent(mock_db)
+    rule = rules["flag_no_spend"]
+    await seed_suggestion(mock_db, agent, rule, "f1", rule_mode="flag")
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "f1"}, {"$set": {"action": None}})
+    res = await actions.apply_suggestion(mock_db, mock_mongo_client, U, "f1", actor=store.ACTOR_USER)
+    assert res["outcome"] == "applied"
+    stats = (await rule_doc(mock_db, rule["_id"]))["stats"]
+    assert stats["streak"] == 0 and stats["approved"] == 0 and stats["last10"] == []
+
+
+async def test_note_call_is_metered(mock_db, monkeypatch):
+    agent, rules = await seed_agent(mock_db)
+    doc = await seed_suggestion(mock_db, agent, rules["pause_over_target"], "s1")
+    billed = []
+
+    async def record_usage(db, user_id, **kw):
+        billed.append((user_id, kw))
+        return 0.0
+
+    monkeypatch.setattr("credits.record_usage", record_usage)
+    use_provider(monkeypatch, FakeProvider(reply='{"kind": "fact", "text": "x"}'))
+    await learning.memory_from_note(mock_db, agent, "note", doc)
+    assert len(billed) == 1 and billed[0][0] == U
+    assert billed[0][1]["source"] == "agents" and billed[0][1]["feature"] == "agent_note_memory"
+
+    async def broken(db, user_id, **kw):
+        raise RuntimeError("billing down")
+
+    monkeypatch.setattr("credits.record_usage", broken)
+    assert (await learning.memory_from_note(mock_db, agent, "note", doc))["text"] == "x"
+
+
+async def test_note_llm_timeout_falls_back_to_fact(mock_db, monkeypatch):
+    import asyncio
+
+    agent, rules = await seed_agent(mock_db)
+    doc = await seed_suggestion(mock_db, agent, rules["pause_over_target"], "s1")
+
+    class Slow(FakeProvider):
+        async def chat_completion(self, messages, **kw):
+            await asyncio.sleep(5)
+            return ProviderResponse(content='{"kind": "exception", "filter": {"weekdays": [5]}}')
+
+    use_provider(monkeypatch, Slow())
+    monkeypatch.setattr(learning, "LLM_TIMEOUT_S", 0.05)
+    mem = await learning.memory_from_note(mock_db, agent, "not on saturdays", doc)
+    assert mem["kind"] == "fact" and mem["text"] == "not on saturdays"
+
+
+async def test_short_ad_name_match_is_a_fact(mock_db, monkeypatch):
+    agent, rules = await seed_agent(mock_db)
+    doc = await seed_suggestion(mock_db, agent, rules["pause_over_target"], "s1")
+    use_provider(monkeypatch, FakeProvider(reply='{"kind": "exception", "filter": {"ad_name_contains": "ab"}}'))
+    assert (await learning.memory_from_note(mock_db, agent, "n", doc))["kind"] == "fact"
+    use_provider(monkeypatch, FakeProvider(reply='{"kind": "exception", "filter": {"ad_name_contains": "Evergreen"}}'))
+    mem = await learning.memory_from_note(mock_db, agent, "n", doc)
+    assert mem["kind"] == "exception" and mem["filter"] == {"ad_name_contains": "Evergreen"}
+
+
+async def test_brake_ignores_undos_before_regraduation(mock_db):
+    agent, rules = await seed_agent(mock_db)
+    rid = rules["pause_over_target"]["_id"]
+    await _auto_rule(mock_db, agent, rid)
+    # One undo, then the user re-graduates (auto_since moves forward).
+    await learning.record_decision(mock_db, agent["_id"], rid, "undone_auto", now=NOW - timedelta(days=2))
+    await mock_db[RULES].update_one({"_id": rid}, {"$set": {"auto_since": NOW - timedelta(days=1)}})
+    res = await learning.record_decision(mock_db, agent["_id"], rid, "undone_auto", now=NOW)
+    assert res["brake"] is False and (await rule_doc(mock_db, rid))["mode"] == "auto"
+    res = await learning.record_decision(mock_db, agent["_id"], rid, "undone_auto", now=NOW + timedelta(hours=1))
+    assert res["brake"] is True
+
+
+async def test_accept_refuses_when_rule_changed(api, mock_db, mock_mongo_client, fake_replay):
+    agent, rules = await seed_agent(mock_db)
+    rule = rules["revive_winner"]
+    for sid, age in (("d1", 64), ("d2", 71), ("d3", 83)):
+        await deny(mock_db, agent, rule, sid, "creative_stale", raw={"creative_age_days": age})
+    [p] = await learning.scan_proposals(mock_db, mock_mongo_client, agent, now=NOW)
+    assert p["rule_version"] == 1
+    r = api.patch(f"/api/agents/{agent['_id']}/rules/{rule['_id']}", json={"params": {"max_creative_age_days": 45}})
+    assert r.status_code == 200
+    r = api.post(f"/api/agents/{agent['_id']}/proposals/{p['_id']}/accept")
+    assert r.status_code == 409 and "changed" in r.json()["detail"]
+    assert (await rule_doc(mock_db, rule["_id"]))["params"]["max_creative_age_days"] == 45
+    assert (await mock_db[PROPOSALS].find_one({"_id": p["_id"]}))["status"] == "open"
+
+
+@pytest.mark.parametrize("choice,posted", [("auto_silent", 0), ("auto_notify", 1)])
+async def test_silent_auto_run_is_not_posted_to_slack(mock_db, mock_mongo_client, meta_calls, no_slack,
+                                                      monkeypatch, choice, posted):
+    from ai.agents import runner
+
+    await _seed_client(mock_db, "cg1")
+    agent = await create_agent(mock_db, "u1")
+    agent = await update_agent(mock_db, "u1", agent["_id"], {
+        "status": "active",
+        "scope": {"client_group_ids": ["cg1"], "schedule": {"time": "07:00", "tz": "Europe/London"}}})
+    rule = await mock_db[RULES].find_one({"agent_id": agent["_id"], "kind": "pause_over_target"})
+    await mock_db[RULES].update_one({"_id": rule["_id"]}, {"$set": {"stats.streak": 10}})
+    await learning.graduate(mock_db, agent, rule["_id"], choice, now=NOW)
+
+    async def birdy_apply(db, mongo_client, user_id, suggestion_id, *, actor="user", source=None, by=None):
+        await db[store.SUGGESTIONS].update_one({"_id": suggestion_id}, {"$set": {
+            "status": "applied", "decided_by": {"actor": actor}, "applied_at": datetime.utcnow()}})
+        return {"ok": True, "outcome": "applied", "doc": None}
+
+    monkeypatch.setattr(runner.actions, "apply_suggestion", birdy_apply)
+    res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+    assert res.auto_applied == 1
+    assert len(no_slack) == posted

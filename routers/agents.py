@@ -681,6 +681,8 @@ async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = D
             raise HTTPException(status_code=404, detail="Proposal not found")
         except learning.ProposalClosed:
             raise HTTPException(status_code=409, detail="This proposal was already decided")
+        except learning.RuleChanged:
+            raise HTTPException(status_code=409, detail="The rule changed since this proposal was made; it is out of date")
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
         return {"proposal": _proposal_to_api(proposal), "rule": _rule_to_api(rule)}

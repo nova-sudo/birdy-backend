@@ -129,6 +129,14 @@ async def _evaluate_client(db, mongo_client, agent: dict, rules: list[dict], mem
     return ctx, findings
 
 
+def _silent_auto_run(doc: dict, rules_by_id: dict) -> bool:
+    """Birdy auto-applied this item on a rule graduated with auto_silent."""
+    rule = rules_by_id.get(str(doc.get("rule_id"))) or {}
+    return (doc.get("status") == sstore.STATUS_APPLIED
+            and (doc.get("decided_by") or {}).get("actor") == sstore.ACTOR_BIRDY
+            and rule.get("notify") is False)
+
+
 async def _auto_apply(db, mongo_client, user_id: str, suggestion_id: str, result: RunResult) -> None:
     try:
         res = await actions.apply_suggestion(db, mongo_client, user_id, suggestion_id,
@@ -242,7 +250,11 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
             docs = await db[sstore.SUGGESTIONS].find({"_id": {"$in": created_ids}}).to_list(length=None)
             order = {sid: i for i, sid in enumerate(created_ids)}
             docs.sort(key=lambda d: order.get(d["_id"], 0))
-            await post_new_suggestions(db, user_id, docs)
+            # "Auto-run silently": what Birdy ran itself on such a rule stays off
+            # Slack (it still shows in the work list's auto-run section).
+            docs = [d for d in docs if not _silent_auto_run(d, rules_by_id)]
+            if docs:
+                await post_new_suggestions(db, user_id, docs)
         except Exception as e:
             logger.warning("agent runner: Slack notify failed for %s: %s", user_id, e)
     if updated_docs:

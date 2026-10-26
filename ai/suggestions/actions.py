@@ -302,8 +302,9 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
         applied_action_type=atype if succeeded else None,
         note="Already done in Meta — nothing changed" if already_in_meta else None,
     )
-    if actor == store.ACTOR_USER:
+    if actor == store.ACTOR_USER and action:
         # Reached once per item: only the request that moved it open -> applied.
+        # Acknowledging a flag item with nothing to write is not an approval.
         await _learn(db, doc, "approved")
     await _sync_slack(db, user_id, suggestion_id, by=by)
     outcome = "already_in_meta" if already_in_meta else ("partial" if failed else "applied")
