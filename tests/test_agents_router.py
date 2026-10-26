@@ -256,6 +256,8 @@ async def test_suggestion_to_api_new_fields():
     assert out["rule_kind"] == "revive_winner" and out["agent_id"] == "a" and out["rule_mode"] == "flag"
     assert out["blocked_reason"]["code"] == "c" and out["auto_failed"] is True and out["undone_at"] is None
     assert dashboard_router._suggestion_to_api({"id": "x", "agent": "useless_ad_purger"})["rule_kind"] is None
+    assert out["has_action"] is False
+    assert dashboard_router._suggestion_to_api({"id": "y", "action": {"type": "pause_ads"}})["has_action"] is True
 
 
 def test_schedule_validation_and_partial_merge(api):

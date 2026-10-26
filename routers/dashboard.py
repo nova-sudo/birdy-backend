@@ -78,6 +78,9 @@ def _suggestion_to_api(doc: dict) -> dict:
         "agent_id": doc.get("agent_id"),
         "rule_kind": _rule_kind(doc.get("agent")),
         "rule_mode": doc.get("rule_mode"),
+        # False for flag-only items (nothing to write in Meta) — the work list
+        # shows "Got it" instead of Approve/Deny.
+        "has_action": bool(doc.get("action")),
         "blocked_reason": doc.get("blocked_reason"),
         "auto_failed": bool(doc.get("auto_failed")),
         "undone_at": doc.get("undone_at"),
