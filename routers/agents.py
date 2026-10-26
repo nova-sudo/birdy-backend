@@ -8,11 +8,11 @@ Every route is owner-scoped: another user's agent is a 404, never a 403.
 Budgets are never writable: `permissions.budgets` is forced to false.
 """
 
-import asyncio
 import hashlib
 import json
 import logging
 import re
+import time
 import uuid
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -195,6 +195,15 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
             unknown = set(body.guardrails) - set(DEFAULT_GUARDRAILS)
             if unknown:
                 raise HTTPException(status_code=400, detail=f"Unknown guardrail(s): {sorted(unknown)}")
+            g = body.guardrails
+            cap = g.get("max_pauses_per_client_day", 0)
+            tags = g.get("protected_tags", [])
+            if (isinstance(cap, bool) or not isinstance(cap, int) or not 0 <= cap <= 50
+                    or not isinstance(g.get("protect_last_live_ad", True), bool)
+                    or not isinstance(tags, list) or not all(isinstance(t, str) and t.strip() for t in tags)):
+                raise HTTPException(status_code=400, detail=(
+                    "guardrails: max_pauses_per_client_day must be an integer 0-50, protect_last_live_ad "
+                    "a boolean, protected_tags a list of non-empty strings"))
             patch["guardrails"] = {**(agent.get("guardrails") or {}), **body.guardrails}
 
         if body.client_caps is not None:
@@ -337,18 +346,18 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
 
 
 # ---------------------------------------------------------------------------
-# Dry run (background job)
+# Dry run (job record, run inside the request)
 # ---------------------------------------------------------------------------
+# The replay runs within the POST, not detached after the response: on Vercel
+# the function freezes once the response is sent, so a background task would
+# never finish (see routers/slack_interactions.py). It reads local DB data only
+# — one load per client, then pure evaluation — so it is bounded; a deadline
+# under the 300s function timeout turns an outsized replay into a clean
+# "timed_out" failure. The job record keeps the POST → job id, GET → status
+# contract, so the frontend polls exactly as before (the first poll sees done).
 
-JOB_TIMEOUT = timedelta(minutes=10)
-_BACKGROUND: set = set()  # strong refs so running jobs aren't garbage-collected
-
-
-def _spawn(coro) -> asyncio.Task:
-    task = asyncio.create_task(coro)
-    _BACKGROUND.add(task)
-    task.add_done_callback(_BACKGROUND.discard)
-    return task
+DRY_RUN_BUDGET_SECONDS = 240     # Vercel's function timeout is 300s (vercel.json sets none)
+JOB_TIMEOUT = timedelta(minutes=5)  # a queued/running job older than this was killed
 
 
 def _rules_sig(rules: list[dict]) -> str:
@@ -372,33 +381,38 @@ def _local_today(agent: dict) -> date:
         return datetime.utcnow().date()
 
 
-async def _run_dry_run_job(job_id: str, user_id: str, agent_id: str) -> None:
-    async with get_mongo_client() as mongo_client:
-        db = mongo_client[DB_NAME]
-        jobs = db[agent_store.JOBS]
-        await jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
-        try:
-            agent = await agent_store.get_agent(db, user_id, agent_id)
-            if agent is None:
-                raise RuntimeError("agent not found")
-            # Local yesterday: every replayed day is complete.
-            result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1))
-            await jobs.update_one({"_id": job_id}, {"$set": {
-                "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
-        except Exception as e:
-            logger.error("dry run job %s failed: %s", job_id, e, exc_info=True)
-            await jobs.update_one({"_id": job_id}, {"$set": {
-                "status": "failed", "error": str(e) or type(e).__name__, "finished_at": datetime.utcnow()}})
+async def _run_dry_run_job(db, mongo_client, job_id: str, user_id: str, agent_id: str,
+                           *, deadline: float) -> None:
+    jobs = db[agent_store.JOBS]
+    await jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
+    try:
+        agent = await agent_store.get_agent(db, user_id, agent_id)
+        if agent is None:
+            raise RuntimeError("agent not found")
+        # Local yesterday: every replayed day is complete.
+        result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1),
+                                      deadline=deadline)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
+    except replay.DryRunTimeout as e:
+        logger.warning("dry run job %s ran out of time: %s", job_id, e)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "failed", "error": "timed_out", "finished_at": datetime.utcnow()}})
+    except Exception as e:
+        logger.error("dry run job %s failed: %s", job_id, e, exc_info=True)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "failed", "error": str(e) or type(e).__name__, "finished_at": datetime.utcnow()}})
 
 
 @router.post("/{agent_id}/dry-run")
 async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_user)):
+    deadline = time.monotonic() + DRY_RUN_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
         sig = _rules_sig(await agent_store.list_rules(db, agent_id))
-        # Rejoin a running job only if it replays these exact rules; after an edit
-        # the old job's answer is stale, so start a new one.
+        # Rejoin a job another request is running only if it replays these exact
+        # rules; after an edit the old job's answer is stale, so start a new one.
         active = await db[agent_store.JOBS].find_one({
             "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
             "status": {"$in": ["queued", "running"]},
@@ -412,7 +426,7 @@ async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_u
             "_id": job_id, "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
             "status": "queued", "created_at": datetime.utcnow(), "rules_sig": sig,
         })
-    _spawn(_run_dry_run_job(job_id, current_user, agent_id))
+        await _run_dry_run_job(db, mongo_client, job_id, current_user, agent_id, deadline=deadline)
     return {"job_id": job_id}
 
 
@@ -428,7 +442,7 @@ async def get_job(agent_id: str, job_id: str, current_user: str = Depends(get_cu
         created = job.get("created_at")
         if (job.get("status") in ("queued", "running") and isinstance(created, datetime)
                 and datetime.utcnow() - created > JOB_TIMEOUT):
-            # The deployment may have killed the background task: report and persist it.
+            # The platform killed the request that was running it: report and persist it.
             await jobs.update_one({"_id": job_id, "status": job["status"]},
                                   {"$set": {"status": "failed", "error": "timed_out",
                                             "finished_at": datetime.utcnow()}})

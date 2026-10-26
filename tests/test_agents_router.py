@@ -285,3 +285,80 @@ async def test_client_caps_validated_and_negative_cpl_rejected(api, mock_db):
     assert api.patch(url, json={"client_caps": {"g1": -1}}).status_code == 400
     api.patch(url, json={"scope": {"client_group_ids": ["g1"]}})
     assert api.put(f"{url}/client-targets/g1", json={"cpl": -3}).status_code == 422
+
+
+# --- final review I1 / I2: decisions on items that are no longer open ----------
+
+async def test_deny_on_applied_item_is_409_and_stays_applied(api, mock_db):
+    await _suggestion(mock_db, status="applied", action={"type": "pause_ads", "targets": [], "params": {}},
+                      decided_by={"actor": "user", "source": "slack", "at": datetime.utcnow()})
+    r = api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "other"})
+    assert r.status_code == 409
+    j = r.json()
+    assert j["detail"] == "Already applied — undo it instead"
+    assert j["outcome"] == "already" and j["status"] == "applied"
+    assert j["decided_by"] == {"actor": "user", "source": "slack"}
+    assert (await mock_db["ai_suggestions"].find_one({"_id": "s1"}))["status"] == "applied"
+    assert await mock_db["ai_activity"].count_documents({"ref_id": "s1"}) == 0
+    # Same for a plain dismiss.
+    assert api.delete("/api/dashboard/suggestions/s1").status_code == 409
+    assert (await mock_db["ai_suggestions"].find_one({"_id": "s1"}))["status"] == "applied"
+
+
+async def test_repeat_dismiss_logs_once(api, mock_db):
+    await _suggestion(mock_db)
+    assert api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "other"}).status_code == 200
+    assert api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "other"}).status_code == 200
+    assert api.delete("/api/dashboard/suggestions/s1").status_code == 200
+    assert await mock_db["ai_activity"].count_documents(
+        {"ref_id": "s1", "kind": "suggestion_dismissed"}) == 1
+
+
+async def test_approve_closed_item_is_409_closed(api, mock_db, monkeypatch):
+    import ai.suggestions.actions as actions_mod
+    writes = []
+
+    async def no_write(*a, **kw):
+        writes.append(a)
+        return {"success": True}
+
+    monkeypatch.setattr(actions_mod, "set_object_status", no_write)
+    for status in ("resolved", "dismissed"):
+        await mock_db["ai_suggestions"].delete_many({})
+        await _suggestion(mock_db, status=status)
+        r = api.post("/api/dashboard/suggestions/s1/apply")
+        assert r.status_code == 409, status
+        j = r.json()
+        assert j["outcome"] == "closed" and j["status"] == status
+        assert j["detail"] == "This item was already closed"
+        assert (await mock_db["ai_suggestions"].find_one({"_id": "s1"}))["status"] == status
+    assert writes == []
+
+
+async def test_approve_applied_item_is_ok_already_with_status(api, mock_db):
+    await _suggestion(mock_db, status="applied",
+                      decided_by={"actor": "user", "source": "slack", "at": datetime.utcnow()})
+    r = api.post("/api/dashboard/suggestions/s1/apply")
+    assert r.status_code == 200
+    j = r.json()
+    assert j["ok"] is True and j["outcome"] == "already" and j["status"] == "applied"
+    assert j["decided_by"] == {"actor": "user", "source": "slack"}
+
+
+# --- final review minors ---------------------------------------------------------
+
+async def test_guardrail_values_validated(api, mock_db):
+    a = make_agent(api)
+    url = f"/api/agents/{a['id']}"
+    for bad in ({"max_pauses_per_client_day": None}, {"max_pauses_per_client_day": "x"},
+                {"max_pauses_per_client_day": 51}, {"max_pauses_per_client_day": True},
+                {"protected_tags": "Evergreen"}, {"protected_tags": [""]}, {"protect_last_live_ad": "yes"}):
+        assert api.patch(url, json={"guardrails": bad}).status_code == 400, bad
+    ok = api.patch(url, json={"guardrails": {"max_pauses_per_client_day": 0, "protected_tags": ["Keep"]}})
+    assert ok.status_code == 200 and ok.json()["guardrails"]["protected_tags"] == ["Keep"]
+
+
+async def test_deny_note_length_capped(api, mock_db):
+    await _suggestion(mock_db)
+    r = api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "other", "note": "x" * 2001})
+    assert r.status_code == 422

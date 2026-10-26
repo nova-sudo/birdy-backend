@@ -170,14 +170,23 @@ def evaluate(rule: dict, client: ClientCtx, ad_days: dict[str, list[AdDay]],
         if (ad.effective_status or "").upper() == "ACTIVE":
             by_adset.setdefault(ad.adset_id, []).append(ad_id)
 
+    tags = [str(t).lower() for t in (rule.get("protected_tags") or []) if str(t).strip()]
     for adset_id, ids in by_adset.items():
-        if adset_id and len(ids) >= 2 and all(i in fired for i in ids):
+        # Without the ad sets permission a rollup would always be blocked: stay per ad.
+        if adset_id and rule.get("adsets_allowed", True) and len(ids) >= 2 and all(i in fired for i in ids):
+            # Pausing the ad set affects every ad in it: carry their names so
+            # guardrails and memory filters see them, and never roll up over a
+            # protected ad (fall back to per-ad findings instead).
+            member_names = [a.name or a.ad_id for a in ads.values() if a.adset_id == adset_id]
+            if any(tag in n.lower() for n in member_names for tag in tags):
+                continue
             ms = [fired[i] for i in ids]
             adset = adsets.get(adset_id)
             name = adset.name if adset and adset.name else adset_id
             out.append(_finding(
                 rule, client, p, name=name,
-                targets=[{"object_id": adset_id, "object_type": "adset", "name": name}],
+                targets=[{"object_id": adset_id, "object_type": "adset", "name": name,
+                          "member_names": member_names}],
                 spend=sum(m["spend"] for m in ms), leads=sum(m["leads"] for m in ms),
                 n_days=max(m["n_days"] for m in ms), days_live=max(m["days_live"] for m in ms),
                 window_kind=ms[0]["window_kind"] if len({m["window_kind"] for m in ms}) == 1 else "mixed",

@@ -6,7 +6,6 @@ case sampling, plus the dry-run job routes. All data is built here through
 mock_db inserts; no network.
 """
 
-import asyncio
 import contextlib
 import json
 from datetime import date, datetime, timedelta
@@ -312,37 +311,39 @@ def api(mock_mongo_client, monkeypatch):
         yield mock_mongo_client
 
     monkeypatch.setattr(agents_router, "get_mongo_client", fake_client)
-    spawned = []
-    monkeypatch.setattr(agents_router, "_spawn", lambda coro: spawned.append(coro))
     state = {"user": USER}
     app.dependency_overrides[get_current_user] = lambda: state["user"]
     client = TestClient(app)
     client.state = state
-    client.spawned = spawned
     yield client
-    for coro in spawned:
-        coro.close()
     app.dependency_overrides.pop(get_current_user, None)
 
 
+def _count_dry_runs(monkeypatch):
+    calls = []
+    real = agents_router.replay.dry_run
+
+    async def counting(*a, **kw):
+        calls.append(kw)
+        return await real(*a, **kw)
+
+    monkeypatch.setattr(agents_router.replay, "dry_run", counting)
+    return calls
+
+
 async def test_dry_run_job_lifecycle(api, mock_db, monkeypatch):
+    # Final review I3: the replay runs inside the POST (nothing detached after
+    # the response, which Vercel would freeze), so the first poll sees "done".
     await _fixture_account(mock_db)
     agent = await _agent(mock_db, ["g1"])
     monkeypatch.setattr(agents_router, "_local_today", lambda agent: END + timedelta(days=1))
+    calls = _count_dry_runs(monkeypatch)
 
     r = api.post(f"/api/agents/{agent['_id']}/dry-run")
     assert r.status_code == 200, r.text
     job_id = r.json()["job_id"]
     assert set(r.json()) == {"job_id"}
-
-    r = api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}")
-    assert r.status_code == 200 and r.json() == {"status": "queued"}
-
-    # A second POST while it is queued returns the same job and starts nothing.
-    assert api.post(f"/api/agents/{agent['_id']}/dry-run").json() == {"job_id": job_id}
-    assert len(api.spawned) == 1
-
-    await api.spawned.pop()  # the background task, run to completion here
+    assert len(calls) == 1 and calls[0]["deadline"] is not None
 
     body = api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}").json()
     assert body["status"] == "done"
@@ -362,15 +363,30 @@ async def test_dry_run_job_failure_recorded(api, mock_db, monkeypatch):
 
     monkeypatch.setattr(agents_router.replay, "dry_run", boom)
     job_id = api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"]
-    await api.spawned.pop()
     body = api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}").json()
     assert body["status"] == "failed" and body["error"]
+
+
+async def test_dry_run_over_budget_fails_timed_out(api, mock_db, monkeypatch):
+    await _fixture_account(mock_db)
+    agent = await _agent(mock_db, ["g1"])
+    monkeypatch.setattr(agents_router, "DRY_RUN_BUDGET_SECONDS", -1)  # already past the deadline
+    job_id = api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"]
+    assert api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}").json() == {
+        "status": "failed", "error": "timed_out"}
+
+
+async def test_dry_run_deadline_stops_replay(mock_db, mock_mongo_client):
+    await _fixture_account(mock_db)
+    agent = await _agent(mock_db, ["g1"])
+    with pytest.raises(replay.DryRunTimeout):
+        await replay.dry_run(mock_db, mock_mongo_client, agent, end=END, days=30, deadline=0.0)
 
 
 async def test_stuck_job_reported_timed_out(api, mock_db):
     agent = await _agent(mock_db, [])
     await mock_db[JOBS].insert_one({"_id": "j1", "agent_id": agent["_id"], "user_id": USER, "kind": "dry_run",
-                                    "status": "running", "created_at": datetime.utcnow() - timedelta(minutes=11)})
+                                    "status": "running", "created_at": datetime.utcnow() - timedelta(minutes=6)})
     body = api.get(f"/api/agents/{agent['_id']}/jobs/j1").json()
     assert body == {"status": "failed", "error": "timed_out"}
     assert (await mock_db[JOBS].find_one({"_id": "j1"}))["status"] == "failed"
@@ -380,14 +396,23 @@ async def test_stuck_job_reported_timed_out(api, mock_db):
     assert api.get(f"/api/agents/{agent['_id']}/jobs/j2").status_code == 404
 
 
-async def test_post_dry_run_reuses_active_job_but_not_timed_out(api, mock_db):
+async def test_post_dry_run_rejoins_a_running_job_with_the_same_rules(api, mock_db, monkeypatch):
     agent = await _agent(mock_db, [])
-    await mock_db[JOBS].insert_one({"_id": "old", "agent_id": agent["_id"], "user_id": USER, "kind": "dry_run",
-                                    "status": "running", "created_at": datetime.utcnow() - timedelta(minutes=11)})
-    first = api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"]
-    assert first != "old" and len(api.spawned) == 1
-    assert api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"] == first
-    assert len(api.spawned) == 1
+    url = f"/api/agents/{agent['_id']}"
+    calls = _count_dry_runs(monkeypatch)
+    first = api.post(f"{url}/dry-run").json()["job_id"]
+    sig = (await mock_db[JOBS].find_one({"_id": first}))["rules_sig"]
+    assert sig and len(calls) == 1
+    # Another request is running one for these rules right now: rejoin it.
+    await mock_db[JOBS].insert_one({"_id": "live", "agent_id": agent["_id"], "user_id": USER, "kind": "dry_run",
+                                    "status": "running", "created_at": datetime.utcnow(), "rules_sig": sig})
+    assert api.post(f"{url}/dry-run").json()["job_id"] == "live"
+    assert len(calls) == 1
+    # One killed long ago is not rejoined.
+    await mock_db[JOBS].update_one({"_id": "live"}, {"$set": {
+        "created_at": datetime.utcnow() - timedelta(minutes=6)}})
+    assert api.post(f"{url}/dry-run").json()["job_id"] not in ("live", first)
+    assert len(calls) == 2
 
 
 async def test_post_dry_run_starts_new_job_after_rule_edit(api, mock_db):
@@ -395,44 +420,29 @@ async def test_post_dry_run_starts_new_job_after_rule_edit(api, mock_db):
     url = f"/api/agents/{agent['_id']}"
     first = api.post(f"{url}/dry-run").json()["job_id"]
     stored = (await mock_db[JOBS].find_one({"_id": first}))["rules_sig"]
-    assert stored and api.post(f"{url}/dry-run").json()["job_id"] == first
-    # Editing a threshold while the first job runs: the old answer is stale.
+    # A job for the old rules is still running elsewhere ...
+    await mock_db[JOBS].update_one({"_id": first}, {"$set": {"status": "running"}})
+    assert api.post(f"{url}/dry-run").json()["job_id"] == first
+    # ... but after a threshold edit its answer is stale: start a new one.
     rid = api.get(f"{url}/rules").json()[0]["id"]
     assert api.patch(f"{url}/rules/{rid}", json={"enabled": False}).status_code == 200
     second = api.post(f"{url}/dry-run").json()["job_id"]
-    assert second != first and len(api.spawned) == 2
+    assert second != first
     assert (await mock_db[JOBS].find_one({"_id": second}))["rules_sig"] != stored
-    # The same edited rules rejoin the new job.
-    assert api.post(f"{url}/dry-run").json()["job_id"] == second
-    assert len(api.spawned) == 2
 
 
 async def test_dry_run_job_uses_local_yesterday(api, mock_db, monkeypatch):
     agent = await _agent(mock_db, [])
     seen = {}
 
-    async def fake(db, mongo_client, agent, *, end, days=30):
+    async def fake(db, mongo_client, agent, *, end, days=30, deadline=None):
         seen["end"] = end
         return replay.DryRunResult()
 
     monkeypatch.setattr(agents_router.replay, "dry_run", fake)
     monkeypatch.setattr(agents_router, "_local_today", lambda agent: date(2026, 10, 26))
     api.post(f"/api/agents/{agent['_id']}/dry-run")
-    await api.spawned.pop()
     assert seen["end"] == date(2026, 10, 25)
-
-
-async def test_spawn_keeps_reference_until_done():
-    done = []
-
-    async def work():
-        done.append(1)
-
-    task = agents_router._spawn(work())
-    assert task in agents_router._BACKGROUND
-    await task
-    await asyncio.sleep(0)  # let the done-callback run
-    assert done == [1] and task not in agents_router._BACKGROUND
 
 
 async def test_case_snapshot_bounded_to_target_neighbourhood(mock_db, mock_mongo_client):

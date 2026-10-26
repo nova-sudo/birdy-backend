@@ -74,6 +74,20 @@ async def test_blocks_protected_tag(mock_db):
     assert "Evergreen" in r.message
 
 
+async def test_adset_target_blocked_when_a_contained_ad_is_protected(mock_db):
+    # C1: the ad set's own name is clean; one of its ads is Evergreen.
+    await _seed_ads(mock_db, [("a1", "s1", "ACTIVE", "Spring static"),
+                              ("a2", "s1", "ACTIVE", "Evergreen – video"),
+                              ("a3", "s2", "ACTIVE", "Other set ad")])
+    doc = _doc([{"object_id": "s1", "object_type": "adset", "name": "Prospecting set"}])
+    r = await check_guardrails(mock_db, _agent(), doc, now_utc=NOW)
+    assert not r.ok and r.reason == "protected_tag"
+    assert "Evergreen – video" in r.message
+
+    clean = _doc([{"object_id": "s2", "object_type": "adset", "name": "Retargeting set"}])
+    assert (await check_guardrails(mock_db, _agent(), clean, now_utc=NOW)).ok
+
+
 async def test_protected_tag_uses_meta_state_name_when_target_has_none(mock_db):
     await _seed_ads(mock_db, [("a1", "s1", "ACTIVE", "evergreen hero"), ("a2", "s1", "ACTIVE", "y")])
     doc = _doc([{"object_id": "a1", "object_type": "ad"}])

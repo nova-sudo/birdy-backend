@@ -109,6 +109,20 @@ async def test_agent_apply_writes_and_logs_agent_fields(mock_db, meta):
     assert act["expires_at"] - act["created_at"] == timedelta(days=395)
 
 
+async def test_adset_pause_blocked_by_protected_member_ad_without_meta_call(mock_db, meta):
+    # C1: two firing ads rolled up into one ad set pause; one is Evergreen.
+    await _seed_agent(mock_db)
+    for ad_id, name in (("a1", "Spring static"), ("a2", "Evergreen – video")):
+        await mock_db[AD_STATE].insert_one({"client_group_id": GID, "ad_id": ad_id, "adset_id": "s1",
+                                            "effective_status": "ACTIVE", "name": name})
+    await _seed_suggestion(mock_db, targets=[{"object_id": "s1", "object_type": "adset",
+                                              "name": "Prospecting set"}])
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1", actor=store.ACTOR_BIRDY,
+                                         source="agent")
+    assert res["outcome"] == "blocked" and res["blocked_reason"]["code"] == "protected_tag", res
+    assert meta["writes"] == [] and meta["reads"] == []
+
+
 async def test_blocked_keeps_open_with_reason(mock_db, meta):
     await _seed_agent(mock_db)
     await _seed_ad_state(mock_db)
@@ -540,3 +554,41 @@ async def test_changing_rule_mode_updates_open_items(mock_db, meta):
     res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
     assert res["outcome"] == "applied", res
     assert meta["writes"] == [("a1", "PAUSED")]
+
+
+# --- final review I1: deny on an applied item; repeat dismiss --------------------
+
+async def test_dismiss_applied_item_leaves_it_applied_and_learns_nothing(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    assert (await actions.apply_suggestion(mock_db, None, "u1", "sug_1"))["outcome"] == "applied"
+    rows_before = await mock_db[store.ACTIVITY].count_documents({"ref_id": "sug_1"})
+
+    res = await actions.dismiss_suggestion(mock_db, None, "u1", "sug_1", reason_code="other")
+    assert res["ok"] is False and res["outcome"] == "already" and res["status"] == "applied"
+    doc = await store.get_suggestion(mock_db, "u1", "sug_1")
+    assert doc["status"] == "applied"
+    assert await mock_db[store.ACTIVITY].count_documents({"ref_id": "sug_1"}) == rows_before
+    # Undo still works.
+    assert (await actions.undo_suggestion(mock_db, None, "u1", "sug_1"))["outcome"] == "undone"
+
+
+async def test_repeat_dismiss_counts_once(mock_db, meta):
+    await _seed_suggestion(mock_db, agent=False)
+    first = await actions.dismiss_suggestion(mock_db, None, "u1", "sug_1")
+    second = await actions.dismiss_suggestion(mock_db, None, "u1", "sug_1")
+    assert first["outcome"] == "dismissed"
+    assert second["ok"] is True and second["outcome"] == "already"
+    assert await mock_db[store.ACTIVITY].count_documents(
+        {"ref_id": "sug_1", "kind": store.KIND_SUGGESTION_DISMISSED}) == 1
+
+
+async def test_apply_on_resolved_item_is_closed_not_ok(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "sug_1"}, {"$set": {"status": "resolved"}})
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["ok"] is False and res["outcome"] == "closed" and res["status"] == "resolved"
+    assert meta["writes"] == []

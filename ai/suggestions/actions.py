@@ -10,12 +10,15 @@ These functions never raise for expected cases; they return an outcome dict so
 each caller can map it to its own surface (HTTP status vs. a Slack message):
 
     {"ok": bool, "outcome": "applied"|"partial"|"already"|"already_in_meta"
-                            |"blocked"|"busy"|"dismissed"|"not_found"|"failed"|"noop",
+                            |"closed"|"blocked"|"busy"|"dismissed"|"not_found"|"failed"|"noop",
      "doc": <suggestion doc or None>, "succeeded": [...], "failed": [...],
      "detail": <str, on failure>,
-     "decided_by": <dict, on "already">, "blocked_reason": <{code, message}, on "blocked">}
+     "status"/"decided_by": <on "already"/"closed">, "blocked_reason": <{code, message}, on "blocked">}
 
-  already          someone else already decided it (or is applying it right now)
+  already          (apply) someone already applied it (or is applying it right now);
+                   (dismiss) it is no longer open: ok only when it was already
+                   dismissed — an applied or resolved item is left as it is
+  closed           (apply) it was dismissed or resolved; nothing was written
   already_in_meta  every target was already in the desired state (or deleted) in
                    Meta, so nothing was written; the suggestion is marked applied
   blocked          an agent guardrail stopped it; it stays open with blocked_reason
@@ -153,13 +156,25 @@ async def _learn(db, doc: dict, decision: str, **kw) -> dict | None:
         return None
 
 
+CLOSED_MESSAGE = "This item was already closed"
+ALREADY_APPLIED_MESSAGE = "Already applied — undo it instead"
+
+
 async def _already(db, user_id: str, suggestion_id: str, fallback: dict) -> dict:
+    """The apply lost: someone applied it (or is applying it) — "already", ok —
+    or it was closed (dismissed / resolved) — "closed", not ok: nothing was
+    written, so it must not read as done."""
     cur = await store.get_suggestion(db, user_id, suggestion_id) or fallback
     if not store.has_live_claim(cur):
         # Re-render a stale card (e.g. Apply on a resolved item) to the real state.
         # Skipped mid-apply: the winner syncs when it finishes.
         await _sync_slack(db, user_id, suggestion_id)
-    return {"ok": True, "outcome": "already", "doc": cur, "decided_by": cur.get("decided_by")}
+    status = cur.get("status")
+    if status in (store.STATUS_DISMISSED, store.STATUS_RESOLVED):
+        return {"ok": False, "outcome": "closed", "doc": cur, "status": status,
+                "decided_by": cur.get("decided_by"), "detail": CLOSED_MESSAGE}
+    return {"ok": True, "outcome": "already", "doc": cur, "status": status,
+            "decided_by": cur.get("decided_by")}
 
 
 async def apply_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
@@ -183,7 +198,8 @@ async def apply_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *
     if not doc:
         return {"ok": False, "outcome": "not_found", "doc": None}
     if doc.get("status") == store.STATUS_APPLIED:
-        return {"ok": True, "outcome": "already", "doc": doc, "decided_by": doc.get("decided_by")}
+        return {"ok": True, "outcome": "already", "doc": doc, "status": store.STATUS_APPLIED,
+                "decided_by": doc.get("decided_by")}
 
     token = await store.claim_for_apply(db, user_id, suggestion_id)
     if not token:
@@ -323,11 +339,23 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
 
     changed = await store.mark_dismissed(db, user_id, suggestion_id)
     if not changed:
-        fresh = await store.get_suggestion(db, user_id, suggestion_id)
+        fresh = await store.get_suggestion(db, user_id, suggestion_id) or doc
         if store.has_live_claim(fresh):
             # An apply is mid-flight; dismissing now would orphan its Meta write.
             return {"ok": False, "outcome": "busy", "doc": fresh,
                     "detail": "Applying right now — try again in a moment"}
+        # No longer open: nothing changes, nothing is logged or learned. A repeat
+        # dismiss is a quiet success; an applied or resolved item is not
+        # dismissed (the pause would be stranded with no undo).
+        status = fresh.get("status")
+        out = {"ok": status == store.STATUS_DISMISSED, "outcome": "already", "doc": fresh,
+               "status": status, "decided_by": fresh.get("decided_by")}
+        if status == store.STATUS_APPLIED:
+            out["detail"] = ALREADY_APPLIED_MESSAGE
+        elif status != store.STATUS_DISMISSED:
+            out["detail"] = CLOSED_MESSAGE
+        await _sync_slack(db, user_id, suggestion_id, by=by)
+        return out
     await store.log_activity(
         db, user_id,
         actor=actor,
@@ -345,9 +373,10 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
         note=note,
     )
     memory = None
-    # Only the request that actually dismissed it counts, and only items with an
-    # action: acknowledging a flag-only item is not a denial.
-    if changed and doc.get("action"):
+    # Only the request that actually dismissed it counts (it changed, above), and
+    # only items with an action: acknowledging a flag-only (or flag-mode) item
+    # is not a denial.
+    if doc.get("action") and doc.get("rule_mode") != "flag":
         learned = await _learn(db, doc, "denied", reason_code=reason_code, note=note)
         memory = (learned or {}).get("memory")
     await _sync_slack(db, user_id, suggestion_id, by=by)

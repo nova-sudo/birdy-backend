@@ -13,11 +13,19 @@ than 3h inside the 2h grace window after the scheduled time: queue a refresh and
 After the grace window: run anyway with force_stale (items are created, nothing is
 auto-applied). run_agent refreshes Meta state itself, so it is not refreshed here.
 
+Time budget: Vercel kills the function at 300s (vercel.json uses `builds`, which
+cannot set maxDuration). A tick stops claiming new agents after TICK_BUDGET_SECONDS
+and leaves them for the next 15-minute tick; the proposal scan is skipped past it.
+A claim that was taken but never finished (the invocation was killed mid-run) goes
+stale after STALE_CLAIM and is retried, at most MAX_RUN_ATTEMPTS times a day; after
+that the day is recorded as last_run {status: "error", reason: "timed_out"}.
+
 agents-outcomes (daily 05:00 UTC): stores the 7-day outcome on applied agent actions
 (see ai/agents/outcomes.py).
 """
 
 import logging
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -34,6 +42,9 @@ MAX_DATA_AGE = timedelta(hours=3)
 GRACE = timedelta(hours=2)
 FRESHNESS_FIELD = "last_meta_refresh"
 IN_FLIGHT = ("pending", "in_progress")
+TICK_BUDGET_SECONDS = 180          # of Vercel's 300s function timeout
+STALE_CLAIM = timedelta(minutes=30)
+MAX_RUN_ATTEMPTS = 3
 
 
 def _aware_utc(dt: datetime) -> datetime:
@@ -124,10 +135,48 @@ def _last_run(result, at: datetime, watched: int) -> dict:
             "blocked": result.blocked, "stale": result.stale}
 
 
-async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
+async def _claim(db, agent: dict, today_iso: str, now_utc: datetime) -> bool:
+    """Atomic once-per-local-day claim, so overlapping ticks cannot both run the
+    agent. A claim from today that is older than STALE_CLAIM never finished (a
+    finished run stamps last_run_at, so the agent is no longer due): take it over,
+    up to MAX_RUN_ATTEMPTS a day."""
+    fresh = await db[AGENTS].find_one_and_update(
+        {"_id": agent["_id"], "status": "active", "run_claimed_for": {"$ne": today_iso}},
+        {"$set": {"run_claimed_for": today_iso, "run_claimed_at": now_utc, "run_attempts": 1}},
+    )
+    if fresh is not None:
+        return True
+    retry = await db[AGENTS].find_one_and_update(
+        {"_id": agent["_id"], "status": "active", "run_claimed_for": today_iso,
+         "run_claimed_at": {"$lt": now_utc - STALE_CLAIM},
+         "$or": [{"run_attempts": {"$exists": False}}, {"run_attempts": {"$lt": MAX_RUN_ATTEMPTS}}]},
+        {"$set": {"run_claimed_at": now_utc}, "$inc": {"run_attempts": 1}},
+    )
+    if retry is not None:
+        logger.warning("agents-tick: retrying agent %s, its last run never finished", agent.get("_id"))
+        return True
+    # Out of attempts and still unfinished: record it, so the day isn't lost silently.
+    at = datetime.utcnow()
+    gave_up = await db[AGENTS].update_one(
+        {"_id": agent["_id"], "run_claimed_for": today_iso, "run_attempts": {"$gte": MAX_RUN_ATTEMPTS},
+         "run_claimed_at": {"$lt": now_utc - STALE_CLAIM}},
+        {"$set": {"last_run": {"status": "error", "reason": "timed_out", "at": at}, "last_run_at": at}},
+    )
+    if gave_up.modified_count:
+        logger.error("agents-tick: agent %s never finished in %d attempts today", agent.get("_id"),
+                     MAX_RUN_ATTEMPTS)
+    return False
+
+
+async def run_due_agents(mongo_client, *, now_utc: datetime, deadline: float | None = None) -> dict:
+    """`deadline` (time.monotonic()): past it, no new agent is claimed and the
+    rest wait for the next tick."""
     now_utc = _aware_utc(now_utc)
     db = mongo_client[DB_NAME]
-    out = {"ran": 0, "skipped": 0, "refreshed": 0, "errors": 0}
+    out = {"ran": 0, "skipped": 0, "refreshed": 0, "errors": 0, "deferred": 0}
+
+    def out_of_time() -> bool:
+        return deadline is not None and time.monotonic() > deadline
 
     for agent in await db[AGENTS].find({"status": "active"}).to_list(length=None):
         try:
@@ -149,21 +198,23 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
                 out["skipped"] += 1
                 continue
 
-            # Atomic once-per-local-day claim: overlapping ticks cannot both run the agent.
-            # Kept on error, so a failing agent is not retried the same day.
-            claimed = await db[AGENTS].find_one_and_update(
-                {"_id": agent["_id"], "status": "active", "run_claimed_for": {"$ne": today.isoformat()}},
-                {"$set": {"run_claimed_for": today.isoformat(), "run_claimed_at": now_utc}},
-            )
-            if claimed is None:
+            if out_of_time():
+                out["deferred"] += 1  # due, not claimed: the next tick runs it
+                continue
+            # A run that raises still records last_run_at (below), so a failing
+            # agent is not retried the same day; only an unfinished one is.
+            if not await _claim(db, agent, today.isoformat(), now_utc):
                 out["skipped"] += 1
                 continue
 
             result = await run_agent(db, mongo_client, agent, as_of=today, force_stale=too_old)
             at = datetime.utcnow()
-            last_run = _last_run(result, at, len((agent.get("scope") or {}).get("client_group_ids") or []))
+            last_run = _last_run(result, at, len(groups))  # clients with a Meta account
             await db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"last_run": last_run, "last_run_at": at}})
             out["ran"] += 1
+            if out_of_time():
+                logger.warning("agents-tick: out of time, proposal scan skipped for %s", agent.get("_id"))
+                continue
             try:
                 await learning.scan_proposals(db, mongo_client, agent, now=at)
             except Exception as e:  # a learning failure never fails the run
@@ -183,8 +234,9 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
 
 
 async def run_agents_tick() -> dict:
+    deadline = time.monotonic() + TICK_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
-        return await run_due_agents(mongo_client, now_utc=datetime.now(timezone.utc))
+        return await run_due_agents(mongo_client, now_utc=datetime.now(timezone.utc), deadline=deadline)
 
 
 async def run_outcomes(mongo_client, now_utc: datetime) -> dict:

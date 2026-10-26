@@ -23,7 +23,8 @@ import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -193,11 +194,29 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
+        if res["outcome"] == "closed":
+            # Dismissed or resolved since the list was loaded: nothing was written.
+            return _conflict(res)
         # "blocked" (agent guardrail) is a 200 with ok=false: the suggestion stays
-        # open and the card shows blocked_reason.
+        # open and the card shows blocked_reason. "already" (applied by someone
+        # else) is ok and carries who decided it.
         return {"ok": res["ok"], "outcome": res["outcome"],
                 "succeeded": res.get("succeeded", []), "failed": res.get("failed", []),
-                "blocked_reason": res.get("blocked_reason")}
+                "blocked_reason": res.get("blocked_reason"),
+                "status": res.get("status"), "decided_by": _decided_by(res)}
+
+
+def _decided_by(res: dict) -> dict | None:
+    d = res.get("decided_by")
+    return {"actor": d.get("actor"), "source": d.get("source")} if isinstance(d, dict) else None
+
+
+def _conflict(res: dict) -> JSONResponse:
+    """409 for a decision on an item that is no longer open (outcome on the body)."""
+    return JSONResponse(status_code=409, content={
+        "detail": res.get("detail") or "This item was already handled",
+        "outcome": res["outcome"], "status": res.get("status"), "decided_by": _decided_by(res),
+    })
 
 
 @router.delete("/suggestions/{suggestion_id}")
@@ -212,12 +231,14 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "busy":
             raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+        if not res["ok"]:
+            return _conflict(res)
         return {"ok": True}
 
 
 class DenyBody(BaseModel):
     reason_code: str
-    note: str | None = None
+    note: str | None = Field(default=None, max_length=2000)
 
 
 @router.post("/suggestions/{suggestion_id}/deny")
@@ -236,6 +257,8 @@ async def deny_suggestion(suggestion_id: str, body: DenyBody, current_user: str 
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "busy":
             raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+        if not res["ok"]:
+            return _conflict(res)
         # What Birdy learned from the note (for the "Birdy will remember: …" toast).
         mem = res.get("memory")
         memory = ({"id": mem.get("_id"), "text": mem.get("text"), "kind": mem.get("kind"),

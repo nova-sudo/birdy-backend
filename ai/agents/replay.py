@@ -36,6 +36,7 @@ Simulated actions (dry_run only)
 import hashlib
 import logging
 import random
+import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 
@@ -196,7 +197,12 @@ def _affected_ads(f: Finding, target: dict) -> list[str]:
     return ids or ([target["object_id"]] if target["object_type"] == "ad" else [])
 
 
-async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30) -> DryRunResult:
+class DryRunTimeout(Exception):
+    """The dry run passed its deadline (time.monotonic()) before finishing."""
+
+
+async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30,
+                  deadline: float | None = None) -> DryRunResult:
     """What the agent would have done each day from end - days + 1 through end.
 
     Each (rule kind, target) counts once, on its first fire day. Near misses
@@ -204,7 +210,11 @@ async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30) -
     revives are simulated from the day after they fire (module docstring), and
     a pause on an ad set counts only if it pauses an ad not already paused.
     spend_saved / leads_at_risk add each paused ad once, from the day after its
-    earliest simulated pause through end; revives and flags add 0."""
+    earliest simulated pause through end; revives and flags add 0.
+
+    `deadline` (a time.monotonic() value) bounds the work: past it the replay
+    raises DryRunTimeout between days instead of running into the platform's
+    function timeout."""
     start, rules, memories, clients = await _prepare(db, agent, end=end, days=days)
     res = DryRunResult(by_rule={r["kind"]: 0 for r in rules})
     seen: set[tuple[str, str, str]] = set()
@@ -212,6 +222,8 @@ async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30) -
     paused_on: dict[tuple[str, str], date] = {}  # (gid, ad_id) -> earliest simulated pause day
     events = []
     for i in range(days):
+        if deadline is not None and time.monotonic() > deadline:
+            raise DryRunTimeout(f"stopped after {i} of {days} days")
         d = start + timedelta(days=i)
         for c in clients:
             csim = sim[c.gid]

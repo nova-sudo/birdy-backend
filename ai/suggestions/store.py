@@ -333,11 +333,12 @@ async def mark_undone(db, user_id: str, suggestion_id: str, *,
 
 async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
     """False if nothing changed — including when a live apply claim holds the doc,
-    or it is already dismissed (a repeat decline neither extends the cooldown
-    nor counts as a second denial)."""
+    or it is no longer open: already dismissed (a repeat decline neither extends
+    the cooldown nor counts as a second denial), applied (undo it instead) or
+    resolved."""
     now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id, "status": {"$ne": STATUS_DISMISSED},
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_OPEN,
          **unclaimed_filter(now)},
         {"$set": {"status": STATUS_DISMISSED, "dismissed_at": now, "updated_at": now}},
     )
@@ -480,5 +481,9 @@ async def create_suggestion_indexes(mongo_client):
         [("agent_id", 1), ("created_at", -1)],
         partialFilterExpression={"agent_id": {"$exists": True}},
     )
+    # The agents' daily pause-cap count (ai/agents/guardrails.py), on every apply.
+    await db[ACTIVITY].create_index([("client_group_id", 1), ("kind", 1), ("created_at", -1)])
+    # sync_open_rule_mode's update_many by rule.
+    await db[SUGGESTIONS].create_index("rule_id", sparse=True)
     # TTL index — Mongo drops activity docs once expires_at passes.
     await db[ACTIVITY].create_index("expires_at", expireAfterSeconds=0)

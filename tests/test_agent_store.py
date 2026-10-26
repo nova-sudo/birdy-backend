@@ -77,3 +77,15 @@ async def test_memory_add_list_deactivate(mock_db):
 
 async def test_create_agent_indexes(mock_mongo_client):
     await create_agent_indexes(mock_mongo_client)
+
+
+async def test_final_review_indexes_created(mock_mongo_client):
+    # Final review minor 8: pause-cap count and rule-mode sync are indexed.
+    from ai.suggestions.store import ACTIVITY, SUGGESTIONS, create_suggestion_indexes
+    from core.database import DB_NAME
+    await create_suggestion_indexes(mock_mongo_client)
+    db = mock_mongo_client[DB_NAME]
+    act = [list(v["key"]) for v in (await db[ACTIVITY].index_information()).values()]
+    sug = [list(v["key"]) for v in (await db[SUGGESTIONS].index_information()).values()]
+    assert [("client_group_id", 1), ("kind", 1), ("created_at", -1)] in act
+    assert [("rule_id", 1)] in sug

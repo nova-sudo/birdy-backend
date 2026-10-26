@@ -20,7 +20,7 @@ from datetime import date, datetime, timedelta
 from typing import Literal
 
 from ai.agents import memory_filters
-from ai.agents.defaults import RULE_KINDS
+from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS, RULE_KINDS
 from ai.agents.evaluators import REGISTRY
 from ai.agents.meta_state import MetaTokenError, backfill_paused_at, refresh_meta_state
 from ai.agents.snapshot import (
@@ -44,7 +44,7 @@ AGENT_WINDOW = "agent"
 MISSING_TARGET_AGENT = "media_buying:missing_target"
 TARGET_ONLY_RULES = {"revive_winner"}
 APPLIED_OUTCOMES = {"applied", "already_in_meta", "partial"}
-NEUTRAL_OUTCOMES = {"already"}  # someone else decided it / holds the claim
+NEUTRAL_OUTCOMES = {"already", "closed"}  # someone else decided or closed it / holds the claim
 
 
 @dataclass
@@ -86,6 +86,10 @@ def evaluate_loaded(agent: dict, rules: list[dict], memories: list[dict], ctx: C
     every enabled rule's evaluator, then memory filters. Pure: no I/O. Shared by
     run_agent and the dry-run replay (ai.agents.replay) so they cannot drift."""
     findings: list[Finding] = []
+    protected_tags = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}.get("protected_tags") or []
+    if isinstance(protected_tags, str):
+        protected_tags = [protected_tags]
+    adsets_allowed = bool({**DEFAULT_PERMISSIONS, **(agent.get("permissions") or {})}.get("adsets"))
     if ctx.target_cpl is None:
         findings.append(_missing_target_finding(agent, ctx))
     for rule in rules:
@@ -95,7 +99,8 @@ def evaluate_loaded(agent: dict, rules: list[dict], memories: list[dict], ctx: C
             continue
         if ctx.target_cpl is None and kind in TARGET_ONLY_RULES:
             continue
-        rule = {**rule, "agent_id": rule.get("agent_id") or agent.get("_id")}
+        rule = {**rule, "agent_id": rule.get("agent_id") or agent.get("_id"),
+                "protected_tags": protected_tags, "adsets_allowed": adsets_allowed}
         findings.extend(evaluate(rule, ctx, ad_days, ads, adsets, as_of, near_miss=near_miss))
     return memory_filters.apply(findings, memories, as_of=as_of)
 

@@ -741,3 +741,14 @@ async def test_silent_auto_run_is_not_posted_to_slack(mock_db, mock_mongo_client
     res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
     assert res.auto_applied == 1
     assert len(no_slack) == posted
+
+
+async def test_got_it_on_flag_mode_item_is_not_a_denial(mock_db, mock_mongo_client):
+    # Final review minor 2: a flag-mode item that carries an action is acknowledged, not denied.
+    agent, rules = await seed_agent(mock_db)
+    rule = rules["pause_over_target"]
+    await seed_suggestion(mock_db, agent, rule, "s1", rule_mode="flag")
+    res = await actions.dismiss_suggestion(mock_db, mock_mongo_client, U, "s1")
+    assert res["outcome"] == "dismissed"
+    stats = (await rule_doc(mock_db, rule["_id"])).get("stats") or {}
+    assert stats.get("denied", 0) == 0 and "no" not in (stats.get("last10") or [])

@@ -121,7 +121,28 @@ def test_adset_rollup_when_all_ads_fail():
     out = run(days, ads)
     assert len(out) == 1
     t = out[0].action.targets
-    assert t == [{"object_id": "as1", "object_type": "adset", "name": "Set One"}]
+    assert t == [{"object_id": "as1", "object_type": "adset", "name": "Set One",
+                  "member_names": ["Ad a", "Ad b"]}]
+
+
+# C1 (final review): an ad set pause affects every ad inside it.
+
+def test_no_rollup_over_a_protected_member_ad():
+    days = {"a": make_days("a", [(20, 0)] * 4), "b": make_days("b", [(25, 0)] * 4)}
+    ads = {"a": make_ad("a"), "b": AdState("b", "as1", "c1", "Evergreen – video", "ACTIVE", None, None)}
+    rule = {**make_rule(), "protected_tags": ["evergreen"]}
+    out = run(days, ads, rule=rule)
+    assert sorted(f.action.targets[0]["object_type"] for f in out) == ["ad", "ad"]
+    assert all(f.action.targets[0]["object_id"] in {"a", "b"} for f in out)
+
+
+def test_memory_filter_on_member_ad_name_suppresses_rollup():
+    from ai.agents import memory_filters
+    days = {"a": make_days("a", [(20, 0)] * 4), "b": make_days("b", [(25, 0)] * 4)}
+    ads = {"a": make_ad("a"), "b": AdState("b", "as1", "c1", "Evergreen – video", "ACTIVE", None, None)}
+    out = run(days, ads)
+    assert len(out) == 1 and out[0].action.targets[0]["object_type"] == "adset"
+    assert memory_filters.apply(out, [{"filter": {"ad_name_contains": "evergreen"}}]) == []
 
 
 def test_no_rollup_when_a_sibling_is_fine():
@@ -171,3 +192,20 @@ def test_suggestion_doc_copies_agent_fields():
     f2 = run(days, {"a": make_ad("a")})[0]
     f2.agent_id = f2.rule_id = ""; f2.rule_version = 0
     assert "agent_id" not in build_suggestion_doc("u1", f2)
+
+
+def test_evaluate_loaded_passes_agent_protected_tags_to_evaluator():
+    from ai.agents.runner import evaluate_loaded
+    days = {"a": make_days("a", [(20, 0)] * 4), "b": make_days("b", [(25, 0)] * 4)}
+    ads = {"a": make_ad("a"), "b": AdState("b", "as1", "c1", "Brand KEEP ad", "ACTIVE", None, None)}
+    agent = {"_id": "a1", "guardrails": {"protected_tags": ["keep"]}}
+    out = evaluate_loaded(agent, [make_rule()], [], make_client(), days, ads, {"as1": make_adset()},
+                          as_of=START + timedelta(days=3), near_miss=False)
+    assert out and all(f.action.targets[0]["object_type"] == "ad" for f in out)
+
+
+def test_no_rollup_without_adsets_permission():
+    # Final review minor 13: the rollup would always be blocked with no_permission.
+    days = {"a": make_days("a", [(20, 0)] * 4), "b": make_days("b", [(25, 0)] * 4)}
+    out = run(days, {"a": make_ad("a"), "b": make_ad("b")}, rule={**make_rule(), "adsets_allowed": False})
+    assert sorted(f.action.targets[0]["object_id"] for f in out) == ["a", "b"]

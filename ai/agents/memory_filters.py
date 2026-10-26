@@ -8,8 +8,9 @@ A memory's `filter` is a dict of conditions, all of which must match (AND) for
 the memory to exclude a finding:
 
   client_group_id   the finding's client
-  ad_name_contains  case-insensitive substring of a target's name (the
-                    finding's title when it has no named targets)
+  ad_name_contains  case-insensitive substring of a target's name, or of any
+                    ad inside an ad set target (`member_names`); the
+                    finding's title when it has no named targets
   weekdays          list of ints, Monday = 0, matched against `as_of`
 
 A memory with no filter, or an empty one, excludes nothing. Unknown keys never
@@ -24,7 +25,11 @@ KNOWN_KEYS = ("client_group_id", "ad_name_contains", "weekdays")
 
 
 def _names(f: Finding) -> list[str]:
-    names = [str(t.get("name") or "") for t in (f.action.targets if f.action else [])]
+    names = []
+    for t in (f.action.targets if f.action else []):
+        names.append(str(t.get("name") or ""))
+        # An ad set target affects every ad inside it.
+        names.extend(str(n or "") for n in (t.get("member_names") or []))
     names = [n for n in names if n]
     return names or [f.title or ""]
 

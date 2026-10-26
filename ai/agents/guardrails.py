@@ -7,7 +7,8 @@ agent_id, whether a person approved them or the agent is auto-running.
 
 Checked in order, first failure wins:
   1. no_permission  the agent may not touch this object type
-  2. protected_tag  a target's name contains a protected tag
+  2. protected_tag  a target's name (or, for an ad set, any of its ads' names)
+                    contains a protected tag
   3. last_live_ad   (pauses) the ad set would be left with no ACTIVE ad
   4. pause_cap      (pauses) the client has hit today's pause limit, counting
                     pauses by any actor since local midnight in the agent's tz
@@ -110,7 +111,9 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
     ad_ids = [str(t.get("object_id")) for t in targets if t.get("object_type", "ad") == "ad"]
     states = await _ad_states(db, gid, ad_ids)
 
-    # 2. Protected tags (case-insensitive substring of the name).
+    # 2. Protected tags (case-insensitive substring of the name). Covers every
+    # ad the action would affect: an ad set target is checked by its own name
+    # and by the names of all its ads in meta_ad_state.
     tags = [str(tag) for tag in (guardrails.get("protected_tags") or []) if str(tag).strip()]
     if tags:
         for t in targets:
@@ -118,6 +121,10 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
             st = states.get(str(t.get("object_id")))
             if st:
                 names.append(st.get("name") or "")
+            if t.get("object_type") == "adset":
+                names.extend(str(n) for n in (t.get("member_names") or []))
+                names.extend([d.get("name") or "" async for d in db[AD_STATE].find(
+                    {"client_group_id": gid, "adset_id": str(t.get("object_id"))})])
             for name in names:
                 low = name.lower()
                 for tag in tags:

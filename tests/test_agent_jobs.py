@@ -65,7 +65,7 @@ async def test_due_at_local_7am_new_york(mock_db, mock_mongo_client, runs):
     early = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=_local(2026, 10, 26, 6, 45))
     assert early["ran"] == 0 and calls == []
     res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=now_ok)
-    assert res == {"ran": 1, "skipped": 0, "refreshed": 0, "errors": 0}
+    assert res == {"ran": 1, "skipped": 0, "refreshed": 0, "errors": 0, "deferred": 0}
     assert calls[0]["as_of"].isoformat() == "2026-10-26" and calls[0]["force_stale"] is False
 
 
@@ -203,3 +203,60 @@ async def test_bad_stored_schedule_is_skipped_not_run(mock_db, mock_mongo_client
     res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=now_ok)
     assert res["ran"] == 0 and res["skipped"] == 1 and res["errors"] == 0 and calls == []
     assert "last_run" not in await _agent_doc(mock_db, bad)
+
+
+# --- final review I4: time budget, and a killed run is retried the same day ------
+
+async def test_past_deadline_defers_due_agents_to_next_tick(mock_db, mock_mongo_client, runs):
+    calls, _ = runs
+    t = _local(2026, 10, 26, 7, 0)
+    agent = await _seed(mock_db, refreshed=t.replace(tzinfo=None))
+    res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t, deadline=0.0)
+    assert res["ran"] == 0 and res["deferred"] == 1 and calls == []
+    assert (await _agent_doc(mock_db, agent)).get("run_claimed_for") is None  # day not consumed
+    nxt = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t + timedelta(minutes=15))
+    assert nxt["ran"] == 1 and len(calls) == 1
+
+
+async def test_tick_budget_is_under_the_platform_limit():
+    assert agent_jobs.TICK_BUDGET_SECONDS <= 0.7 * 300
+
+
+async def test_unfinished_claim_is_retried_after_it_goes_stale(mock_db, mock_mongo_client, runs):
+    calls, _ = runs
+    t = _local(2026, 10, 26, 7, 0)
+    agent = await _seed(mock_db, refreshed=t.replace(tzinfo=None))
+    # A tick claimed it and was killed before stamping last_run_at.
+    await mock_db.agents.update_one({"_id": agent["_id"]}, {"$set": {
+        "run_claimed_for": "2026-10-26", "run_claimed_at": t, "run_attempts": 1}})
+    soon = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t + timedelta(minutes=15))
+    assert soon["ran"] == 0 and calls == []  # could still be running
+    later = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t + timedelta(minutes=45))
+    assert later["ran"] == 1 and len(calls) == 1
+    assert (await _agent_doc(mock_db, agent))["run_attempts"] == 2
+
+
+async def test_unfinished_claim_gives_up_after_max_attempts_and_records_it(mock_db, mock_mongo_client, runs):
+    calls, _ = runs
+    t = _local(2026, 10, 26, 7, 0)
+    agent = await _seed(mock_db, refreshed=t.replace(tzinfo=None))
+    await mock_db.agents.update_one({"_id": agent["_id"]}, {"$set": {
+        "run_claimed_for": "2026-10-26", "run_claimed_at": t,
+        "run_attempts": agent_jobs.MAX_RUN_ATTEMPTS}})
+    res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t + timedelta(hours=1))
+    assert res["ran"] == 0 and calls == []
+    doc = await _agent_doc(mock_db, agent)
+    assert doc["last_run"]["status"] == "error" and doc["last_run"]["reason"] == "timed_out"
+
+
+async def test_all_connected_clients_token_dead_reads_skipped_token(mock_db, mock_mongo_client, runs):
+    # Final review minor 9: a watched client with no Meta account doesn't turn it into "partial".
+    calls, state = runs
+    t = _local(2026, 10, 26, 7, 0)
+    agent = await _seed(mock_db, refreshed=t.replace(tzinfo=None))
+    await mock_db.client_groups.insert_one({"id": "nometa", "user_id": USER, "name": "nometa"})
+    await mock_db.agents.update_one({"_id": agent["_id"]},
+                                    {"$set": {"scope.client_group_ids": ["cg1", "nometa"]}})
+    state["result"] = runner.RunResult(skipped=["meta_token:cg1", "no_meta:nometa"])
+    await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t)
+    assert (await _agent_doc(mock_db, agent))["last_run"]["status"] == "skipped_token"
