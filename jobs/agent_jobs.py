@@ -18,6 +18,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
+from ai.agents import learning
 from ai.agents.runner import run_agent
 from ai.agents.store import AGENTS
 from core.database import DB_NAME
@@ -159,6 +160,10 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
             last_run = _last_run(result, at, len((agent.get("scope") or {}).get("client_group_ids") or []))
             await db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"last_run": last_run, "last_run_at": at}})
             out["ran"] += 1
+            try:
+                await learning.scan_proposals(db, mongo_client, agent, now=at)
+            except Exception as e:  # a learning failure never fails the run
+                logger.error("agents-tick: proposal scan failed for %s: %s", agent.get("_id"), e, exc_info=True)
         except Exception as e:
             logger.error("agents-tick: agent %s failed: %s", agent.get("_id"), e, exc_info=True)
             out["errors"] += 1

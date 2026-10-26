@@ -140,6 +140,19 @@ async def _record_meta_state(db, user_id: str, doc: dict, targets: list[dict],
         logger.warning("apply: meta_ad_state write-back failed for %s: %s", doc.get("_id"), e)
 
 
+async def _learn(db, doc: dict, decision: str, **kw) -> dict | None:
+    """Best-effort: feed a decision on an agent item to the learning engine.
+    A learning failure never fails the user's apply / deny / undo."""
+    if not (doc.get("agent_id") and doc.get("rule_id")):
+        return None
+    try:
+        from ai.agents import learning  # lazy: learning -> replay -> runner -> actions
+        return await learning.record_decision(db, doc["agent_id"], doc["rule_id"], decision, doc=doc, **kw)
+    except Exception as e:
+        logger.error("actions: learning (%s) failed for %s: %s", decision, doc.get("_id"), e, exc_info=True)
+        return None
+
+
 async def _already(db, user_id: str, suggestion_id: str, fallback: dict) -> dict:
     cur = await store.get_suggestion(db, user_id, suggestion_id) or fallback
     if not store.has_live_claim(cur):
@@ -288,6 +301,9 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
         applied_action_type=atype if succeeded else None,
         note="Already done in Meta — nothing changed" if already_in_meta else None,
     )
+    if actor == store.ACTOR_USER:
+        # Reached once per item: only the request that moved it open -> applied.
+        await _learn(db, doc, "approved")
     await _sync_slack(db, user_id, suggestion_id, by=by)
     outcome = "already_in_meta" if already_in_meta else ("partial" if failed else "applied")
     return {"ok": True, "outcome": outcome, "doc": marked,
@@ -303,7 +319,8 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
     if not doc:
         return {"ok": False, "outcome": "not_found", "doc": None}
 
-    if not await store.mark_dismissed(db, user_id, suggestion_id):
+    changed = await store.mark_dismissed(db, user_id, suggestion_id)
+    if not changed:
         fresh = await store.get_suggestion(db, user_id, suggestion_id)
         if store.has_live_claim(fresh):
             # An apply is mid-flight; dismissing now would orphan its Meta write.
@@ -325,8 +342,14 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
         reason_code=reason_code,
         note=note,
     )
+    memory = None
+    # Only the request that actually dismissed it counts, and only items with an
+    # action: acknowledging a flag-only item is not a denial.
+    if changed and doc.get("action"):
+        learned = await _learn(db, doc, "denied", reason_code=reason_code, note=note)
+        memory = (learned or {}).get("memory")
     await _sync_slack(db, user_id, suggestion_id, by=by)
-    return {"ok": True, "outcome": "dismissed", "doc": doc}
+    return {"ok": True, "outcome": "dismissed", "doc": doc, "memory": memory}
 
 
 async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
@@ -364,8 +387,8 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
                     "detail": failed[0]["error"] if failed else "Undo failed",
                     "succeeded": succeeded, "failed": failed}
 
-    await store.mark_undone(db, user_id, suggestion_id,
-                            undone_by={"actor": actor, "source": source, "by": by})
+    undone = await store.mark_undone(db, user_id, suggestion_id,
+                                     undone_by={"actor": actor, "source": source, "by": by})
     await store.log_activity(
         db, user_id,
         actor=actor,
@@ -377,7 +400,15 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
         window=doc.get("window"),
         label="Undone by you",
         source=source,
+        agent_id=doc.get("agent_id"),
+        rule_id=doc.get("rule_id"),
     )
+    if undone:
+        # Who applied it decides what the undo teaches: undoing Birdy's own
+        # auto-run counts towards the brake. (mark_undone clears decided_by, so
+        # it is read from the doc as it was before the undo.)
+        applied_by = (doc.get("decided_by") or {}).get("actor")
+        await _learn(db, doc, "undone_auto" if applied_by == store.ACTOR_BIRDY else "undone_user")
     await _sync_slack(db, user_id, suggestion_id, by=by)
     return {"ok": True, "outcome": "undone", "doc": doc,
             "succeeded": succeeded, "failed": failed}

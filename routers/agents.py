@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai.agents import confidence as agent_confidence
+from ai.agents import learning
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents import validation
@@ -31,6 +32,7 @@ from ai.agents.defaults import (
     DEFAULT_PARAMS,
     DEFAULT_PERMISSIONS,
 )
+from ai.suggestions import actions as sug_actions
 from ai.suggestions import store as sug_store
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -585,3 +587,114 @@ async def activate(agent_id: str, current_user: str = Depends(get_current_user))
             {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {"$set": {
             "status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()}})
         return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))
+
+
+# ---------------------------------------------------------------------------
+# Learning: offers, graduation, auto-run undo, proposals
+# ---------------------------------------------------------------------------
+
+UNDO_AUTO_WINDOW = timedelta(hours=24)
+
+
+@router.get("/{agent_id}/offers")
+async def get_offers(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Graduation offers, then brake notices (shapes in ai/agents/learning.py)."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        return await learning.pending_offers(db, agent)
+
+
+class GraduateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    choice: Literal["auto_notify", "auto_silent", "keep_asking"]
+
+
+@router.post("/{agent_id}/rules/{rule_id}/graduate")
+async def graduate_rule(agent_id: str, rule_id: str, body: GraduateBody,
+                        current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        try:
+            rule = await learning.graduate(db, agent, rule_id, body.choice)
+        except KeyError:
+            raise HTTPException(status_code=404, detail="Rule not found")
+        except learning.NoOffer:
+            raise HTTPException(status_code=409, detail="There is no offer to answer for this rule")
+        return _rule_to_api(rule)
+
+
+@router.post("/{agent_id}/suggestions/{suggestion_id}/undo-auto")
+async def undo_auto(agent_id: str, suggestion_id: str, current_user: str = Depends(get_current_user)):
+    """Undo an action Birdy auto-ran, within 24 hours of it running."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        doc = await db[sug_store.SUGGESTIONS].find_one(
+            {"_id": suggestion_id, "user_id": current_user, "agent_id": agent_id})
+        if doc is None:
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if (doc.get("status") != sug_store.STATUS_APPLIED
+                or (doc.get("decided_by") or {}).get("actor") != sug_store.ACTOR_BIRDY):
+            raise HTTPException(status_code=409, detail="Only an action Birdy ran on its own can be undone here")
+        applied_at = doc.get("applied_at")
+        if not isinstance(applied_at, datetime) or datetime.utcnow() - applied_at > UNDO_AUTO_WINDOW:
+            raise HTTPException(status_code=410, detail="Auto-run actions can only be undone for 24 hours")
+        res = await sug_actions.undo_suggestion(
+            db, mongo_client, current_user, suggestion_id, actor=sug_store.ACTOR_USER, source="dashboard")
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "failed":
+            raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
+        return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
+
+
+def _proposal_to_api(doc: dict) -> dict:
+    out = {k: v for k, v in doc.items() if k != "_id"}
+    out["id"] = doc["_id"]
+    out["rule_label"] = learning.RULE_LABELS.get(doc.get("rule_kind"), doc.get("rule_kind"))
+    return out
+
+
+@router.get("/{agent_id}/proposals")
+async def list_proposals(agent_id: str, status: Literal["open", "accepted", "rejected", "all"] = "open",
+                         current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        q: dict = {"agent_id": agent_id}
+        if status != "all":
+            q["status"] = status
+        docs = await db[agent_store.PROPOSALS].find(q).sort("created_at", -1).to_list(length=None)
+        return [_proposal_to_api(d) for d in docs]
+
+
+@router.post("/{agent_id}/proposals/{proposal_id}/accept")
+async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        try:
+            proposal, rule = await learning.accept_proposal(db, agent, proposal_id)
+        except learning.ProposalNotFound:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        except learning.ProposalClosed:
+            raise HTTPException(status_code=409, detail="This proposal was already decided")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"proposal": _proposal_to_api(proposal), "rule": _rule_to_api(rule)}
+
+
+@router.post("/{agent_id}/proposals/{proposal_id}/reject")
+async def reject_proposal(agent_id: str, proposal_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        try:
+            proposal = await learning.reject_proposal(db, agent, proposal_id)
+        except learning.ProposalNotFound:
+            raise HTTPException(status_code=404, detail="Proposal not found")
+        except learning.ProposalClosed:
+            raise HTTPException(status_code=409, detail="This proposal was already decided")
+        return {"proposal": _proposal_to_api(proposal)}

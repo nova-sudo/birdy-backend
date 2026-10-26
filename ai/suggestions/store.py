@@ -319,7 +319,8 @@ async def mark_undone(db, user_id: str, suggestion_id: str, *,
     """
     now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id},
+        # Only an applied doc: of two concurrent undos, one reports the change.
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_APPLIED},
         {
             "$set": {"status": STATUS_OPEN, "updated_at": now,
                      "undone_at": now, "undone_by": undone_by},
@@ -331,10 +332,13 @@ async def mark_undone(db, user_id: str, suggestion_id: str, *,
 
 
 async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
-    """False if nothing changed — including when a live apply claim holds the doc."""
+    """False if nothing changed — including when a live apply claim holds the doc,
+    or it is already dismissed (a repeat decline neither extends the cooldown
+    nor counts as a second denial)."""
     now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id, **unclaimed_filter(now)},
+        {"_id": suggestion_id, "user_id": user_id, "status": {"$ne": STATUS_DISMISSED},
+         **unclaimed_filter(now)},
         {"$set": {"status": STATUS_DISMISSED, "dismissed_at": now, "updated_at": now}},
     )
     return res.modified_count > 0

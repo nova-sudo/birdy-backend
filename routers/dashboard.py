@@ -235,7 +235,11 @@ async def deny_suggestion(suggestion_id: str, body: DenyBody, current_user: str 
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "busy":
             raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
-        return {"ok": True}
+        # What Birdy learned from the note (for the "Birdy will remember: …" toast).
+        mem = res.get("memory")
+        memory = ({"id": mem.get("_id"), "text": mem.get("text"), "kind": mem.get("kind"),
+                   "filter": mem.get("filter")} if mem else None)
+        return {"ok": True, "memory": memory}
 
 
 @router.post("/suggestions/{suggestion_id}/undo")

@@ -249,6 +249,30 @@ async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30) -
     return res
 
 
+async def fired_targets(db, agent: dict, variants: list[dict], *, end: date, days: int = 30
+                        ) -> list[set[tuple[str, str]]]:
+    """For each rule variant (the same rule with different params / client
+    overrides), the (client_group_id, target object_id) pairs it fires on over
+    end - days + 1 .. end. Near misses don't count. Data is loaded once and
+    shared by every variant; each variant is evaluated on its own (no other
+    rules, no simulated actions), with the agent's active memories applied.
+    Used by learning.replay_effect to show what a proposed change removes."""
+    start = end - timedelta(days=days - 1)
+    memories = await list_memory(db, agent["_id"], active_only=True)
+    clients = await _load_clients(db, agent, start=start, end=end)
+    out: list[set[tuple[str, str]]] = []
+    for rule in variants:
+        fired: set[tuple[str, str]] = set()
+        for i in range(days):
+            d = start + timedelta(days=i)
+            for c in clients:
+                for f in _evaluate_day(agent, [rule], memories, c, d, near_miss=False):
+                    if not f.near_miss:
+                        fired.add((c.gid, _target(f)["object_id"]))
+        out.append(fired)
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Practice cases
 # ---------------------------------------------------------------------------

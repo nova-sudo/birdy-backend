@@ -225,7 +225,8 @@ async def _suggestion(db, **kw):
 async def test_deny_records_reason_and_note(api, mock_db):
     await _suggestion(mock_db)
     r = api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "creative_stale", "note": "refresh soon"})
-    assert r.status_code == 200 and r.json() == {"ok": True}
+    # No action on this item, so nothing is learned (memory is None).
+    assert r.status_code == 200 and r.json() == {"ok": True, "memory": None}
     assert (await mock_db["ai_suggestions"].find_one({"_id": "s1"}))["status"] == "dismissed"
     act = await mock_db["ai_activity"].find_one({"ref_id": "s1"})
     assert act["reason_code"] == "creative_stale" and act["note"] == "refresh soon"

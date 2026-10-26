@@ -160,11 +160,15 @@ async def update_rule(db, agent_id: str, rule_id: str, *, params=None, client_ov
     if updates:
         await db[RULES].update_one({"_id": rule_id, "agent_id": agent_id}, {"$set": updates})
     if mode is not None and mode != rule.get("mode"):
-        # Open items carry their rule's mode (apply's flag_only check, Slack
-        # buttons); keep it current so a mode change takes effect immediately.
-        await db[SUGGESTIONS].update_many(
-            {"rule_id": rule_id, "status": "open"}, {"$set": {"rule_mode": mode}})
+        await sync_open_rule_mode(db, rule_id, mode)
     return await db[RULES].find_one({"_id": rule_id, "agent_id": agent_id})
+
+
+async def sync_open_rule_mode(db, rule_id: str, mode: str) -> None:
+    """Open items carry their rule's mode (apply's flag_only check, Slack
+    buttons); keep it current so a mode change takes effect immediately."""
+    await db[SUGGESTIONS].update_many(
+        {"rule_id": rule_id, "status": "open"}, {"$set": {"rule_mode": mode}})
 
 
 # ---------------------------------------------------------------------------
