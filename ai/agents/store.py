@@ -206,3 +206,5 @@ async def create_agent_indexes(mongo_client):
     await db[MEMORY].create_index([("agent_id", 1), ("active", 1)])
     await db[PRACTICE].create_index("agent_id")
     await db[PROPOSALS].create_index([("agent_id", 1), ("status", 1)])
+    await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
+    await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)
