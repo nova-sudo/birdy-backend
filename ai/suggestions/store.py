@@ -340,7 +340,8 @@ async def set_slack_message(db, user_id: str, suggestion_id: str, channel: str, 
 
 
 async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
-                           keep_ids: set) -> int:
+                           keep_ids: set, *, client_group_ids: list | None = None,
+                           agent_id: str | None = None) -> int:
     """
     Auto-close open suggestions this pass no longer produced (the ad improved, or
     was paused). Scoped per (user, agent, origin_window) across ALL of the user's
@@ -349,17 +350,26 @@ async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
     must therefore be the UNION of everything kept across every client this pass.
     origin_window (the window that CREATED the suggestion) keeps weekly and
     monthly from closing each other's findings.
+
+    BirdyHub agents narrow it further: `client_group_ids` limits closing to the
+    clients actually evaluated this run (a client skipped for a token error keeps
+    its items), and `agent_id` to items that agent created.
     """
+    q = {
+        "user_id": user_id,
+        "agent": agent,
+        "origin_window": origin_window,
+        "status": STATUS_OPEN,
+        "_id": {"$nin": list(keep_ids)},
+        # Never resolve one that is being applied right now.
+        **unclaimed_filter(_now()),
+    }
+    if client_group_ids is not None:
+        q["client_group_id"] = {"$in": list(client_group_ids)}
+    if agent_id is not None:
+        q["agent_id"] = agent_id
     res = await db[SUGGESTIONS].update_many(
-        {
-            "user_id": user_id,
-            "agent": agent,
-            "origin_window": origin_window,
-            "status": STATUS_OPEN,
-            "_id": {"$nin": list(keep_ids)},
-            # Never resolve one that is being applied right now.
-            **unclaimed_filter(_now()),
-        },
+        q,
         {"$set": {"status": STATUS_RESOLVED, "resolved_at": _now(), "updated_at": _now()}},
     )
     return res.modified_count
