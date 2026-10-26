@@ -62,6 +62,17 @@ async def run_pass_for_user(
         query["id"] = {"$in": client_group_ids}
     groups = await db["client_groups"].find(query, _PROJECTION).to_list(length=500)
 
+    # Clients watched by one of this user's running BirdyHub agents are the
+    # agent's job; the classic subagents would only duplicate its items.
+    agent_gids: set = set()
+    async for a in db["agents"].find(
+        {"user_id": user_id, "status": {"$in": ["active", "dry_run"]}},
+        {"scope.client_group_ids": 1},
+    ):
+        agent_gids.update((a.get("scope") or {}).get("client_group_ids") or [])
+    if agent_gids:
+        groups = [g for g in groups if g.get("id") not in agent_gids]
+
     # One provider per user (BYOK, else global key, else None → template copy).
     provider = await get_composer_provider(user_id, db)
     # Enforcement: an out-of-credits user still gets template suggestions, but we

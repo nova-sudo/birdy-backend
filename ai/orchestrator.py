@@ -8,8 +8,10 @@ from ai.providers.base import BaseLLMProvider
 from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
 from ai.prompts.media_buying import get_media_buying_module
+from ai.prompts import agent_training as agent_training_prompt
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
+from ai.tools.agent_tools import AGENT_TOOL_NAMES
 from ai.prompts.rich_output import with_rich_output
 from ai.tools.render_ui_tools import RENDER_UI_TOOL_NAME, materialize as materialize_ui
 from ai import mcp_client
@@ -106,6 +108,16 @@ _PAGE_TOOLS = {
         "catalog_search",
         "get_client_groups",
     ],
+    "agent_training": [
+        "get_playbook",
+        "set_rule_param",
+        "set_client_target",
+        "set_client_override",
+        "add_memory",
+        "add_exception",
+        "answer_topic",
+        "get_client_groups",
+    ],
     "client_detail": [
         "get_client_groups",
         "get_campaign_insights",
@@ -140,7 +152,7 @@ DEFAULT_MAX_TOKENS = 4096
 # page) gets every registered tool otherwise; the dashboard tools would only add
 # ~13k characters of catalog-laden schemas there, and their ops have no editor
 # to land in.
-_PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES)
+_PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES) | set(AGENT_TOOL_NAMES)
 
 # Client-scoped pages hard-pin these tools to the page's client server-side:
 # whatever group_id the model passes (or omits) is overwritten with the page's
@@ -427,6 +439,7 @@ _PAGE_SYSTEM_PROMPTS = {
     "report_designer": _REPORT_DESIGNER_SYSTEM_PROMPT,
     # Built when a session starts (a callable), so it reads the current catalog.
     "dashboards": dashboards_prompt.system_prompt,
+    "agent_training": agent_training_prompt.system_prompt,
 }
 
 # Surfaces where the optional "media_buying" capability (Settings -> Capabilities)
@@ -588,6 +601,9 @@ async def run_chat(
     # Rendered visuals from render_ui, in order; the final reply's [[viz:N]]
     # placeholders are swapped for these (see ai/tools/render_ui_tools.py).
     ui_blocks: list = []
+    # {tool, changed} from every successful agent training tool this turn, so
+    # the training UI can show what Birdy changed in the playbook.
+    agent_changes: list = []
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -735,6 +751,7 @@ async def run_chat(
                     "tools_used": tools_used,
                     "session_id": session_id,
                     "dashboard_ops": dashboard_ops,
+            "agent_changes": agent_changes,
                     **(await _resolve_turn_scope()),
                 }
 
@@ -814,6 +831,14 @@ async def run_chat(
 
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
 
+                if tc.name in AGENT_TOOL_NAMES and not bad_args:
+                    try:
+                        parsed = json.loads(result)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict) and parsed.get("ok") and parsed.get("changed"):
+                        agent_changes.append({"tool": tc.name, "changed": parsed["changed"]})
+
                 history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -845,5 +870,6 @@ async def run_chat(
             "tools_used": tools_used,
             "session_id": session_id,
             "dashboard_ops": dashboard_ops,
+            "agent_changes": agent_changes,
             **(await _resolve_turn_scope()),
         }

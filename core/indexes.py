@@ -37,6 +37,7 @@ def _load_creators():
     merely mentions this module — including the request path, which is the
     thing this file exists to keep clear.
     """
+    from ai.agents.store import create_agent_indexes
     from ai.conversation_log import create_conversation_log_indexes
     from ai.session_store import create_ai_session_indexes
     from ai.suggestions.store import create_suggestion_indexes
@@ -75,6 +76,7 @@ def _load_creators():
         create_slack_ui_interaction_indexes,
         create_ai_session_indexes,
         create_suggestion_indexes,
+        create_agent_indexes,
         create_conversation_log_indexes,
         create_note_indexes,
         create_ai_usage_indexes,

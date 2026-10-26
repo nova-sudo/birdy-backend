@@ -23,6 +23,7 @@ from ai.tools.hp_tools import register_hp_tools
 from ai.tools.call_analysis_tools import register_call_analysis_tools
 from ai.tools.report_designer_tools import register_report_designer_tools
 from ai.tools.dashboard_tools import register_dashboard_tools
+from ai.tools.agent_tools import register_agent_tools
 from ai.tools.render_ui_tools import register_render_ui_tools
 from ai.orchestrator import run_chat
 
@@ -45,6 +46,7 @@ register_hp_tools()
 register_call_analysis_tools()
 register_report_designer_tools()
 register_dashboard_tools()
+register_agent_tools()
 register_render_ui_tools()
 
 

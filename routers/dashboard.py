@@ -23,10 +23,12 @@ import logging
 from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
+from ai.agents.defaults import DENY_REASONS
 from ai.suggestions import actions, store
 from ai.suggestions.contracts import WINDOWS
 from ai.suggestions.orchestrator import run_pass_for_user
@@ -54,6 +56,13 @@ def _relative_time(dt: datetime | None) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
+def _rule_kind(agent: str | None) -> str | None:
+    """'media_buying:pause_over_target' -> 'pause_over_target'; None for legacy agents."""
+    if agent and agent.startswith("media_buying:"):
+        return agent.split(":", 1)[1]
+    return None
+
+
 def _suggestion_to_api(doc: dict) -> dict:
     return {
         "id": doc.get("id"),
@@ -67,6 +76,16 @@ def _suggestion_to_api(doc: dict) -> dict:
         "description": doc.get("description"),
         "stats": doc.get("stats") or [],
         "window": doc.get("window"),
+        "agent_id": doc.get("agent_id"),
+        "rule_kind": _rule_kind(doc.get("agent")),
+        "rule_mode": doc.get("rule_mode"),
+        # False for flag-only items (nothing to write in Meta) — the work list
+        # shows "Got it" instead of Approve/Deny.
+        "has_action": bool(doc.get("action")),
+        "blocked_reason": doc.get("blocked_reason"),
+        "auto_failed": bool(doc.get("auto_failed")),
+        "undone_at": doc.get("undone_at"),
+        "applied_at": doc.get("applied_at"),
     }
 
 
@@ -175,8 +194,29 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
-        return {"ok": True, "outcome": res["outcome"],
-                "succeeded": res.get("succeeded", []), "failed": res.get("failed", [])}
+        if res["outcome"] == "closed":
+            # Dismissed or resolved since the list was loaded: nothing was written.
+            return _conflict(res)
+        # "blocked" (agent guardrail) is a 200 with ok=false: the suggestion stays
+        # open and the card shows blocked_reason. "already" (applied by someone
+        # else) is ok and carries who decided it.
+        return {"ok": res["ok"], "outcome": res["outcome"],
+                "succeeded": res.get("succeeded", []), "failed": res.get("failed", []),
+                "blocked_reason": res.get("blocked_reason"),
+                "status": res.get("status"), "decided_by": _decided_by(res)}
+
+
+def _decided_by(res: dict) -> dict | None:
+    d = res.get("decided_by")
+    return {"actor": d.get("actor"), "source": d.get("source")} if isinstance(d, dict) else None
+
+
+def _conflict(res: dict) -> JSONResponse:
+    """409 for a decision on an item that is no longer open (outcome on the body)."""
+    return JSONResponse(status_code=409, content={
+        "detail": res.get("detail") or "This item was already handled",
+        "outcome": res["outcome"], "status": res.get("status"), "decided_by": _decided_by(res),
+    })
 
 
 @router.delete("/suggestions/{suggestion_id}")
@@ -189,7 +229,41 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
         )
         if res["outcome"] == "not_found":
             raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "busy":
+            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+        if not res["ok"]:
+            return _conflict(res)
         return {"ok": True}
+
+
+class DenyBody(BaseModel):
+    reason_code: str
+    note: str | None = Field(default=None, max_length=2000)
+
+
+@router.post("/suggestions/{suggestion_id}/deny")
+async def deny_suggestion(suggestion_id: str, body: DenyBody, current_user: str = Depends(get_current_user)):
+    """Decline an agent work item with a reason code and optional note."""
+    if body.reason_code not in DENY_REASONS:
+        raise HTTPException(status_code=400, detail=f"reason_code must be one of {list(DENY_REASONS)}")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        res = await actions.dismiss_suggestion(
+            db, mongo_client, current_user, suggestion_id,
+            actor=store.ACTOR_USER, source="dashboard",
+            reason_code=body.reason_code, note=body.note,
+        )
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "busy":
+            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+        if not res["ok"]:
+            return _conflict(res)
+        # What Birdy learned from the note (for the "Birdy will remember: …" toast).
+        mem = res.get("memory")
+        memory = ({"id": mem.get("_id"), "text": mem.get("text"), "kind": mem.get("kind"),
+                   "filter": mem.get("filter")} if mem else None)
+        return {"ok": True, "memory": memory}
 
 
 @router.post("/suggestions/{suggestion_id}/undo")

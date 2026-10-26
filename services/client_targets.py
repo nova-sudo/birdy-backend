@@ -21,6 +21,7 @@ never set, several times smaller than the one they did.
 """
 
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -71,3 +72,27 @@ async def defaults_for(user_id: str, db: Any) -> dict:
         logger.warning(f"default targets lookup failed for {user_id}: {e}")
         return {}
     return clean((user or {}).get("default_targets"))
+
+
+async def apply_targets(db: Any, user_id: str, group_id: str, sent: dict,
+                        clear: tuple = ()) -> Optional[dict]:
+    """Merge goal fields into one client group's ``targets``, field by field.
+
+    Dotted ``$set`` so a partial save never blanks fields it did not send (the
+    wizard and the settings modal each own a different subset). Fields named in
+    ``clear`` are unset. Returns the group's stored ``targets`` ({} if none), or
+    None when the group does not exist for this user.
+    """
+    now = datetime.utcnow()
+    sets = {f"targets.{f}": v for f, v in sent.items()}
+    sets["targets.updated_at"] = now
+    sets["updated_at"] = now
+    op: dict = {"$set": sets}
+    if clear:
+        op["$unset"] = {f"targets.{f}": "" for f in clear}
+    res = await db["client_groups"].update_one({"id": group_id, "user_id": user_id}, op)
+    if res.matched_count == 0:
+        return None
+    stored = await db["client_groups"].find_one(
+        {"id": group_id, "user_id": user_id}, {"targets": 1, "_id": 0})
+    return (stored or {}).get("targets", {})

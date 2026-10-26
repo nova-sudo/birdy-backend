@@ -195,6 +195,8 @@ class ChatResponse(BaseModel):
     # dashkit edit ops for the dashboards editor to apply, in order (empty
     # unless a dashboard tool succeeded this turn).
     dashboard_ops: list = []
+    # {tool, changed} for each agent training tool that changed the playbook.
+    agent_changes: list = []
 
 
 # ── Capabilities (per-user agent toggles) ─────────────────────────────────────

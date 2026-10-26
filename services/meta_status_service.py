@@ -91,6 +91,89 @@ async def set_object_status(
     }
 
 
+_GRAPH_NOT_FOUND = 100  # "Object with ID ... does not exist" (deleted / no access)
+
+
+async def get_object_status(
+    user_id: str,
+    object_id: str,
+    object_type: str,
+    mongo_client,
+) -> str | None:
+    """
+    A Meta object's live delivery status: `effective_status`, falling back to
+    the configured `status` (campaigns sometimes return only that). None when
+    the object no longer exists (Graph error code 100).
+    """
+    state = await get_object_state(user_id, object_id, object_type, mongo_client)
+    if state is None:
+        return None
+    return state["effective_status"] or state["status"]
+
+
+async def get_object_state(
+    user_id: str,
+    object_id: str,
+    object_type: str,
+    mongo_client,
+) -> dict | None:
+    """
+    Read both of a Meta object's statuses in one Graph call, used to re-check
+    state right before a write:
+      status            what the object itself is set to (ACTIVE, PAUSED,
+                        ARCHIVED, DELETED)
+      effective_status  what is actually delivering, which also reflects the
+                        parents and review (ADSET_PAUSED, PENDING_REVIEW, ...)
+    Values are upper-cased; either may be None if Meta omits it. Returns None
+    when Meta says the object no longer exists (Graph error code 100).
+
+    Raises MetaStatusError for anything else (no token, transport error, other
+    Graph errors, no status at all) so the caller can decide how to proceed.
+    """
+    if object_type not in _VALID_TYPES:
+        raise MetaStatusError("object_type must be 'campaign', 'adset', or 'ad'", 400)
+
+    token_data = await get_facebook_token(user_id, mongo_client)
+    if not token_data or not token_data.get("access_token"):
+        raise MetaStatusError("No valid Facebook token found", 401)
+    access_token = token_data["access_token"]
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.get(
+                f"{_GRAPH}/{object_id}",
+                params={"fields": "effective_status,status", "access_token": access_token},
+            )
+    except httpx.HTTPError as e:
+        logger.error("Meta status read transport error for %s: %s", object_id, e)
+        raise MetaStatusError(f"Failed to reach Meta: {e}", 502)
+
+    try:
+        body = resp.json()
+    except Exception:
+        body = {}
+
+    if resp.status_code != 200:
+        err = (body or {}).get("error") or {}
+        if err.get("code") == _GRAPH_NOT_FOUND:
+            logger.info("Meta %s %s no longer exists", object_type, object_id)
+            return None
+        error_msg = err.get("message") or f"HTTP {resp.status_code}"
+        logger.error("Meta status read failed for %s: %s", object_id, error_msg)
+        code = resp.status_code if 400 <= resp.status_code < 600 else 502
+        raise MetaStatusError(f"Meta API error: {error_msg}", code)
+
+    def _up(v):
+        return str(v).upper() if v else None
+
+    state = {"status": _up((body or {}).get("status")),
+             "effective_status": _up((body or {}).get("effective_status"))}
+    if not state["status"] and not state["effective_status"]:
+        # A 200 without a status is unexpected; never let it read as "deleted".
+        raise MetaStatusError(f"Meta returned no status for {object_id}", 502)
+    return state
+
+
 async def _rewrite_cached_status(mongo_client, user_id: str, object_type: str,
                                  object_id: str, status: str) -> None:
     """

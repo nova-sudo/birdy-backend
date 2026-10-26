@@ -56,6 +56,14 @@ def test_build_blocks_advisory_has_only_ignore():
     print("PASS test_build_blocks_advisory_has_only_ignore")
 
 
+def test_build_blocks_flag_mode_item_has_no_apply_button():
+    doc = {"id": "sug_3", "title": "Pause “Ad”", "description": "d", "client_name": "C",
+           "stats": [], "rule_mode": "flag",
+           "action": {"type": "pause_ads", "targets": [{"object_id": "ad_1", "object_type": "ad"}]}}
+    blocks, _ = build_suggestion_blocks(doc)
+    assert [e["action_id"] for e in blocks[1]["elements"]] == ["suggestion_ignore"]
+
+
 # --- shared actions -----------------------------------------------------------
 
 async def _seed(db, action=None):

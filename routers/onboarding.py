@@ -309,17 +309,10 @@ async def set_client_targets(
     if not sent:
         raise HTTPException(status_code=400, detail="No targets provided")
 
-    updates = {f"targets.{field}": value for field, value in sent.items()}
-    updates["targets.updated_at"] = datetime.utcnow()
-    updates["updated_at"] = datetime.utcnow()
-
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        result = await db["client_groups"].update_one(
-            {"id": group_id, "user_id": current_user},
-            {"$set": updates},
-        )
-        if result.matched_count == 0:
+        targets = await client_targets_service.apply_targets(db, current_user, group_id, sent)
+        if targets is None:
             raise HTTPException(status_code=404, detail="Client group not found")
 
         if body.save_as_default:
@@ -331,12 +324,9 @@ async def set_client_targets(
                 upsert=True,
             )
 
-        stored = await db["client_groups"].find_one(
-            {"id": group_id, "user_id": current_user}, {"targets": 1, "_id": 0}
-        )
         return {
             "ok": True,
-            "targets": (stored or {}).get("targets", {}),
+            "targets": targets,
             "saved_as_default": body.save_as_default,
         }
 

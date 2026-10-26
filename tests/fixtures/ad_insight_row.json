@@ -1,0 +1,32 @@
+{
+  "_comment": "Synthetic facebook_ad_insights document (fake IDs). Shape follows integrations/facebook_utils/facebook_ads.py save_ad_insights.",
+  "user_id": "user-fixture-1",
+  "ad_account_id": "act_1000000000001",
+  "client_group_id": "cg-fixture-1",
+  "client_group_name": "Fixture Client",
+  "ad_id": "6000000000001",
+  "ad_name": "Fixture Ad A",
+  "adset_id": "5000000000001",
+  "adset_name": "Fixture Adset",
+  "campaign_id": "4000000000001",
+  "campaign_name": "Fixture Campaign",
+  "date_start": "2026-10-20",
+  "date_stop": "2026-10-20",
+  "insight_data": {
+    "ad_id": "6000000000001",
+    "ad_name": "Fixture Ad A",
+    "adset_id": "5000000000001",
+    "campaign_id": "4000000000001",
+    "date_start": "2026-10-20",
+    "date_stop": "2026-10-20",
+    "spend": "12.34",
+    "impressions": "1500",
+    "clicks": "40",
+    "actions": [
+      {"action_type": "link_click", "value": "40"},
+      {"action_type": "lead", "value": "3"}
+    ]
+  },
+  "created_at": "2026-10-21T04:00:00",
+  "updated_at": "2026-10-21T04:00:00"
+}

@@ -23,6 +23,8 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from pymongo import ReturnDocument
+
 from core.database import DB_NAME
 from ai.suggestions.contracts import Finding
 
@@ -38,6 +40,8 @@ DISMISS_COOLDOWN_DAYS = 14
 
 # Activity feed retention.
 ACTIVITY_TTL_DAYS = 60
+# Agent activity is kept ~13 months (outcomes, practice, the learning brake).
+AGENT_ACTIVITY_TTL_DAYS = 395
 
 STATUS_OPEN = "open"
 STATUS_APPLIED = "applied"
@@ -45,6 +49,25 @@ STATUS_DISMISSED = "dismissed"
 # Auto-closed by a later pass because the finding no longer reproduces (e.g. the
 # ad improved or was already paused). Distinct from a user "dismissed".
 STATUS_RESOLVED = "resolved"
+
+# An apply claim (applying_at) older than this is treated as abandoned (crashed
+# worker, timed-out request) and may be taken over, so a suggestion can't get
+# stuck "applying". Younger claims are live: no other decision may touch the doc.
+APPLY_CLAIM_STALE_AFTER = timedelta(minutes=5)
+
+
+def unclaimed_filter(now: datetime) -> dict:
+    """Mongo filter fragment: no live apply claim (none, or a stale one)."""
+    return {"$or": [
+        {"applying_at": None},  # null or missing
+        {"applying_at": {"$lt": now - APPLY_CLAIM_STALE_AFTER}},
+    ]}
+
+
+def has_live_claim(doc: dict | None, now: datetime | None = None) -> bool:
+    at = (doc or {}).get("applying_at")
+    return bool(at) and at >= (now or _now()) - APPLY_CLAIM_STALE_AFTER
+
 
 # Activity kinds → (actor, human label). actor keeps the frontend's existing
 # birdy/user split working; label is the richer, kind-specific caption.
@@ -86,7 +109,7 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
     """Turn a Finding (+ its already-composed copy) into a persistable document."""
     key = suggestion_key(user_id, finding)
     now = _now()
-    return {
+    doc = {
         "_id": key,
         "id": key,
         "user_id": user_id,
@@ -109,6 +132,13 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
         "created_at": now,
         "updated_at": now,
     }
+    if finding.agent_id:
+        doc["agent_id"] = finding.agent_id
+    if finding.rule_id:
+        doc["rule_id"] = finding.rule_id
+    if finding.rule_version:
+        doc["rule_version"] = finding.rule_version
+    return doc
 
 
 async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = "template") -> tuple[dict | None, bool, bool]:
@@ -176,6 +206,9 @@ async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = 
             "status": STATUS_OPEN,
             "updated_at": now,
         }
+        if finding.rule_id:  # agent items: credit the rule version that fired now
+            update.update(agent_id=finding.agent_id, rule_id=finding.rule_id,
+                          rule_version=finding.rule_version)
         if reopening:
             update["origin_window"] = finding_window  # a reopen is a fresh start
         await db[SUGGESTIONS].update_one({"_id": key}, {"$set": update, "$unset": {"dismissed_at": "", "applied_at": ""}})
@@ -213,12 +246,51 @@ async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
     return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
 
 
+async def claim_for_apply(db, user_id: str, suggestion_id: str) -> str | None:
+    """
+    Atomically reserve an OPEN suggestion for applying, BEFORE anything is
+    written to Meta. Returns a claim token, or None if the suggestion isn't
+    open or another request holds a fresh claim. Exactly one of N concurrent
+    callers wins, which is what keeps double-clicks / dashboard+Slack races to
+    a single Meta write.
+    """
+    now = _now()
+    token = uuid.uuid4().hex
+    won = await db[SUGGESTIONS].find_one_and_update(
+        {
+            "_id": suggestion_id,
+            "user_id": user_id,
+            "status": STATUS_OPEN,
+            **unclaimed_filter(now),
+        },
+        {"$set": {"applying_at": now, "applying_token": token}},
+        projection={"_id": 1},
+    )
+    return token if won else None
+
+
+async def release_claim(db, user_id: str, suggestion_id: str, token: str, *,
+                        blocked_reason: dict | None = None) -> None:
+    """Drop our claim (only ours) so the suggestion stays open and retryable."""
+    update: dict = {"$unset": {"applying_at": "", "applying_token": ""}}
+    if blocked_reason is not None:
+        update["$set"] = {"blocked_reason": blocked_reason, "updated_at": _now()}
+    await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id, "applying_token": token}, update
+    )
+
+
 async def mark_applied(db, user_id: str, suggestion_id: str, *,
                        applied_targets: list | None = None,
-                       applied_action_type: str | None = None) -> bool:
+                       applied_action_type: str | None = None,
+                       decided_by: dict | None = None,
+                       already_in_meta: bool = False) -> dict | None:
     """
     Mark applied, recording exactly which objects were changed so the action can
     be UNDONE later (undo re-applies the inverse to these targets only).
+
+    The open → applied transition is atomic: returns the updated doc, or None if
+    the suggestion was no longer open (another request already decided it).
     """
     now = _now()
     update = {"status": STATUS_APPLIED, "applied_at": now, "updated_at": now}
@@ -226,29 +298,49 @@ async def mark_applied(db, user_id: str, suggestion_id: str, *,
         update["applied_targets"] = applied_targets
     if applied_action_type:
         update["applied_action_type"] = applied_action_type
-    res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id}, {"$set": update}
+    if decided_by is not None:
+        update["decided_by"] = decided_by
+    if already_in_meta:
+        update["already_in_meta"] = True
+    return await db[SUGGESTIONS].find_one_and_update(
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_OPEN},
+        {"$set": update,
+         "$unset": {"applying_at": "", "applying_token": "", "blocked_reason": ""}},
+        return_document=ReturnDocument.AFTER,
     )
-    return res.modified_count > 0
 
 
-async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
-    """Revert an applied suggestion back to open once its action was undone."""
+async def mark_undone(db, user_id: str, suggestion_id: str, *,
+                      undone_by: dict | None = None) -> bool:
+    """
+    Revert an applied suggestion back to open once its action was undone.
+    undone_at stays on the doc (upsert_finding never clears it) so an agent
+    never auto-applies it again; a person still can.
+    """
     now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id},
+        # Only an applied doc: of two concurrent undos, one reports the change.
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_APPLIED},
         {
-            "$set": {"status": STATUS_OPEN, "updated_at": now},
-            "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": ""},
+            "$set": {"status": STATUS_OPEN, "updated_at": now,
+                     "undone_at": now, "undone_by": undone_by},
+            "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": "",
+                       "decided_by": "", "already_in_meta": ""},
         },
     )
     return res.modified_count > 0
 
 
 async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
+    """False if nothing changed — including when a live apply claim holds the doc,
+    or it is no longer open: already dismissed (a repeat decline neither extends
+    the cooldown nor counts as a second denial), applied (undo it instead) or
+    resolved."""
+    now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id},
-        {"$set": {"status": STATUS_DISMISSED, "dismissed_at": _now(), "updated_at": _now()}},
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_OPEN,
+         **unclaimed_filter(now)},
+        {"$set": {"status": STATUS_DISMISSED, "dismissed_at": now, "updated_at": now}},
     )
     return res.modified_count > 0
 
@@ -262,7 +354,8 @@ async def set_slack_message(db, user_id: str, suggestion_id: str, channel: str, 
 
 
 async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
-                           keep_ids: set) -> int:
+                           keep_ids: set, *, client_group_ids: list | None = None,
+                           agent_id: str | None = None) -> int:
     """
     Auto-close open suggestions this pass no longer produced (the ad improved, or
     was paused). Scoped per (user, agent, origin_window) across ALL of the user's
@@ -271,15 +364,26 @@ async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
     must therefore be the UNION of everything kept across every client this pass.
     origin_window (the window that CREATED the suggestion) keeps weekly and
     monthly from closing each other's findings.
+
+    BirdyHub agents narrow it further: `client_group_ids` limits closing to the
+    clients actually evaluated this run (a client skipped for a token error keeps
+    its items), and `agent_id` to items that agent created.
     """
+    q = {
+        "user_id": user_id,
+        "agent": agent,
+        "origin_window": origin_window,
+        "status": STATUS_OPEN,
+        "_id": {"$nin": list(keep_ids)},
+        # Never resolve one that is being applied right now.
+        **unclaimed_filter(_now()),
+    }
+    if client_group_ids is not None:
+        q["client_group_id"] = {"$in": list(client_group_ids)}
+    if agent_id is not None:
+        q["agent_id"] = agent_id
     res = await db[SUGGESTIONS].update_many(
-        {
-            "user_id": user_id,
-            "agent": agent,
-            "origin_window": origin_window,
-            "status": STATUS_OPEN,
-            "_id": {"$nin": list(keep_ids)},
-        },
+        q,
         {"$set": {"status": STATUS_RESOLVED, "resolved_at": _now(), "updated_at": _now()}},
     )
     return res.modified_count
@@ -302,8 +406,19 @@ async def log_activity(
     window: str | None = None,
     label: str | None = None,
     source: str | None = None,
+    agent_id: str | None = None,
+    rule_id: str | None = None,
+    reason_code: str | None = None,
+    note: str | None = None,
+    applied_action_type: str | None = None,
 ) -> dict:
-    """Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS)."""
+    """
+    Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS).
+
+    Agent entries (agent_id set) are kept AGENT_ACTIVITY_TTL_DAYS instead: the
+    TTL index fires on each doc's own `expires_at`, so a longer retention is
+    just a later date — no second index needed.
+    """
     now = _now()
     doc = {
         "_id": "act_" + uuid.uuid4().hex[:16],
@@ -321,6 +436,11 @@ async def log_activity(
         "created_at": now,
         "expires_at": now + timedelta(days=ACTIVITY_TTL_DAYS),
     }
+    optional = {"agent_id": agent_id, "rule_id": rule_id, "reason_code": reason_code,
+                "note": note, "applied_action_type": applied_action_type}
+    doc.update({k: v for k, v in optional.items() if v is not None})
+    if agent_id:
+        doc["expires_at"] = now + timedelta(days=AGENT_ACTIVITY_TTL_DAYS)
     doc["id"] = doc["_id"]
     await db[ACTIVITY].insert_one(doc)
     return doc
@@ -356,5 +476,14 @@ async def create_suggestion_indexes(mongo_client):
     await db[SUGGESTIONS].create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
     await db[SUGGESTIONS].create_index("client_group_id")
     await db[ACTIVITY].create_index([("user_id", 1), ("created_at", -1)])
+    # Agent rows (feed, impact, the outcomes job). Partial: most rows have no agent_id.
+    await db[ACTIVITY].create_index(
+        [("agent_id", 1), ("created_at", -1)],
+        partialFilterExpression={"agent_id": {"$exists": True}},
+    )
+    # The agents' daily pause-cap count (ai/agents/guardrails.py), on every apply.
+    await db[ACTIVITY].create_index([("client_group_id", 1), ("kind", 1), ("created_at", -1)])
+    # sync_open_rule_mode's update_many by rule.
+    await db[SUGGESTIONS].create_index("rule_id", sparse=True)
     # TTL index — Mongo drops activity docs once expires_at passes.
     await db[ACTIVITY].create_index("expires_at", expireAfterSeconds=0)
