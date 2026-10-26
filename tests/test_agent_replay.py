@@ -159,6 +159,41 @@ async def test_spend_saved_sums_after_fire_day(mock_db, mock_mongo_client):
     assert res.leads_at_risk == 9
 
 
+async def test_ad_then_its_adset_fire_no_double_count(mock_db, mock_mongo_client):
+    """B1 fires alone on 10-03 and is sim-paused from 10-04. B2 fires on 10-07: with
+    B1 simulated off, the ad set has one live ad, so B2 is an ad target — not an
+    ad-set target that would re-count B1's spend."""
+    await _group(mock_db, "g1")
+    await _adset(mock_db, "g1", "S9", "C9")
+    await _ad(mock_db, "g1", "B1", "S9", "C9", created=datetime(2026, 10, 1))
+    await _ad(mock_db, "g1", "B2", "S9", "C9", created=datetime(2026, 10, 1))
+    await _spend(mock_db, "g1", "B1", "S9", "C9", date(2026, 10, 1), END, 30, 0)  # £90 by 10-03
+    await _spend(mock_db, "g1", "B2", "S9", "C9", date(2026, 10, 1), END, 12, 0)  # £84 by 10-07
+    agent = await _agent(mock_db, ["g1"])
+
+    res = await replay.dry_run(mock_db, mock_mongo_client, agent, end=END, days=30)
+
+    assert res.actions == 2
+    assert {(e["title"], e["day"]) for e in res.examples} == {
+        ("Pause “Ad B1”", "2026-10-03"), ("Pause “Ad B2”", "2026-10-07")}
+    # B1: 10-04..10-25 = 22 × £30. B2: 10-08..10-25 = 18 × £12. Each ad once.
+    assert res.spend_saved == pytest.approx(660 + 216)
+    assert res.leads_at_risk == 0
+
+
+def test_simulated_status_layers_over_history():
+    base = {"a": AdState(ad_id="a", adset_id="s", campaign_id="c", name="a", effective_status="ACTIVE",
+                         created_time=None, paused_at=None),
+            "r": AdState(ad_id="r", adset_id="s", campaign_id="c", name="r", effective_status="PAUSED",
+                         created_time=None, paused_at=date(2026, 9, 1))}
+    sim = {"a": ("PAUSED", date(2026, 10, 5)), "r": ("ACTIVE", date(2026, 10, 5))}
+    before = replay.apply_sim(base, sim, date(2026, 10, 4))
+    after = replay.apply_sim(base, sim, date(2026, 10, 5))
+    assert before == base
+    assert after["a"].effective_status == "PAUSED" and after["a"].paused_at == date(2026, 10, 5)
+    assert after["r"].effective_status == "ACTIVE" and after["r"].paused_at is None
+
+
 async def test_dry_run_on_fixture_account_known_totals(mock_db, mock_mongo_client):
     await _fixture_account(mock_db)
     agent = await _agent(mock_db, ["g1"])
@@ -293,7 +328,7 @@ def api(mock_mongo_client, monkeypatch):
 async def test_dry_run_job_lifecycle(api, mock_db, monkeypatch):
     await _fixture_account(mock_db)
     agent = await _agent(mock_db, ["g1"])
-    monkeypatch.setattr(agents_router, "_local_today", lambda agent: END)
+    monkeypatch.setattr(agents_router, "_local_today", lambda agent: END + timedelta(days=1))
 
     r = api.post(f"/api/agents/{agent['_id']}/dry-run")
     assert r.status_code == 200, r.text
@@ -302,6 +337,10 @@ async def test_dry_run_job_lifecycle(api, mock_db, monkeypatch):
 
     r = api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}")
     assert r.status_code == 200 and r.json() == {"status": "queued"}
+
+    # A second POST while it is queued returns the same job and starts nothing.
+    assert api.post(f"/api/agents/{agent['_id']}/dry-run").json() == {"job_id": job_id}
+    assert len(api.spawned) == 1
 
     await api.spawned.pop()  # the background task, run to completion here
 
@@ -339,6 +378,31 @@ async def test_stuck_job_reported_timed_out(api, mock_db):
     await mock_db[JOBS].insert_one({"_id": "j2", "agent_id": "other", "user_id": USER, "kind": "dry_run",
                                     "status": "queued", "created_at": datetime.utcnow()})
     assert api.get(f"/api/agents/{agent['_id']}/jobs/j2").status_code == 404
+
+
+async def test_post_dry_run_reuses_active_job_but_not_timed_out(api, mock_db):
+    agent = await _agent(mock_db, [])
+    await mock_db[JOBS].insert_one({"_id": "old", "agent_id": agent["_id"], "user_id": USER, "kind": "dry_run",
+                                    "status": "running", "created_at": datetime.utcnow() - timedelta(minutes=11)})
+    first = api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"]
+    assert first != "old" and len(api.spawned) == 1
+    assert api.post(f"/api/agents/{agent['_id']}/dry-run").json()["job_id"] == first
+    assert len(api.spawned) == 1
+
+
+async def test_dry_run_job_uses_local_yesterday(api, mock_db, monkeypatch):
+    agent = await _agent(mock_db, [])
+    seen = {}
+
+    async def fake(db, mongo_client, agent, *, end, days=30):
+        seen["end"] = end
+        return replay.DryRunResult()
+
+    monkeypatch.setattr(agents_router.replay, "dry_run", fake)
+    monkeypatch.setattr(agents_router, "_local_today", lambda agent: date(2026, 10, 26))
+    api.post(f"/api/agents/{agent['_id']}/dry-run")
+    await api.spawned.pop()
+    assert seen["end"] == date(2026, 10, 25)
 
 
 async def test_spawn_keeps_reference_until_done():

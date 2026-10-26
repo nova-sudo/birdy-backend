@@ -22,7 +22,15 @@ Historical status approximation
             otherwise                              -> keeps its current status
       - everything else                            -> unchanged
     Ad set (and campaign) status always stays current, so an ad set paused
-    last week counts as paused for the whole window.
+    last week counts as paused for the whole window. created_time is not used:
+    an ad created after d shows as-is, which is harmless because the evaluators
+    need spend rows on or before d.
+
+Simulated actions (dry_run only)
+    The dry run also layers the agent's own actions over that approximation
+    (see apply_sim): an ad the replay pauses on day d is PAUSED from d+1, and an
+    ad it revives is ACTIVE from d+1. So one ad can't fire twice, and a later
+    ad-set rollup only covers ads that are still live.
 """
 
 import hashlib
@@ -77,6 +85,19 @@ def ads_on_day(ads: dict[str, AdState], ad_days: dict[str, list[AdDay]], d: date
     return out
 
 
+def apply_sim(ads: dict[str, AdState], sim: dict[str, tuple[str, date]], d: date) -> dict[str, AdState]:
+    """Layer simulated actions over `ads`: sim[ad_id] = (status, effective_from)."""
+    if not sim:
+        return ads
+    out = dict(ads)
+    for ad_id, (status, since) in sim.items():
+        ad = out.get(ad_id)
+        if ad is None or d < since:
+            continue
+        out[ad_id] = replace(ad, effective_status=status, paused_at=since if status == "PAUSED" else None)
+    return out
+
+
 def _slice(ad_days: dict[str, list[AdDay]], d: date) -> dict[str, list[AdDay]]:
     """The rows a live run on day d would have loaded: [d - HISTORY_DAYS, d]."""
     lo = d - timedelta(days=HISTORY_DAYS)
@@ -114,22 +135,22 @@ async def _load_clients(db, agent: dict, *, start: date, end: date) -> list[_Cli
     return out
 
 
-async def _replay(db, agent: dict, *, end: date, days: int, near_miss: bool):
-    """(day, client, findings) for every replay day (oldest first) and client.
-    The missing-target advisory is dropped: it is not an action or a case."""
+async def _prepare(db, agent: dict, *, end: date, days: int):
     start = end - timedelta(days=days - 1)
     rules = [r for r in await list_rules(db, agent["_id"]) if r.get("enabled", True)]
     memories = await list_memory(db, agent["_id"], active_only=True)
     clients = await _load_clients(db, agent, start=start, end=end)
-    out = []
-    for i in range(days):
-        d = start + timedelta(days=i)
-        for c in clients:
-            sliced = _slice(c.ad_days, d)
-            findings = evaluate_loaded(agent, rules, memories, c.ctx, sliced, ads_on_day(c.ads, sliced, d),
-                                       c.adsets, as_of=d, near_miss=near_miss)
-            out.append((d, c, [f for f in findings if f.agent != MISSING_TARGET_AGENT]))
-    return rules, out
+    return start, rules, memories, clients
+
+
+def _evaluate_day(agent: dict, rules: list[dict], memories: list[dict], c: "_Client", d: date, *,
+                  near_miss: bool, sim: dict | None = None) -> list[Finding]:
+    """One client's findings on replay day d. The missing-target advisory is
+    dropped: it is not an action or a case."""
+    sliced = _slice(c.ad_days, d)
+    ads = apply_sim(ads_on_day(c.ads, sliced, d), sim or {}, d)
+    findings = evaluate_loaded(agent, rules, memories, c.ctx, sliced, ads, c.adsets, as_of=d, near_miss=near_miss)
+    return [f for f in findings if f.agent != MISSING_TARGET_AGENT]
 
 
 def _kind(f: Finding) -> str:
@@ -156,47 +177,64 @@ def _target(f: Finding) -> dict:
 # Dry run
 # ---------------------------------------------------------------------------
 
-def _after(c: _Client, target: dict, fire_day: date, end: date) -> tuple[float, int]:
-    """Spend and leads of the target's ads from fire_day + 1 through end."""
-    oid, otype = target["object_id"], target["object_type"]
-    spend, leads = 0.0, 0
-    for ad_id, rows in c.ad_days.items():
-        for r in rows:
-            if not (fire_day < r.day <= end):
-                continue
-            if (otype == "adset" and r.adset_id == oid) or (otype != "adset" and ad_id == oid):
-                spend += r.spend
-                leads += r.leads
-    return spend, leads
+def _ad_totals(c: "_Client", ad_id: str, after: date, end: date) -> tuple[float, int]:
+    """Spend and leads of one ad from after + 1 through end."""
+    rows = [r for r in c.ad_days.get(ad_id, []) if after < r.day <= end]
+    return sum(r.spend for r in rows), sum(r.leads for r in rows)
+
+
+def _affected_ads(f: Finding, target: dict) -> list[str]:
+    ids = [str(i) for i in (f.evidence.raw or {}).get("ad_ids") or []]
+    return ids or ([target["object_id"]] if target["object_type"] == "ad" else [])
 
 
 async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30) -> DryRunResult:
     """What the agent would have done each day from end - days + 1 through end.
 
     Each (rule kind, target) counts once, on its first fire day. Near misses
-    and the missing-target advisory never count. Pauses add the target's spend
-    and leads after the fire day; revives and flags add 0."""
-    rules, replayed = await _replay(db, agent, end=end, days=days, near_miss=False)
+    and the missing-target advisory never count. The agent's own pauses and
+    revives are simulated from the day after they fire (module docstring), and
+    a pause on an ad set counts only if it pauses an ad not already paused.
+    spend_saved / leads_at_risk add each paused ad once, from the day after its
+    earliest simulated pause through end; revives and flags add 0."""
+    start, rules, memories, clients = await _prepare(db, agent, end=end, days=days)
     res = DryRunResult(by_rule={r["kind"]: 0 for r in rules})
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
+    sim: dict[str, dict[str, tuple[str, date]]] = {c.gid: {} for c in clients}
+    paused_on: dict[tuple[str, str], date] = {}  # (gid, ad_id) -> earliest simulated pause day
     events = []
-    for d, c, findings in replayed:
-        for f in findings:
-            if f.near_miss:
-                continue
-            kind, target = _kind(f), _target(f)
-            key = (kind, target["object_id"])
-            if key in seen:
-                continue
-            seen.add(key)
-            res.actions += 1
-            res.by_rule[kind] = res.by_rule.get(kind, 0) + 1
-            if f.action is not None and f.action.type == ACTION_PAUSE_ADS:
-                spend, leads = _after(c, target, d, end)
-                res.spend_saved += spend
-                res.leads_at_risk += leads
-            events.append({"day": d.isoformat(), "rule_kind": kind, "title": f.title,
-                           "client_name": f.client_name, "why": f.description})
+    for i in range(days):
+        d = start + timedelta(days=i)
+        for c in clients:
+            csim = sim[c.gid]
+            for f in _evaluate_day(agent, rules, memories, c, d, near_miss=False, sim=csim):
+                if f.near_miss:
+                    continue
+                kind, target = _kind(f), _target(f)
+                key = (kind, target["object_type"], target["object_id"])
+                if key in seen:
+                    continue
+                act = f.action.type if f.action is not None else None
+                ads = _affected_ads(f, target)
+                if act == ACTION_PAUSE_ADS:
+                    fresh = [a for a in ads if (c.gid, a) not in paused_on]
+                    if ads and not fresh:
+                        continue  # every ad it would pause is already paused
+                    for a in fresh:
+                        paused_on[(c.gid, a)] = d
+                        spend, leads = _ad_totals(c, a, d, end)
+                        res.spend_saved += spend
+                        res.leads_at_risk += leads
+                    for a in ads:
+                        csim[a] = ("PAUSED", d + timedelta(days=1))
+                elif act == ACTION_ENABLE_ADS:
+                    for a in ads:
+                        csim[a] = ("ACTIVE", d + timedelta(days=1))
+                seen.add(key)
+                res.actions += 1
+                res.by_rule[kind] = res.by_rule.get(kind, 0) + 1
+                events.append({"day": d.isoformat(), "rule_kind": kind, "title": f.title,
+                               "client_name": f.client_name, "why": f.description})
     res.spend_saved = round(res.spend_saved, 2)
     # Stable sort: same-day events keep their evaluation order.
     res.examples = sorted(events, key=lambda e: e["day"], reverse=True)[:MAX_EXAMPLES]
@@ -263,12 +301,14 @@ async def sample_cases(db, mongo_client, agent: dict, *, end: date, days: int = 
     (nor any in exclude_ad_ids). random.Random(seed) is the only randomness, so
     the same data and seed give the same cases."""
     rng = random.Random(seed)
-    _, replayed = await _replay(db, agent, end=end, days=days, near_miss=True)
+    start, rules, memories, clients = await _prepare(db, agent, end=end, days=days)
 
     latest: dict[tuple[str, str], tuple[date, _Client, Finding]] = {}
-    for d, c, findings in replayed:  # oldest first: later days overwrite
-        for f in findings:
-            latest[(_kind(f), _target(f)["object_id"])] = (d, c, f)
+    for i in range(days):  # oldest first: later days overwrite
+        d = start + timedelta(days=i)
+        for c in clients:
+            for f in _evaluate_day(agent, rules, memories, c, d, near_miss=True):
+                latest[(_kind(f), _target(f)["object_id"])] = (d, c, f)
 
     # kind -> client -> candidates, each level in a seeded order.
     buckets: dict[str, dict[str, list]] = {}

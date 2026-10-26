@@ -374,7 +374,8 @@ async def _run_dry_run_job(job_id: str, user_id: str, agent_id: str) -> None:
             agent = await agent_store.get_agent(db, user_id, agent_id)
             if agent is None:
                 raise RuntimeError("agent not found")
-            result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent))
+            # Local yesterday: every replayed day is complete.
+            result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1))
             await jobs.update_one({"_id": job_id}, {"$set": {
                 "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
         except Exception as e:
@@ -388,6 +389,13 @@ async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_u
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
+        active = await db[agent_store.JOBS].find_one({
+            "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
+            "status": {"$in": ["queued", "running"]},
+            "created_at": {"$gt": datetime.utcnow() - JOB_TIMEOUT},
+        })
+        if active is not None:
+            return {"job_id": active["_id"]}  # one dry run at a time per agent
         job_id = uuid.uuid4().hex
         await db[agent_store.JOBS].insert_one({
             "_id": job_id, "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
