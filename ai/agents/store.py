@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime
 
 from core.database import DB_NAME
+from ai.suggestions.store import SUGGESTIONS
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
     DEFAULT_MODE,
@@ -38,6 +39,7 @@ MEMORY = "agent_memory"
 PRACTICE = "agent_practice"
 PROPOSALS = "agent_proposals"
 JOBS = "agent_jobs"
+
 
 AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training"}
 
@@ -157,6 +159,11 @@ async def update_rule(db, agent_id: str, rule_id: str, *, params=None, client_ov
 
     if updates:
         await db[RULES].update_one({"_id": rule_id, "agent_id": agent_id}, {"$set": updates})
+    if mode is not None and mode != rule.get("mode"):
+        # Open items carry their rule's mode (apply's flag_only check, Slack
+        # buttons); keep it current so a mode change takes effect immediately.
+        await db[SUGGESTIONS].update_many(
+            {"rule_id": rule_id, "status": "open"}, {"$set": {"rule_mode": mode}})
     return await db[RULES].find_one({"_id": rule_id, "agent_id": agent_id})
 
 

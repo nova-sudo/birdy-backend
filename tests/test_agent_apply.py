@@ -499,3 +499,31 @@ async def test_undo_marks_undone_and_manual_reapply_allowed(mock_db, meta):
     # A person may still choose to apply it again.
     res2 = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
     assert res2["outcome"] == "applied", res2
+
+
+# --- rule_mode follows the rule (fix round 2) -----------------------------------
+
+async def test_changing_rule_mode_updates_open_items(mock_db, meta):
+    from ai.agents.store import RULES, update_rule
+
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await mock_db[RULES].insert_one({"_id": "r1", "agent_id": "ag1", "kind": "pause_over_target",
+                                     "version": 1, "enabled": True, "mode": "ask", "params": {},
+                                     "client_overrides": {}})
+    await _seed_suggestion(mock_db)
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "sug_1"}, {"$set": {"rule_mode": "ask"}})
+    await _seed_suggestion(mock_db, sid="sug_done")
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "sug_done"},
+                                                {"$set": {"status": "applied", "rule_mode": "ask"}})
+
+    await update_rule(mock_db, "ag1", "r1", mode="flag")
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "blocked" and res["blocked_reason"]["code"] == "flag_only", res
+    assert meta["writes"] == []
+    assert (await store.get_suggestion(mock_db, "u1", "sug_done"))["rule_mode"] == "ask"  # closed items untouched
+
+    await update_rule(mock_db, "ag1", "r1", mode="ask")
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "applied", res
+    assert meta["writes"] == [("a1", "PAUSED")]
