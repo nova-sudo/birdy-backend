@@ -592,3 +592,88 @@ async def test_apply_on_resolved_item_is_closed_not_ok(mock_db, meta):
     res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
     assert res["ok"] is False and res["outcome"] == "closed" and res["status"] == "resolved"
     assert meta["writes"] == []
+
+
+# --- final re-review C1 residual: ad set contents checked live before the write ---
+
+ADSET_TARGET = [{"object_id": "s1", "object_type": "adset", "name": "Prospecting set"}]
+
+
+async def _seed_clean_adset(db):
+    for ad_id, name in (("a1", "Spring static"), ("a2", "Spring video")):
+        await db[AD_STATE].insert_one({"client_group_id": GID, "ad_id": ad_id, "adset_id": "s1",
+                                       "effective_status": "ACTIVE", "name": name})
+
+
+@pytest.fixture
+def live_ads(monkeypatch):
+    import ai.agents.meta_state as meta_state_mod
+    state = {"ads": [{"id": "a1", "name": "Spring static", "effective_status": "ACTIVE"},
+                     {"id": "a2", "name": "Spring video", "effective_status": "ACTIVE"}],
+             "raise": None, "reads": []}
+
+    async def fake_fetch(mongo_client, user_id, adset_id):
+        state["reads"].append(adset_id)
+        if state["raise"]:
+            raise state["raise"]
+        return state["ads"]
+
+    monkeypatch.setattr(meta_state_mod, "fetch_adset_ads", fake_fetch)
+    return state
+
+
+async def test_adset_pause_blocked_by_ad_added_since_last_refresh(mock_db, meta, live_ads):
+    await _seed_agent(mock_db)
+    await _seed_clean_adset(mock_db)  # the cache knows only clean ads
+    live_ads["ads"].append({"id": "a9", "name": "Evergreen – new hero", "effective_status": "ACTIVE"})
+    await _seed_suggestion(mock_db, targets=ADSET_TARGET)
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "blocked" and res["blocked_reason"]["code"] == "protected_tag", res
+    assert "Evergreen – new hero" in res["blocked_reason"]["message"]
+    assert live_ads["reads"] == ["s1"]
+    assert meta["writes"] == [] and meta["reads"] == []
+    assert (await store.get_suggestion(mock_db, "u1", "sug_1"))["status"] == "open"
+
+
+async def test_adset_pause_blocked_by_taught_exception_on_live_ad(mock_db, meta, live_ads):
+    from ai.agents.store import add_memory
+    await _seed_agent(mock_db)
+    await _seed_clean_adset(mock_db)
+    live_ads["ads"][1]["name"] = "Spring video – client favourite"  # renamed in Meta
+    await add_memory(mock_db, "ag1", text="Never touch the client's favourite", kind="exception",
+                     source="note", filter={"ad_name_contains": "favourite"})
+    await _seed_suggestion(mock_db, targets=ADSET_TARGET)
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1", actor=store.ACTOR_BIRDY,
+                                         source="agent")
+    assert res["outcome"] == "blocked" and res["blocked_reason"]["code"] == "exception", res
+    assert meta["writes"] == []
+
+
+async def test_adset_pause_fails_closed_when_live_read_fails(mock_db, meta, live_ads):
+    await _seed_agent(mock_db)
+    await _seed_clean_adset(mock_db)
+    live_ads["raise"] = RuntimeError("Meta Graph error on s1/ads: 500")
+    await _seed_suggestion(mock_db, targets=ADSET_TARGET)
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "blocked" and res["blocked_reason"]["code"] == "live_check_failed", res
+    assert "nothing was changed" in res["blocked_reason"]["message"]
+    assert meta["writes"] == []
+    assert "applying_at" not in (await store.get_suggestion(mock_db, "u1", "sug_1"))  # retryable
+
+
+async def test_clean_adset_still_pauses_after_live_check(mock_db, meta, live_ads):
+    await _seed_agent(mock_db)
+    await _seed_clean_adset(mock_db)
+    await _seed_suggestion(mock_db, targets=ADSET_TARGET)
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "applied", res
+    assert live_ads["reads"] == ["s1"]
+    assert meta["writes"] == [("s1", "PAUSED")]
+
+
+async def test_ad_target_does_not_read_adset_live(mock_db, meta, live_ads):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    assert (await actions.apply_suggestion(mock_db, None, "u1", "sug_1"))["outcome"] == "applied"
+    assert live_ads["reads"] == []

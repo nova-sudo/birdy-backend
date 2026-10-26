@@ -71,6 +71,17 @@ async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: s
     return out
 
 
+async def fetch_adset_ads(mongo_client, user_id: str, adset_id: str) -> list[dict]:
+    """The ad set's ads as Meta has them right now: [{id, name, effective_status}].
+    Raises (MetaTokenError, RuntimeError, httpx.HTTPError) when it can't read them."""
+    token_data = await get_facebook_token(user_id, mongo_client)
+    token = (token_data or {}).get("access_token")
+    if not token:
+        raise MetaTokenError("No valid Facebook token found")
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        return await _fetch_all(client, f"{adset_id}/ads", "id,name,effective_status", token)
+
+
 async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: str, ad_account_id: str,
                              *, today: date) -> dict:
     token_data = await get_facebook_token(user_id, mongo_client)

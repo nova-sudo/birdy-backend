@@ -16,6 +16,13 @@ Checked in order, first failure wins:
 Also returned as a blocked_reason code, by apply_suggestion itself before
 these checks run:
   flag_only         the item came from a flag-mode rule; it never writes
+
+check_adset_contents_live (run by apply_suggestion right after the checks
+above, just before the write) re-reads an ad set target's ads live from Meta, so
+an ad added to the set or renamed since the last refresh is still covered:
+  protected_tag     a live ad's name contains a protected tag
+  exception         a taught "never touch" memory matches the live ads
+  live_check_failed Meta couldn't be read: fail closed, nothing is written
 """
 
 import logging
@@ -23,9 +30,10 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ai.agents import memory_filters, meta_state
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS
 from ai.agents.meta_state import AD_STATE
-from ai.suggestions.contracts import ACTION_PAUSE_ADS
+from ai.suggestions.contracts import ACTION_PAUSE_ADS, Action, Evidence, Finding
 from ai.suggestions.store import ACTIVITY, KIND_ACTION_APPLIED
 
 logger = logging.getLogger(__name__)
@@ -174,4 +182,47 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
                 f"(limit {int(cap)}).",
             )
 
+    return GuardrailResult.passed()
+
+
+LIVE_CHECK_FAILED_MESSAGE = ("Couldn't check the ads inside this ad set in Meta, so nothing was "
+                             "changed. Try again in a moment.")
+
+
+async def check_adset_contents_live(db, mongo_client, agent: dict, doc: dict, *,
+                                    memories: list[dict], now_utc: datetime) -> GuardrailResult:
+    """For each ad set target, read its ads live from Meta and run the protected
+    tag and taught-exception checks over their names. Any read failure blocks."""
+    targets = [t for t in ((doc.get("action") or {}).get("targets") or []) if t.get("object_type") == "adset"]
+    if not targets:
+        return GuardrailResult.passed()
+    guardrails = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}
+    tags = guardrails.get("protected_tags") or []
+    tags = [tags] if isinstance(tags, str) else tags
+    tags = [str(tag) for tag in tags if str(tag).strip()]
+    as_of = local_today(now_utc, agent_tz(agent))
+    for t in targets:
+        try:
+            ads = await meta_state.fetch_adset_ads(mongo_client, agent["user_id"], str(t.get("object_id")))
+        except Exception as e:
+            logger.warning("guardrails: live read of ad set %s failed: %s", t.get("object_id"), e)
+            return GuardrailResult.blocked("live_check_failed", LIVE_CHECK_FAILED_MESSAGE)
+        names = [str(a.get("name") or "") for a in ads]
+        for name in names:
+            low = name.lower()
+            for tag in tags:
+                if tag.lower() in low:
+                    return GuardrailResult.blocked(
+                        "protected_tag", f"\"{name}\" is tagged {tag}, which is protected.")
+        probe = Finding(
+            agent=doc.get("agent") or "", client_group_id=doc.get("client_group_id") or "",
+            client_name=doc.get("client_name") or "", severity="", title=doc.get("title") or "",
+            description="", evidence=Evidence(window="agent"),
+            action=Action(type=(doc.get("action") or {}).get("type") or "",
+                          targets=[{**t, "member_names": names}]),
+        )
+        for mem in memories:
+            if not memory_filters.apply([probe], [mem], as_of=as_of):
+                return GuardrailResult.blocked(
+                    "exception", f"Birdy was told to leave this alone: {mem.get('text') or 'a saved exception'}")
     return GuardrailResult.passed()

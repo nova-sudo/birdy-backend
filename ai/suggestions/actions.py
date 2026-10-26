@@ -32,9 +32,16 @@ mark_applied. The claim comes first so concurrent applies make one Meta write.
 import logging
 from datetime import datetime
 
-from ai.agents.guardrails import FLAG_ONLY, FLAG_ONLY_MESSAGE, agent_tz, check_guardrails, local_today
+from ai.agents.guardrails import (
+    FLAG_ONLY,
+    FLAG_ONLY_MESSAGE,
+    agent_tz,
+    check_adset_contents_live,
+    check_guardrails,
+    local_today,
+)
 from ai.agents.meta_state import record_status_write
-from ai.agents.store import get_agent
+from ai.agents.store import get_agent, list_memory
 from ai.suggestions import store
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
 from services.meta_status_service import MetaStatusError, get_object_state, set_object_status
@@ -236,6 +243,13 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
             reason = {"code": "no_permission", "message": "The agent behind this suggestion no longer exists."}
         else:
             g = await check_guardrails(db, agent, doc, now_utc=datetime.utcnow())
+            if g.ok and atype in (ACTION_PAUSE_ADS, ACTION_ENABLE_ADS) and any(
+                    t.get("object_type") == "adset" for t in (action.get("targets") or [])):
+                # An ad set write reaches every ad in it: check them live, not
+                # from the cache, so one added or renamed since the run counts.
+                g = await check_adset_contents_live(
+                    db, mongo_client, agent, doc, now_utc=datetime.utcnow(),
+                    memories=await list_memory(db, agent_id, active_only=True))
             reason = None if g.ok else {"code": g.reason, "message": g.message}
         if reason:
             await store.release_claim(db, user_id, suggestion_id, token, blocked_reason=reason)
