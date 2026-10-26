@@ -23,6 +23,7 @@ class AdDay:
     day: date
     spend: float
     leads: int
+    campaign_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -111,6 +112,7 @@ async def load_ad_days(db, user_id: str, client_group_id: str, start: date, end:
             day=day,
             spend=_num(data.get("spend")),
             leads=leads_from_insight(data),
+            campaign_name=row.get("campaign_name") or data.get("campaign_name") or "",
         ))
     for days in out.values():
         days.sort(key=lambda d: d.day)

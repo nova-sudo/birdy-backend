@@ -38,7 +38,8 @@ async def test_load_ad_days_sorts_and_dedups(mock_db):
     assert set(out) == {"a1", "a2"}
     assert [d.day for d in out["a1"]] == [date(2026, 10, 1), date(2026, 10, 2)]
     assert out["a1"][1] == AdDay("a1", "5000000000001", "4000000000001", "Fixture Ad A",
-                                 date(2026, 10, 2), 99.0, 9)
+                                 date(2026, 10, 2), 99.0, 9, "Fixture Campaign")
+    assert out["a1"][0].campaign_name == "Fixture Campaign"
 
 
 async def test_load_client_ctx_target_and_overrides(mock_db):
