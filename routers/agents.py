@@ -9,6 +9,8 @@ Budgets are never writable: `permissions.budgets` is forced to false.
 """
 
 import asyncio
+import hashlib
+import json
 import logging
 import re
 import uuid
@@ -286,9 +288,9 @@ async def put_client_target(agent_id: str, gid: str, body: ClientTargetBody,
     same merge as PUT /api/client-groups/{id}/targets, so other targets survive."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        agent = await _agent_or_404(db, current_user, agent_id)
-        if gid not in ((agent.get("scope") or {}).get("client_group_ids") or []):
-            raise HTTPException(status_code=404, detail="Client not in this agent's scope")
+        # A CPL target belongs to the client, not the agent: any owned group may be
+        # set, watched or not. apply_targets is owner-scoped (None -> 404).
+        await _agent_or_404(db, current_user, agent_id)
         targets = await client_targets.apply_targets(
             db, current_user, gid,
             {} if body.cpl is None else {"cpl": body.cpl},
@@ -357,6 +359,19 @@ def _spawn(coro) -> asyncio.Task:
     return task
 
 
+def _rules_sig(rules: list[dict]) -> str:
+    """Stable hash of everything in the rules that changes a dry run's answer."""
+    parts = sorted(
+        (
+            str(r.get("_id")), r.get("version"), r.get("mode"), r.get("enabled"),
+            r.get("params") or {}, r.get("client_overrides") or {},
+        )
+        for r in rules
+    )
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+
 def _local_today(agent: dict) -> date:
     tz = ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or "UTC"
     try:
@@ -389,17 +404,21 @@ async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_u
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
+        sig = _rules_sig(await agent_store.list_rules(db, agent_id))
+        # Rejoin a running job only if it replays these exact rules; after an edit
+        # the old job's answer is stale, so start a new one.
         active = await db[agent_store.JOBS].find_one({
             "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
             "status": {"$in": ["queued", "running"]},
             "created_at": {"$gt": datetime.utcnow() - JOB_TIMEOUT},
+            "rules_sig": sig,
         })
         if active is not None:
-            return {"job_id": active["_id"]}  # one dry run at a time per agent
+            return {"job_id": active["_id"]}  # one dry run at a time per rule set
         job_id = uuid.uuid4().hex
         await db[agent_store.JOBS].insert_one({
             "_id": job_id, "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
-            "status": "queued", "created_at": datetime.utcnow(),
+            "status": "queued", "created_at": datetime.utcnow(), "rules_sig": sig,
         })
     _spawn(_run_dry_run_job(job_id, current_user, agent_id))
     return {"job_id": job_id}

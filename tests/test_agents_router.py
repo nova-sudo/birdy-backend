@@ -161,9 +161,14 @@ async def test_client_target_merges(api, mock_db):
     stored = (await mock_db["client_groups"].find_one({"id": "g1"}))["targets"]
     assert stored["cpl"] == 9.5 and stored["cpa"] == 40 and stored["monthly_wins"] == 12
     assert r.json()["targets"]["cpl"] == 9.5
-    # not in scope -> 404; unknown group -> 404
-    assert api.put(f"/api/agents/{a['id']}/client-targets/g2", json={"cpl": 1}).status_code == 404
+    # An owned client outside the scope can still get a target (targets belong to
+    # the client), and the scope is left alone. Unknown or foreign group -> 404.
+    r2 = api.put(f"/api/agents/{a['id']}/client-targets/g2", json={"cpl": 1})
+    assert r2.status_code == 200 and r2.json()["targets"]["cpl"] == 1
+    assert api.get(f"/api/agents/{a['id']}").json()["scope"]["client_group_ids"] == ["g1"]
     assert api.put(f"/api/agents/{a['id']}/client-targets/zzz", json={"cpl": 1}).status_code == 404
+    await group(mock_db, "gx", user=OTHER)
+    assert api.put(f"/api/agents/{a['id']}/client-targets/gx", json={"cpl": 1}).status_code == 404
     # clearing
     api.put(f"/api/agents/{a['id']}/client-targets/g1", json={"cpl": None})
     stored = (await mock_db["client_groups"].find_one({"id": "g1"}))["targets"]

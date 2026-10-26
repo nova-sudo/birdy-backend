@@ -390,6 +390,23 @@ async def test_post_dry_run_reuses_active_job_but_not_timed_out(api, mock_db):
     assert len(api.spawned) == 1
 
 
+async def test_post_dry_run_starts_new_job_after_rule_edit(api, mock_db):
+    agent = await _agent(mock_db, [])
+    url = f"/api/agents/{agent['_id']}"
+    first = api.post(f"{url}/dry-run").json()["job_id"]
+    stored = (await mock_db[JOBS].find_one({"_id": first}))["rules_sig"]
+    assert stored and api.post(f"{url}/dry-run").json()["job_id"] == first
+    # Editing a threshold while the first job runs: the old answer is stale.
+    rid = api.get(f"{url}/rules").json()[0]["id"]
+    assert api.patch(f"{url}/rules/{rid}", json={"enabled": False}).status_code == 200
+    second = api.post(f"{url}/dry-run").json()["job_id"]
+    assert second != first and len(api.spawned) == 2
+    assert (await mock_db[JOBS].find_one({"_id": second}))["rules_sig"] != stored
+    # The same edited rules rejoin the new job.
+    assert api.post(f"{url}/dry-run").json()["job_id"] == second
+    assert len(api.spawned) == 2
+
+
 async def test_dry_run_job_uses_local_yesterday(api, mock_db, monkeypatch):
     agent = await _agent(mock_db, [])
     seen = {}
