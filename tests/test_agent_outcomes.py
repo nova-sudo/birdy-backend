@@ -32,9 +32,10 @@ def api(mock_mongo_client, monkeypatch):
     app.dependency_overrides.pop(get_current_user, None)
 
 
-async def _group(db, gid="g1", user=U, currency="GBP"):
+async def _group(db, gid="g1", user=U, currency="GBP", refreshed=datetime(2026, 12, 1)):
     await db["client_groups"].insert_one(
-        {"id": gid, "user_id": user, "name": f"Client {gid}", "ad_account_currency": currency})
+        {"id": gid, "user_id": user, "name": f"Client {gid}", "ad_account_currency": currency,
+         "last_meta_refresh": refreshed})
 
 
 async def _insights(db, ad_id, start: date, days: int, spend: float, leads: int,
@@ -93,8 +94,18 @@ async def test_pause_outcome_account_cpl_before_after(mock_db):
     assert out["after"] == pytest.approx(50.0)  # Oct 11-17: a2 only, 50 per lead
     assert out["currency"] == "GBP"
 
-    # Less than 7 full days after the action: too early.
+    # Too early: the after-window (Oct 11-17) needs a day's buffer, so not before Oct 19.
     assert await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 16)) is None
+    assert await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 18)) is None
+    assert (await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 19)))["after"] == pytest.approx(50.0)
+
+    # Not fresh: the client's Meta data was last refreshed before Oct 18 -> retried later.
+    await mock_db["client_groups"].update_one({"id": "g1"}, {"$set": {"last_meta_refresh": datetime(2026, 10, 17, 23, 0)}})
+    assert await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 20)) is None
+    await mock_db["client_groups"].update_one({"id": "g1"}, {"$unset": {"last_meta_refresh": ""}})
+    assert await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 20)) is None
+    await mock_db["client_groups"].update_one({"id": "g1"}, {"$set": {"last_meta_refresh": datetime(2026, 10, 18, 4, 0)}})
+    assert await outcomes.compute_outcome(mock_db, row, today=date(2026, 10, 20)) is not None
 
 
 async def test_revive_outcome(mock_db):
@@ -165,6 +176,9 @@ async def test_impact_wasted_spend_math(mock_db, api):
     await _suggestion(mock_db, "s3", agent_id=aid, atype="pause_ads", targets=[AD("a3")], status="dismissed")
     await _row(mock_db, "s3", agent_id=aid, kind=sstore.KIND_SUGGESTION_DISMISSED, actor="user",
                at=datetime(2026, 10, 12, 7, 0), reason_code="still_learning")
+    # The same item dismissed again from Slack: still one denial.
+    await _row(mock_db, "s3", agent_id=aid, kind=sstore.KIND_SUGGESTION_DISMISSED, actor="user",
+               at=datetime(2026, 10, 12, 7, 5))
     await _suggestion(mock_db, "s4", agent_id=aid, atype=None, targets=[])
     await _row(mock_db, "s4", agent_id=aid, kind=sstore.KIND_ACTION_APPLIED, actor="user",
                at=datetime(2026, 10, 13, 7, 0))
@@ -173,17 +187,20 @@ async def test_impact_wasted_spend_math(mock_db, api):
     await _row(mock_db, "s5", agent_id=aid, kind=sstore.KIND_ACTION_APPLIED, actor="birdy",
                at=datetime(2026, 9, 20, 7, 0), atype="pause_ads")
 
-    imp = await outcomes.compute_impact(mock_db, agent, month="2026-10", today=date(2026, 11, 5))
-    # a1: 100/day x 22 days (Oct 10-31); a2: 50/day x 2 days (Oct 25-26, undone Oct 27).
-    assert imp["wasted_spend_stopped"] == pytest.approx(2300.0)
+    imp = await outcomes.compute_impact(mock_db, agent, month="2026-10", now=datetime(2026, 11, 5))
+    # a1: 100/day from Oct 10 07:00 to month end (Nov 1 00:00 London = UTC) = 21d17h;
+    # a2: 50/day from Oct 25 07:00 until its undo on Oct 27 09:00 = 2d2h.
+    assert imp["wasted_spend_stopped"] == pytest.approx(100 * (21 + 17 / 24) + 50 * (2 + 2 / 24), abs=0.01)
     assert imp["actions"] == 2 and imp["auto"] == 1
-    assert imp["approval_rate"] == pytest.approx(1 / 3)  # 1 approved, 1 denied, 1 undone by user
+    # The approved-then-undone item is only undone_user (as in confidence.py); s3 is one denial.
+    assert imp["approval_counts"] == {"approved": 0, "denied": 1, "undone_user": 1}
+    assert imp["approval_rate"] == 0.0
     assert imp["vs_prev_month"]["actions"] == 1
     assert imp["currency"] == "GBP" and imp["month"] == "2026-10"
 
     # Mid-month, days paused stop at today.
-    mid = await outcomes.compute_impact(mock_db, agent, month="2026-10", today=date(2026, 10, 20))
-    assert mid["wasted_spend_stopped"] == pytest.approx(100.0 * 11)  # Oct 10-20, s2 not yet
+    mid = await outcomes.compute_impact(mock_db, agent, month="2026-10", now=datetime(2026, 10, 20, 12, 0))
+    assert mid["wasted_spend_stopped"] == pytest.approx(100 * (10 + 5 / 24), abs=0.01)  # s2 not yet
 
     r = api.get(f"/api/agents/{aid}/impact", params={"month": "2026-10"})
     assert r.status_code == 200, r.text
@@ -248,6 +265,18 @@ async def test_activity_can_undo_only_auto_under_24h(mock_db, api):
     p2 = api.get(f"/api/agents/{aid}/activity", params={"limit": 50, "before": p1["next_before"]}).json()
     assert len(p2["items"]) == 4 and p2["next_before"] is None
     assert api.get(f"/api/agents/{aid}/activity", params={"before": "yesterday"}).status_code == 422
+
+    # The opaque cursor never skips rows that share a timestamp (fresh_auto / fresh_user).
+    seen, cur = [], None
+    for _ in range(10):
+        params = {"limit": 1, **({"cursor": cur} if cur else {})}
+        page = api.get(f"/api/agents/{aid}/activity", params=params).json()
+        seen += [x["id"] for x in page["items"]]
+        cur = page["next_cursor"]
+        if not cur:
+            break
+    assert len(seen) == 6 and len(set(seen)) == 6
+    assert api.get(f"/api/agents/{aid}/activity", params={"cursor": "%%%"}).status_code == 422
 
     api.state["user"] = OTHER
     assert api.get(f"/api/agents/{aid}/activity").status_code == 404

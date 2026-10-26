@@ -709,19 +709,26 @@ async def reject_proposal(agent_id: str, proposal_id: str, current_user: str = D
 
 @router.get("/{agent_id}/activity")
 async def get_activity(agent_id: str, limit: int = Query(50, ge=1, le=200),
-                       before: Optional[str] = None,
+                       before: Optional[str] = None, cursor: Optional[str] = None,
                        current_user: str = Depends(get_current_user)):
-    """The agent's decisions, newest first. `before` is the `at` of the last row seen."""
-    cursor = None
+    """The agent's decisions, newest first. Page with `cursor` = the previous page's
+    `next_cursor` (exact, tie-safe); `before` = an ISO `at` still works."""
+    after = None
+    if cursor:
+        try:
+            after = outcomes.decode_cursor(cursor)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="cursor is not valid")
+    before_dt = None
     if before:
         try:
-            cursor = outcomes.parse_cursor(before)
+            before_dt = outcomes.parse_cursor(before)
         except ValueError:
             raise HTTPException(status_code=422, detail="before must be an ISO datetime")
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        return await outcomes.list_activity(db, agent, limit=limit, before=cursor)
+        return await outcomes.list_activity(db, agent, limit=limit, before=before_dt, cursor=after)
 
 
 @router.get("/{agent_id}/impact")
@@ -734,5 +741,5 @@ async def get_impact(agent_id: str, month: Optional[str] = None,
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         if month is None:
-            month = datetime.now(outcomes._zone(outcomes.agent_tz(agent))).strftime("%Y-%m")
+            month = outcomes.current_month(agent)
         return await outcomes.compute_impact(db, agent, month=month)

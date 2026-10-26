@@ -26,6 +26,7 @@ Days are UTC days, as insights are stored per `date_start`; the impact month is
 the agent's local calendar month.
 """
 
+import base64
 import logging
 import re
 from collections import Counter
@@ -131,11 +132,19 @@ async def compute_outcome(db, activity_doc: dict, *, today: date) -> dict | None
     action_day = _naive_utc(at).date()
     after_start = action_day + timedelta(days=1)
     after_end = action_day + timedelta(days=WINDOW_DAYS)
-    if after_end >= today:  # the 7th full day after has not finished yet
+    # Complete and fresh: one day's buffer after the 7th day (insights are dated in the
+    # ad account's timezone), and the client's Meta data refreshed after d+7 ended.
+    if today < action_day + timedelta(days=WINDOW_DAYS + 2):
         return None
 
     user_id = activity_doc.get("user_id")
-    currency = (await _currencies(db, user_id, [gid])).get(gid)
+    group = await db["client_groups"].find_one(
+        {"id": gid, "user_id": user_id}, projection={"ad_account_currency": 1, "last_meta_refresh": 1}) or {}
+    refreshed = group.get("last_meta_refresh")
+    if not isinstance(refreshed, datetime) or _naive_utc(refreshed).date() < action_day + timedelta(days=WINDOW_DAYS + 1):
+        return None
+    cur = group.get("ad_account_currency")
+    currency = cur.upper() if isinstance(cur, str) and cur else None
 
     if atype == ACTION_PAUSE_ADS:
         before_start = action_day - timedelta(days=WINDOW_DAYS)
@@ -170,7 +179,7 @@ async def run_outcomes_db(db, *, now_utc: datetime) -> dict:
         "kind": sstore.KIND_ACTION_APPLIED,
         "applied_action_type": {"$in": [ACTION_PAUSE_ADS, ACTION_ENABLE_ADS]},
         "outcome_7d": {"$exists": False},
-        "created_at": {"$gte": now - MEASURE_UNTIL, "$lte": now - timedelta(days=WINDOW_DAYS)},
+        "created_at": {"$gte": now - MEASURE_UNTIL, "$lte": now - timedelta(days=WINDOW_DAYS + 1)},
     }
     out = {"checked": 0, "measured": 0, "errors": 0}
     async for row in db[sstore.ACTIVITY].find(q):
@@ -234,13 +243,36 @@ def can_undo(row: dict, sug: dict | None, now: datetime) -> bool:
     return now - applied_at <= UNDO_AUTO_WINDOW
 
 
+def encode_cursor(row: dict) -> str:
+    """Opaque page cursor: the row's exact (created_at, _id)."""
+    raw = f"{_naive_utc(row['created_at']).isoformat()}|{row['_id']}"
+    return base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+
+
+def decode_cursor(value: str) -> tuple[datetime, str]:
+    """ValueError if it is not a cursor from encode_cursor."""
+    try:
+        raw = base64.urlsafe_b64decode(value + "=" * (-len(value) % 4)).decode()
+        at, _id = raw.split("|", 1)
+        return _naive_utc(datetime.fromisoformat(at)), _id
+    except Exception as e:
+        raise ValueError("bad cursor") from e
+
+
 async def list_activity(db, agent: dict, *, limit: int = 50, before: datetime | None = None,
+                        cursor: tuple[datetime, str] | None = None,
                         now: datetime | None = None) -> dict:
+    """Newest first, ordered by (created_at, _id). `cursor` (from next_cursor) pages without
+    skipping rows that share a timestamp; `before` (an ISO `at`) is kept for older callers."""
     now = now or datetime.utcnow()
     q: dict = {"user_id": agent["user_id"], "agent_id": agent["_id"], "kind": {"$in": list(DECIDED_KINDS)}}
-    if before is not None:
+    if cursor is not None:
+        at, _id = cursor
+        q["$or"] = [{"created_at": {"$lt": at}}, {"created_at": at, "_id": {"$lt": _id}}]
+    elif before is not None:
         q["created_at"] = {"$lt": before}
-    rows = await db[sstore.ACTIVITY].find(q).sort("created_at", -1).limit(limit).to_list(length=limit)
+    rows = await (db[sstore.ACTIVITY].find(q).sort([("created_at", -1), ("_id", -1)])
+                  .limit(limit).to_list(length=limit))
 
     sids = list({r.get("ref_id") for r in rows if r.get("ref_id")})
     sugs = {}
@@ -269,8 +301,10 @@ async def list_activity(db, agent: dict, *, limit: int = 50, before: datetime | 
             if r.get(k) is not None:
                 item[k] = r[k]
         items.append(item)
-    next_before = items[-1]["at"] if len(items) == limit and items else None
-    return {"items": items, "next_before": next_before}
+    more = len(items) == limit and items
+    return {"items": items,
+            "next_before": items[-1]["at"] if more else None,
+            "next_cursor": encode_cursor(rows[-1]) if more else None}
 
 
 # ---------------------------------------------------------------------------
@@ -308,16 +342,20 @@ async def _month_rows(db, agent: dict, start: datetime, end: datetime) -> list[d
     return await db[sstore.ACTIVITY].find(q).sort("created_at", 1).to_list(length=None)
 
 
-async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, month_end: date,
-                        today: date, tz) -> tuple[float, dict]:
-    """Sum over the month's pauses of (target avg daily spend in the 7 days before)
-    x (days paused inside the month). A pause ends at its undo or at a later agent
-    revive of the same object; days count from the action day, up to month end and
-    up to today (inclusive)."""
+def _local_date(dt: datetime, tz) -> date:
+    return dt.replace(tzinfo=timezone.utc).astimezone(tz).date()
+
+
+async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, month_end: datetime,
+                        now: datetime, tz) -> tuple[float, dict]:
+    """Sum over the month's pauses of (target avg daily spend in the 7 local days before
+    the action day) x (days paused inside the month). Days paused run from the pause
+    instant to the earliest of: its undo, a later agent revive of the same object, the
+    end of the month, now. Fractional days count."""
     if not pauses:
         return 0.0, {}
     user_id, agent_id = agent["user_id"], agent["_id"]
-    cap = min(month_end, today + timedelta(days=1))  # exclusive
+    cap = min(month_end, now)
 
     # Later events that end a pause: undo rows and agent revives.
     first_at = min(p["created_at"] for p in pauses)
@@ -341,9 +379,9 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
         if not gid or not targets:
             continue
         start = p["created_at"]
-        local_day = start.replace(tzinfo=timezone.utc).astimezone(tz).date()
+        local_day = _local_date(start, tz)
         for t in targets:
-            end_day = cap
+            end = cap
             for e in enders:
                 if e["created_at"] <= start:
                     continue
@@ -353,10 +391,10 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
                     hit = any(str(x.get("object_id")) == str(t.get("object_id"))
                               for x in _targets(sugs.get(e.get("ref_id"))))
                 if hit:
-                    end_day = min(end_day, e["created_at"].replace(tzinfo=timezone.utc).astimezone(tz).date())
+                    end = min(end, e["created_at"])
                     break
-            days_paused = max(0, (end_day - local_day).days)
-            if not days_paused:
+            days_paused = (end - start).total_seconds() / 86400
+            if days_paused <= 0:
                 continue
             b_start, b_end = local_day - timedelta(days=WINDOW_DAYS), local_day - timedelta(days=1)
             key = (gid, b_start)
@@ -370,7 +408,29 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
     return total, by_currency
 
 
-async def _month_figures(db, agent: dict, month: str, today: date, *, with_spend: bool) -> dict:
+async def _reversed_applies(db, agent: dict, applies: list[dict]) -> set:
+    """_ids of the given apply rows that a later undo reversed: the next apply/undo row
+    of the same suggestion is an undo. One query for all of them."""
+    refs = list({a.get("ref_id") for a in applies if a.get("ref_id")})
+    if not refs:
+        return set()
+    events = await db[sstore.ACTIVITY].find({
+        "user_id": agent["user_id"], "agent_id": agent["_id"], "ref_id": {"$in": refs},
+        "kind": {"$in": [sstore.KIND_ACTION_APPLIED, sstore.KIND_ACTION_UNDONE]},
+        "created_at": {"$gte": min(a["created_at"] for a in applies)},
+    }).sort([("created_at", 1), ("_id", 1)]).to_list(length=None)
+    by_ref: dict = {}
+    for e in events:
+        by_ref.setdefault(e.get("ref_id"), []).append(e)
+    out = set()
+    for evs in by_ref.values():
+        for cur, nxt in zip(evs, evs[1:]):
+            if cur.get("kind") == sstore.KIND_ACTION_APPLIED and nxt.get("kind") == sstore.KIND_ACTION_UNDONE:
+                out.add(cur["_id"])
+    return out
+
+
+async def _month_figures(db, agent: dict, month: str, now: datetime, *, with_spend: bool) -> dict:
     tz_name = agent_tz(agent)
     first, nxt, start, end = _month_bounds(month, tz_name)
     rows = await _month_rows(db, agent, start, end)
@@ -386,20 +446,16 @@ async def _month_figures(db, agent: dict, month: str, today: date, *, with_spend
     applied = [r for r in rows if r.get("kind") == sstore.KIND_ACTION_APPLIED]
     actions = [r for r in applied if r.get("applied_action_type")]
     auto = [r for r in actions if r.get("actor") == sstore.ACTOR_BIRDY]
-    approved = sum(1 for r in applied if r.get("actor") == sstore.ACTOR_USER and has_action(r))
-    denied = sum(1 for r in rows if r.get("kind") == sstore.KIND_SUGGESTION_DISMISSED and has_action(r))
 
-    # An undo counts against approval only when the user had approved the action:
-    # the apply row it reverses is the latest apply of that suggestion before it.
-    undone_user = 0
-    undos = [r for r in rows if r.get("kind") == sstore.KIND_ACTION_UNDONE]
-    for u in undos:
-        prior = await db[sstore.ACTIVITY].find_one(
-            {"user_id": agent["user_id"], "agent_id": agent["_id"], "ref_id": u.get("ref_id"),
-             "kind": sstore.KIND_ACTION_APPLIED, "created_at": {"$lt": u["created_at"]}},
-            sort=[("created_at", -1)])
-        if prior and prior.get("actor") == sstore.ACTOR_USER:
-            undone_user += 1
+    # Each user approval in the month is one decision, as in confidence.py: an approval
+    # the user later undid is undone_user (a failure), not also an approval.
+    user_applies = [r for r in applied if r.get("actor") == sstore.ACTOR_USER and has_action(r)]
+    reversed_ids = await _reversed_applies(db, agent, user_applies)
+    undone_user = sum(1 for r in user_applies if r["_id"] in reversed_ids)
+    approved = len(user_applies) - undone_user
+    # A repeat dismissal of the same item (Slack + dashboard) is one denial.
+    denied = len({r.get("ref_id") for r in rows
+                  if r.get("kind") == sstore.KIND_SUGGESTION_DISMISSED and has_action(r)})
     denom = approved + denied + undone_user
 
     out = {"actions": len(actions), "auto": len(auto),
@@ -407,7 +463,7 @@ async def _month_figures(db, agent: dict, month: str, today: date, *, with_spend
            "approved": approved, "denied": denied, "undone_user": undone_user}
     if with_spend:
         pauses = [r for r in actions if r.get("applied_action_type") == ACTION_PAUSE_ADS]
-        total, by_cur = await _wasted_spend(db, agent, pauses, sugs, month_end=nxt, today=today,
+        total, by_cur = await _wasted_spend(db, agent, pauses, sugs, month_end=end, now=now,
                                             tz=_zone(tz_name))
         out["wasted_spend_stopped"] = round(total, 2)
         out["wasted_spend_by_currency"] = {k: round(v, 2) for k, v in by_cur.items()}
@@ -420,13 +476,19 @@ async def _month_figures(db, agent: dict, month: str, today: date, *, with_spend
     return out
 
 
-async def compute_impact(db, agent: dict, *, month: str, today: date | None = None) -> dict:
-    """Impact for one local calendar month (YYYY-MM)."""
+def current_month(agent: dict, now: datetime | None = None) -> str:
+    """This month (YYYY-MM) in the agent's timezone."""
+    now = _naive_utc(now or datetime.utcnow())
+    return _local_date(now, _zone(agent_tz(agent))).strftime("%Y-%m")
+
+
+async def compute_impact(db, agent: dict, *, month: str, now: datetime | None = None) -> dict:
+    """Impact for one local calendar month (YYYY-MM), measured up to `now` (default: now)."""
     if not MONTH_RE.match(month or ""):
         raise ValueError("month must be YYYY-MM")
-    today = today or datetime.utcnow().date()
-    cur = await _month_figures(db, agent, month, today, with_spend=True)
-    prev = await _month_figures(db, agent, _prev_month(month), today, with_spend=False)
+    now = _naive_utc(now or datetime.utcnow())
+    cur = await _month_figures(db, agent, month, now, with_spend=True)
+    prev = await _month_figures(db, agent, _prev_month(month), now, with_spend=False)
     return {
         "month": month,
         "actions": cur["actions"],
