@@ -205,7 +205,8 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
     agent = None
 
     # 1b. A flag-mode rule only flags: its item never writes, whoever asks.
-    if doc.get("rule_mode") == "flag":
+    # An item with nothing to write is just acknowledged (marked applied).
+    if doc.get("rule_mode") == "flag" and action:
         reason = {"code": FLAG_ONLY, "message": FLAG_ONLY_MESSAGE}
         await store.release_claim(db, user_id, suggestion_id, token, blocked_reason=reason)
         await _sync_slack(db, user_id, suggestion_id, by=by)

@@ -482,6 +482,19 @@ async def test_flag_mode_item_refuses_apply(mock_db, meta, actor):
     assert doc["blocked_reason"]["code"] == "flag_only"
 
 
+async def test_flag_mode_item_without_action_is_acknowledged(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "sug_1"}, {"$set": {"rule_mode": "flag", "action": None}})
+
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1", source="dashboard")
+
+    assert res["ok"] is True and res["outcome"] == "applied", res
+    assert meta["writes"] == []
+    assert (await store.get_suggestion(mock_db, "u1", "sug_1"))["status"] == store.STATUS_APPLIED
+
+
 # --- Undo leaves a marker (fix round 1, I2) ---------------------------------------
 
 async def test_undo_marks_undone_and_manual_reapply_allowed(mock_db, meta):
