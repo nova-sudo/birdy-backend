@@ -193,3 +193,13 @@ async def test_freshness_skip_does_not_consume_the_day(mock_db, mock_mongo_clien
     assert first["ran"] == 0 and calls == []
     later = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=sched + timedelta(hours=2, minutes=1))
     assert later["ran"] == 1 and len(calls) == 1
+
+
+async def test_bad_stored_schedule_is_skipped_not_run(mock_db, mock_mongo_client, runs):
+    calls, _ = runs
+    now_ok = _local(2026, 10, 26, 7, 0)
+    bad = await _seed(mock_db, tz="America/New_York", refreshed=now_ok.replace(tzinfo=None))
+    await mock_db.agents.update_one({"_id": bad["_id"]}, {"$set": {"scope.schedule.tz": "Nope/Zone"}})
+    res = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=now_ok)
+    assert res["ran"] == 0 and res["skipped"] == 1 and res["errors"] == 0 and calls == []
+    assert "last_run" not in await _agent_doc(mock_db, bad)

@@ -37,8 +37,14 @@ def _aware_utc(dt: datetime) -> datetime:
 
 def _schedule(agent: dict) -> tuple[int, int, ZoneInfo]:
     sched = (agent.get("scope") or {}).get("schedule") or {}
-    hh, mm = (sched.get("time") or "07:00").split(":")
-    return int(hh), int(mm), ZoneInfo(sched.get("tz") or "Europe/London")
+    try:
+        hh, mm = (sched.get("time") or "07:00").split(":")
+        hh, mm = int(hh), int(mm)
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            raise ValueError("time out of range")
+        return hh, mm, ZoneInfo(sched.get("tz") or "Europe/London")
+    except Exception as e:
+        raise ValueError(f"invalid schedule {sched!r}: {e}") from e
 
 
 def _scheduled_utc(agent: dict, now_utc: datetime) -> tuple[datetime, "datetime.date"]:
@@ -119,6 +125,13 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
     out = {"ran": 0, "skipped": 0, "refreshed": 0, "errors": 0}
 
     for agent in await db[AGENTS].find({"status": "active"}).to_list(length=None):
+        try:
+            _schedule(agent)
+        except ValueError as e:
+            # Pre-validation docs may hold a bad schedule: skip this agent, don't record a run.
+            logger.error("agents-tick: skipping agent %s: %s", agent.get("_id"), e)
+            out["skipped"] += 1
+            continue
         try:
             if not _is_due(agent, now_utc):
                 continue

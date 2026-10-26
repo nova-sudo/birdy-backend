@@ -95,7 +95,8 @@ def test_patch_rejects_status_training_unknown(api):
         assert api.patch(f"/api/agents/{a['id']}", json=body).status_code == 422
 
 
-def test_budgets_forced_false(api):
+async def test_budgets_forced_false(api, mock_db):
+    await group(mock_db, "g1")
     a = make_agent(api)
     r = api.patch(f"/api/agents/{a['id']}", json={"permissions": {"budgets": True, "campaigns": True},
                                                  "guardrails": {"max_pauses_per_client_day": 5},
@@ -250,3 +251,28 @@ async def test_suggestion_to_api_new_fields():
     assert out["rule_kind"] == "revive_winner" and out["agent_id"] == "a" and out["rule_mode"] == "flag"
     assert out["blocked_reason"]["code"] == "c" and out["auto_failed"] is True and out["undone_at"] is None
     assert dashboard_router._suggestion_to_api({"id": "x", "agent": "useless_ad_purger"})["rule_kind"] is None
+
+
+def test_schedule_validation_and_partial_merge(api):
+    a = make_agent(api)
+    url = f"/api/agents/{a['id']}"
+    assert api.patch(url, json={"scope": {"schedule": {"tz": "Nope/Zone"}}}).status_code == 400
+    assert api.patch(url, json={"scope": {"schedule": {"time": "7am"}}}).status_code == 400
+    assert api.patch(url, json={"scope": {"schedule": {"time": "24:00"}}}).status_code == 400
+    assert api.patch(url, json={"scope": {"schedule": "x"}}).status_code == 400
+    assert api.patch(url, json={"scope": {"bogus": 1}}).status_code == 400
+    r = api.patch(url, json={"scope": {"schedule": {"tz": "America/New_York"}}})
+    assert r.status_code == 200
+    assert r.json()["scope"]["schedule"] == {"time": "07:00", "tz": "America/New_York"}
+    r = api.patch(url, json={"scope": {"schedule": {"time": "09:30"}}})
+    assert r.json()["scope"]["schedule"] == {"time": "09:30", "tz": "America/New_York"}
+
+
+async def test_client_caps_validated_and_negative_cpl_rejected(api, mock_db):
+    await group(mock_db, "g1")
+    a = make_agent(api)
+    url = f"/api/agents/{a['id']}"
+    assert api.patch(url, json={"client_caps": {"zzz": 2}}).status_code == 400
+    assert api.patch(url, json={"client_caps": {"g1": -1}}).status_code == 400
+    api.patch(url, json={"scope": {"client_group_ids": ["g1"]}})
+    assert api.put(f"{url}/client-targets/g1", json={"cpl": -3}).status_code == 422

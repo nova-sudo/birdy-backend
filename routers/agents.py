@@ -9,11 +9,13 @@ Budgets are never writable: `permissions.budgets` is forced to false.
 """
 
 import logging
+import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from ai.agents import store as agent_store
 from ai.agents.defaults import (
@@ -104,6 +106,26 @@ def _validate_params(kind: str, params: dict) -> None:
             raise HTTPException(status_code=400, detail=f"Param '{k}' must not be negative")
 
 
+_TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+SCOPE_KEYS = {"client_group_ids", "schedule"}
+
+
+def _validate_schedule(sched) -> dict:
+    if not isinstance(sched, dict):
+        raise HTTPException(status_code=400, detail="schedule must be an object")
+    unknown = set(sched) - {"time", "tz"}
+    if unknown:
+        raise HTTPException(status_code=400, detail=f"Unknown schedule key(s): {sorted(unknown)}")
+    if "time" in sched and not (isinstance(sched["time"], str) and _TIME_RE.match(sched["time"])):
+        raise HTTPException(status_code=400, detail="schedule.time must be HH:MM (24h)")
+    if "tz" in sched:
+        try:
+            ZoneInfo(sched["tz"])
+        except Exception:
+            raise HTTPException(status_code=400, detail="schedule.tz is not a valid timezone")
+    return sched
+
+
 # ---------------------------------------------------------------------------
 # Agents
 # ---------------------------------------------------------------------------
@@ -123,10 +145,6 @@ async def create_agent(current_user: str = Depends(get_current_user)):
             agent = await agent_store.create_agent(db, current_user)
         except agent_store.AgentExists:
             raise HTTPException(status_code=409, detail="You already have a media buying agent")
-        if agent["permissions"].get("budgets"):
-            agent = await agent_store.update_agent(
-                db, current_user, agent["_id"],
-                {"permissions": {**agent["permissions"], "budgets": False}})
         return _agent_to_api(agent)
 
 
@@ -153,12 +171,20 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
         patch: dict = {}
 
         if body.scope is not None:
+            unknown = set(body.scope) - SCOPE_KEYS
+            if unknown:
+                raise HTTPException(status_code=400, detail=f"Unknown scope key(s): {sorted(unknown)}")
             ids = body.scope.get("client_group_ids")
             if ids is not None:
                 if not isinstance(ids, list) or not all(isinstance(i, str) for i in ids):
                     raise HTTPException(status_code=400, detail="client_group_ids must be a list of ids")
                 await _require_owned_groups(db, current_user, ids)
-            patch["scope"] = {**(agent.get("scope") or {}), **body.scope}
+            current = agent.get("scope") or {}
+            merged_scope = {**current, **{k: v for k, v in body.scope.items() if k != "schedule"}}
+            if "schedule" in body.scope:
+                merged_scope["schedule"] = {**(current.get("schedule") or {}),
+                                            **_validate_schedule(body.scope["schedule"])}
+            patch["scope"] = merged_scope
 
         if body.permissions is not None:
             unknown = set(body.permissions) - set(DEFAULT_PERMISSIONS)
@@ -175,6 +201,10 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
             patch["guardrails"] = {**(agent.get("guardrails") or {}), **body.guardrails}
 
         if body.client_caps is not None:
+            await _require_owned_groups(db, current_user, body.client_caps.keys())
+            for v in body.client_caps.values():
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0:
+                    raise HTTPException(status_code=400, detail="client_caps values must be numbers >= 0")
             patch["client_caps"] = body.client_caps
 
         updated = await agent_store.update_agent(db, current_user, agent_id, patch)
@@ -207,7 +237,7 @@ async def patch_rule(agent_id: str, rule_id: str, body: RulePatch,
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        rule = next((r for r in await agent_store.list_rules(db, agent_id) if r["_id"] == rule_id), None)
+        rule = await db[agent_store.RULES].find_one({"_id": rule_id, "agent_id": agent_id})
         if rule is None:
             raise HTTPException(status_code=404, detail="Rule not found")
         kind = rule["kind"]
@@ -243,7 +273,7 @@ async def patch_rule(agent_id: str, rule_id: str, body: RulePatch,
 
 class ClientTargetBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    cpl: Optional[float] = None
+    cpl: Optional[float] = Field(default=None, ge=0)
 
 
 @router.put("/{agent_id}/client-targets/{gid}")
@@ -256,16 +286,13 @@ async def put_client_target(agent_id: str, gid: str, body: ClientTargetBody,
         agent = await _agent_or_404(db, current_user, agent_id)
         if gid not in ((agent.get("scope") or {}).get("client_group_ids") or []):
             raise HTTPException(status_code=404, detail="Client not in this agent's scope")
-        now = datetime.utcnow()
-        if body.cpl is None:
-            op = {"$unset": {"targets.cpl": ""}, "$set": {"targets.updated_at": now, "updated_at": now}}
-        else:
-            op = {"$set": {"targets.cpl": body.cpl, "targets.updated_at": now, "updated_at": now}}
-        res = await db["client_groups"].update_one({"id": gid, "user_id": current_user}, op)
-        if res.matched_count == 0:
+        targets = await client_targets.apply_targets(
+            db, current_user, gid,
+            {} if body.cpl is None else {"cpl": body.cpl},
+            clear=("cpl",) if body.cpl is None else ())
+        if targets is None:
             raise HTTPException(status_code=404, detail="Client group not found")
-        group = await db["client_groups"].find_one({"id": gid, "user_id": current_user}, {"targets": 1, "_id": 0})
-        return {"client_group_id": gid, "targets": client_targets.clean((group or {}).get("targets"))}
+        return {"client_group_id": gid, "targets": client_targets.clean(targets)}
 
 
 # ---------------------------------------------------------------------------
