@@ -310,8 +310,33 @@ async def test_activate_sets_modes_and_snapshot_score(api, mock_db):
     assert (await mock_db.agent_rules.find_one({"_id": pause_id}))["mode"] == "auto"
 
 
+async def test_activation_keeps_practice_score_until_6_real_decisions(mock_db):
+    agent = await _ready_agent(mock_db)
+    aid = agent["_id"]
+    before = await compute_confidence(mock_db, agent)
+    assert before["practice_source"] == "practice"
+    await mock_db.agents.update_one({"_id": aid}, {"$set": {"status": "active"}})
+    agent = await mock_db.agents.find_one({"_id": aid})
+
+    after = await compute_confidence(mock_db, agent)  # 0 decisions
+    assert after["score"] == before["score"] and after["practice"] == before["practice"]
+    assert after["practice_source"] == "practice"
+    assert after["parts"]["practice_answered"] == 6 and after["parts"]["practice_agreed"] == 6
+
+    ask_rule = next(r for r in await list_rules(mock_db, aid) if r["kind"] == "pause_over_target")["_id"]
+    rows = [{"_id": f"d{i}", "user_id": USER, "agent_id": aid, "rule_id": ask_rule,
+             "kind": sstore.KIND_SUGGESTION_DISMISSED if i < 3 else sstore.KIND_ACTION_APPLIED,
+             "actor": "user", "ref_id": f"s{i}", "created_at": datetime(2026, 10, 1) + timedelta(hours=i)}
+            for i in range(6)]
+    await mock_db[sstore.ACTIVITY].insert_many(rows)
+    switched = await compute_confidence(mock_db, agent)
+    assert switched["practice_source"] == "decisions"
+    assert switched["parts"]["practice_answered"] == 6 and switched["parts"]["practice_agreed"] == 3
+    assert switched["practice"] == round(60 * wilson_lower(3, 6))
+
+
 async def test_post_launch_uses_rolling_decisions(mock_db):
-    agent = await _ready_agent(mock_db)  # practice cases say 6/6, but they no longer count
+    agent = await _ready_agent(mock_db)  # practice cases say 6/6; they only count until 6 decisions
     aid = agent["_id"]
     rules = {r["kind"]: r for r in await list_rules(mock_db, aid)}
     ask_rule, flag_rule = rules["pause_over_target"]["_id"], rules["flag_no_spend"]["_id"]
@@ -348,10 +373,14 @@ async def test_post_launch_uses_rolling_decisions(mock_db):
     assert c["practice"] == round(60 * wilson_lower(26, 30))
     assert c["score"] == round(40 + 60 * wilson_lower(26, 30))
 
-    # Fewer than 6 decisions: practice is 0.
+    assert c["practice_source"] == "decisions"
+
+    # Fewer than 6 decisions: the practice cases (6/6) keep counting.
     await mock_db[sstore.ACTIVITY].delete_many({"_id": {"$nin": ["act30", "act31"]}})
     c = await compute_confidence(mock_db, agent)
-    assert c["parts"]["practice_answered"] == 2 and c["practice"] == 0
+    assert c["practice_source"] == "practice"
+    assert c["parts"]["practice_answered"] == 6 and c["parts"]["practice_agreed"] == 6
+    assert c["practice"] == round(60 * wilson_lower(6, 6))
 
 
 def test_answer_label_shared_with_sampler():

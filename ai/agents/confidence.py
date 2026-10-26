@@ -9,7 +9,9 @@ The agent's confidence score (0-100): coverage + practice.
   practice  60 x wilson_lower(agreed, answered), 0 when answered < 6.
             Before activation: the user's practice cases (agent_practice).
             After activation (status "active"): the last 30 decisions on
-            ask-mode rules (approved = success, denied or undone = failure).
+            ask-mode rules (approved = success, denied or undone = failure),
+            once there are at least 6 of them; until then the practice cases
+            keep counting, so the score does not drop at launch.
 
 ready = score >= 80 and every watched client has a target.
 
@@ -148,9 +150,13 @@ async def compute_confidence(db, agent: dict) -> dict:
     parts = {"targets": targets_ok, **{t: bool(topics.get(t)) for t in TOPICS if t != "targets"}}
     coverage = TOPIC_POINTS * sum(1 for t in TOPICS if parts[t])
 
+    practice_source = "practice"
+    agreed = answered = 0
     if agent.get("status") == "active":
         agreed, answered = await _decision_counts(db, agent)
-    else:
+        if answered >= MIN_ANSWERED:
+            practice_source = "decisions"
+    if practice_source == "practice":
         agreed, answered = await _practice_counts(db, agent)
     practice = _practice_points(agreed, answered)
     score = round(coverage + practice)
@@ -170,6 +176,7 @@ async def compute_confidence(db, agent: dict) -> dict:
         "coverage": coverage,
         "practice": round(practice),
         "parts": parts,
+        "practice_source": practice_source,
         "ready": score >= READY_SCORE and targets_ok,
         "missing": missing,
     }
