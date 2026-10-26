@@ -200,9 +200,10 @@ async def answer_topic(db, user_id, topic=None, **_):
         return _fail(NO_AGENT)
     if topic not in TOPICS:
         return _fail(f"Unknown topic. Use one of {list(TOPICS)}")
-    training = copy.deepcopy(agent.get("training") or {})
-    training.setdefault("topics", {})[topic] = True
-    await store.update_agent(db, user_id, agent["_id"], {"training": training})
+    # Targeted $set so concurrent topic answers don't overwrite each other.
+    await db[store.AGENTS].update_one(
+        {"_id": agent["_id"], "user_id": user_id}, {"$set": {f"training.topics.{topic}": True}}
+    )
     return {"ok": True, "changed": {"topic": topic, "answered": True}}
 
 
