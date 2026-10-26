@@ -23,7 +23,15 @@ from ai.agents import memory_filters
 from ai.agents.defaults import RULE_KINDS
 from ai.agents.evaluators import REGISTRY
 from ai.agents.meta_state import MetaTokenError, backfill_paused_at, refresh_meta_state
-from ai.agents.snapshot import ClientCtx, load_ad_days, load_client_ctx, load_state
+from ai.agents.snapshot import (
+    AdDay,
+    AdsetState,
+    AdState,
+    ClientCtx,
+    load_ad_days,
+    load_client_ctx,
+    load_state,
+)
 from ai.agents.store import AGENTS, list_memory, list_rules
 from ai.suggestions import actions
 from ai.suggestions import store as sstore
@@ -71,6 +79,27 @@ def _missing_target_finding(agent: dict, ctx: ClientCtx) -> Finding:
     )
 
 
+def evaluate_loaded(agent: dict, rules: list[dict], memories: list[dict], ctx: ClientCtx,
+                    ad_days: dict[str, list[AdDay]], ads: dict[str, AdState], adsets: dict[str, AdsetState],
+                    *, as_of: date, near_miss: bool) -> list[Finding]:
+    """Findings for one client from preloaded data: the missing-target advisory,
+    every enabled rule's evaluator, then memory filters. Pure: no I/O. Shared by
+    run_agent and the dry-run replay (ai.agents.replay) so they cannot drift."""
+    findings: list[Finding] = []
+    if ctx.target_cpl is None:
+        findings.append(_missing_target_finding(agent, ctx))
+    for rule in rules:
+        kind = rule.get("kind")
+        evaluate = REGISTRY.get(kind)
+        if evaluate is None:
+            continue
+        if ctx.target_cpl is None and kind in TARGET_ONLY_RULES:
+            continue
+        rule = {**rule, "agent_id": rule.get("agent_id") or agent.get("_id")}
+        findings.extend(evaluate(rule, ctx, ad_days, ads, adsets, as_of, near_miss=near_miss))
+    return memory_filters.apply(findings, memories, as_of=as_of)
+
+
 async def _evaluate_client(db, mongo_client, agent: dict, rules: list[dict], memories: list[dict],
                            gid: str, *, as_of: date, live: bool, near_miss: bool, result: RunResult):
     """(ctx, findings) for one client, or None when it was skipped."""
@@ -93,20 +122,8 @@ async def _evaluate_client(db, mongo_client, agent: dict, rules: list[dict], mem
     if latest is not None and latest < as_of - timedelta(days=1):
         result.stale = True
 
-    findings: list[Finding] = []
-    if ctx.target_cpl is None:
-        findings.append(_missing_target_finding(agent, ctx))
-    for rule in rules:
-        kind = rule.get("kind")
-        evaluate = REGISTRY.get(kind)
-        if evaluate is None:
-            continue
-        if ctx.target_cpl is None and kind in TARGET_ONLY_RULES:
-            continue
-        rule = {**rule, "agent_id": rule.get("agent_id") or agent.get("_id")}
-        findings.extend(evaluate(rule, ctx, ad_days, ads, adsets, as_of, near_miss=near_miss))
-
-    findings = memory_filters.apply(findings, memories, as_of=as_of)
+    findings = evaluate_loaded(agent, rules, memories, ctx, ad_days, ads, adsets,
+                               as_of=as_of, near_miss=near_miss)
     if live:
         findings = [f for f in findings if not f.near_miss]
     return ctx, findings

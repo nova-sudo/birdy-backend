@@ -8,15 +8,18 @@ Every route is owner-scoped: another user's agent is a 404, never a 403.
 Budgets are never writable: `permissions.budgets` is forced to false.
 """
 
+import asyncio
 import logging
 import re
-from datetime import datetime, timedelta
+import uuid
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
@@ -337,3 +340,83 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
         if not await agent_store.deactivate_memory(db, agent_id, memory_id):
             raise HTTPException(status_code=404, detail="Memory not found")
         return {"ok": True}
+
+
+# ---------------------------------------------------------------------------
+# Dry run (background job)
+# ---------------------------------------------------------------------------
+
+JOB_TIMEOUT = timedelta(minutes=10)
+_BACKGROUND: set = set()  # strong refs so running jobs aren't garbage-collected
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BACKGROUND.add(task)
+    task.add_done_callback(_BACKGROUND.discard)
+    return task
+
+
+def _local_today(agent: dict) -> date:
+    tz = ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or "UTC"
+    try:
+        return datetime.now(ZoneInfo(tz)).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+
+async def _run_dry_run_job(job_id: str, user_id: str, agent_id: str) -> None:
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        jobs = db[agent_store.JOBS]
+        await jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
+        try:
+            agent = await agent_store.get_agent(db, user_id, agent_id)
+            if agent is None:
+                raise RuntimeError("agent not found")
+            result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent))
+            await jobs.update_one({"_id": job_id}, {"$set": {
+                "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
+        except Exception as e:
+            logger.error("dry run job %s failed: %s", job_id, e, exc_info=True)
+            await jobs.update_one({"_id": job_id}, {"$set": {
+                "status": "failed", "error": str(e) or type(e).__name__, "finished_at": datetime.utcnow()}})
+
+
+@router.post("/{agent_id}/dry-run")
+async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        job_id = uuid.uuid4().hex
+        await db[agent_store.JOBS].insert_one({
+            "_id": job_id, "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
+            "status": "queued", "created_at": datetime.utcnow(),
+        })
+    _spawn(_run_dry_run_job(job_id, current_user, agent_id))
+    return {"job_id": job_id}
+
+
+@router.get("/{agent_id}/jobs/{job_id}")
+async def get_job(agent_id: str, job_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        jobs = db[agent_store.JOBS]
+        job = await jobs.find_one({"_id": job_id, "agent_id": agent_id, "user_id": current_user})
+        if job is None:
+            raise HTTPException(status_code=404, detail="Job not found")
+        created = job.get("created_at")
+        if (job.get("status") in ("queued", "running") and isinstance(created, datetime)
+                and datetime.utcnow() - created > JOB_TIMEOUT):
+            # The deployment may have killed the background task: report and persist it.
+            await jobs.update_one({"_id": job_id, "status": job["status"]},
+                                  {"$set": {"status": "failed", "error": "timed_out",
+                                            "finished_at": datetime.utcnow()}})
+            job = {**job, "status": "failed", "error": "timed_out"}
+        out = {"status": job.get("status")}
+        if job.get("status") == "done":
+            out["result"] = job.get("result")
+        elif job.get("status") == "failed":
+            out["error"] = job.get("error")
+        return out
