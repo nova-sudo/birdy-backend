@@ -175,9 +175,9 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
-        # "blocked" (agent guardrail) is a 200: the suggestion stays open and the
-        # card shows blocked_reason; the client reads `outcome`.
-        return {"ok": True, "outcome": res["outcome"],
+        # "blocked" (agent guardrail) is a 200 with ok=false: the suggestion stays
+        # open and the card shows blocked_reason.
+        return {"ok": res["ok"], "outcome": res["outcome"],
                 "succeeded": res.get("succeeded", []), "failed": res.get("failed", []),
                 "blocked_reason": res.get("blocked_reason")}
 
@@ -192,6 +192,8 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
         )
         if res["outcome"] == "not_found":
             raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "busy":
+            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
         return {"ok": True}
 
 

@@ -212,6 +212,7 @@ async def _post_action_error(db, birdy_user_id: str, payload: dict, res: dict) -
         "not_applied": "Nothing to undo — this suggestion isn't applied.",
         "failed": f"Couldn't complete that — {res.get('detail', 'error')}",
         "blocked": f"Held back by a guardrail — {res.get('detail', 'blocked')}",
+        "busy": "Applying right now — try again in a moment.",
     }.get(res.get("outcome"), "Couldn't complete that action.")
     from slack_sdk.web.async_client import AsyncWebClient
     try:

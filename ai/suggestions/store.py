@@ -50,6 +50,25 @@ STATUS_DISMISSED = "dismissed"
 # ad improved or was already paused). Distinct from a user "dismissed".
 STATUS_RESOLVED = "resolved"
 
+# An apply claim (applying_at) older than this is treated as abandoned (crashed
+# worker, timed-out request) and may be taken over, so a suggestion can't get
+# stuck "applying". Younger claims are live: no other decision may touch the doc.
+APPLY_CLAIM_STALE_AFTER = timedelta(minutes=5)
+
+
+def unclaimed_filter(now: datetime) -> dict:
+    """Mongo filter fragment: no live apply claim (none, or a stale one)."""
+    return {"$or": [
+        {"applying_at": None},  # null or missing
+        {"applying_at": {"$lt": now - APPLY_CLAIM_STALE_AFTER}},
+    ]}
+
+
+def has_live_claim(doc: dict | None, now: datetime | None = None) -> bool:
+    at = (doc or {}).get("applying_at")
+    return bool(at) and at >= (now or _now()) - APPLY_CLAIM_STALE_AFTER
+
+
 # Activity kinds → (actor, human label). actor keeps the frontend's existing
 # birdy/user split working; label is the richer, kind-specific caption.
 ACTOR_BIRDY = "birdy"
@@ -224,11 +243,6 @@ async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
     return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
 
 
-# A claim older than this is treated as abandoned (crashed worker, timed-out
-# request) and may be taken over, so a suggestion can't get stuck "applying".
-APPLY_CLAIM_STALE_AFTER = timedelta(minutes=5)
-
-
 async def claim_for_apply(db, user_id: str, suggestion_id: str) -> str | None:
     """
     Atomically reserve an OPEN suggestion for applying, BEFORE anything is
@@ -244,10 +258,7 @@ async def claim_for_apply(db, user_id: str, suggestion_id: str) -> str | None:
             "_id": suggestion_id,
             "user_id": user_id,
             "status": STATUS_OPEN,
-            "$or": [
-                {"applying_at": None},  # null or missing
-                {"applying_at": {"$lt": now - APPLY_CLAIM_STALE_AFTER}},
-            ],
+            **unclaimed_filter(now),
         },
         {"$set": {"applying_at": now, "applying_token": token}},
         projection={"_id": 1},
@@ -311,9 +322,11 @@ async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
 
 
 async def mark_dismissed(db, user_id: str, suggestion_id: str) -> bool:
+    """False if nothing changed — including when a live apply claim holds the doc."""
+    now = _now()
     res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id},
-        {"$set": {"status": STATUS_DISMISSED, "dismissed_at": _now(), "updated_at": _now()}},
+        {"_id": suggestion_id, "user_id": user_id, **unclaimed_filter(now)},
+        {"$set": {"status": STATUS_DISMISSED, "dismissed_at": now, "updated_at": now}},
     )
     return res.modified_count > 0
 
@@ -344,6 +357,8 @@ async def close_stale_open(db, user_id: str, agent: str, origin_window: str,
             "origin_window": origin_window,
             "status": STATUS_OPEN,
             "_id": {"$nin": list(keep_ids)},
+            # Never resolve one that is being applied right now.
+            **unclaimed_filter(_now()),
         },
         {"$set": {"status": STATUS_RESOLVED, "resolved_at": _now(), "updated_at": _now()}},
     )

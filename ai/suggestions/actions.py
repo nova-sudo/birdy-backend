@@ -10,7 +10,7 @@ These functions never raise for expected cases; they return an outcome dict so
 each caller can map it to its own surface (HTTP status vs. a Slack message):
 
     {"ok": bool, "outcome": "applied"|"partial"|"already"|"already_in_meta"
-                            |"blocked"|"dismissed"|"not_found"|"failed"|"noop",
+                            |"blocked"|"busy"|"dismissed"|"not_found"|"failed"|"noop",
      "doc": <suggestion doc or None>, "succeeded": [...], "failed": [...],
      "detail": <str, on failure>,
      "decided_by": <dict, on "already">, "blocked_reason": <{code, message}, on "blocked">}
@@ -19,6 +19,8 @@ each caller can map it to its own surface (HTTP status vs. a Slack message):
   already_in_meta  every target was already in the desired state (or deleted) in
                    Meta, so nothing was written; the suggestion is marked applied
   blocked          an agent guardrail stopped it; it stays open with blocked_reason
+  busy             (dismiss) an apply holds a live claim on it right now; nothing
+                   changed — try again in a moment
 
 Apply order (see apply_suggestion): claim → guardrails → re-read → write →
 mark_applied. The claim comes first so concurrent applies make one Meta write.
@@ -27,7 +29,8 @@ mark_applied. The claim comes first so concurrent applies make one Meta write.
 import logging
 from datetime import datetime
 
-from ai.agents.guardrails import check_guardrails
+from ai.agents.guardrails import agent_tz, check_guardrails, local_today
+from ai.agents.meta_state import record_status_write
 from ai.agents.store import get_agent
 from ai.suggestions import store
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
@@ -118,8 +121,31 @@ async def _targets_needing_write(mongo_client, user_id: str, action: dict) -> li
     return pending
 
 
+async def _record_meta_state(db, user_id: str, doc: dict, targets: list[dict],
+                             object_ids: list, desired: str, *, agent: dict | None = None) -> None:
+    """
+    Best-effort: mirror what we just wrote into meta_ad_state so the next
+    guardrail check (protect_last_live_ad) sees it before the next refresh.
+    """
+    try:
+        types = {str(t.get("object_id")): t.get("object_type", "ad") for t in targets}
+        ad_ids = [str(o) for o in object_ids if types.get(str(o), "ad") == "ad"]
+        if not ad_ids or not doc.get("client_group_id"):
+            return
+        if agent is None and doc.get("agent_id"):
+            agent = await get_agent(db, user_id, doc["agent_id"])
+        today = local_today(datetime.utcnow(), agent_tz(agent))
+        await record_status_write(db, doc["client_group_id"], ad_ids, desired, today=today)
+    except Exception as e:
+        logger.warning("apply: meta_ad_state write-back failed for %s: %s", doc.get("_id"), e)
+
+
 async def _already(db, user_id: str, suggestion_id: str, fallback: dict) -> dict:
     cur = await store.get_suggestion(db, user_id, suggestion_id) or fallback
+    if not store.has_live_claim(cur):
+        # Re-render a stale card (e.g. Apply on a resolved item) to the real state.
+        # Skipped mid-apply: the winner syncs when it finishes.
+        await _sync_slack(db, user_id, suggestion_id)
     return {"ok": True, "outcome": "already", "doc": cur, "decided_by": cur.get("decided_by")}
 
 
@@ -163,6 +189,7 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
     action = doc.get("action")
     atype = (action or {}).get("type")
     agent_id = doc.get("agent_id")
+    agent = None
 
     # 2. Guardrails — agent suggestions only.
     if agent_id and action:
@@ -188,6 +215,10 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
         else:
             res = await execute_action(mongo_client, user_id, {**action, "targets": pending})
             succeeded, failed = res["succeeded"], res["failed"]
+            if succeeded:
+                await _record_meta_state(db, user_id, doc, pending, succeeded,
+                                         "PAUSED" if atype == ACTION_PAUSE_ADS else "ACTIVE",
+                                         agent=agent)
             if not succeeded:
                 await store.release_claim(db, user_id, suggestion_id, token)
                 return {"ok": False, "outcome": "failed", "doc": doc,
@@ -263,7 +294,12 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
     if not doc:
         return {"ok": False, "outcome": "not_found", "doc": None}
 
-    await store.mark_dismissed(db, user_id, suggestion_id)
+    if not await store.mark_dismissed(db, user_id, suggestion_id):
+        fresh = await store.get_suggestion(db, user_id, suggestion_id)
+        if store.has_live_claim(fresh):
+            # An apply is mid-flight; dismissing now would orphan its Meta write.
+            return {"ok": False, "outcome": "busy", "doc": fresh,
+                    "detail": "Applying right now — try again in a moment"}
     await store.log_activity(
         db, user_id,
         actor=actor,
@@ -307,6 +343,9 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
     if targets:
         res = await execute_action(mongo_client, user_id, {"type": inverse, "targets": targets})
         succeeded, failed = res["succeeded"], res["failed"]
+        if succeeded:
+            await _record_meta_state(db, user_id, doc, targets, succeeded,
+                                     "PAUSED" if inverse == ACTION_PAUSE_ADS else "ACTIVE")
         if not succeeded:
             return {"ok": False, "outcome": "failed", "doc": doc,
                     "detail": failed[0]["error"] if failed else "Undo failed",

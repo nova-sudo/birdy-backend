@@ -380,3 +380,83 @@ async def test_get_object_status_other_error_raises(graph):
     graph["resp"] = (500, {"error": {"code": 2, "message": "Service temporarily unavailable"}})
     with pytest.raises(mss.MetaStatusError):
         await mss.get_object_status("u1", "a1", "ad", None)
+
+
+# --- fix round 1: claims respected by dismiss / auto-resolve (I1) --------------
+
+async def test_dismiss_during_inflight_claim_is_busy(mock_db, meta):
+    await _seed_suggestion(mock_db, agent=False)
+    token = await store.claim_for_apply(mock_db, "u1", "sug_1")
+    assert token
+
+    res = await actions.dismiss_suggestion(mock_db, None, "u1", "sug_1", source="slack")
+    assert res["outcome"] == "busy" and res["ok"] is False, res
+    doc = await store.get_suggestion(mock_db, "u1", "sug_1")
+    assert doc["status"] == "open"
+    assert doc["applying_token"] == token  # claim intact
+    assert await mock_db[store.ACTIVITY].count_documents({"ref_id": "sug_1"}) == 0
+
+
+async def test_dismiss_with_stale_claim_goes_through(mock_db, meta):
+    await _seed_suggestion(mock_db, agent=False)
+    await mock_db[store.SUGGESTIONS].update_one(
+        {"_id": "sug_1"}, {"$set": {"applying_at": datetime.utcnow() - timedelta(minutes=6)}})
+    res = await actions.dismiss_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "dismissed", res
+
+
+async def test_close_stale_open_skips_claimed_docs(mock_db, meta):
+    for sid in ("sug_a", "sug_b"):
+        await _seed_suggestion(mock_db, agent=False, sid=sid)
+        await mock_db[store.SUGGESTIONS].update_one({"_id": sid}, {"$set": {"agent": "purger",
+                                                                              "origin_window": "weekly"}})
+    assert await store.claim_for_apply(mock_db, "u1", "sug_a")
+    closed = await store.close_stale_open(mock_db, "u1", "purger", "weekly", keep_ids=set())
+    assert closed == 1
+    assert (await store.get_suggestion(mock_db, "u1", "sug_a"))["status"] == "open"
+    assert (await store.get_suggestion(mock_db, "u1", "sug_b"))["status"] == "resolved"
+
+
+# --- fix round 1: meta_ad_state written back after a write (I2) ----------------
+
+async def test_sequential_pauses_cannot_empty_an_adset(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)  # a1, a2: the only ACTIVE ads in s1
+    await _seed_suggestion(mock_db, sid="sug_1",
+                           targets=[{"object_id": "a1", "object_type": "ad", "name": "a1"}])
+    await _seed_suggestion(mock_db, sid="sug_2",
+                           targets=[{"object_id": "a2", "object_type": "ad", "name": "a2"}])
+
+    r1 = await actions.apply_suggestion(mock_db, None, "u1", "sug_1", actor=store.ACTOR_BIRDY)
+    assert r1["outcome"] == "applied", r1
+    st = await mock_db[AD_STATE].find_one({"client_group_id": GID, "ad_id": "a1"})
+    assert st["effective_status"] == "PAUSED" and st["status"] == "PAUSED"
+    assert st["paused_at"]  # local today, ISO date
+
+    r2 = await actions.apply_suggestion(mock_db, None, "u1", "sug_2", actor=store.ACTOR_BIRDY)
+    assert r2["outcome"] == "blocked", r2
+    assert r2["blocked_reason"]["code"] == "last_live_ad"
+    assert meta["writes"] == [("a1", "PAUSED")]
+
+
+async def test_undo_writes_back_active_and_clears_paused_at(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    res = await actions.undo_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "undone", res
+    st = await mock_db[AD_STATE].find_one({"client_group_id": GID, "ad_id": "a1"})
+    assert st["effective_status"] == "ACTIVE" and st["status"] == "ACTIVE"
+    assert st["paused_at"] is None
+
+
+async def test_writeback_keeps_existing_paused_at(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await mock_db[AD_STATE].update_one({"ad_id": "a1"}, {"$set": {"paused_at": "2026-01-01"}})
+    await _seed_suggestion(mock_db)
+    meta["status"]["a1"] = {"status": "ACTIVE", "effective_status": "ADSET_PAUSED"}
+    await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    st = await mock_db[AD_STATE].find_one({"client_group_id": GID, "ad_id": "a1"})
+    assert st["paused_at"] == "2026-01-01"

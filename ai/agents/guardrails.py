@@ -15,7 +15,7 @@ Checked in order, first failure wins:
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime, time, timezone
+from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS
@@ -51,13 +51,26 @@ def _naive_utc(dt: datetime) -> datetime:
     return dt
 
 
-def local_day_start_utc(now_utc: datetime, tz_name: str | None) -> datetime:
-    """Midnight today in `tz_name`, as naive UTC. DST-safe via zoneinfo."""
+def _zone(tz_name: str | None) -> ZoneInfo:
     try:
-        tz = ZoneInfo(tz_name or DEFAULT_TZ)
+        return ZoneInfo(tz_name or DEFAULT_TZ)
     except (ZoneInfoNotFoundError, ValueError):
         logger.warning("guardrails: unknown tz %r, using %s", tz_name, DEFAULT_TZ)
-        tz = ZoneInfo(DEFAULT_TZ)
+        return ZoneInfo(DEFAULT_TZ)
+
+
+def agent_tz(agent: dict | None) -> str:
+    return (((agent or {}).get("scope") or {}).get("schedule") or {}).get("tz") or DEFAULT_TZ
+
+
+def local_today(now_utc: datetime, tz_name: str | None) -> date:
+    """Today's date in `tz_name`."""
+    return _naive_utc(now_utc).replace(tzinfo=timezone.utc).astimezone(_zone(tz_name)).date()
+
+
+def local_day_start_utc(now_utc: datetime, tz_name: str | None) -> datetime:
+    """Midnight today in `tz_name`, as naive UTC. DST-safe via zoneinfo."""
+    tz = _zone(tz_name)
     local_now = _naive_utc(now_utc).replace(tzinfo=timezone.utc).astimezone(tz)
     midnight = datetime.combine(local_now.date(), time(0, 0), tzinfo=tz)
     return midnight.astimezone(timezone.utc).replace(tzinfo=None)
@@ -134,8 +147,7 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
     cap = caps.get(gid, guardrails.get("max_pauses_per_client_day"))
     if cap is not None:
         now = _naive_utc(now_utc)
-        tz_name = ((agent.get("scope") or {}).get("schedule") or {}).get("tz")
-        start = local_day_start_utc(now, tz_name)
+        start = local_day_start_utc(now, agent_tz(agent))
         used = await db[ACTIVITY].count_documents({
             "client_group_id": gid,
             "kind": KIND_ACTION_APPLIED,

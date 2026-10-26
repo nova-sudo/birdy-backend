@@ -146,3 +146,27 @@ async def backfill_paused_at(db, client_group_id: str) -> int:
                 {"_id": ad["_id"]}, {"$set": {"paused_at": date.fromordinal(paused).isoformat()}})
             set_count += 1
     return set_count
+
+
+async def record_status_write(db, client_group_id: str, ad_ids: list[str], status: str,
+                              *, today: date) -> None:
+    """
+    Mirror a status Birdy just wrote to Meta into meta_ad_state, so guardrails
+    (protect_last_live_ad) see it before the next refresh. Only updates ads
+    already cached; never creates rows.
+      PAUSED  status/effective_status PAUSED; paused_at = today unless already set
+      ACTIVE  status/effective_status ACTIVE; paused_at cleared
+    """
+    if not client_group_id or not ad_ids:
+        return
+    key = {"client_group_id": client_group_id, "ad_id": {"$in": [str(a) for a in ad_ids]}}
+    now = datetime.utcnow()
+    if status == "PAUSED":
+        await db[AD_STATE].update_many(
+            key, {"$set": {"status": "PAUSED", "effective_status": "PAUSED", "updated_at": now}})
+        await db[AD_STATE].update_many(
+            {**key, "paused_at": None}, {"$set": {"paused_at": today.isoformat()}})
+    elif status == "ACTIVE":
+        await db[AD_STATE].update_many(
+            key, {"$set": {"status": "ACTIVE", "effective_status": "ACTIVE",
+                           "paused_at": None, "updated_at": now}})
