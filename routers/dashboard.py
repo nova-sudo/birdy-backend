@@ -175,8 +175,11 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
+        # "blocked" (agent guardrail) is a 200: the suggestion stays open and the
+        # card shows blocked_reason; the client reads `outcome`.
         return {"ok": True, "outcome": res["outcome"],
-                "succeeded": res.get("succeeded", []), "failed": res.get("failed", [])}
+                "succeeded": res.get("succeeded", []), "failed": res.get("failed", []),
+                "blocked_reason": res.get("blocked_reason")}
 
 
 @router.delete("/suggestions/{suggestion_id}")

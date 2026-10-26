@@ -23,6 +23,8 @@ import logging
 import uuid
 from datetime import datetime, timedelta
 
+from pymongo import ReturnDocument
+
 from core.database import DB_NAME
 from ai.suggestions.contracts import Finding
 
@@ -38,6 +40,8 @@ DISMISS_COOLDOWN_DAYS = 14
 
 # Activity feed retention.
 ACTIVITY_TTL_DAYS = 60
+# Agent activity is kept ~13 months (outcomes, practice, the learning brake).
+AGENT_ACTIVITY_TTL_DAYS = 395
 
 STATUS_OPEN = "open"
 STATUS_APPLIED = "applied"
@@ -220,12 +224,59 @@ async def get_suggestion(db, user_id: str, suggestion_id: str) -> dict | None:
     return await db[SUGGESTIONS].find_one({"_id": suggestion_id, "user_id": user_id})
 
 
+# A claim older than this is treated as abandoned (crashed worker, timed-out
+# request) and may be taken over, so a suggestion can't get stuck "applying".
+APPLY_CLAIM_STALE_AFTER = timedelta(minutes=5)
+
+
+async def claim_for_apply(db, user_id: str, suggestion_id: str) -> str | None:
+    """
+    Atomically reserve an OPEN suggestion for applying, BEFORE anything is
+    written to Meta. Returns a claim token, or None if the suggestion isn't
+    open or another request holds a fresh claim. Exactly one of N concurrent
+    callers wins, which is what keeps double-clicks / dashboard+Slack races to
+    a single Meta write.
+    """
+    now = _now()
+    token = uuid.uuid4().hex
+    won = await db[SUGGESTIONS].find_one_and_update(
+        {
+            "_id": suggestion_id,
+            "user_id": user_id,
+            "status": STATUS_OPEN,
+            "$or": [
+                {"applying_at": None},  # null or missing
+                {"applying_at": {"$lt": now - APPLY_CLAIM_STALE_AFTER}},
+            ],
+        },
+        {"$set": {"applying_at": now, "applying_token": token}},
+        projection={"_id": 1},
+    )
+    return token if won else None
+
+
+async def release_claim(db, user_id: str, suggestion_id: str, token: str, *,
+                        blocked_reason: dict | None = None) -> None:
+    """Drop our claim (only ours) so the suggestion stays open and retryable."""
+    update: dict = {"$unset": {"applying_at": "", "applying_token": ""}}
+    if blocked_reason is not None:
+        update["$set"] = {"blocked_reason": blocked_reason, "updated_at": _now()}
+    await db[SUGGESTIONS].update_one(
+        {"_id": suggestion_id, "user_id": user_id, "applying_token": token}, update
+    )
+
+
 async def mark_applied(db, user_id: str, suggestion_id: str, *,
                        applied_targets: list | None = None,
-                       applied_action_type: str | None = None) -> bool:
+                       applied_action_type: str | None = None,
+                       decided_by: dict | None = None,
+                       already_in_meta: bool = False) -> dict | None:
     """
     Mark applied, recording exactly which objects were changed so the action can
     be UNDONE later (undo re-applies the inverse to these targets only).
+
+    The open → applied transition is atomic: returns the updated doc, or None if
+    the suggestion was no longer open (another request already decided it).
     """
     now = _now()
     update = {"status": STATUS_APPLIED, "applied_at": now, "updated_at": now}
@@ -233,10 +284,16 @@ async def mark_applied(db, user_id: str, suggestion_id: str, *,
         update["applied_targets"] = applied_targets
     if applied_action_type:
         update["applied_action_type"] = applied_action_type
-    res = await db[SUGGESTIONS].update_one(
-        {"_id": suggestion_id, "user_id": user_id}, {"$set": update}
+    if decided_by is not None:
+        update["decided_by"] = decided_by
+    if already_in_meta:
+        update["already_in_meta"] = True
+    return await db[SUGGESTIONS].find_one_and_update(
+        {"_id": suggestion_id, "user_id": user_id, "status": STATUS_OPEN},
+        {"$set": update,
+         "$unset": {"applying_at": "", "applying_token": "", "blocked_reason": ""}},
+        return_document=ReturnDocument.AFTER,
     )
-    return res.modified_count > 0
 
 
 async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
@@ -246,7 +303,8 @@ async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
         {"_id": suggestion_id, "user_id": user_id},
         {
             "$set": {"status": STATUS_OPEN, "updated_at": now},
-            "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": ""},
+            "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": "",
+                       "decided_by": "", "already_in_meta": ""},
         },
     )
     return res.modified_count > 0
@@ -309,8 +367,19 @@ async def log_activity(
     window: str | None = None,
     label: str | None = None,
     source: str | None = None,
+    agent_id: str | None = None,
+    rule_id: str | None = None,
+    reason_code: str | None = None,
+    note: str | None = None,
+    applied_action_type: str | None = None,
 ) -> dict:
-    """Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS)."""
+    """
+    Append one entry to the activity feed (TTL-expired after ACTIVITY_TTL_DAYS).
+
+    Agent entries (agent_id set) are kept AGENT_ACTIVITY_TTL_DAYS instead: the
+    TTL index fires on each doc's own `expires_at`, so a longer retention is
+    just a later date — no second index needed.
+    """
     now = _now()
     doc = {
         "_id": "act_" + uuid.uuid4().hex[:16],
@@ -328,6 +397,11 @@ async def log_activity(
         "created_at": now,
         "expires_at": now + timedelta(days=ACTIVITY_TTL_DAYS),
     }
+    optional = {"agent_id": agent_id, "rule_id": rule_id, "reason_code": reason_code,
+                "note": note, "applied_action_type": applied_action_type}
+    doc.update({k: v for k, v in optional.items() if v is not None})
+    if agent_id:
+        doc["expires_at"] = now + timedelta(days=AGENT_ACTIVITY_TTL_DAYS)
     doc["id"] = doc["_id"]
     await db[ACTIVITY].insert_one(doc)
     return doc

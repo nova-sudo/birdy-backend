@@ -9,17 +9,29 @@ whether it's clicked in the app or in Slack.
 These functions never raise for expected cases; they return an outcome dict so
 each caller can map it to its own surface (HTTP status vs. a Slack message):
 
-    {"ok": bool, "outcome": "applied"|"partial"|"already"|"dismissed"
-                            |"not_found"|"failed"|"noop",
+    {"ok": bool, "outcome": "applied"|"partial"|"already"|"already_in_meta"
+                            |"blocked"|"dismissed"|"not_found"|"failed"|"noop",
      "doc": <suggestion doc or None>, "succeeded": [...], "failed": [...],
-     "detail": <str, on failure>}
+     "detail": <str, on failure>,
+     "decided_by": <dict, on "already">, "blocked_reason": <{code, message}, on "blocked">}
+
+  already          someone else already decided it (or is applying it right now)
+  already_in_meta  every target was already in the desired state (or deleted) in
+                   Meta, so nothing was written; the suggestion is marked applied
+  blocked          an agent guardrail stopped it; it stays open with blocked_reason
+
+Apply order (see apply_suggestion): claim → guardrails → re-read → write →
+mark_applied. The claim comes first so concurrent applies make one Meta write.
 """
 
 import logging
+from datetime import datetime
 
+from ai.agents.guardrails import check_guardrails
+from ai.agents.store import get_agent
 from ai.suggestions import store
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
-from services.meta_status_service import MetaStatusError, set_object_status
+from services.meta_status_service import MetaStatusError, get_object_status, set_object_status
 
 logger = logging.getLogger(__name__)
 
@@ -60,26 +72,120 @@ async def _sync_slack(db, user_id: str, suggestion_id: str, by: str | None = Non
         logger.warning("actions: slack sync failed for %s: %s", suggestion_id, e)
 
 
+def _is_desired(atype: str, status: str | None) -> bool:
+    """
+    Is the object already where this action would put it? None = deleted in Meta,
+    which counts as done. Pause: anything not ACTIVE is already not delivering.
+    Enable: only ACTIVE counts — CAMPAIGN_PAUSED / ADSET_PAUSED etc. are not.
+    """
+    if status is None:
+        return True
+    if atype == ACTION_PAUSE_ADS:
+        return status != "ACTIVE"
+    return status == "ACTIVE"
+
+
+async def _targets_needing_write(mongo_client, user_id: str, action: dict) -> list[dict]:
+    """
+    Re-read each target in Meta right before writing and keep only those not
+    already in the desired state. A failed read keeps the target (fail-open to
+    the write, which is idempotent and surfaces the real error if there is one).
+    """
+    atype = action.get("type")
+    pending = []
+    for t in action.get("targets") or []:
+        try:
+            status = await get_object_status(user_id, t.get("object_id"),
+                                             t.get("object_type", "ad"), mongo_client)
+        except Exception as e:
+            logger.warning("apply: re-read of %s failed, writing anyway: %s", t.get("object_id"), e)
+            pending.append(t)
+            continue
+        if not _is_desired(atype, status):
+            pending.append(t)
+    return pending
+
+
+async def _already(db, user_id: str, suggestion_id: str, fallback: dict) -> dict:
+    cur = await store.get_suggestion(db, user_id, suggestion_id) or fallback
+    return {"ok": True, "outcome": "already", "doc": cur, "decided_by": cur.get("decided_by")}
+
+
 async def apply_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
                            actor: str = store.ACTOR_USER, source: str | None = None,
                            by: str | None = None) -> dict:
     """
     Approve + execute a suggestion. actor=ACTOR_USER means a human approved it
-    ("Approved by you"); actor=ACTOR_BIRDY would be an autonomous run.
+    ("Approved by you"); actor=ACTOR_BIRDY is an autonomous agent run.
+
+    Order matters — this writes to live ad accounts:
+      1. claim      atomically reserve the open suggestion (applying_at), so of
+                    N concurrent applies exactly one reaches Meta; losers get
+                    "already". A claim older than 5 minutes may be taken over.
+      2. guardrails agent suggestions only; blocked → release, stay open.
+      3. re-read    each target's live status; skip what's already done.
+      4. write      set_object_status for the remaining targets.
+      5. mark       atomic open → applied (clears the claim).
+    Blocked, failed or raising → the claim is released so it can be retried.
     """
     doc = await store.get_suggestion(db, user_id, suggestion_id)
     if not doc:
         return {"ok": False, "outcome": "not_found", "doc": None}
     if doc.get("status") == store.STATUS_APPLIED:
-        return {"ok": True, "outcome": "already", "doc": doc}
+        return {"ok": True, "outcome": "already", "doc": doc, "decided_by": doc.get("decided_by")}
 
+    token = await store.claim_for_apply(db, user_id, suggestion_id)
+    if not token:
+        return await _already(db, user_id, suggestion_id, doc)
+
+    try:
+        return await _apply_claimed(db, mongo_client, user_id, suggestion_id, doc, token,
+                                    actor=actor, source=source, by=by)
+    except BaseException:
+        await store.release_claim(db, user_id, suggestion_id, token)
+        raise
+
+
+async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc: dict, token: str,
+                         *, actor: str, source: str | None, by: str | None) -> dict:
     action = doc.get("action")
+    atype = (action or {}).get("type")
+    agent_id = doc.get("agent_id")
+
+    # 2. Guardrails — agent suggestions only.
+    if agent_id and action:
+        agent = await get_agent(db, user_id, agent_id)
+        if agent is None:
+            reason = {"code": "no_permission", "message": "The agent behind this suggestion no longer exists."}
+        else:
+            g = await check_guardrails(db, agent, doc, now_utc=datetime.utcnow())
+            reason = None if g.ok else {"code": g.reason, "message": g.message}
+        if reason:
+            await store.release_claim(db, user_id, suggestion_id, token, blocked_reason=reason)
+            await _sync_slack(db, user_id, suggestion_id, by=by)
+            return {"ok": False, "outcome": "blocked", "doc": doc, "blocked_reason": reason,
+                    "detail": reason["message"]}
+
+    # 3. Re-read, then 4. write only what still needs it.
     succeeded, failed = [], []
-    if action:
+    already_in_meta = False
+    if action and action.get("targets") and atype in (ACTION_PAUSE_ADS, ACTION_ENABLE_ADS):
+        pending = await _targets_needing_write(mongo_client, user_id, action)
+        if not pending:
+            already_in_meta = True
+        else:
+            res = await execute_action(mongo_client, user_id, {**action, "targets": pending})
+            succeeded, failed = res["succeeded"], res["failed"]
+            if not succeeded:
+                await store.release_claim(db, user_id, suggestion_id, token)
+                return {"ok": False, "outcome": "failed", "doc": doc,
+                        "detail": failed[0]["error"] if failed else "Action failed",
+                        "succeeded": succeeded, "failed": failed}
+    elif action:
         res = await execute_action(mongo_client, user_id, action)
         succeeded, failed = res["succeeded"], res["failed"]
-        # Every target failed → don't mark applied; report the failure.
         if action.get("targets") and not succeeded:
+            await store.release_claim(db, user_id, suggestion_id, token)
             return {"ok": False, "outcome": "failed", "doc": doc,
                     "detail": failed[0]["error"] if failed else "Action failed",
                     "succeeded": succeeded, "failed": failed}
@@ -94,11 +200,26 @@ async def apply_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *
         }
         for oid in succeeded
     ]
-    await store.mark_applied(
+    decided_by = {"actor": actor, "source": source, "by": by, "at": datetime.utcnow()}
+
+    # 5. Atomic open → applied.
+    marked = await store.mark_applied(
         db, user_id, suggestion_id,
         applied_targets=applied_targets,
-        applied_action_type=(action or {}).get("type"),
+        applied_action_type=atype,
+        decided_by=decided_by,
+        already_in_meta=already_in_meta,
     )
+    if marked is None:
+        # Moved out of "open" while we held the claim (e.g. dismissed or
+        # auto-resolved mid-apply, or our claim went stale and was taken over).
+        if succeeded:
+            logger.warning("apply: %s wrote %s to Meta but the suggestion was no longer open",
+                           suggestion_id, succeeded)
+        await store.release_claim(db, user_id, suggestion_id, token)
+        return await _already(db, user_id, suggestion_id, doc)
+
+    label = "Approved by you" if actor == store.ACTOR_USER else "Auto-run by Birdy"
     await store.log_activity(
         db, user_id,
         actor=actor,
@@ -108,11 +229,17 @@ async def apply_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *
         client_group_id=doc.get("client_group_id"),
         ref_id=suggestion_id,
         window=doc.get("window"),
-        label="Approved by you" if actor == store.ACTOR_USER else "Auto-run by Birdy",
+        label=label,
         source=source,
+        agent_id=agent_id,
+        rule_id=doc.get("rule_id"),
+        # Only a real write counts towards the daily pause cap.
+        applied_action_type=atype if succeeded else None,
+        note="Already done in Meta — nothing changed" if already_in_meta else None,
     )
     await _sync_slack(db, user_id, suggestion_id, by=by)
-    return {"ok": True, "outcome": "partial" if failed else "applied", "doc": doc,
+    outcome = "already_in_meta" if already_in_meta else ("partial" if failed else "applied")
+    return {"ok": True, "outcome": outcome, "doc": marked,
             "succeeded": succeeded, "failed": failed}
 
 
