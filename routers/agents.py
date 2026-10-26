@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from ai.agents import confidence as agent_confidence
 from ai.agents import replay
 from ai.agents import store as agent_store
+from ai.agents import validation
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
     DEFAULT_PARAMS,
@@ -88,29 +89,15 @@ async def _agent_or_404(db, user_id: str, agent_id: str) -> dict:
 
 
 async def _require_owned_groups(db, user_id: str, group_ids) -> None:
-    ids = list(group_ids)
-    if not ids:
-        return
-    owned = await db["client_groups"].find(
-        {"user_id": user_id, "id": {"$in": ids}}, {"id": 1, "_id": 0}
-    ).to_list(length=None)
-    missing = set(ids) - {g["id"] for g in owned}
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Unknown client group(s): {sorted(missing)}")
+    err = await validation.owned_groups_error(db, user_id, group_ids)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
 
 
 def _validate_params(kind: str, params: dict) -> None:
-    allowed = DEFAULT_PARAMS[kind]
-    if not isinstance(params, dict):
-        raise HTTPException(status_code=400, detail="params must be an object")
-    unknown = set(params) - set(allowed)
-    if unknown:
-        raise HTTPException(status_code=400, detail=f"Unknown param(s) for {kind}: {sorted(unknown)}")
-    for k, v in params.items():
-        if isinstance(v, bool) or not isinstance(v, (int, float)):
-            raise HTTPException(status_code=400, detail=f"Param '{k}' must be a number")
-        if v < 0:
-            raise HTTPException(status_code=400, detail=f"Param '{k}' must not be negative")
+    err = validation.params_error(kind, params)
+    if err:
+        raise HTTPException(status_code=400, detail=err)
 
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
