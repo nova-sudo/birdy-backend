@@ -353,7 +353,7 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
     instant to the earliest of: its undo, a later agent revive of the same object, the
     end of the month, now. Fractional days count."""
     if not pauses:
-        return 0.0, {}
+        return 0.0, {}, {}
     user_id, agent_id = agent["user_id"], agent["_id"]
     cap = min(month_end, now)
 
@@ -372,7 +372,7 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
 
     currencies = await _currencies(db, user_id, [p.get("client_group_id") for p in pauses])
     cache: dict = {}
-    total, by_currency = 0.0, {}
+    total, by_currency, daily = 0.0, {}, {}
     for p in pauses:
         gid = p.get("client_group_id")
         targets = _targets(sugs.get(p.get("ref_id")))
@@ -401,11 +401,43 @@ async def _wasted_spend(db, agent: dict, pauses: list[dict], sugs: dict, *, mont
             if key not in cache:
                 cache[key] = await load_ad_days(db, user_id, gid, b_start, b_end)
             spend, _ = _sum(cache[key], b_start, b_end, [t])
-            value = spend / WINDOW_DAYS * days_paused
-            total += value
             cur = currencies.get(gid) or "unknown"
-            by_currency[cur] = by_currency.get(cur, 0.0) + value
-    return total, by_currency
+            per_day = spend / WINDOW_DAYS
+            for day, secs in _split_local_days(start, end, tz):
+                value = per_day * secs / 86400
+                total += value
+                by_currency[cur] = by_currency.get(cur, 0.0) + value
+                bucket = daily.setdefault(day, {})
+                bucket[cur] = bucket.get(cur, 0.0) + value
+    return total, by_currency, daily
+
+
+def _midnight_utc(d: date, tz) -> datetime:
+    return datetime.combine(d, time(0, 0), tzinfo=tz).astimezone(timezone.utc).replace(tzinfo=None)
+
+
+def _split_local_days(start: datetime, end: datetime, tz) -> list[tuple[date, float]]:
+    """[start, end) (naive UTC) cut at local midnights -> [(local date, seconds)]."""
+    out = []
+    cur = start
+    while cur < end:
+        day = _local_date(cur, tz)
+        boundary = min(_midnight_utc(day + timedelta(days=1), tz), end)
+        out.append((day, (boundary - cur).total_seconds()))
+        cur = boundary
+    return out
+
+
+def _cents_series(values: list[float]) -> list[float]:
+    """Round each value to cents so the rounded values add up to the rounded total
+    (cumulative rounding): sum(result) == round(sum(values), 2)."""
+    out, cum, prev = [], 0.0, 0.0
+    for v in values:
+        cum += v
+        r = round(cum, 2)
+        out.append(round(r - prev, 2))
+        prev = r
+    return out
 
 
 async def _reversed_applies(db, agent: dict, applies: list[dict]) -> set:
@@ -463,10 +495,16 @@ async def _month_figures(db, agent: dict, month: str, now: datetime, *, with_spe
            "approved": approved, "denied": denied, "undone_user": undone_user}
     if with_spend:
         pauses = [r for r in actions if r.get("applied_action_type") == ACTION_PAUSE_ADS]
-        total, by_cur = await _wasted_spend(db, agent, pauses, sugs, month_end=end, now=now,
-                                            tz=_zone(tz_name))
+        tz = _zone(tz_name)
+        total, by_cur, daily = await _wasted_spend(db, agent, pauses, sugs, month_end=end, now=now, tz=tz)
         out["wasted_spend_stopped"] = round(total, 2)
         out["wasted_spend_by_currency"] = {k: round(v, 2) for k, v in by_cur.items()}
+        out["series"] = _series(first, nxt, now, tz, actions, auto, daily, list(by_cur))
+        # Totals are the sums of the daily cents, so the chart and the tab always agree.
+        out["wasted_spend_stopped"] = round(sum(e["wasted_spend_stopped"] for e in out["series"]), 2)
+        if len(by_cur) > 1:
+            out["wasted_spend_by_currency"] = {
+                c: round(sum(e["wasted_spend_by_currency"][c] for e in out["series"]), 2) for c in by_cur}
         # Majority currency: of the paused clients, else of this month's rows, else of scope.
         gids = ([p.get("client_group_id") for p in pauses]
                 or [r.get("client_group_id") for r in rows]
@@ -474,6 +512,26 @@ async def _month_figures(db, agent: dict, month: str, now: datetime, *, with_spe
         cur_by_gid = await _currencies(db, agent["user_id"], gids)
         out["currency"] = _majority(cur_by_gid.get(g) for g in gids)
     return out
+
+
+def _series(first: date, nxt: date, now: datetime, tz, actions: list[dict], auto: list[dict],
+            daily: dict, currencies: list[str]) -> list[dict]:
+    """One zero-filled entry per local day of the month, up to today for the current month."""
+    last = min(nxt - timedelta(days=1), _local_date(now, tz))
+    days = [first + timedelta(days=i) for i in range((last - first).days + 1)]
+    n_actions = Counter(_local_date(r["created_at"], tz) for r in actions)
+    n_auto = Counter(_local_date(r["created_at"], tz) for r in auto)
+    totals = _cents_series([sum((daily.get(d) or {}).values()) for d in days])
+    split = len(currencies) > 1
+    per_cur = {c: _cents_series([(daily.get(d) or {}).get(c, 0.0) for d in days]) for c in currencies} if split else {}
+    series = []
+    for i, d in enumerate(days):
+        entry = {"date": d.isoformat(), "actions": n_actions.get(d, 0), "auto": n_auto.get(d, 0),
+                 "wasted_spend_stopped": totals[i]}
+        if split:
+            entry["wasted_spend_by_currency"] = {c: per_cur[c][i] for c in currencies}
+        series.append(entry)
+    return series
 
 
 def current_month(agent: dict, now: datetime | None = None) -> str:
@@ -501,4 +559,5 @@ async def compute_impact(db, agent: dict, *, month: str, now: datetime | None = 
                             "undone_user": cur["undone_user"]},
         "vs_prev_month": {"month": _prev_month(month), "actions": prev["actions"],
                           "auto": prev["auto"], "approval_rate": prev["approval_rate"]},
+        "series": cur["series"],
     }

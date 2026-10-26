@@ -198,9 +198,25 @@ async def test_impact_wasted_spend_math(mock_db, api):
     assert imp["vs_prev_month"]["actions"] == 1
     assert imp["currency"] == "GBP" and imp["month"] == "2026-10"
 
+    # Daily series: every day of October, zero-filled, adding up to the month totals.
+    series = imp["series"]
+    assert [e["date"] for e in series][:2] == ["2026-10-01", "2026-10-02"] and len(series) == 31
+    assert sum(e["actions"] for e in series) == imp["actions"]
+    assert sum(e["auto"] for e in series) == imp["auto"]
+    assert round(sum(e["wasted_spend_stopped"] for e in series), 2) == imp["wasted_spend_stopped"]
+    by_date = {e["date"]: e for e in series}
+    assert by_date["2026-10-10"]["actions"] == 1 and by_date["2026-10-10"]["auto"] == 1
+    assert by_date["2026-10-09"]["wasted_spend_stopped"] == 0
+    assert by_date["2026-10-11"]["wasted_spend_stopped"] == pytest.approx(100.0)
+    assert by_date["2026-10-10"]["wasted_spend_stopped"] == pytest.approx(100 * 16 / 24, abs=0.01)  # 08:00 BST on
+    assert by_date["2026-10-27"]["wasted_spend_stopped"] == pytest.approx(100 + 50 * 9 / 24, abs=0.01)  # undo 09:00 UTC
+    assert "wasted_spend_by_currency" not in series[0]
+
     # Mid-month, days paused stop at today.
     mid = await outcomes.compute_impact(mock_db, agent, month="2026-10", now=datetime(2026, 10, 20, 12, 0))
     assert mid["wasted_spend_stopped"] == pytest.approx(100 * (10 + 5 / 24), abs=0.01)  # s2 not yet
+    assert len(mid["series"]) == 20 and mid["series"][-1]["date"] == "2026-10-20"
+    assert round(sum(e["wasted_spend_stopped"] for e in mid["series"]), 2) == mid["wasted_spend_stopped"]
 
     r = api.get(f"/api/agents/{aid}/impact", params={"month": "2026-10"})
     assert r.status_code == 200, r.text
@@ -318,3 +334,24 @@ def test_outcomes_cron_wired(monkeypatch):
     assert client.get("/api/cron/agents-outcomes").status_code == 401
     r = client.get("/api/cron/agents-outcomes", headers={"Authorization": "Bearer s3cret"})
     assert r.status_code == 200 and r.json()["result"]["measured"] == 0 and calls
+
+
+async def test_impact_series_per_currency(mock_db):
+    await _group(mock_db, "g1", currency="GBP")
+    await _group(mock_db, "g2", currency="USD")
+    agent = await create_agent(mock_db, U)
+    aid = agent["_id"]
+    await _insights(mock_db, "a1", date(2026, 10, 3), 7, 33.33, 1, gid="g1")
+    await _insights(mock_db, "b1", date(2026, 10, 3), 7, 77.77, 1, gid="g2")
+    for sid, gid, ad in (("p1", "g1", "a1"), ("p2", "g2", "b1")):
+        await _suggestion(mock_db, sid, agent_id=aid, gid=gid, atype="pause_ads", targets=[AD(ad)])
+        await _row(mock_db, sid, agent_id=aid, gid=gid, kind=sstore.KIND_ACTION_APPLIED, actor="birdy",
+                   at=datetime(2026, 10, 10, 13, 17), atype="pause_ads")
+
+    imp = await outcomes.compute_impact(mock_db, agent, month="2026-10", now=datetime(2026, 10, 26, 18, 41))
+    series = imp["series"]
+    assert len(series) == 26
+    assert round(sum(e["wasted_spend_stopped"] for e in series), 2) == imp["wasted_spend_stopped"]
+    for c in ("GBP", "USD"):
+        assert round(sum(e["wasted_spend_by_currency"][c] for e in series), 2) == imp["wasted_spend_by_currency"][c]
+    assert imp["wasted_spend_by_currency"]["USD"] > imp["wasted_spend_by_currency"]["GBP"] > 0
