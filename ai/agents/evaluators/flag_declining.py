@@ -41,40 +41,52 @@ def evaluate(rule: dict, client: ClientCtx, ad_days: dict[str, list[AdDay]],
             else:
                 a[2] += r.spend
                 a[3] += r.leads
-            if r.campaign_name and not a[4]:
+            if r.campaign_name:
                 a[4] = r.campaign_name
 
     out: list[Finding] = []
     for campaign_id, (spend_now, leads_now, spend_prev, leads_prev, cname) in agg.items():
-        # CPL is undefined without leads in either window.
-        if leads_now <= 0 or leads_prev <= 0 or spend_prev <= 0:
+        # No leads in the previous window: CPL is undefined, nothing to compare.
+        if leads_prev <= 0 or spend_prev <= 0:
             continue
         if leads_now + leads_prev < p["min_leads"]:
             continue
-        cpl_now = spend_now / leads_now
         cpl_prev = spend_prev / leads_prev
-        if cpl_now < cpl_prev * (1 + p["pct_rise"] / 100):
-            continue
-        pct = round((cpl_now / cpl_prev - 1) * 100)
+        threshold = cpl_prev * (1 + p["pct_rise"] / 100)
+        no_leads_now = leads_now <= 0
+        if no_leads_now:
+            # Spend with zero leads is the sharpest decline: treat as one lead.
+            if spend_now < threshold - 1e-9:
+                continue
+            cpl_now, pct = None, None
+        else:
+            cpl_now = spend_now / leads_now
+            if cpl_now < threshold - 1e-9:
+                continue
+            pct = round((cpl_now / cpl_prev - 1) * 100)
         label = cname or campaign_id
         out.append(Finding(
             agent=f"media_buying:{rule['kind']}",
             client_group_id=client.client_group_id,
             client_name=client.name,
             severity=SEVERITY_MEDIUM,
-            title=f"CPL up {pct}% week on week",
-            description=f"{sym}{cpl_prev:.2f} → {sym}{cpl_now:.2f} · {label}",
+            title=(f"No leads this week after {leads_prev} last week" if no_leads_now
+                   else f"CPL up {pct}% week on week"),
+            description=(f"{sym}{cpl_prev:.2f} CPL → {sym}{spend_now:.0f} spent, 0 leads · {label}" if no_leads_now
+                         else f"{sym}{cpl_prev:.2f} → {sym}{cpl_now:.2f} · {label}"),
             evidence=Evidence(
                 window=f"last_{w}d",
                 stats=[
-                    Stat("CPL now", f"{sym}{cpl_now:.2f}", bad=True),
+                    (Stat("Spent now", f"{sym}{spend_now:.0f}", bad=True) if no_leads_now
+                     else Stat("CPL now", f"{sym}{cpl_now:.2f}", bad=True)),
+                    Stat("Leads now", str(leads_now), bad=no_leads_now),
                     Stat("CPL before", f"{sym}{cpl_prev:.2f}"),
                     Stat("Leads", str(leads_now + leads_prev)),
                 ],
                 raw={
                     "campaign_id": campaign_id,
                     "campaign_name": cname,
-                    "cpl_now": round(cpl_now, 2),
+                    "cpl_now": round(cpl_now, 2) if cpl_now is not None else None,
                     "cpl_prev": round(cpl_prev, 2),
                     "leads_now": leads_now,
                     "leads_prev": leads_prev,

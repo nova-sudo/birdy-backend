@@ -121,9 +121,20 @@ def test_declining_handles_zero_leads_prev_window():
     assert run_dc(rows) == []
 
 
-def test_declining_zero_leads_now_no_crash():
+def test_declining_zero_leads_now_fires():
     rows = [day(o, 10, 2) for o in range(7, 14)] + [day(o, 20, 0) for o in range(0, 7)]
-    assert run_dc(rows) == []
+    out = run_dc(rows)  # prev CPL 5; spent 140 with 0 leads
+    assert len(out) == 1
+    f = out[0]
+    assert f.title == "No leads this week after 14 last week"
+    assert f.description == "£5.00 CPL → £140 spent, 0 leads · Camp One"
+    assert f.action is None and f.severity == SEVERITY_MEDIUM
+    assert f.evidence.raw["spend_now"] == 140.0 and f.evidence.raw["leads_now"] == 0
+
+
+def test_declining_zero_leads_now_low_spend_no_fire():
+    rows = [day(o, 10, 2) for o in range(7, 14)] + [day(o, 0.5, 0) for o in range(0, 7)]
+    assert run_dc(rows) == []  # spent 3.5 < 6.50 threshold
 
 
 def test_declining_falls_back_to_campaign_id_and_symbol():
