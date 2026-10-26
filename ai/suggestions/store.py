@@ -86,7 +86,7 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
     """Turn a Finding (+ its already-composed copy) into a persistable document."""
     key = suggestion_key(user_id, finding)
     now = _now()
-    return {
+    doc = {
         "_id": key,
         "id": key,
         "user_id": user_id,
@@ -109,6 +109,13 @@ def build_suggestion_doc(user_id: str, finding: Finding, *, composer: str = "tem
         "created_at": now,
         "updated_at": now,
     }
+    if finding.agent_id:
+        doc["agent_id"] = finding.agent_id
+    if finding.rule_id:
+        doc["rule_id"] = finding.rule_id
+    if finding.rule_version:
+        doc["rule_version"] = finding.rule_version
+    return doc
 
 
 async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = "template") -> tuple[dict | None, bool, bool]:

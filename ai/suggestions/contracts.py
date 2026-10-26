@@ -99,6 +99,11 @@ class Finding:
     icon: str = "sparkles"
     # Explicit override; if empty, computed from agent + window + client + targets.
     dedup_key: str = ""
+    # Set by BirdyHub agent evaluators; empty for the classic subagents.
+    agent_id: str = ""
+    rule_id: str = ""
+    rule_version: int = 0
+    near_miss: bool = False
 
     def compute_dedup_key(self) -> str:
         """
