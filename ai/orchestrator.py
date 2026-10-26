@@ -601,6 +601,9 @@ async def run_chat(
     # Rendered visuals from render_ui, in order; the final reply's [[viz:N]]
     # placeholders are swapped for these (see ai/tools/render_ui_tools.py).
     ui_blocks: list = []
+    # {tool, changed} from every successful agent training tool this turn, so
+    # the training UI can show what Birdy changed in the playbook.
+    agent_changes: list = []
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -748,6 +751,7 @@ async def run_chat(
                     "tools_used": tools_used,
                     "session_id": session_id,
                     "dashboard_ops": dashboard_ops,
+            "agent_changes": agent_changes,
                     **(await _resolve_turn_scope()),
                 }
 
@@ -827,6 +831,14 @@ async def run_chat(
 
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
 
+                if tc.name in AGENT_TOOL_NAMES and not bad_args:
+                    try:
+                        parsed = json.loads(result)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed = None
+                    if isinstance(parsed, dict) and parsed.get("ok") and parsed.get("changed"):
+                        agent_changes.append({"tool": tc.name, "changed": parsed["changed"]})
+
                 history.append({
                     "role": "tool",
                     "tool_call_id": tc.id,
@@ -858,5 +870,6 @@ async def run_chat(
             "tools_used": tools_used,
             "session_id": session_id,
             "dashboard_ops": dashboard_ops,
+            "agent_changes": agent_changes,
             **(await _resolve_turn_scope()),
         }

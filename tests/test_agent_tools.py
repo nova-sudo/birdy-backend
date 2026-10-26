@@ -192,3 +192,38 @@ def test_prompt_content():
 def test_agent_tools_hidden_from_general_chat():
     from ai.orchestrator import _PAGE_ONLY_TOOLS
     assert set(t.AGENT_TOOL_NAMES) <= _PAGE_ONLY_TOOLS
+
+
+async def test_run_chat_returns_agent_changes(mock_db, monkeypatch):
+    import json
+    from ai.orchestrator import run_chat
+    from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall
+
+    class Scripted(BaseLLMProvider):
+        def __init__(self, responses):
+            self._r, self.model = list(responses), "stub-model"
+
+        async def chat_completion(self, messages, tools=None, tool_choice="auto", temperature=0.3, max_tokens=2048):
+            return self._r.pop(0)
+
+    def call(name, args, cid):
+        return ProviderResponse(content=None, finish_reason="tool_calls",
+                                tool_calls=[ToolCall(id=cid, name=name, arguments=json.dumps(args))])
+
+    monkeypatch.setattr("ai.orchestrator.mcp_client.needs_mcp", lambda allowed: False)
+    reg = ToolRegistry()
+    t.register_agent_tools(reg)
+    await create_agent(mock_db, U)
+    provider = Scripted([
+        call("set_rule_param", {"rule_kind": "pause_over_target", "param": "cpl_multiple", "value": 2}, "a"),
+        call("set_rule_param", {"rule_kind": "pause_over_target", "param": "bogus", "value": 1}, "b"),
+        call("answer_topic", {"topic": "pause"}, "c"),
+        ProviderResponse(content="Done."),
+    ])
+    out = await run_chat(provider=provider, tool_registry=reg, db=mock_db, user_id=U,
+                         message="pause at 2x", page="agent_training")
+    assert out["agent_changes"] == [
+        {"tool": "set_rule_param", "changed": {"rule_kind": "pause_over_target", "param": "cpl_multiple",
+                                               "before": 1.5, "after": 2}},
+        {"tool": "answer_topic", "changed": {"topic": "pause", "answered": True}},
+    ]
