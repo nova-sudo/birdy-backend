@@ -132,7 +132,8 @@ async def _auto_apply(db, mongo_client, user_id: str, suggestion_id: str, result
 
 
 async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
-                    mode: Literal["live", "replay"] = "live", near_miss: bool = False) -> RunResult:
+                    mode: Literal["live", "replay"] = "live", near_miss: bool = False,
+                    force_stale: bool = False) -> RunResult:
     if mode not in ("live", "replay"):
         raise ValueError(f"unknown mode: {mode}")
     live = mode == "live"
@@ -142,7 +143,7 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
     rules = [r for r in await list_rules(db, agent_id) if r.get("enabled", True)]
     rules_by_id = {str(r["_id"]): r for r in rules}
     memories = await list_memory(db, agent_id, active_only=True)
-    result = RunResult()
+    result = RunResult(stale=force_stale)  # force_stale: caller knows the data is old -> no auto-apply
 
     # 1. Evaluate every client (live: refresh its Meta state first). The stale
     #    flag must be known before anything is auto-applied.

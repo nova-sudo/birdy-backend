@@ -338,6 +338,19 @@ async def test_stale_data_creates_items_but_never_auto_applies(mock_db, mock_mon
     assert len(docs) == 1 and docs[0]["status"] == "open"
 
 
+async def test_force_stale_blocks_auto_apply_on_fresh_data(mock_db, mock_mongo_client, meta_calls,
+                                                          no_slack, fake_apply):
+    await _seed_client(mock_db, "cg1")
+    agent = await _agent(mock_db, ["cg1"])
+    rule = await _rule(mock_db, agent, "pause_over_target")
+    await update_rule(mock_db, agent["_id"], rule["_id"], mode="auto")
+
+    res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF, force_stale=True)
+
+    assert res.stale is True and res.created >= 1
+    assert fake_apply["calls"] == [] and res.auto_applied == 0
+
+
 async def test_fresh_data_is_not_stale(mock_db, mock_mongo_client, meta_calls, no_slack):
     await _seed_client(mock_db, "cg1", last_day=AS_OF - timedelta(days=1))
     agent = await _agent(mock_db, ["cg1"])
