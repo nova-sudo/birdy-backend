@@ -198,7 +198,8 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
                 elif changed and doc.get("slack_ts"):
                     updated_docs.append(doc)
                 if (rule_mode == "auto" and f.action is not None and not result.stale
-                        and doc.get("status") == sstore.STATUS_OPEN and not doc.get("auto_failed")):
+                        and doc.get("status") == sstore.STATUS_OPEN and not doc.get("auto_failed")
+                        and not doc.get("undone_at")):
                     to_apply.append(doc["_id"])
             for sid in to_apply:
                 await _auto_apply(db, mongo_client, user_id, sid, result)

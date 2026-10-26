@@ -460,3 +460,42 @@ async def test_writeback_keeps_existing_paused_at(mock_db, meta):
     await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
     st = await mock_db[AD_STATE].find_one({"client_group_id": GID, "ad_id": "a1"})
     assert st["paused_at"] == "2026-01-01"
+
+
+# --- Flag-mode items never write (fix round 1, I1) ------------------------------
+
+@pytest.mark.parametrize("actor", [store.ACTOR_USER, store.ACTOR_BIRDY])
+async def test_flag_mode_item_refuses_apply(mock_db, meta, actor):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    await mock_db[store.SUGGESTIONS].update_one({"_id": "sug_1"}, {"$set": {"rule_mode": "flag"}})
+
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1", actor=actor, source="dashboard")
+
+    assert res["ok"] is False and res["outcome"] == "blocked", res
+    assert res["blocked_reason"]["code"] == "flag_only"
+    assert res["blocked_reason"]["message"] == "This rule only flags — change it to Ask or Auto to act"
+    assert meta["writes"] == [] and meta["reads"] == [] and meta["guardrail_calls"] == 0
+    doc = await store.get_suggestion(mock_db, "u1", "sug_1")
+    assert doc["status"] == "open" and "applying_at" not in doc
+    assert doc["blocked_reason"]["code"] == "flag_only"
+
+
+# --- Undo leaves a marker (fix round 1, I2) ---------------------------------------
+
+async def test_undo_marks_undone_and_manual_reapply_allowed(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    await actions.apply_suggestion(mock_db, None, "u1", "sug_1", actor=store.ACTOR_BIRDY, source="agent")
+    res = await actions.undo_suggestion(mock_db, None, "u1", "sug_1", source="dashboard", by="U123")
+    assert res["outcome"] == "undone", res
+    doc = await store.get_suggestion(mock_db, "u1", "sug_1")
+    assert doc["status"] == "open"
+    assert isinstance(doc["undone_at"], datetime)
+    assert doc["undone_by"]["actor"] == store.ACTOR_USER and doc["undone_by"]["by"] == "U123"
+
+    # A person may still choose to apply it again.
+    res2 = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res2["outcome"] == "applied", res2

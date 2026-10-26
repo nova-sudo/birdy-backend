@@ -42,7 +42,7 @@ def build_suggestion_blocks(doc: dict) -> tuple[list[dict], str]:
 
     elements = []
     action = doc.get("action")
-    if action:
+    if action and doc.get("rule_mode") != "flag":  # flag-mode items never write
         verb = "pause" if action.get("type") == "pause_ads" else "update"
         elements.append({
             "type": "button",

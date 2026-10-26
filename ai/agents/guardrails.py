@@ -11,6 +11,10 @@ Checked in order, first failure wins:
   3. last_live_ad   (pauses) the ad set would be left with no ACTIVE ad
   4. pause_cap      (pauses) the client has hit today's pause limit, counting
                     pauses by any actor since local midnight in the agent's tz
+
+Also returned as a blocked_reason code, by apply_suggestion itself before
+these checks run:
+  flag_only         the item came from a flag-mode rule; it never writes
 """
 
 import logging
@@ -27,12 +31,14 @@ logger = logging.getLogger(__name__)
 
 PERMISSION_KEY = {"ad": "ads", "adset": "adsets", "campaign": "campaigns"}
 DEFAULT_TZ = "Europe/London"
+FLAG_ONLY = "flag_only"
+FLAG_ONLY_MESSAGE = "This rule only flags — change it to Ask or Auto to act"
 
 
 @dataclass
 class GuardrailResult:
     ok: bool
-    reason: str | None = None   # machine code: no_permission | protected_tag | last_live_ad | pause_cap
+    reason: str | None = None   # machine code: no_permission | protected_tag | last_live_ad | pause_cap (| flag_only)
     message: str | None = None  # human sentence for the card / Slack
 
     @classmethod

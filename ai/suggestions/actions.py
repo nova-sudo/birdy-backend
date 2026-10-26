@@ -29,7 +29,7 @@ mark_applied. The claim comes first so concurrent applies make one Meta write.
 import logging
 from datetime import datetime
 
-from ai.agents.guardrails import agent_tz, check_guardrails, local_today
+from ai.agents.guardrails import FLAG_ONLY, FLAG_ONLY_MESSAGE, agent_tz, check_guardrails, local_today
 from ai.agents.meta_state import record_status_write
 from ai.agents.store import get_agent
 from ai.suggestions import store
@@ -191,6 +191,14 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
     agent_id = doc.get("agent_id")
     agent = None
 
+    # 1b. A flag-mode rule only flags: its item never writes, whoever asks.
+    if doc.get("rule_mode") == "flag":
+        reason = {"code": FLAG_ONLY, "message": FLAG_ONLY_MESSAGE}
+        await store.release_claim(db, user_id, suggestion_id, token, blocked_reason=reason)
+        await _sync_slack(db, user_id, suggestion_id, by=by)
+        return {"ok": False, "outcome": "blocked", "doc": doc, "blocked_reason": reason,
+                "detail": reason["message"]}
+
     # 2. Guardrails — agent suggestions only.
     if agent_id and action:
         agent = await get_agent(db, user_id, agent_id)
@@ -351,7 +359,8 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
                     "detail": failed[0]["error"] if failed else "Undo failed",
                     "succeeded": succeeded, "failed": failed}
 
-    await store.mark_undone(db, user_id, suggestion_id)
+    await store.mark_undone(db, user_id, suggestion_id,
+                            undone_by={"actor": actor, "source": source, "by": by})
     await store.log_activity(
         db, user_id,
         actor=actor,

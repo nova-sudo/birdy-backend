@@ -206,6 +206,9 @@ async def upsert_finding(db, user_id: str, finding: Finding, *, composer: str = 
             "status": STATUS_OPEN,
             "updated_at": now,
         }
+        if finding.rule_id:  # agent items: credit the rule version that fired now
+            update.update(agent_id=finding.agent_id, rule_id=finding.rule_id,
+                          rule_version=finding.rule_version)
         if reopening:
             update["origin_window"] = finding_window  # a reopen is a fresh start
         await db[SUGGESTIONS].update_one({"_id": key}, {"$set": update, "$unset": {"dismissed_at": "", "applied_at": ""}})
@@ -307,13 +310,19 @@ async def mark_applied(db, user_id: str, suggestion_id: str, *,
     )
 
 
-async def mark_undone(db, user_id: str, suggestion_id: str) -> bool:
-    """Revert an applied suggestion back to open once its action was undone."""
+async def mark_undone(db, user_id: str, suggestion_id: str, *,
+                      undone_by: dict | None = None) -> bool:
+    """
+    Revert an applied suggestion back to open once its action was undone.
+    undone_at stays on the doc (upsert_finding never clears it) so an agent
+    never auto-applies it again; a person still can.
+    """
     now = _now()
     res = await db[SUGGESTIONS].update_one(
         {"_id": suggestion_id, "user_id": user_id},
         {
-            "$set": {"status": STATUS_OPEN, "updated_at": now},
+            "$set": {"status": STATUS_OPEN, "updated_at": now,
+                     "undone_at": now, "undone_by": undone_by},
             "$unset": {"applied_at": "", "applied_targets": "", "applied_action_type": "",
                        "decided_by": "", "already_in_meta": ""},
         },

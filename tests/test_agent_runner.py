@@ -448,3 +448,42 @@ def test_memory_filter_name_falls_back_to_title_without_targets():
                 severity="MEDIUM", title="“Evergreen set” spent £0 for 24 hrs", description="",
                 evidence=Evidence(window="agent"))
     assert memory_filters.apply([f], [{"filter": {"ad_name_contains": "EVERGREEN"}}], as_of=AS_OF) == []
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: undone items are never auto-applied again (I2); M2
+# ---------------------------------------------------------------------------
+
+async def test_undone_auto_item_not_reapplied(mock_db, mock_mongo_client, meta_calls, no_slack, fake_apply):
+    await _seed_client(mock_db, "cg1")
+    agent = await _agent(mock_db, ["cg1"])
+    rule = await _rule(mock_db, agent, "pause_over_target")
+    await update_rule(mock_db, agent["_id"], rule["_id"], mode="auto")
+
+    await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+    assert len(fake_apply["calls"]) == 1
+    sid = fake_apply["calls"][0]["id"]
+    assert await sstore.mark_undone(mock_db, USER, sid, undone_by={"actor": "user"})
+
+    await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+
+    assert len(fake_apply["calls"]) == 1
+    doc = await mock_db[sstore.SUGGESTIONS].find_one({"_id": sid})
+    assert doc["status"] == "open" and doc.get("undone_at")
+
+
+async def test_reupsert_keeps_undone_at_and_refreshes_rule_version(mock_db):
+    f = _f()
+    f.agent_id, f.rule_id, f.rule_version = "ag", "r1", 1
+    doc, created, _ = await sstore.upsert_finding(mock_db, USER, f)
+    assert created
+    await mock_db[sstore.SUGGESTIONS].update_one({"_id": doc["_id"]}, {"$set": {"status": "applied"}})
+    assert await sstore.mark_undone(mock_db, USER, doc["_id"])
+
+    f2 = _f()
+    f2.agent_id, f2.rule_id, f2.rule_version = "ag", "r1", 2
+    doc2, created2, changed2 = await sstore.upsert_finding(mock_db, USER, f2)
+    assert not created2 and changed2
+    saved = await mock_db[sstore.SUGGESTIONS].find_one({"_id": doc["_id"]})
+    assert saved["undone_at"] and doc2["undone_at"] == saved["undone_at"]
+    assert saved["rule_version"] == 2
