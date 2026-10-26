@@ -84,6 +84,7 @@ def _suggestion_to_api(doc: dict) -> dict:
         "blocked_reason": doc.get("blocked_reason"),
         "auto_failed": bool(doc.get("auto_failed")),
         "undone_at": doc.get("undone_at"),
+        "applied_at": doc.get("applied_at"),
     }
 
 
