@@ -16,11 +16,13 @@ import re
 import uuid
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai.agents import confidence as agent_confidence
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents.defaults import (
@@ -447,3 +449,149 @@ async def get_job(agent_id: str, job_id: str, current_user: str = Depends(get_cu
         elif job.get("status") == "failed":
             out["error"] = job.get("error")
         return out
+
+
+# ---------------------------------------------------------------------------
+# Confidence, practice cases and activation
+# ---------------------------------------------------------------------------
+
+PRACTICE_DAYS = 60
+PUBLIC_CASE_KEYS = ("case_id", "rule_kind", "client_name", "title", "facts", "options", "birdy_answer", "why")
+
+
+def _case_to_api(case: dict) -> dict:
+    """A practice case without its snapshot (that stays server-side)."""
+    return {k: case.get(k) for k in PUBLIC_CASE_KEYS}
+
+
+async def _confidence(db, agent: dict) -> dict:
+    """Compute the score and persist it on the agent (at_activation untouched)."""
+    conf = await agent_confidence.compute_confidence(db, agent)
+    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$set": {
+        **{f"confidence.{k}": v for k, v in conf.items()},
+        "confidence.updated_at": datetime.utcnow(),
+    }})
+    return conf
+
+
+async def _practice_case_or_404(db, agent_id: str, case_id: str) -> dict:
+    doc = await db[agent_store.PRACTICE].find_one({"agent_id": agent_id, "case_id": case_id})
+    if doc is None:
+        raise HTTPException(status_code=404, detail="Practice case not found")
+    return doc
+
+
+@router.get("/{agent_id}/confidence")
+async def get_confidence(agent_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        return await _confidence(db, agent)
+
+
+@router.get("/{agent_id}/practice")
+async def get_practice(agent_id: str, k: int = Query(3, ge=1, le=20),
+                       current_user: str = Depends(get_current_user)):
+    """Up to k practice cases: unanswered ones already served come first, then
+    new ones from the last 60 complete days, never repeating a served ad."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        coll = db[agent_store.PRACTICE]
+        served = await coll.find({"agent_id": agent_id}).sort("served_at", 1).to_list(length=None)
+        out = [d["case"] for d in served if d.get("resolution") == "unanswered"][:k]
+        if len(out) < k:
+            answered = sum(1 for d in served if d.get("resolution") != "unanswered")
+            seed = int(hashlib.sha1(f"{agent_id}:{answered}".encode()).hexdigest()[:12], 16)
+            exclude: set = set()
+            for d in served:
+                exclude |= set(d.get("ad_ids") or replay.case_ad_keys(d.get("case") or {}))
+            cases = await replay.sample_cases(
+                db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1), days=PRACTICE_DAYS,
+                k=k - len(out), seed=seed, exclude_ad_ids=exclude)
+            rule_ids = {r["kind"]: r["_id"] for r in await agent_store.list_rules(db, agent_id)}
+            now = datetime.utcnow()
+            for case in cases:
+                # Keyed per agent: case ids are content hashes and two users can watch one account.
+                await coll.update_one({"_id": f"{agent_id}:{case['case_id']}"}, {"$setOnInsert": {
+                    "agent_id": agent_id, "case_id": case["case_id"], "case": case,
+                    "ad_ids": sorted(replay.case_ad_keys(case)), "rule_id": rule_ids.get(case["rule_kind"]),
+                    "rule_version_at_answer": None, "user_answer": None, "resolution": "unanswered",
+                    "served_at": now,
+                }}, upsert=True)
+                out.append(case)
+        return [_case_to_api(c) for c in out]
+
+
+class PracticeAnswer(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    answer: str
+
+
+@router.post("/{agent_id}/practice/{case_id}")
+async def answer_practice(agent_id: str, case_id: str, body: PracticeAnswer,
+                          current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        doc = await _practice_case_or_404(db, agent_id, case_id)
+        case = doc.get("case") or {}
+        if doc.get("resolution") != "unanswered":
+            raise HTTPException(status_code=409, detail="This case is already answered")
+        if body.answer not in (case.get("options") or []):
+            raise HTTPException(status_code=400, detail=f"answer must be one of {case.get('options')}")
+        rule = await db[agent_store.RULES].find_one({"_id": doc.get("rule_id"), "agent_id": agent_id}) \
+            if doc.get("rule_id") else None
+        agreed = body.answer == case.get("birdy_answer")
+        res = await db[agent_store.PRACTICE].update_one({"_id": doc["_id"], "resolution": "unanswered"}, {"$set": {
+            "user_answer": body.answer,
+            "rule_version_at_answer": int((rule or {}).get("version") or 0),
+            "resolution": "agreed" if agreed else "pending",
+            "answered_at": datetime.utcnow(),
+        }})
+        if res.modified_count == 0:
+            raise HTTPException(status_code=409, detail="This case is already answered")
+        return {"agreed": agreed, "birdy_answer": case.get("birdy_answer"), "why": case.get("why")}
+
+
+class PracticeResolution(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    resolution: Literal["birdy_right", "user_right"]
+
+
+@router.post("/{agent_id}/practice/{case_id}/resolve")
+async def resolve_practice(agent_id: str, case_id: str, body: PracticeResolution,
+                           current_user: str = Depends(get_current_user)):
+    """Settle a disagreement. birdy_right counts as agreed; user_right stays
+    disagreed until a rule edit makes Birdy answer the same (lazy re-score)."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        doc = await _practice_case_or_404(db, agent_id, case_id)
+        res = await db[agent_store.PRACTICE].update_one(
+            {"_id": doc["_id"], "resolution": "pending"},
+            {"$set": {"resolution": body.resolution, "resolved_at": datetime.utcnow()}})
+        if res.modified_count == 0:
+            raise HTTPException(status_code=409, detail="Only a case you disagreed on can be resolved")
+        return {"resolution": body.resolution}
+
+
+@router.post("/{agent_id}/activate")
+async def activate(agent_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        if agent.get("status") == "active":
+            return _agent_to_api(agent)  # idempotent: nothing changes
+        conf = await _confidence(db, agent)
+        if not conf["ready"]:
+            return JSONResponse(status_code=409, content={
+                "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
+        for rule in await agent_store.list_rules(db, agent_id):
+            mode = ("ask" if rule["kind"] in agent_confidence.ASK_KINDS
+                    else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)
+            if mode is not None:
+                await agent_store.update_rule(db, agent_id, rule["_id"], mode=mode)  # syncs open items
+        await db[agent_store.AGENTS].update_one({"_id": agent_id, "user_id": current_user}, {"$set": {
+            "status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()}})
+        return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))

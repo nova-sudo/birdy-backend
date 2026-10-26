@@ -37,10 +37,18 @@ import hashlib
 import logging
 import random
 from dataclasses import asdict, dataclass, field, replace
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 from ai.agents.runner import HISTORY_DAYS, MISSING_TARGET_AGENT, evaluate_loaded
-from ai.agents.snapshot import AdDay, AdState, load_ad_days, load_client_ctx, load_state
+from ai.agents.snapshot import (
+    AdDay,
+    AdsetState,
+    AdState,
+    ClientCtx,
+    load_ad_days,
+    load_client_ctx,
+    load_state,
+)
 from ai.agents.store import list_memory, list_rules
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS, Finding
 
@@ -249,17 +257,24 @@ def _case_id(kind: str, object_id: str, d: date) -> str:
     return hashlib.sha1(f"{kind}|{object_id}|{d.isoformat()}".encode()).hexdigest()[:16]
 
 
-def _options_and_answer(kind: str, f: Finding) -> tuple[list[str], str]:
+def answer_label(f: Finding | None) -> str:
+    """The practice answer a finding stands for. Shared by the sampler's
+    birdy_answer and the confidence re-score, so the two can't drift."""
+    if f is None or f.near_miss:
+        return LEAVE_IT
+    if f.action is not None:
+        if f.action.type == ACTION_PAUSE_ADS:
+            return "Pause"
+        if f.action.type == ACTION_ENABLE_ADS:
+            return "Revive"
+        return LEAVE_IT
+    return "Flag" if _kind(f) in FLAG_KINDS else LEAVE_IT
+
+
+def _options(kind: str) -> list[str]:
     if kind in FLAG_KINDS:
-        return list(FLAG_OPTIONS), "Flag"
-    options = list(PAUSED_OPTIONS) if kind == "revive_winner" else list(LIVE_OPTIONS)
-    if f.near_miss or f.action is None:
-        return options, LEAVE_IT
-    if f.action.type == ACTION_PAUSE_ADS:
-        return options, "Pause"
-    if f.action.type == ACTION_ENABLE_ADS:
-        return options, "Revive"
-    return options, LEAVE_IT
+        return list(FLAG_OPTIONS)
+    return list(PAUSED_OPTIONS) if kind == "revive_winner" else list(LIVE_OPTIONS)
 
 
 def _ad_keys(f: Finding, target: dict) -> set[str]:
@@ -268,11 +283,101 @@ def _ad_keys(f: Finding, target: dict) -> set[str]:
     return set(ids) or {target["object_id"]}
 
 
+# ---------------------------------------------------------------------------
+# Case snapshots and re-scoring
+# ---------------------------------------------------------------------------
+
+def _iso(v) -> str | None:
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
+def _eval_snapshot(c: "_Client", d: date, f: Finding, kind: str) -> dict:
+    """Everything needed to re-run this case's evaluator on day d without the
+    database: the client context, the in-scope ads' state (as approximated on
+    d) and their non-zero day rows in [d - HISTORY_DAYS, d], and the ad sets.
+
+    Scope per kind: pause, the ads in the target ads' ad sets (the ad-set
+    rollup needs the siblings); revive, the ad itself; no-spend, the ads with
+    rows in the ad set; declining, the ads with rows in the campaign. All-zero
+    rows are dropped: they add nothing to any evaluator's sums."""
+    sliced = _slice(c.ad_days, d)
+    ads = ads_on_day(c.ads, sliced, d)
+    raw = f.evidence.raw or {}
+    ad_ids = {str(a) for a in raw.get("ad_ids") or []}
+    if kind == "pause_over_target":
+        sets = {ads[a].adset_id for a in ad_ids if a in ads}
+        scope = {a for a, ad in ads.items() if ad.adset_id in sets} | ad_ids
+    elif kind == "flag_no_spend":
+        scope = {a for a, rows in sliced.items() if any(r.adset_id == raw.get("adset_id") for r in rows)}
+    elif kind == "flag_declining":
+        scope = {a for a, rows in sliced.items() if any(r.campaign_id == raw.get("campaign_id") for r in rows)}
+    else:
+        scope = ad_ids
+    adset_ids = {ads[a].adset_id for a in scope if a in ads}
+    if raw.get("adset_id"):
+        adset_ids.add(raw["adset_id"])
+    ctx = c.ctx
+    return {
+        "ctx": {"client_group_id": ctx.client_group_id, "name": ctx.name,
+                "currency_symbol": ctx.currency_symbol, "target_cpl": ctx.target_cpl, "tz": ctx.tz},
+        "ads": [{"ad_id": a.ad_id, "adset_id": a.adset_id, "campaign_id": a.campaign_id, "name": a.name,
+                 "effective_status": a.effective_status, "created_time": _iso(a.created_time),
+                 "paused_at": _iso(a.paused_at)}
+                for a in (ads[i] for i in sorted(scope) if i in ads)],
+        "adsets": [asdict(c.adsets[s]) for s in sorted(adset_ids) if s in c.adsets],
+        "ad_days": [[r.ad_id, r.adset_id, r.campaign_id, r.ad_name, r.campaign_name, r.day.isoformat(),
+                     r.spend, r.leads]
+                    for a in sorted(scope) for r in sliced.get(a, []) if r.spend or r.leads],
+    }
+
+
+def _load_eval(ev: dict):
+    ctx = ClientCtx(**ev["ctx"])
+    ads = {a["ad_id"]: AdState(**{**a,
+                                  "created_time": datetime.fromisoformat(a["created_time"]) if a["created_time"] else None,
+                                  "paused_at": date.fromisoformat(a["paused_at"]) if a["paused_at"] else None})
+           for a in ev.get("ads") or []}
+    adsets = {s["adset_id"]: AdsetState(**s) for s in ev.get("adsets") or []}
+    ad_days: dict[str, list[AdDay]] = {}
+    for ad_id, adset_id, campaign_id, ad_name, campaign_name, day, spend, leads in ev.get("ad_days") or []:
+        ad_days.setdefault(ad_id, []).append(AdDay(
+            ad_id=ad_id, adset_id=adset_id, campaign_id=campaign_id, ad_name=ad_name,
+            day=date.fromisoformat(day), spend=spend, leads=leads, campaign_name=campaign_name))
+    return ctx, ad_days, ads, adsets
+
+
+def case_ad_keys(case: dict) -> set[str]:
+    """The ads a stored case is about (the target itself for ad-set / campaign flags)."""
+    snap = case.get("snapshot") or {}
+    ids = {str(i) for i in (snap.get("raw") or {}).get("ad_ids") or []}
+    return ids or {str((snap.get("target") or {}).get("object_id") or "")} - {""}
+
+
+def rescore_case(agent: dict, rule: dict, memories: list[dict], case: dict) -> str | None:
+    """Re-run the case's evaluator on its stored snapshot with `rule` as it is
+    now (current params and client overrides) and return the answer Birdy would
+    give, or None when the snapshot predates re-scoring."""
+    snap = case.get("snapshot") or {}
+    ev = snap.get("eval")
+    if not ev:
+        return None
+    ctx, ad_days, ads, adsets = _load_eval(ev)
+    d = date.fromisoformat(snap["day"])
+    findings = evaluate_loaded(agent, [rule], memories, ctx, ad_days, ads, adsets, as_of=d, near_miss=True)
+    kind, target, keys = snap.get("rule_kind"), snap.get("target") or {}, case_ad_keys(case)
+    match = [f for f in findings
+             if f.agent != MISSING_TARGET_AGENT and _kind(f) == kind
+             and (_target(f)["object_id"] == target.get("object_id") or _ad_keys(f, _target(f)) & keys)]
+    # A firing finding outranks a near miss on the same ads.
+    match.sort(key=lambda f: f.near_miss)
+    return answer_label(match[0] if match else None)
+
+
 def _case(d: date, c: _Client, f: Finding) -> dict:
     kind, target = _kind(f), _target(f)
     if not target["name"] and target["object_type"] == "adset" and target["object_id"] in c.adsets:
         target["name"] = c.adsets[target["object_id"]].name
-    options, answer = _options_and_answer(kind, f)
+    options, answer = _options(kind), answer_label(f)
     return {
         "case_id": _case_id(kind, target["object_id"], d),
         "rule_kind": kind,
@@ -288,6 +393,7 @@ def _case(d: date, c: _Client, f: Finding) -> dict:
             "target": target,
             "day": d.isoformat(),
             "raw": dict(f.evidence.raw or {}),
+            "eval": _eval_snapshot(c, d, f, kind),
         },
     }
 

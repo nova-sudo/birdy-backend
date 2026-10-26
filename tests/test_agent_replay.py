@@ -279,7 +279,7 @@ async def test_sample_cases_deterministic_and_unique_ads(mock_db, mock_mongo_cli
     for c in every:
         assert set(c) == {"case_id", "rule_kind", "client_name", "title", "facts", "options",
                           "birdy_answer", "why", "snapshot"}
-        assert set(c["snapshot"]) == {"rule_kind", "client_group_id", "target", "day", "raw"}
+        assert set(c["snapshot"]) == {"rule_kind", "client_group_id", "target", "day", "raw", "eval"}
         assert all(set(f) == {"label", "value"} for f in c["facts"])
         if c["rule_kind"] == "revive_winner":
             assert c["options"] == ["Revive", "Leave it"] and c["birdy_answer"] == "Revive"
