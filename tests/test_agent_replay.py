@@ -433,3 +433,44 @@ async def test_spawn_keeps_reference_until_done():
     await task
     await asyncio.sleep(0)  # let the done-callback run
     assert done == [1] and task not in agents_router._BACKGROUND
+
+
+async def test_case_snapshot_bounded_to_target_neighbourhood(mock_db, mock_mongo_client):
+    """A case for an ad in ad set SA stores nothing from ad set SB, keeps at
+    most EXACT_DAYS + 1 rows per ad, and still re-scores correctly."""
+    await _group(mock_db, "g1")
+    await _adset(mock_db, "g1", "SA", "C1")
+    await _adset(mock_db, "g1", "SB", "C2")
+    await _ad(mock_db, "g1", "A1", "SA", "C1", created=datetime(2026, 4, 1))
+    await _ad(mock_db, "g1", "A2", "SA", "C1", created=datetime(2026, 4, 1))
+    await _ad(mock_db, "g1", "B1", "SB", "C2", created=datetime(2026, 4, 1))
+    await _ad(mock_db, "g1", "B2", "SB", "C2", created=datetime(2026, 4, 1))
+    first = date(2026, 4, 1)
+    await _spend(mock_db, "g1", "A1", "SA", "C1", first, END, 50, 1)   # £50 CPL > £30: fires
+    await _spend(mock_db, "g1", "A2", "SA", "C1", first, END, 10, 1)   # £10 CPL: fine
+    await _spend(mock_db, "g1", "B1", "SB", "C2", first, END, 10, 1)
+    await _spend(mock_db, "g1", "B2", "SB", "C2", first, END, 10, 1)
+    agent = await _agent(mock_db, ["g1"])
+
+    cases = await replay.sample_cases(mock_db, mock_mongo_client, agent, end=END, k=20, seed=1,
+                                      exclude_ad_ids=set())
+    case = next(c for c in cases if c["title"] == "Pause “Ad A1”")
+    ev = case["snapshot"]["eval"]
+    assert {a["ad_id"] for a in ev["ads"]} == {"A1", "A2"}
+    assert {s["adset_id"] for s in ev["adsets"]} == {"SA"}
+    assert {r[0] for r in ev["ad_days"]} == {"A1", "A2"}
+    assert not any(r[1] == "SB" for r in ev["ad_days"])
+    assert all(r[5] <= END.isoformat() for r in ev["ad_days"])
+    a1 = [r for r in ev["ad_days"] if r[0] == "A1"]
+    assert len(a1) == replay.EXACT_DAYS + 1  # 208 days of history, compacted
+    assert a1[0][5] == first.isoformat()  # first spend day survives
+    lifetime = (END - first).days + 1
+    assert sum(r[6] for r in a1) == 50 * lifetime and sum(r[7] for r in a1) == lifetime
+    json.dumps(case)
+
+    from ai.agents.store import list_memory, list_rules
+    rule = next(r for r in await list_rules(mock_db, agent["_id"]) if r["kind"] == "pause_over_target")
+    mems = await list_memory(mock_db, agent["_id"])
+    assert replay.rescore_case(agent, rule, mems, case) == "Pause"
+    assert replay.rescore_case(agent, {**rule, "params": {**rule["params"], "cpl_multiple": 3}}, mems,
+                               case) == "Leave it"

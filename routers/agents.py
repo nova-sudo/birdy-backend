@@ -498,7 +498,9 @@ async def get_practice(agent_id: str, k: int = Query(3, ge=1, le=20),
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         coll = db[agent_store.PRACTICE]
-        served = await coll.find({"agent_id": agent_id}).sort("served_at", 1).to_list(length=None)
+        # Only unanswered cases need their full body; the rest are counted / excluded.
+        served = await coll.find({"agent_id": agent_id}, {"case.snapshot.eval": 0}).sort(
+            "served_at", 1).to_list(length=None)
         out = [d["case"] for d in served if d.get("resolution") == "unanswered"][:k]
         if len(out) < k:
             answered = sum(1 for d in served if d.get("resolution") != "unanswered")
@@ -592,6 +594,7 @@ async def activate(agent_id: str, current_user: str = Depends(get_current_user))
                     else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)
             if mode is not None:
                 await agent_store.update_rule(db, agent_id, rule["_id"], mode=mode)  # syncs open items
-        await db[agent_store.AGENTS].update_one({"_id": agent_id, "user_id": current_user}, {"$set": {
+        await db[agent_store.AGENTS].update_one(
+            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {"$set": {
             "status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()}})
         return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))

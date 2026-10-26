@@ -291,28 +291,54 @@ def _iso(v) -> str | None:
     return v.isoformat() if hasattr(v, "isoformat") else v
 
 
+EXACT_DAYS = 60  # day rows kept as-is in a case snapshot; older ones collapse to one row per ad
+
+
+def _compact_rows(rows: list[AdDay], d: date) -> list[AdDay]:
+    """Non-zero rows on or before d. Rows older than EXACT_DAYS collapse into one
+    row on the ad's first spend day carrying their summed spend and leads. That
+    keeps everything an evaluator reads: the first spend day and lifetime sums
+    (pause patience, revive), and the exact recent days (the pause 7-day window,
+    the no-spend and declining windows)."""
+    cutoff = d - timedelta(days=EXACT_DAYS - 1)
+    kept = [r for r in rows if r.day <= d and (r.spend or r.leads)]
+    old = [r for r in kept if r.day < cutoff]
+    recent = [r for r in kept if r.day >= cutoff]
+    if not old:
+        return recent
+    first = next((r for r in old if r.spend > 0), old[0])
+    merged = replace(first, spend=sum(r.spend for r in old), leads=sum(r.leads for r in old))
+    return [merged] + recent
+
+
+def _neighbourhood(kind: str, f: Finding, ads: dict, sliced: dict) -> set[str]:
+    """The ads whose rows are needed to re-score this target, and no others:
+    an ad target -> the ad plus the other ads in its ad set (the pause ad-set
+    rollup checks them); an ad-set target -> its member ads; a campaign flag
+    (declining) -> the ads in that campaign."""
+    raw = f.evidence.raw or {}
+    ad_ids = {str(a) for a in raw.get("ad_ids") or []}
+    if kind == "flag_declining":
+        cid = raw.get("campaign_id")
+        return {a for a, ad in ads.items() if ad.campaign_id == cid} | \
+               {a for a, rows in sliced.items() if any(r.campaign_id == cid for r in rows)}
+    if kind == "flag_no_spend":
+        sid = raw.get("adset_id")
+        return {a for a, ad in ads.items() if ad.adset_id == sid} | \
+               {a for a, rows in sliced.items() if any(r.adset_id == sid for r in rows)}
+    sets = {ads[a].adset_id for a in ad_ids if a in ads}
+    return {a for a, ad in ads.items() if ad.adset_id in sets} | ad_ids
+
+
 def _eval_snapshot(c: "_Client", d: date, f: Finding, kind: str) -> dict:
     """Everything needed to re-run this case's evaluator on day d without the
-    database: the client context, the in-scope ads' state (as approximated on
-    d) and their non-zero day rows in [d - HISTORY_DAYS, d], and the ad sets.
-
-    Scope per kind: pause, the ads in the target ads' ad sets (the ad-set
-    rollup needs the siblings); revive, the ad itself; no-spend, the ads with
-    rows in the ad set; declining, the ads with rows in the campaign. All-zero
-    rows are dropped: they add nothing to any evaluator's sums."""
+    database: the client context, plus state and compacted day rows (see
+    _compact_rows) for the target's neighbourhood only (see _neighbourhood),
+    and the state of those ads' ad sets. Nothing else in the client is stored."""
     sliced = _slice(c.ad_days, d)
     ads = ads_on_day(c.ads, sliced, d)
     raw = f.evidence.raw or {}
-    ad_ids = {str(a) for a in raw.get("ad_ids") or []}
-    if kind == "pause_over_target":
-        sets = {ads[a].adset_id for a in ad_ids if a in ads}
-        scope = {a for a, ad in ads.items() if ad.adset_id in sets} | ad_ids
-    elif kind == "flag_no_spend":
-        scope = {a for a, rows in sliced.items() if any(r.adset_id == raw.get("adset_id") for r in rows)}
-    elif kind == "flag_declining":
-        scope = {a for a, rows in sliced.items() if any(r.campaign_id == raw.get("campaign_id") for r in rows)}
-    else:
-        scope = ad_ids
+    scope = _neighbourhood(kind, f, ads, sliced)
     adset_ids = {ads[a].adset_id for a in scope if a in ads}
     if raw.get("adset_id"):
         adset_ids.add(raw["adset_id"])
@@ -327,7 +353,7 @@ def _eval_snapshot(c: "_Client", d: date, f: Finding, kind: str) -> dict:
         "adsets": [asdict(c.adsets[s]) for s in sorted(adset_ids) if s in c.adsets],
         "ad_days": [[r.ad_id, r.adset_id, r.campaign_id, r.ad_name, r.campaign_name, r.day.isoformat(),
                      r.spend, r.leads]
-                    for a in sorted(scope) for r in sliced.get(a, []) if r.spend or r.leads],
+                    for a in sorted(scope) for r in _compact_rows(sliced.get(a, []), d)],
     }
 
 
