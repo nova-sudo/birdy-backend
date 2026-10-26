@@ -131,6 +131,16 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
                 out["skipped"] += 1
                 continue
 
+            # Atomic once-per-local-day claim: overlapping ticks cannot both run the agent.
+            # Kept on error, so a failing agent is not retried the same day.
+            claimed = await db[AGENTS].find_one_and_update(
+                {"_id": agent["_id"], "status": "active", "run_claimed_for": {"$ne": today.isoformat()}},
+                {"$set": {"run_claimed_for": today.isoformat(), "run_claimed_at": now_utc}},
+            )
+            if claimed is None:
+                out["skipped"] += 1
+                continue
+
             result = await run_agent(db, mongo_client, agent, as_of=today, force_stale=too_old)
             at = datetime.utcnow()
             last_run = _last_run(result, at, len((agent.get("scope") or {}).get("client_group_ids") or []))

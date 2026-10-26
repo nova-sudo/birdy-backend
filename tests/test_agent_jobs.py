@@ -142,7 +142,7 @@ async def test_partial_ok_and_error_statuses(mock_db, mock_mongo_client, runs):
     lr = (await _agent_doc(mock_db, agent))["last_run"]
     assert lr["status"] == "partial" and lr["skipped"] == ["meta_token:cg2"]
 
-    await mock_db.agents.update_one({"_id": agent["_id"]}, {"$set": {"last_run_at": None}})
+    await mock_db.agents.update_one({"_id": agent["_id"]}, {"$set": {"last_run_at": None, "run_claimed_for": None}})
     state["result"] = runner.RunResult(created=3, auto_applied=1, blocked=2)
     await agent_jobs.run_due_agents(mock_mongo_client, now_utc=t)
     lr = (await _agent_doc(mock_db, agent))["last_run"]
@@ -170,3 +170,26 @@ async def test_one_agent_failing_does_not_stop_others(mock_db, mock_mongo_client
     assert res["errors"] == 1 and res["ran"] == 1
     statuses = {d["user_id"]: d.get("last_run", {}).get("status") for d in await mock_db.agents.find({}).to_list(None)}
     assert sorted(statuses.values()) == ["error", "ok"]
+
+
+async def test_concurrent_ticks_run_agent_once(mock_db, mock_mongo_client, runs):
+    import asyncio
+    calls, _ = runs
+    t = _local(2026, 10, 26, 7, 0)
+    await _seed(mock_db, refreshed=t.replace(tzinfo=None))
+    results = await asyncio.gather(
+        agent_jobs.run_due_agents(mock_mongo_client, now_utc=t),
+        agent_jobs.run_due_agents(mock_mongo_client, now_utc=t),
+    )
+    assert len(calls) == 1
+    assert sum(r["ran"] for r in results) == 1
+
+
+async def test_freshness_skip_does_not_consume_the_day(mock_db, mock_mongo_client, runs):
+    calls, _ = runs
+    sched = _local(2026, 10, 26, 7, 0)
+    await _seed(mock_db, refreshed=sched.replace(tzinfo=None) - timedelta(hours=6))
+    first = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=sched + timedelta(minutes=15))
+    assert first["ran"] == 0 and calls == []
+    later = await agent_jobs.run_due_agents(mock_mongo_client, now_utc=sched + timedelta(hours=2, minutes=1))
+    assert later["ran"] == 1 and len(calls) == 1
