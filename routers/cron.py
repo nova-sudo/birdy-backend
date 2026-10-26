@@ -808,6 +808,23 @@ async def agents_tick(authorization: str | None = Header(default=None)):
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
 
 
+@router.get("/agents-outcomes")
+async def agents_outcomes(authorization: str | None = Header(default=None)):
+    """Daily 05:00 UTC: the 7-day outcome of each applied BirdyHub agent action."""
+    _verify_cron_auth(authorization)
+
+    from jobs.agent_jobs import run_agents_outcomes
+
+    tick_start = time.monotonic()
+    result = None
+    try:
+        result = await run_agents_outcomes()
+    except Exception as e:
+        logger.error(f"[agents-outcomes] raised: {e}", exc_info=True)
+
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
 @router.get("/health-weekly")
 async def health_weekly(authorization: str | None = Header(default=None)):
     """Recomputes every client's health band from its monthly closes goal.

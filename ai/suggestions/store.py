@@ -475,5 +475,10 @@ async def create_suggestion_indexes(mongo_client):
     await db[SUGGESTIONS].create_index([("user_id", 1), ("status", 1), ("created_at", -1)])
     await db[SUGGESTIONS].create_index("client_group_id")
     await db[ACTIVITY].create_index([("user_id", 1), ("created_at", -1)])
+    # Agent rows (feed, impact, the outcomes job). Partial: most rows have no agent_id.
+    await db[ACTIVITY].create_index(
+        [("agent_id", 1), ("created_at", -1)],
+        partialFilterExpression={"agent_id": {"$exists": True}},
+    )
     # TTL index — Mongo drops activity docs once expires_at passes.
     await db[ACTIVITY].create_index("expires_at", expireAfterSeconds=0)

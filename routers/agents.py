@@ -24,6 +24,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from ai.agents import confidence as agent_confidence
 from ai.agents import learning
+from ai.agents import outcomes
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents import validation
@@ -593,7 +594,7 @@ async def activate(agent_id: str, current_user: str = Depends(get_current_user))
 # Learning: offers, graduation, auto-run undo, proposals
 # ---------------------------------------------------------------------------
 
-UNDO_AUTO_WINDOW = timedelta(hours=24)
+UNDO_AUTO_WINDOW = outcomes.UNDO_AUTO_WINDOW  # the activity feed's can_undo uses the same window
 
 
 @router.get("/{agent_id}/offers")
@@ -700,3 +701,38 @@ async def reject_proposal(agent_id: str, proposal_id: str, current_user: str = D
         except learning.ProposalClosed:
             raise HTTPException(status_code=409, detail="This proposal was already decided")
         return {"proposal": _proposal_to_api(proposal)}
+
+
+# ---------------------------------------------------------------------------
+# Activity and impact
+# ---------------------------------------------------------------------------
+
+@router.get("/{agent_id}/activity")
+async def get_activity(agent_id: str, limit: int = Query(50, ge=1, le=200),
+                       before: Optional[str] = None,
+                       current_user: str = Depends(get_current_user)):
+    """The agent's decisions, newest first. `before` is the `at` of the last row seen."""
+    cursor = None
+    if before:
+        try:
+            cursor = outcomes.parse_cursor(before)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="before must be an ISO datetime")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        return await outcomes.list_activity(db, agent, limit=limit, before=cursor)
+
+
+@router.get("/{agent_id}/impact")
+async def get_impact(agent_id: str, month: Optional[str] = None,
+                     current_user: str = Depends(get_current_user)):
+    """Impact for one month (YYYY-MM, the agent's local calendar month; default: this month)."""
+    if month is not None and not outcomes.MONTH_RE.match(month):
+        raise HTTPException(status_code=422, detail="month must be YYYY-MM")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        if month is None:
+            month = datetime.now(outcomes._zone(outcomes.agent_tz(agent))).strftime("%Y-%m")
+        return await outcomes.compute_impact(db, agent, month=month)

@@ -82,6 +82,16 @@ def start_background_jobs():
         max_instances=1,
     )
 
+    # BirdyHub agents: daily 05:00 UTC, the 7-day outcome of applied actions.
+    from jobs.agent_jobs import run_agents_outcomes
+    scheduler.add_job(
+        run_agents_outcomes,
+        CronTrigger(hour=5, minute=0, timezone='UTC'),
+        id='agents_outcomes',
+        replace_existing=True,
+        max_instances=1,
+    )
+
     # Client health: same Monday 06:00 slot, measured through the previous
     # Sunday. Registered separately from the suggestion passes so a failure in
     # one cannot stop the other.

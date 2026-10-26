@@ -12,6 +12,9 @@ field meta_refresh_manager stamps when a refresh reaches a terminal state). Data
 than 3h inside the 2h grace window after the scheduled time: queue a refresh and wait.
 After the grace window: run anyway with force_stale (items are created, nothing is
 auto-applied). run_agent refreshes Meta state itself, so it is not refreshed here.
+
+agents-outcomes (daily 05:00 UTC): stores the 7-day outcome on applied agent actions
+(see ai/agents/outcomes.py).
 """
 
 import logging
@@ -19,6 +22,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from ai.agents import learning
+from ai.agents import outcomes
 from ai.agents.runner import run_agent
 from ai.agents.store import AGENTS
 from core.database import DB_NAME
@@ -181,3 +185,13 @@ async def run_due_agents(mongo_client, *, now_utc: datetime) -> dict:
 async def run_agents_tick() -> dict:
     async with get_mongo_client() as mongo_client:
         return await run_due_agents(mongo_client, now_utc=datetime.now(timezone.utc))
+
+
+async def run_outcomes(mongo_client, now_utc: datetime) -> dict:
+    """Measure the 7-day outcome of every applied agent action that is due one."""
+    return await outcomes.run_outcomes(mongo_client, now_utc)
+
+
+async def run_agents_outcomes() -> dict:
+    async with get_mongo_client() as mongo_client:
+        return await run_outcomes(mongo_client, datetime.now(timezone.utc))
