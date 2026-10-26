@@ -27,16 +27,21 @@ def meta(monkeypatch):
     state = {"status": {}, "writes": [], "reads": [], "guardrail_calls": 0}
 
     async def fake_get(user_id, object_id, object_type, mongo_client):
+        """Value in state["status"]: None (deleted), an effective status string
+        (own status assumed equal), or a full {status, effective_status} dict."""
         state["reads"].append(object_id)
         await asyncio.sleep(0)
-        return state["status"].get(object_id, "ACTIVE")
+        v = state["status"].get(object_id, "ACTIVE")
+        if v is None or isinstance(v, dict):
+            return v
+        return {"status": v, "effective_status": v}
 
     async def fake_set(user_id, object_id, object_type, status, mongo_client):
         await asyncio.sleep(0)
         state["writes"].append((object_id, status))
         return {"success": True}
 
-    monkeypatch.setattr(actions_mod, "get_object_status", fake_get)
+    monkeypatch.setattr(actions_mod, "get_object_state", fake_get)
     monkeypatch.setattr(actions_mod, "set_object_status", fake_set)
 
     real_check = actions_mod.check_guardrails
@@ -148,10 +153,61 @@ async def test_already_in_meta_skips_write(mock_db, meta):
 async def test_enable_with_parent_paused_still_writes(mock_db, meta):
     await _seed_agent(mock_db)
     await _seed_suggestion(mock_db, atype="enable_ads")
-    meta["status"]["a1"] = "ADSET_PAUSED"
+    meta["status"]["a1"] = {"status": "PAUSED", "effective_status": "ADSET_PAUSED"}
     res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
     assert res["outcome"] == "applied", res
     assert meta["writes"] == [("a1", "ACTIVE")]
+
+
+async def test_enable_decides_from_effective_status(mock_db, meta):
+    # Enable is unchanged: only an effective ACTIVE counts as done.
+    await _seed_agent(mock_db)
+    await _seed_suggestion(mock_db, atype="enable_ads")
+    meta["status"]["a1"] = {"status": "ACTIVE", "effective_status": "ACTIVE"}
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "already_in_meta", res
+
+
+async def test_adset_paused_ad_still_gets_paused(mock_db, meta):
+    # Own status ACTIVE: it would start spending again once the ad set is re-enabled.
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    meta["status"]["a1"] = {"status": "ACTIVE", "effective_status": "ADSET_PAUSED"}
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "applied", res
+    assert meta["writes"] == [("a1", "PAUSED")]
+
+
+@pytest.mark.parametrize("eff", ["PENDING_REVIEW", "WITH_ISSUES", "CAMPAIGN_PAUSED", "IN_PROCESS"])
+async def test_not_yet_delivering_ad_still_gets_paused(mock_db, meta, eff):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    meta["status"]["a1"] = {"status": "ACTIVE", "effective_status": eff}
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "applied", res
+    assert meta["writes"] == [("a1", "PAUSED")]
+
+
+async def test_archived_is_already_in_meta(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    meta["status"]["a1"] = {"status": "ARCHIVED", "effective_status": "ARCHIVED"}
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "already_in_meta", res
+    assert meta["writes"] == []
+
+
+async def test_effective_only_accepts_paused_archived_deleted(mock_db, meta):
+    await _seed_agent(mock_db)
+    await _seed_ad_state(mock_db)
+    await _seed_suggestion(mock_db)
+    meta["status"]["a1"] = {"status": None, "effective_status": "ADSET_PAUSED"}
+    res = await actions.apply_suggestion(mock_db, None, "u1", "sug_1")
+    assert res["outcome"] == "applied", res
+    assert meta["writes"] == [("a1", "PAUSED")]
 
 
 async def test_deleted_ad_is_already_in_meta(mock_db, meta):
@@ -301,6 +357,17 @@ async def test_get_object_status_reads_effective_status(graph):
 
     graph["resp"] = (200, {"id": "c1", "status": "PAUSED"})
     assert await mss.get_object_status("u1", "c1", "campaign", None) == "PAUSED"
+
+
+async def test_get_object_state_reads_both_fields_in_one_call(graph):
+    graph["resp"] = (200, {"id": "a1", "effective_status": "adset_paused", "status": "ACTIVE"})
+    st = await mss.get_object_state("u1", "a1", "ad", None)
+    assert st == {"status": "ACTIVE", "effective_status": "ADSET_PAUSED"}
+    assert len(graph["calls"]) == 1
+    assert set(graph["calls"][0][1]["fields"].split(",")) == {"effective_status", "status"}
+
+    graph["resp"] = (400, {"error": {"code": 100, "message": "does not exist"}})
+    assert await mss.get_object_state("u1", "a1", "ad", None) is None
 
 
 async def test_get_object_status_deleted_returns_none(graph):

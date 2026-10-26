@@ -101,13 +101,34 @@ async def get_object_status(
     mongo_client,
 ) -> str | None:
     """
-    Read a Meta object's live delivery status, used to re-check state right
-    before a write. Returns `effective_status` (falling back to `status`, which
-    is what campaigns sometimes return alone), or None when Meta says the object
-    no longer exists (Graph error code 100).
+    A Meta object's live delivery status: `effective_status`, falling back to
+    the configured `status` (campaigns sometimes return only that). None when
+    the object no longer exists (Graph error code 100).
+    """
+    state = await get_object_state(user_id, object_id, object_type, mongo_client)
+    if state is None:
+        return None
+    return state["effective_status"] or state["status"]
+
+
+async def get_object_state(
+    user_id: str,
+    object_id: str,
+    object_type: str,
+    mongo_client,
+) -> dict | None:
+    """
+    Read both of a Meta object's statuses in one Graph call, used to re-check
+    state right before a write:
+      status            what the object itself is set to (ACTIVE, PAUSED,
+                        ARCHIVED, DELETED)
+      effective_status  what is actually delivering, which also reflects the
+                        parents and review (ADSET_PAUSED, PENDING_REVIEW, ...)
+    Values are upper-cased; either may be None if Meta omits it. Returns None
+    when Meta says the object no longer exists (Graph error code 100).
 
     Raises MetaStatusError for anything else (no token, transport error, other
-    Graph errors) so the caller can decide how to proceed.
+    Graph errors, no status at all) so the caller can decide how to proceed.
     """
     if object_type not in _VALID_TYPES:
         raise MetaStatusError("object_type must be 'campaign', 'adset', or 'ad'", 400)
@@ -142,11 +163,15 @@ async def get_object_status(
         code = resp.status_code if 400 <= resp.status_code < 600 else 502
         raise MetaStatusError(f"Meta API error: {error_msg}", code)
 
-    status = (body or {}).get("effective_status") or (body or {}).get("status")
-    if not status:
+    def _up(v):
+        return str(v).upper() if v else None
+
+    state = {"status": _up((body or {}).get("status")),
+             "effective_status": _up((body or {}).get("effective_status"))}
+    if not state["status"] and not state["effective_status"]:
         # A 200 without a status is unexpected; never let it read as "deleted".
         raise MetaStatusError(f"Meta returned no status for {object_id}", 502)
-    return str(status).upper()
+    return state
 
 
 async def _rewrite_cached_status(mongo_client, user_id: str, object_type: str,

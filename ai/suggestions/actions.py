@@ -31,7 +31,7 @@ from ai.agents.guardrails import check_guardrails
 from ai.agents.store import get_agent
 from ai.suggestions import store
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
-from services.meta_status_service import MetaStatusError, get_object_status, set_object_status
+from services.meta_status_service import MetaStatusError, get_object_state, set_object_status
 
 logger = logging.getLogger(__name__)
 
@@ -72,17 +72,29 @@ async def _sync_slack(db, user_id: str, suggestion_id: str, by: str | None = Non
         logger.warning("actions: slack sync failed for %s: %s", suggestion_id, e)
 
 
-def _is_desired(atype: str, status: str | None) -> bool:
+# A pause is only "already done" when the object ITSELF is off. ADSET_PAUSED,
+# CAMPAIGN_PAUSED, PENDING_REVIEW, WITH_ISSUES etc. leave the ad's own status
+# ACTIVE, so it would start spending again once its parent is re-enabled or it
+# clears review: those still get written.
+_PAUSED_DONE = frozenset({"PAUSED", "ARCHIVED", "DELETED"})
+
+
+def _is_desired(atype: str, state: dict | None) -> bool:
     """
-    Is the object already where this action would put it? None = deleted in Meta,
-    which counts as done. Pause: anything not ACTIVE is already not delivering.
-    Enable: only ACTIVE counts — CAMPAIGN_PAUSED / ADSET_PAUSED etc. are not.
+    Is the object already where this action would put it? None = deleted in
+    Meta, which counts as done.
+      pause   decided from the configured `status` (PAUSED / ARCHIVED /
+              DELETED); if Meta omitted it, effective_status must be one of those.
+      enable  only an effective ACTIVE counts — ADSET_PAUSED etc. are not.
     """
-    if status is None:
+    if state is None:
         return True
     if atype == ACTION_PAUSE_ADS:
-        return status != "ACTIVE"
-    return status == "ACTIVE"
+        own = state.get("status")
+        if own:
+            return own in _PAUSED_DONE
+        return state.get("effective_status") in _PAUSED_DONE
+    return (state.get("effective_status") or state.get("status")) == "ACTIVE"
 
 
 async def _targets_needing_write(mongo_client, user_id: str, action: dict) -> list[dict]:
@@ -95,13 +107,13 @@ async def _targets_needing_write(mongo_client, user_id: str, action: dict) -> li
     pending = []
     for t in action.get("targets") or []:
         try:
-            status = await get_object_status(user_id, t.get("object_id"),
-                                             t.get("object_type", "ad"), mongo_client)
+            state = await get_object_state(user_id, t.get("object_id"),
+                                           t.get("object_type", "ad"), mongo_client)
         except Exception as e:
             logger.warning("apply: re-read of %s failed, writing anyway: %s", t.get("object_id"), e)
             pending.append(t)
             continue
-        if not _is_desired(atype, status):
+        if not _is_desired(atype, state):
             pending.append(t)
     return pending
 
