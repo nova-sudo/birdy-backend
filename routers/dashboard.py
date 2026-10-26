@@ -27,6 +27,7 @@ from pydantic import BaseModel
 
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
+from ai.agents.defaults import DENY_REASONS
 from ai.suggestions import actions, store
 from ai.suggestions.contracts import WINDOWS
 from ai.suggestions.orchestrator import run_pass_for_user
@@ -54,6 +55,13 @@ def _relative_time(dt: datetime | None) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
+def _rule_kind(agent: str | None) -> str | None:
+    """'media_buying:pause_over_target' -> 'pause_over_target'; None for legacy agents."""
+    if agent and agent.startswith("media_buying:"):
+        return agent.split(":", 1)[1]
+    return None
+
+
 def _suggestion_to_api(doc: dict) -> dict:
     return {
         "id": doc.get("id"),
@@ -67,6 +75,12 @@ def _suggestion_to_api(doc: dict) -> dict:
         "description": doc.get("description"),
         "stats": doc.get("stats") or [],
         "window": doc.get("window"),
+        "agent_id": doc.get("agent_id"),
+        "rule_kind": _rule_kind(doc.get("agent")),
+        "rule_mode": doc.get("rule_mode"),
+        "blocked_reason": doc.get("blocked_reason"),
+        "auto_failed": bool(doc.get("auto_failed")),
+        "undone_at": doc.get("undone_at"),
     }
 
 
@@ -189,6 +203,30 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
         res = await actions.dismiss_suggestion(
             db, mongo_client, current_user, suggestion_id,
             actor=store.ACTOR_USER, source="dashboard",
+        )
+        if res["outcome"] == "not_found":
+            raise HTTPException(status_code=404, detail="Suggestion not found")
+        if res["outcome"] == "busy":
+            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+        return {"ok": True}
+
+
+class DenyBody(BaseModel):
+    reason_code: str
+    note: str | None = None
+
+
+@router.post("/suggestions/{suggestion_id}/deny")
+async def deny_suggestion(suggestion_id: str, body: DenyBody, current_user: str = Depends(get_current_user)):
+    """Decline an agent work item with a reason code and optional note."""
+    if body.reason_code not in DENY_REASONS:
+        raise HTTPException(status_code=400, detail=f"reason_code must be one of {list(DENY_REASONS)}")
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        res = await actions.dismiss_suggestion(
+            db, mongo_client, current_user, suggestion_id,
+            actor=store.ACTOR_USER, source="dashboard",
+            reason_code=body.reason_code, note=body.note,
         )
         if res["outcome"] == "not_found":
             raise HTTPException(status_code=404, detail="Suggestion not found")

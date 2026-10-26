@@ -44,3 +44,7 @@ DEFAULT_PERMISSIONS = {
     "campaigns": False,
     "budgets": False,
 }
+
+# Why a user denied a work item. Stored on the activity entry; a repeated code
+# on one rule drives rule-change proposals.
+DENY_REASONS = ("still_learning", "client_wants_on", "creative_stale", "target_wrong", "other")

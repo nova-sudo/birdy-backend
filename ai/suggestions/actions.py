@@ -296,7 +296,8 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
 
 async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
                              actor: str = store.ACTOR_USER, source: str | None = None,
-                             by: str | None = None) -> dict:
+                             by: str | None = None, reason_code: str | None = None,
+                             note: str | None = None) -> dict:
     """Decline a suggestion (respects the store's dismiss cooldown)."""
     doc = await store.get_suggestion(db, user_id, suggestion_id)
     if not doc:
@@ -319,6 +320,10 @@ async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str,
         window=doc.get("window"),
         label="Declined by you",
         source=source,
+        agent_id=doc.get("agent_id"),
+        rule_id=doc.get("rule_id"),
+        reason_code=reason_code,
+        note=note,
     )
     await _sync_slack(db, user_id, suggestion_id, by=by)
     return {"ok": True, "outcome": "dismissed", "doc": doc}
