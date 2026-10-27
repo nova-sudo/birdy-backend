@@ -152,6 +152,20 @@ async def get_agent(agent_id: str, current_user: str = Depends(get_current_user)
         return _agent_to_api(await _agent_or_404(db, current_user, agent_id))
 
 
+@router.delete("/{agent_id}")
+async def delete_agent(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Start setup over: deletes a draft agent and its rules, practice and memory."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            deleted = await agent_store.delete_draft_agent(db, current_user, agent_id)
+        except agent_store.AgentActive:
+            raise HTTPException(status_code=409, detail="A switched-on agent can't be deleted")
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Agent not found")
+        return {"deleted": agent_id}
+
+
 class AgentPatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
     scope: Optional[dict] = None
