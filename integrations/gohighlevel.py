@@ -42,7 +42,8 @@ OAUTH_CONFIG = {
         "locations.readonly",
         "locations.write",
         "opportunities.readonly",
-        "opportunities.write"
+        "opportunities.write",
+        "conversations/message.readonly"
     ],
     "max_concurrent_requests": 5,
     "request_timeout": 30.0,
