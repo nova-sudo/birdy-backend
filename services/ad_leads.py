@@ -627,6 +627,53 @@ async def fetch_ad_leads(
     return rows[:limit] if limit else rows
 
 
+def opp_rollup(leads: list[dict]) -> dict:
+    """
+    GHL opportunity outcomes per campaign/ad set/ad, from fetch_ad_leads rows.
+
+    Shared by /api/campaigns/opp-rollup (the GHL columns on the Marketing Hub
+    tables) and Birdy's get_closes_by_ad, so both count a close the same way.
+    A lead with no opportunity adds to `contacts` but not `total`.
+    """
+    def _empty_bucket() -> dict:
+        return {
+            "won": 0, "lost": 0, "open": 0, "abandoned": 0,
+            "total": 0, "revenue": 0.0, "contacts": 0,
+        }
+
+    by_campaign: dict[str, dict] = {}
+    by_adset: dict[str, dict] = {}
+    by_ad: dict[str, dict] = {}
+
+    for lead in leads:
+        if not lead["ghl_matched"]:
+            continue  # unmatched lead — contributes nothing to GHL columns
+
+        status = lead["ghl_opportunity_status"]
+        value = lead["ghl_opportunity_value"]
+
+        for bucket_map, key in (
+            (by_campaign, lead["campaign_id"]),
+            (by_adset, lead["adset_id"]),
+            (by_ad, lead["ad_id"]),
+        ):
+            if not key:
+                continue
+            bucket = bucket_map.setdefault(key, _empty_bucket())
+            bucket["contacts"] += 1
+            if status:
+                bucket["total"] += 1
+                bucket[status] = bucket.get(status, 0) + 1
+                if status == "won":
+                    bucket["revenue"] += value
+
+    return {
+        "by_campaign": by_campaign,
+        "by_adset": by_adset,
+        "by_ad": by_ad,
+    }
+
+
 async def _fetch_count_rows(
     db, user_id: str, group_ids: list[str] | None, date_range: dict
 ) -> list[dict]:

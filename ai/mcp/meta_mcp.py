@@ -13,12 +13,11 @@ module for the (unchanged, still-registered) fallback path used by the
 orchestrator if the MCP path is unavailable.
 """
 
-from ai.config import MAX_RESULT_ITEMS
 from ai.tools.derived_metrics import enrich
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.server import mcp, current_user_id as _current_user_id
-from ai.tools.meta_tools import _legacy_insights
+from ai.tools.meta_tools import _legacy_insights, shape_cached_insights
 from services.facebook_cache_shape import read_preset
 
 
@@ -129,7 +128,7 @@ async def get_campaign_insights(
     # Try cache first (where the data actually is)
     cached = await _get_cached_data(db, user_id, "campaigns", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_campaign_insights", user_id, start_date, end_date, group_ids)
@@ -153,7 +152,7 @@ async def get_adset_insights(
 
     cached = await _get_cached_data(db, user_id, "adsets", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_adset_insights", user_id, start_date, end_date, group_ids)
@@ -177,7 +176,7 @@ async def get_ad_insights(
 
     cached = await _get_cached_data(db, user_id, "ads", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_ad_insights", user_id, start_date, end_date, group_ids)

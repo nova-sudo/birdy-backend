@@ -120,6 +120,7 @@ If asked for multiple day-count windows, always reach for `get_metrics_by_day_wi
 - `get_unified_lead_stats` — Cross-source totals + overlap counts (GHL-only, GHL+Meta, GHL+HP, all three). Use for "what's my lead match rate" questions.
 
 **GHL Opportunities & Tags:**
+- `get_closes_by_ad` — Closes (won opportunities), revenue, leads, close rate, spend and cost per close per ad, ad set or campaign, best first. **Use for any "which ad/campaign drives the closes / sales / revenue" question**; the ad insights and opportunity stats tools cannot be joined to answer it.
 - `get_ghl_opportunity_stats` — Opp stats per group for one of 13 cached presets (maximum, today, last_7d, last_30d, this_month, last_month, this_quarter, last_quarter, this_year, last_year, etc.). Fast (reads from cache). **Prefer this for standard preset-based questions.**
 - `get_ghl_opp_stats_windowed` — Opp stats for an **arbitrary date window** (e.g. "March 15 to April 15", "Q3 2024"). Slower (~3-10s) because it fetches live, but works for any range not in the preset list. **Use this when the user asks for a specific custom window.**
 - `get_ghl_opp_stats_monthly` — **Month-by-month opp stats for a given year.** Returns all 12 months as an array plus a yearly total. Use this whenever the user asks for a **monthly breakdown** ("monthly revenue for 2025", "how did each month perform in 2024"). Do NOT answer "monthly data unavailable" — call this tool.

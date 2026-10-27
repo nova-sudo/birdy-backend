@@ -135,6 +135,44 @@ def _pick_preset(start_date, end_date):
     return "maximum"
 
 
+# Ad rows carry the creative: full ad copy and signed image URLs, ~1.7k chars an
+# ad. Nineteen ads came to 33k characters against an 8k result budget, so every
+# ad-level answer was truncated before the model saw a single number. The model
+# needs the numbers and a way to name the ad, not the creative itself.
+_CREATIVE_DROP = ("creative_body", "creative_image", "creative_thumbnail", "creative_video_id")
+
+
+def shape_cached_insights(rows: list) -> dict:
+    """Biggest spenders first, without the creative payload."""
+    def spend(r):
+        try:
+            return float(r.get("spend") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    ordered = sorted(rows, key=spend, reverse=True)
+    # One client (every client page, most questions): say so once, not per row.
+    groups = {(r.get("client_group_id"), r.get("client_group_name")) for r in ordered}
+    single = len(groups) == 1
+    out = []
+    for r in ordered[:MAX_RESULT_ITEMS]:
+        row = {}
+        for k, v in r.items():
+            if k in _CREATIVE_DROP or (single and k in ("client_group_id", "client_group_name")):
+                continue
+            row[k] = round(v, 2) if isinstance(v, float) else v
+        if row.get("cost_per_result") == row.get("cpl"):
+            row.pop("cost_per_result", None)
+        if isinstance(row.get("creative_title"), str) and len(row["creative_title"]) > 80:
+            row["creative_title"] = row["creative_title"][:80] + "…"
+        out.append(row)
+    shaped = {"insights": out, "total": len(rows), "sorted_by": "spend"}
+    if single and ordered:
+        gid, gname = next(iter(groups))
+        shaped["client_group"] = {"id": gid, "name": gname}
+    return shaped
+
+
 async def _get_cached_data(db, user_id, level, group_ids=None, start_date=None, end_date=None):
     """
     Read campaign/adset/ad data from facebook_cache on client_groups.
@@ -186,7 +224,7 @@ async def get_campaign_insights(db, user_id, start_date=None, end_date=None, gro
     # Try cache first (where the data actually is)
     cached = await _get_cached_data(db, user_id, "campaigns", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_campaign_insights", user_id, start_date, end_date, group_ids)
@@ -195,7 +233,7 @@ async def get_campaign_insights(db, user_id, start_date=None, end_date=None, gro
 async def get_adset_insights(db, user_id, start_date=None, end_date=None, group_ids=None):
     cached = await _get_cached_data(db, user_id, "adsets", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_adset_insights", user_id, start_date, end_date, group_ids)
@@ -204,7 +242,7 @@ async def get_adset_insights(db, user_id, start_date=None, end_date=None, group_
 async def get_ad_insights(db, user_id, start_date=None, end_date=None, group_ids=None):
     cached = await _get_cached_data(db, user_id, "ads", group_ids, start_date, end_date)
     if cached:
-        return {"insights": cached[:MAX_RESULT_ITEMS], "total": len(cached)}
+        return shape_cached_insights(cached)
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_ad_insights", user_id, start_date, end_date, group_ids)

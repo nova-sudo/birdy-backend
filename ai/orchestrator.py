@@ -13,6 +13,8 @@ from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
+from ai.tools.attribution_tools import TOOL_NAME as CLOSES_BY_AD_TOOL
+from datetime import date
 from ai.prompts.rich_output import with_rich_output
 from ai.tools.render_ui_tools import RENDER_UI_TOOL_NAME, materialize as materialize_ui
 from ai import mcp_client
@@ -145,6 +147,9 @@ _PAGE_TOOLS = {
 # chat, which gets every tool); the browser sends the column lists they need.
 for _page in ("dashboard", "campaigns", "leads", "opportunities", "call_center", "client_detail"):
     _PAGE_TOOLS[_page].extend(sorted(PAGE_VIEW_TOOL_NAMES))
+# Closes per ad: wherever ad or pipeline questions get asked.
+for _page in ("dashboard", "campaigns", "leads", "opportunities", "client_detail"):
+    _PAGE_TOOLS[_page].append(CLOSES_BY_AD_TOOL)
 
 # Output budget per page. The default suits answers; the report copilot writes
 # whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
@@ -168,7 +173,7 @@ _PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES) | set(AGENT_TOOL_NAMES)
 _CLIENT_PINNED_GROUP_TOOLS = {"get_call_recordings_summary", "analyze_call_recordings"}
 # The same guarantee for tools that take a group_ids list: omitting it means
 # "every client", which on a client page would chart other clients' numbers.
-_CLIENT_PINNED_GROUP_IDS_TOOLS = {"get_daily_metrics"}
+_CLIENT_PINNED_GROUP_IDS_TOOLS = {"get_daily_metrics", CLOSES_BY_AD_TOOL}
 
 # ── Alerts page system prompt ─────────────────────────────────────────────────
 
@@ -456,7 +461,10 @@ _MEDIA_BUYING_PAGES = {None, "campaigns", "dashboard", "client_detail", "opportu
 
 
 def _build_client_detail_prompt(client_name: str, client_group_id: str) -> str:
+    today = date.today().isoformat()
     prompt = f"""You are Birdy AI, a marketing analyst assistant scoped exclusively to the client "{client_name}" (group ID: {client_group_id}).
+
+Today's date is {today}. Work out every relative period ("last 30 days", "this month") from it. Any year up to {today[:4]} is history, not the future.
 
 ## Strict scope
 You ONLY answer questions about {client_name}. You have no knowledge of and must not discuss any other client.
@@ -467,6 +475,7 @@ If the user asks about a different client, another account, or anything outside 
 - Campaign performance: call get_campaign_insights, get_adset_insights, get_ad_insights — always pass group_ids=["{client_group_id}"]
 - GHL opportunities & pipeline: call get_ghl_opp_stats_windowed, get_ghl_opp_stats_monthly, get_ghl_tag_breakdown — always pass group_ids=["{client_group_id}"]
 - Leads: call get_unified_leads, get_unified_lead_stats — always pass group_ids=["{client_group_id}"]
+- Which ad / ad set / campaign produces the closes (won deals), revenue and cost per close: call get_closes_by_ad — always pass group_ids=["{client_group_id}"]. Prefer it over combining ad insights with opportunity stats, which cannot be joined.
 - Period comparison: call compare_periods — always pass group_ids=["{client_group_id}"]
 - Active alerts: call get_alerts and filter by this client
 - Live Meta data: call get_meta_insights_live — always pass group_ids=["{client_group_id}"]

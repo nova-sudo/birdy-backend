@@ -73,7 +73,7 @@ from services.ghl_service import (
     get_ghl_contacts_sorted,
     get_tag_metrics_from_cache,
 )
-from services.ad_leads import fetch_ad_leads
+from services.ad_leads import fetch_ad_leads, opp_rollup
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
@@ -2392,43 +2392,7 @@ async def get_campaign_opp_rollup(
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-            def _empty_bucket() -> dict:
-                return {
-                    "won": 0, "lost": 0, "open": 0, "abandoned": 0,
-                    "total": 0, "revenue": 0.0, "contacts": 0,
-                }
-
-            by_campaign: dict[str, dict] = {}
-            by_adset: dict[str, dict] = {}
-            by_ad: dict[str, dict] = {}
-
-            for lead in leads:
-                if not lead["ghl_matched"]:
-                    continue  # unmatched lead — contributes nothing to GHL columns
-
-                status = lead["ghl_opportunity_status"]
-                value = lead["ghl_opportunity_value"]
-
-                for bucket_map, key in (
-                    (by_campaign, lead["campaign_id"]),
-                    (by_adset, lead["adset_id"]),
-                    (by_ad, lead["ad_id"]),
-                ):
-                    if not key:
-                        continue
-                    bucket = bucket_map.setdefault(key, _empty_bucket())
-                    bucket["contacts"] += 1
-                    if status:
-                        bucket["total"] += 1
-                        bucket[status] = bucket.get(status, 0) + 1
-                        if status == "won":
-                            bucket["revenue"] += value
-
-            return {
-                "by_campaign": by_campaign,
-                "by_adset": by_adset,
-                "by_ad": by_ad,
-            }
+            return opp_rollup(leads)
 
         except HTTPException:
             raise
