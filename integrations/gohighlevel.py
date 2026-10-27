@@ -945,6 +945,35 @@ class GHLIntegration:
             logger.error("Failed to fetch opportunities for location %s: %s", location_id, e, exc_info=True)
             return False, opps
 
+    async def fetch_pipelines(
+            self,
+            location_id: str,
+            access_token: str,
+    ) -> Tuple[bool, List[Dict]]:
+        """Fetch all opportunity pipelines (with stages) for a location.
+
+        Returns (True, pipelines) on success, (False, []) on any failure.
+        """
+        url = "https://services.leadconnectorhq.com/opportunities/pipelines"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                resp = await client.get(url, headers=headers, params={"locationId": location_id})
+            if resp.status_code != 200:
+                logger.warning(
+                    "GHL pipelines fetch returned %s for location %s: %s",
+                    resp.status_code, location_id, resp.text[:200],
+                )
+                return False, []
+            return True, resp.json().get("pipelines", []) or []
+        except Exception as e:
+            logger.error("Failed to fetch pipelines for location %s: %s", location_id, e, exc_info=True)
+            return False, []
+
     async def fetch_opportunity_stats(
             self,
             location_id: str,
