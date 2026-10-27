@@ -18,6 +18,7 @@ from dependencies import get_mongo_client
 from integrations.gohighlevel import (
     ghl_integration,
     get_subaccount_tokens,
+    mint_location_token,
 )
 from services.contact_classifier import classify_contact_type
 
@@ -521,8 +522,12 @@ async def fetch_and_cache_ghl_data_optimized(
 
         access_token = location_data.get("access_token")
         if not access_token:
-            logger.warning(f"No access token for GHL location {ghl_location_id}")
-            return
+            # Issue one from the agency token. Returning quietly here let the
+            # tick stamp the refresh complete while nothing was fetched.
+            location_data = await mint_location_token(user_id, ghl_location_id, mongo_client) or {}
+            access_token = location_data.get("access_token")
+            if not access_token:
+                raise RuntimeError(f"No GHL token for location {ghl_location_id}; reconnect GoHighLevel")
 
         location_name = location_data.get("name", "Unknown Location")
         location_address = location_data.get("address", "")

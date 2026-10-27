@@ -1515,6 +1515,35 @@ async def get_agency_token(user_id: str, mongo_client: AsyncIOMotorClient):
     return None
 
 
+async def mint_location_token(user_id: str, location_id: str, mongo_client, company_id: str = None,
+                              agency_access_token: str = None) -> dict | None:
+    """
+    Issue a location token from the agency token and save it, as Add Subaccount
+    does. Returns the saved token data, or None when GHL refuses.
+
+    Location tokens are only ever renewed, never created, by the token job, so
+    a reconnect that rewrote the GHL integration without its subaccounts left
+    every client's sync with no token at all (Oct 2026: no contacts for days).
+    """
+    if not company_id or not agency_access_token:
+        agency = await get_agency_token(user_id, mongo_client) or {}
+        company_id = agency.get("company_id")
+        agency_access_token = agency.get("access_token")
+    if not company_id or not agency_access_token:
+        return None
+
+    success, tokens = await ghl_integration.generate_location_token(company_id, location_id, agency_access_token)
+    if not success:
+        logger.error(f"Failed to issue a token for location {location_id}: {tokens.get('error')}")
+        return None
+
+    location_details = await fetch_location_details(location_id, tokens.get("access_token"))
+    contact_count = await get_contact_count_from_ghl(location_id, tokens.get("access_token"))
+    await save_subaccount_token(user_id, location_id, tokens, mongo_client, location_details,
+                                contact_count=contact_count)
+    return {**tokens, **(location_details or {})}
+
+
 
 # SOLUTION 2: Add index for performance
 async def create_contacts_indexes(mongo_client):

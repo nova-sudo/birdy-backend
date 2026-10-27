@@ -182,6 +182,13 @@ async def refresh_tokens_for_all_users():
                     # STEP 2: Regenerate location tokens (not refresh!)
                     # ============================================
                     subaccount_tokens = await get_subaccount_tokens(user_id, mongo_client)
+                    # Plus every location a client uses: a location with no
+                    # stored token (lost on a reconnect) gets its first one
+                    # here, rather than never.
+                    for location_id in await db["client_groups"].distinct(
+                        "ghl_location_id", {"user_id": user_id, "ghl_location_id": {"$nin": [None, ""]}}
+                    ):
+                        subaccount_tokens.setdefault(location_id, {})
 
                     if subaccount_tokens:
                         logger.info(f"🔄 Regenerating {len(subaccount_tokens)} location tokens for user {user_id}")
