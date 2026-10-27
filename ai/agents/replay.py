@@ -40,6 +40,7 @@ import time
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
 
+from ai.agents import history as ad_history
 from ai.agents.runner import HISTORY_DAYS, MISSING_TARGET_AGENT, evaluate_loaded
 from ai.agents.snapshot import (
     AdDay,
@@ -70,6 +71,8 @@ class DryRunResult:
     spend_saved: float = 0.0
     leads_at_risk: int = 0
     examples: list[dict] = field(default_factory=list)
+    clients_used: int = 0    # watched clients whose ad history was ready and so replayed
+    clients_total: int = 0   # watched clients with a Meta ad account
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -128,12 +131,16 @@ class _Client:
 
 
 async def _load_clients(db, agent: dict, *, start: date, end: date) -> list[_Client]:
+    """The watched clients with a Meta account whose ad history is ready; the
+    rest are left out so partial history never produces a case or an action."""
     user_id = agent["user_id"]
+    gids = (agent.get("scope") or {}).get("client_group_ids") or []
+    history = await ad_history.statuses(db, list(gids))
     out: list[_Client] = []
-    for gid in (agent.get("scope") or {}).get("client_group_ids") or []:
+    for gid in gids:
         try:
             group = await db["client_groups"].find_one({"id": gid, "user_id": user_id}) or {}
-            if not group.get("meta_ad_account_id"):
+            if not group.get("meta_ad_account_id") or not ad_history.is_ready(history[gid]):
                 continue
             ctx = await load_client_ctx(db, user_id, gid, agent)
             ad_days = await load_ad_days(db, user_id, gid, start - timedelta(days=HISTORY_DAYS), end)
@@ -142,6 +149,13 @@ async def _load_clients(db, agent: dict, *, start: date, end: date) -> list[_Cli
         except Exception as e:
             logger.error("agent replay: loading %s/%s failed: %s", user_id, gid, e, exc_info=True)
     return out
+
+
+async def _count_watched(db, agent: dict) -> int:
+    """Watched clients that have a Meta ad account (what the history sync covers)."""
+    gids = (agent.get("scope") or {}).get("client_group_ids") or []
+    return await db["client_groups"].count_documents(
+        {"id": {"$in": list(gids)}, "user_id": agent["user_id"], "meta_ad_account_id": {"$nin": [None, ""]}})
 
 
 async def _prepare(db, agent: dict, *, end: date, days: int):
@@ -216,7 +230,8 @@ async def dry_run(db, mongo_client, agent: dict, *, end: date, days: int = 30,
     raises DryRunTimeout between days instead of running into the platform's
     function timeout."""
     start, rules, memories, clients = await _prepare(db, agent, end=end, days=days)
-    res = DryRunResult(by_rule={r["kind"]: 0 for r in rules})
+    res = DryRunResult(by_rule={r["kind"]: 0 for r in rules}, clients_used=len(clients),
+                       clients_total=await _count_watched(db, agent))
     seen: set[tuple[str, str, str]] = set()
     sim: dict[str, dict[str, tuple[str, date]]] = {c.gid: {} for c in clients}
     paused_on: dict[tuple[str, str], date] = {}  # (gid, ad_id) -> earliest simulated pause day

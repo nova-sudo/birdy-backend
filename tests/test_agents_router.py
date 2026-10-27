@@ -10,6 +10,7 @@ from ai.agents.defaults import DEFAULT_PARAMS
 from ai.agents.store import create_agent, list_rules
 from dependencies import get_current_user
 from main import app
+from agent_history_helpers import seed_history
 
 U = "u1@example.com"
 OTHER = "u2@example.com"
@@ -392,3 +393,37 @@ async def test_delete_refuses_an_active_agent(api, mock_db):
     r = api.delete(f"/api/agents/{a['id']}")
     assert r.status_code == 409
     assert api.get(f"/api/agents/{a['id']}").status_code == 200
+
+
+async def test_history_endpoint_counts_and_errors(api, mock_db):
+    for gid in ("g1", "g2", "g3"):
+        await mock_db["client_groups"].insert_one(
+            {"id": gid, "user_id": U, "name": f"Client {gid}", "meta_ad_account_id": f"act_{gid}"})
+    await mock_db["client_groups"].insert_one({"id": "nometa", "user_id": U, "name": "No Meta"})
+    await seed_history(mock_db, "g1")
+    await seed_history(mock_db, "g2", status="error", error="no_access", oldest_done=None)
+    agent = make_agent(api)
+    r = api.patch(f"/api/agents/{agent['id']}", json={"scope": {"client_group_ids": ["g1", "g2", "nometa", "g3"]}})
+    assert r.status_code == 200, r.text
+
+    body = api.get(f"/api/agents/{agent['id']}/history").json()
+    assert body == {"total": 3, "ready": 1, "clients": [
+        {"client_group_id": "g1", "name": "Client g1", "status": "ready", "error": None},
+        {"client_group_id": "g2", "name": "Client g2", "status": "error", "error": "no_access"},
+        {"client_group_id": "g3", "name": "Client g3", "status": "pending", "error": None},
+    ]}
+
+    api.state["user"] = OTHER
+    assert api.get(f"/api/agents/{agent['id']}/history").status_code == 404
+
+
+async def test_history_endpoint_counts_a_topup_error_as_ready(api, mock_db):
+    await mock_db["client_groups"].insert_one(
+        {"id": "g1", "user_id": U, "name": "Acme", "meta_ad_account_id": "act_1"})
+    await seed_history(mock_db, "g1", status="error", error="rate_limited", last_topup_at=datetime(2026, 10, 24))
+    agent = make_agent(api)
+    api.patch(f"/api/agents/{agent['id']}", json={"scope": {"client_group_ids": ["g1"]}})
+
+    body = api.get(f"/api/agents/{agent['id']}/history").json()
+    assert body["ready"] == 1
+    assert body["clients"] == [{"client_group_id": "g1", "name": "Acme", "status": "ready", "error": "rate_limited"}]

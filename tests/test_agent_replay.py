@@ -19,6 +19,7 @@ from ai.agents.snapshot import AdDay, AdState
 from ai.agents.store import JOBS, create_agent, update_agent
 from dependencies import get_current_user
 from main import app
+from agent_history_helpers import seed_history
 
 USER = "u1"
 OTHER = "u2"
@@ -47,11 +48,13 @@ def _days(first: date, last: date):
         d += timedelta(days=1)
 
 
-async def _group(db, gid, *, target=20, name=None, user=USER):
+async def _group(db, gid, *, target=20, name=None, user=USER, ready=True):
     await db.client_groups.insert_one({
         "id": gid, "user_id": user, "name": name or f"Client {gid}", "ad_account_currency": "GBP",
         "meta_ad_account_id": f"act_{gid}", "targets": {"cpl": target},
     })
+    if ready:
+        await seed_history(db, gid)
 
 
 async def _ad(db, gid, ad_id, adset_id, campaign_id, *, status="ACTIVE", created=datetime(2026, 9, 1),
@@ -301,6 +304,36 @@ async def test_sample_cases_include_near_miss_with_leave_it(mock_db, mock_mongo_
     assert fired[0]["snapshot"]["day"] == END.isoformat()  # latest occurrence
 
 
+async def _two_identical_clients(db, *, g2_status):
+    await _fixture_account(db, "g1")
+    await _fixture_account(db, "g2")
+    await seed_history(db, "g2", status=g2_status)  # same ad data as g1, but still syncing
+    return await _agent(db, ["g1", "g2"])
+
+
+async def test_sample_cases_ignore_clients_still_syncing(mock_db, mock_mongo_client):
+    agent = await _two_identical_clients(mock_db, g2_status="running")
+    cases = await replay.sample_cases(mock_db, mock_mongo_client, agent, end=END, k=50, seed=1,
+                                      exclude_ad_ids=set())
+    assert cases and {c["snapshot"]["client_group_id"] for c in cases} == {"g1"}
+
+
+async def test_dry_run_reports_clients_used(mock_db, mock_mongo_client):
+    agent = await _two_identical_clients(mock_db, g2_status="running")
+    res = await replay.dry_run(mock_db, mock_mongo_client, agent, end=END)
+    assert (res.clients_used, res.clients_total) == (1, 2)
+    assert res.actions == 4  # g2's identical data adds nothing
+    assert res.to_dict()["clients_used"] == 1 and res.to_dict()["clients_total"] == 2
+
+
+async def test_dry_run_total_counts_only_clients_with_a_meta_account(mock_db, mock_mongo_client):
+    await _fixture_account(mock_db, "g1")
+    await mock_db.client_groups.insert_one({"id": "g2", "user_id": USER, "name": "No Meta"})
+    agent = await _agent(mock_db, ["g1", "g2"])
+    res = await replay.dry_run(mock_db, mock_mongo_client, agent, end=END)
+    assert (res.clients_used, res.clients_total) == (1, 1)
+
+
 # ---------------------------------------------------------------------------
 # Job routes
 # ---------------------------------------------------------------------------
@@ -349,7 +382,9 @@ async def test_dry_run_job_lifecycle(api, mock_db, monkeypatch):
     body = api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}").json()
     assert body["status"] == "done"
     assert body["result"]["actions"] == 4
-    assert set(body["result"]) == {"actions", "by_rule", "spend_saved", "leads_at_risk", "examples"}
+    assert set(body["result"]) == {"actions", "by_rule", "spend_saved", "leads_at_risk", "examples",
+                                   "clients_used", "clients_total"}
+    assert (body["result"]["clients_used"], body["result"]["clients_total"]) == (1, 1)
 
     api.state["user"] = OTHER
     assert api.get(f"/api/agents/{agent['_id']}/jobs/{job_id}").status_code == 404

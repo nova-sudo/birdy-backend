@@ -16,6 +16,7 @@ from ai.agents.meta_state import MetaTokenError
 from ai.agents.store import add_memory, create_agent, list_rules, update_agent, update_rule
 from ai.suggestions import actions
 from ai.suggestions import store as sstore
+from agent_history_helpers import seed_history
 from ai.suggestions.contracts import Evidence, Finding, Action, ACTION_PAUSE_ADS
 
 USER = "u1"
@@ -35,13 +36,16 @@ def _insight(gid, ad_id, adset_id, day, spend, leads, ad_name=None):
     }
 
 
-async def _seed_client(db, gid, *, target=20, meta=True, last_day=AS_OF, extra_near=False, name=None):
+async def _seed_client(db, gid, *, target=20, meta=True, last_day=AS_OF, extra_near=False, name=None,
+                       ready=True):
     group = {"id": gid, "user_id": USER, "name": name or f"Client {gid}", "ad_account_currency": "GBP"}
     if target is not None:
         group["targets"] = {"cpl": target}
     if meta:
         group["meta_ad_account_id"] = f"act_{gid}"
     await db.client_groups.insert_one(group)
+    if ready and meta:
+        await seed_history(db, gid)
 
     ads = [(f"{gid}_bad", f"{gid}_s1", "Bad ad"), (f"{gid}_good", f"{gid}_s2", "Good ad")]
     if extra_near:
@@ -152,6 +156,20 @@ async def test_live_run_creates_items_with_agent_fields(mock_db, mock_mongo_clie
     # The activity row is an agent row.
     act = await mock_db[sstore.ACTIVITY].find_one({"kind": sstore.KIND_SUGGESTION_CREATED})
     assert act["agent_id"] == agent["_id"] and act["rule_id"] == rule["_id"]
+
+
+async def test_live_run_skips_client_without_history(mock_db, mock_mongo_client, meta_calls, no_slack):
+    await _seed_client(mock_db, "g1")  # ready: its bad ad is paused
+    await _seed_client(mock_db, "g2")  # identical data, but the history is still syncing
+    await seed_history(mock_db, "g2", status="running")
+    agent = await _agent(mock_db, ["g1", "g2"])
+
+    result = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+
+    assert result.skipped == ["history:g2"]
+    assert result.created == 1
+    assert {d["client_group_id"] for d in await _docs(mock_db)} == {"g1"}
+    assert {c[1] for c in meta_calls} == {"g1"}  # g2's Meta state was never refreshed
 
 
 async def test_auto_mode_rule_applies_as_birdy(mock_db, mock_mongo_client, meta_calls, no_slack, fake_apply):

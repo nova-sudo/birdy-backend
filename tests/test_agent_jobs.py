@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from agent_history_helpers import seed_history
 from ai.agents import runner
 from ai.agents.meta_state import MetaTokenError
 from ai.agents.store import create_agent, update_agent
@@ -29,6 +30,7 @@ async def _seed(db, gids=("cg1",), time="07:00", tz="America/New_York", refreshe
             "id": gid, "user_id": USER, "name": gid, "meta_ad_account_id": f"act_{gid}",
             "last_meta_refresh": refreshed,
         })
+        await seed_history(db, gid)
     agent = await create_agent(db, USER)
     agent = await update_agent(db, USER, agent["_id"], {
         "status": "active",

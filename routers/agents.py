@@ -23,6 +23,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai.agents import confidence as agent_confidence
+from ai.agents import history as ad_history
 from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents import replay
@@ -313,6 +314,31 @@ async def put_client_target(agent_id: str, gid: str, body: ClientTargetBody,
         if targets is None:
             raise HTTPException(status_code=404, detail="Client group not found")
         return {"client_group_id": gid, "targets": client_targets.clean(targets)}
+
+
+# ---------------------------------------------------------------------------
+# Ad history sync progress
+# ---------------------------------------------------------------------------
+
+@router.get("/{agent_id}/history")
+async def get_history(agent_id: str, current_user: str = Depends(get_current_user)):
+    """How far each watched client's Meta ad history has been pulled. A client
+    counts as ready when the agent may read it (see history.is_ready)."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        gids = (agent.get("scope") or {}).get("client_group_ids") or []
+        groups = {g["id"]: g async for g in db["client_groups"].find(
+            {"id": {"$in": list(gids)}, "user_id": current_user})}
+        states = await ad_history.statuses(db, [g for g in gids if groups.get(g, {}).get("meta_ad_account_id")])
+        clients = [{
+            "client_group_id": gid,
+            "name": groups[gid].get("name") or "",
+            "status": "ready" if ad_history.is_ready(state) else state["status"],
+            "error": state["error"],
+        } for gid, state in states.items()]
+        return {"total": len(clients), "ready": sum(c["status"] == "ready" for c in clients),
+                "clients": clients}
 
 
 # ---------------------------------------------------------------------------

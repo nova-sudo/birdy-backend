@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
 
+from ai.agents import history as ad_history
 from ai.agents import memory_filters
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS, RULE_KINDS
 from ai.agents.evaluators import REGISTRY
@@ -113,6 +114,12 @@ async def _evaluate_client(db, mongo_client, agent: dict, rules: list[dict], mem
     account = group.get("meta_ad_account_id")
     if not account:
         result.skipped.append(f"no_meta:{gid}")
+        return None
+
+    if live and not ad_history.is_ready((await ad_history.statuses(db, [gid]))[gid]):
+        # Still pulling this client's ad history: a run on partial data would call
+        # real problems "no findings" or act on a thin window.
+        result.skipped.append(f"history:{gid}")
         return None
 
     if live:
