@@ -14,10 +14,10 @@ into resumable ticks (see meta_refresh_manager.execute_refresh's
 max_seconds parameter).
 
 Endpoints (Vercel crons invoke with GET):
-    GET /api/cron/meta-tick         — every 1 min  (ongoing presets, 5h cadence)
-    GET /api/cron/ghl-tick          — every 1 min  (GHL data, 1h cadence:
-                                                    incremental, with one FULL
-                                                    LOAD per group per day)
+    GET /api/cron/meta-tick         — every 1 min  (ongoing presets, daily cadence)
+    GET /api/cron/ghl-tick          — every 1 min  (GHL data, daily cadence;
+                                                    each daily run is a FULL
+                                                    LOAD)
     GET /api/cron/hp-tick           — every 1 min  (HotProspector data, daily cadence)
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
@@ -68,9 +68,9 @@ GHL_GROUPS_PER_TICK = 2
 META_BUDGET_PER_JOB_SECONDS = 250
 
 # Cadence cutoffs — how stale a group must be before the tick picks it up.
-META_ONGOING_CUTOFF_HOURS = 5
+META_ONGOING_CUTOFF_HOURS = 24
 META_STATIC_CUTOFF_HOURS = 24 * 28  # ~monthly; static presets only change at period boundaries
-GHL_CUTOFF_HOURS = 1
+GHL_CUTOFF_HOURS = 24
 # How often a group gets a FULL LOAD instead of the hourly incremental pass.
 # The incremental pass asks GHL only for contacts updated since the last run,
 # which catches new and edited contacts but not deleted ones — only a full
@@ -92,7 +92,7 @@ GHL_STALE_CLAIM_MINUTES = 10
 # env-tunable so the cadence can change without a redeploy. Fewer per tick than GHL
 # because the windowed call fetch is heavier.
 HP_GROUPS_PER_TICK = int(os.getenv("HP_GROUPS_PER_TICK", "3"))
-HP_CUTOFF_HOURS = int(os.getenv("HP_CUTOFF_HOURS", "12"))
+HP_CUTOFF_HOURS = int(os.getenv("HP_CUTOFF_HOURS", "24"))
 HP_STALE_CLAIM_MINUTES = 10
 
 # HotProspector member-dashboard sync (account-level). The current-year backfill is
