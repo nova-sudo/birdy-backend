@@ -60,11 +60,11 @@ async def test_stage_name_resolved(mock_db, monkeypatch):
 async def test_meta_attribution_with_creative_and_form_answers(mock_db):
     await _seed_contact(mock_db)
     await mock_db["facebook_leads"].insert_one({
-        "user_id": USER, "match_keys": ["email:ann@x.com"],
+        "user_id": USER, "client_group_id": "g1", "match_keys": ["email:ann@x.com"],
         "lead_data": {"ad_id": "a1", "ad_name": "Ad One", "adset_id": "as1", "adset_name": "Set",
                       "campaign_id": "c9", "campaign_name": "Camp", "created_time": "2026-07-17T10:00:00+0000",
                       "platform": "fb", "is_organic": False,
-                      "field_data": [{"name": "budget", "values": ["£100–150"]}]}})
+                      "field_data": {"budget": "£100–150"}}})
     await mock_db["client_groups"].insert_one({
         "id": "g1", "user_id": USER,
         "facebook_cache": {"entities": {"ads": [
@@ -76,7 +76,8 @@ async def test_meta_attribution_with_creative_and_form_answers(mock_db):
     assert a["creative_body"] == "Body text"
     assert a["creative_thumbnail"] == "thumb"
     assert a["form_answers"] == [{"question": "budget", "answer": "£100–150"}]
-    assert a["submitted_at"] == "2026-07-17T10:00:00+0000"
+    assert a["submitted_at"] .endswith("+00:00")
+    assert a["submitted_at"].startswith("2026-07-17T10:00:00")
 
 
 @pytest.mark.asyncio
@@ -134,3 +135,65 @@ async def test_naive_started_at_serialised_as_utc(mock_db):
     await _seed_contact(mock_db)
     r = await build_lead_detail(mock_db, USER, "c1")
     assert r["calls"][0]["started_at"].endswith("+00:00")
+
+
+async def _seed_lead(db, **over):
+    doc = {"user_id": USER, "client_group_id": "g1", "match_keys": ["email:ann@x.com"],
+           "lead_data": {"ad_id": "a1", "created_time": "2026-07-17T10:00:00+0000"}}
+    doc.update(over)
+    await db["facebook_leads"].insert_one(doc)
+
+
+@pytest.mark.asyncio
+async def test_field_data_list_shape_still_supported(mock_db):
+    await _seed_contact(mock_db)
+    await _seed_lead(mock_db, lead_data={"ad_id": "a1", "created_time": "2026-07-17T10:00:00+0000",
+                                         "field_data": [{"name": "budget", "values": ["100"]}]})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["form_answers"] == [{"question": "budget", "answer": "100"}]
+
+
+@pytest.mark.asyncio
+async def test_names_resolved_from_ad_cache_over_utm(mock_db):
+    await _seed_contact(mock_db, {"attributionSource": {"utmContent": "utm-ad", "utmMedium": "utm-set",
+                                                        "campaign": "utm-camp"}})
+    await _seed_lead(mock_db, lead_data={"ad_id": 123, "ad_name": "", "adset_name": "", "campaign_name": "",
+                                         "created_time": "2026-07-17T10:00:00+0000"})
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": USER,
+        "facebook_cache": {"entities": {
+            "ads": [{"id": "123", "name": "Cached Ad", "adset_id": "s1", "campaign_id": "k1"}],
+            "adsets": [{"id": "s1", "name": "Cached Set", "campaign_id": "k1"}]},
+            "maximum": {"campaigns": [{"id": "k1", "name": "Cached Camp"}]}}})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["ad_name"] == "Cached Ad"
+    assert a["adset_name"] == "Cached Set"
+    assert a["campaign_name"] == "Cached Camp"
+    assert a["campaign_id"] == "k1"
+
+
+@pytest.mark.asyncio
+async def test_meta_lead_in_other_client_group_ignored(mock_db):
+    await _seed_contact(mock_db)
+    await _seed_lead(mock_db, client_group_id="g2",
+                     lead_data={"ad_id": "zz", "created_time": "2026-07-17T10:00:00+0000"})
+    assert (await build_lead_detail(mock_db, USER, "c1"))["attribution"] is None
+
+
+@pytest.mark.asyncio
+async def test_newest_meta_lead_wins(mock_db):
+    await _seed_contact(mock_db)
+    await _seed_lead(mock_db, lead_data={"ad_id": "old", "created_time": "2026-07-01T10:00:00+0000"})
+    await _seed_lead(mock_db, lead_data={"ad_id": "new", "created_time": "2026-07-20T10:00:00+0000"})
+    assert (await build_lead_detail(mock_db, USER, "c1"))["attribution"]["ad_id"] == "new"
+
+
+@pytest.mark.asyncio
+async def test_no_stage_lookup_without_opportunities(mock_db, monkeypatch):
+    async def _boom(*a, **k):
+        raise AssertionError("stage_lookup must not be called")
+
+    monkeypatch.setattr("services.lead_detail.stage_lookup", _boom)
+    await _seed_contact(mock_db)
+    r = await build_lead_detail(mock_db, USER, "c1")
+    assert r["opportunities"] == []

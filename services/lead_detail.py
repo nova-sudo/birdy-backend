@@ -59,19 +59,35 @@ def _opportunities(contact: dict, stages: dict) -> list[dict]:
     return rows
 
 
-def _find_ad(group: dict | None, ad_id: str) -> dict:
-    if not group or not ad_id:
+def _find_entity(group: dict | None, kind: str, entity_id) -> dict:
+    if not group or entity_id in (None, ""):
         return {}
     fb = group.get("facebook_cache") or {}
-    ads = (fb.get("entities") or {}).get("ads") or (fb.get("maximum") or {}).get("ads") or []
-    return next((a for a in ads if a.get("id") == ad_id), {})
+    rows = (fb.get("entities") or {}).get(kind) or (fb.get("maximum") or {}).get(kind) or []
+    target = str(entity_id)
+    return next((r for r in rows if isinstance(r, dict) and str(r.get("id")) == target), {})
+
+
+def _form_answers(field_data) -> list[dict]:
+    if isinstance(field_data, dict):
+        return [{"question": k, "answer": v} for k, v in field_data.items()]
+    answers = []
+    for f in field_data or []:
+        if not isinstance(f, dict):
+            continue
+        values = f.get("values") or []
+        answers.append({"question": f.get("name"), "answer": values[0] if values else None})
+    return answers
 
 
 async def _attribution(db, user_id: str, doc: dict, contact: dict):
     keys = doc.get("match_keys") or compute_match_keys(contact.get("email"), contact.get("phone"))
     meta = None
     if keys:
-        meta = await db["facebook_leads"].find_one({"user_id": user_id, "match_keys": {"$in": keys}})
+        query = {"user_id": user_id, "match_keys": {"$in": keys}}
+        if doc.get("client_group_id"):
+            query["client_group_id"] = doc["client_group_id"]
+        meta = await db["facebook_leads"].find_one(query, sort=[("lead_data.created_time", -1)])
     src = contact.get("attributionSource") or {}
     if not meta and not (src.get("adId") or src.get("campaign") or src.get("utmSource")):
         return None
@@ -81,27 +97,30 @@ async def _attribution(db, user_id: str, doc: dict, contact: dict):
     group = None
     if doc.get("client_group_id"):
         group = await db["client_groups"].find_one({"id": doc["client_group_id"], "user_id": user_id})
-    ad = _find_ad(group, ad_id)
+    ad = _find_entity(group, "ads", ad_id)
+    adset_id = ld.get("adset_id") or ad.get("adset_id")
+    campaign_id = ld.get("campaign_id") or src.get("campaignId") or ad.get("campaign_id")
+    adset = _find_entity(group, "adsets", adset_id)
+    campaign = _find_entity(group, "campaigns", campaign_id)
 
-    answers = []
-    for f in ld.get("field_data") or []:
-        values = f.get("values") or []
-        answers.append({"question": f.get("name"), "answer": values[0] if values else None})
+    created = ld.get("created_time")
+    parsed = _parse_dt(created)
+    submitted_at = _iso(parsed) if parsed else created
 
     return {
         "platform": ld.get("platform"),
         "is_organic": ld.get("is_organic"),
-        "ad_id": ad_id or None,
-        "ad_name": ld.get("ad_name") or src.get("utmContent") or ad.get("name") or None,
-        "adset_name": ld.get("adset_name") or src.get("utmMedium") or None,
-        "campaign_name": ld.get("campaign_name") or src.get("campaign") or None,
-        "campaign_id": ld.get("campaign_id") or src.get("campaignId") or ad.get("campaign_id") or None,
+        "ad_id": str(ad_id) if ad_id else None,
+        "ad_name": ld.get("ad_name") or ad.get("name") or src.get("utmContent") or None,
+        "adset_name": ld.get("adset_name") or adset.get("name") or src.get("utmMedium") or None,
+        "campaign_name": ld.get("campaign_name") or campaign.get("name") or src.get("campaign") or None,
+        "campaign_id": campaign_id or None,
         "creative_title": ad.get("creative_title"),
         "creative_body": ad.get("creative_body"),
         "creative_image": ad.get("creative_image"),
         "creative_thumbnail": ad.get("creative_thumbnail"),
-        "submitted_at": ld.get("created_time"),
-        "form_answers": answers,
+        "submitted_at": submitted_at,
+        "form_answers": _form_answers(ld.get("field_data")),
         "utm": {
             "source": src.get("utmSource"),
             "medium": src.get("utmMedium"),
@@ -180,7 +199,8 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
         return None
     contact = doc.get("contact_data") or {}
 
-    stages = await stage_lookup(db, user_id, doc.get("location_id")) if doc.get("location_id") else {}
+    has_opps = any(isinstance(o, dict) for o in contact.get("opportunities") or [])
+    stages = await stage_lookup(db, user_id, doc.get("location_id")) if (has_opps and doc.get("location_id")) else {}
     calls = await _calls(db, user_id, contact)
 
     return {

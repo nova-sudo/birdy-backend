@@ -961,7 +961,7 @@ class GHLIntegration:
             "Accept": "application/json",
         }
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(url, headers=headers, params={"locationId": location_id})
             if resp.status_code != 200:
                 logger.warning(
