@@ -777,6 +777,7 @@ async def schedule_stale_groups(
     presets: list[str],
     limit: int = 100,
     stale_field: str = "last_meta_refresh",
+    due_clauses: list[dict] | None = None,
 ) -> list[str]:
     """
     Find client groups whose Meta cache is older than `cutoff_hours` and
@@ -792,6 +793,8 @@ async def schedule_stale_groups(
                       growth of meta_refresh_jobs per minute).
         stale_field:  which timestamp decides staleness. Each tier must read
                       the stamp its own work writes — see below.
+        due_clauses:  `$or` branches that decide "due" instead of cutoff_hours
+                      (the nightly slot, services/daily_refresh_slot.py).
 
     ── Why `stale_field` is a parameter ──────────────────────────────────────
 
@@ -832,7 +835,7 @@ async def schedule_stale_groups(
             # The static tier reads a different stamp and runs monthly over a
             # collection this size, so it is left to scan rather than carrying
             # a second index for twelve queries a year.
-            "$or": [
+            "$or": due_clauses or [
                 {stale_field: {"$lt": cutoff}},
                 {stale_field: None},
             ],

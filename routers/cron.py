@@ -14,11 +14,11 @@ into resumable ticks (see meta_refresh_manager.execute_refresh's
 max_seconds parameter).
 
 Endpoints (Vercel crons invoke with GET):
-    GET /api/cron/meta-tick         — every 1 min  (ongoing presets, daily cadence)
-    GET /api/cron/ghl-tick          — every 1 min  (GHL data, daily cadence;
+    GET /api/cron/meta-tick         — every 1 min  (ongoing presets, nightly after 01:00 local)
+    GET /api/cron/ghl-tick          — every 1 min  (GHL data, nightly after 01:00 local;
                                                     each daily run is a FULL
                                                     LOAD)
-    GET /api/cron/hp-tick           — every 1 min  (HotProspector data, daily cadence)
+    GET /api/cron/hp-tick           — every 1 min  (HotProspector data, nightly after 01:00 local)
     GET /api/cron/meta-static-tick  — 1st of month (Last Month/Quarter/Year)
     GET /api/cron/ghl-tokens        — every 30 min (token rotation)
     GET /api/cron/alerts            — hourly       (alert evaluation)
@@ -44,6 +44,7 @@ from core.constants import META_ONGOING_PRESETS, META_STATIC_PRESETS
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from services.attribution_service import run_match_tick
+from services.daily_refresh_slot import daily_due_clauses
 from services.ghl_lead_push import push_pending_for_group
 
 logger = logging.getLogger(__name__)
@@ -67,15 +68,18 @@ GHL_GROUPS_PER_TICK = 2
 # Leaves headroom for the function's own startup/shutdown overhead.
 META_BUDGET_PER_JOB_SECONDS = 250
 
-# Cadence cutoffs — how stale a group must be before the tick picks it up.
-META_ONGOING_CUTOFF_HOURS = 24
+# Cadence. The daily Meta (ongoing presets), GHL and HotProspector refreshes
+# fall due once a night just after midnight in the account's timezone, so the
+# morning starts with yesterday complete (services/daily_refresh_slot.py).
+# Only the static Meta presets still run on a rolling cutoff.
 META_STATIC_CUTOFF_HOURS = 24 * 28  # ~monthly; static presets only change at period boundaries
-GHL_CUTOFF_HOURS = 24
 # How often a group gets a FULL LOAD instead of the hourly incremental pass.
 # The incremental pass asks GHL only for contacts updated since the last run,
 # which catches new and edited contacts but not deleted ones — only a full
 # walk can notice that GHL stopped returning a contact and prune it.
-GHL_FULL_RELOAD_HOURS = 24
+# 20, not 24: the nightly runs land a few minutes apart, and at 24 a run that
+# came 23h57m after the last one would have been only incremental.
+GHL_FULL_RELOAD_HOURS = 20
 # The incremental window starts this long before the previous run's stamp,
 # so a contact edited while that run was in flight, or a clock a little
 # behind GHL's, is picked up on the next pass rather than lost until the
@@ -92,7 +96,6 @@ GHL_STALE_CLAIM_MINUTES = 10
 # env-tunable so the cadence can change without a redeploy. Fewer per tick than GHL
 # because the windowed call fetch is heavier.
 HP_GROUPS_PER_TICK = int(os.getenv("HP_GROUPS_PER_TICK", "3"))
-HP_CUTOFF_HOURS = int(os.getenv("HP_CUTOFF_HOURS", "24"))
 HP_STALE_CLAIM_MINUTES = 10
 
 # HotProspector member-dashboard sync (account-level). The current-year backfill is
@@ -119,7 +122,7 @@ def _verify_cron_auth(authorization: str | None):
 
 
 # ---------------------------------------------------------------------------
-# Meta refresh — 5-hour cadence for ongoing presets
+# Meta refresh — ongoing presets nightly, after midnight local
 # ---------------------------------------------------------------------------
 
 @router.get("/meta-tick")
@@ -129,7 +132,7 @@ async def meta_tick(authorization: str | None = Header(default=None)):
 
     Each tick does two things:
       1. Schedule: enqueue refresh jobs for groups whose Meta cache is
-         older than META_ONGOING_CUTOFF_HOURS and don't already have an
+         not refreshed since last night's slot and don't already have an
          open job.
       2. Work: atomically claim up to N jobs (pending, partial, or
          crash-recovered) and advance them in parallel within a per-job
@@ -153,9 +156,12 @@ async def meta_tick(authorization: str | None = Header(default=None)):
             # 1. Schedule new work
             scheduled = await schedule_stale_groups(
                 mongo_client,
-                cutoff_hours=META_ONGOING_CUTOFF_HOURS,
+                cutoff_hours=24,  # unused: due_clauses decides
                 presets=META_ONGOING_PRESETS,
                 limit=20,
+                due_clauses=await daily_due_clauses(
+                    mongo_client[DB_NAME], "last_meta_refresh", datetime.utcnow()
+                ),
             )
 
             # 1b. Mop up static presets whose monthly sweep missed them.
@@ -282,7 +288,7 @@ async def meta_static_tick(authorization: str | None = Header(default=None)):
 
 
 # ---------------------------------------------------------------------------
-# GHL data refresh — 1-hour cadence (matches the legacy APScheduler)
+# GHL data refresh — nightly, after midnight local
 # ---------------------------------------------------------------------------
 
 def ghl_refresh_plan(group: dict, now: datetime) -> tuple[bool, datetime | None]:
@@ -340,7 +346,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
         db = mongo_client[DB_NAME]
         client_groups = db["client_groups"]
         now = datetime.utcnow()
-        cutoff = now - timedelta(hours=GHL_CUTOFF_HOURS)
+        due = await daily_due_clauses(db, "last_ghl_refresh", now)
         stale_lock_before = now - timedelta(minutes=GHL_STALE_CLAIM_MINUTES)
 
         # A lock is only a lock because it expires, and the claim time is what
@@ -359,11 +365,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
             doc = await client_groups.find_one_and_update(
                 {
                     "ghl_location_id": {"$exists": True, "$ne": None},
-                    "$or": [
-                        {"last_ghl_refresh": {"$lt": cutoff}},
-                        {"last_ghl_refresh": {"$exists": False}},
-                        {"last_ghl_refresh": None},
-                    ],
+                    "$or": due,
                     # Either not running, or running-but-stuck.
                     #
                     # Note what is NOT here: a `_ghl_claimed_at does not exist`
@@ -473,14 +475,14 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
 
 
 # ---------------------------------------------------------------------------
-# HotProspector data refresh — 6-hour cadence (Sales-Hub call-center data)
+# HotProspector data refresh — nightly, after midnight local (Sales-Hub call-center data)
 # ---------------------------------------------------------------------------
 
 @router.get("/hp-tick")
 async def hp_tick(authorization: str | None = Header(default=None)):
     """
     Refreshes HotProspector call-center data for the stalest HP-provider groups.
-    Runs every minute; the 24-hour cutoff governs how often a group is actually
+    Runs every minute; the nightly slot (services/daily_refresh_slot.py) governs when a group is actually
     refetched (full history re-pull + per-preset stat re-derivation).
 
     Same inline atomic-claim pattern as ghl-tick, on a separate status flag
@@ -507,7 +509,7 @@ async def hp_tick(authorization: str | None = Header(default=None)):
         db = mongo_client[DB_NAME]
         client_groups = db["client_groups"]
         now = datetime.utcnow()
-        cutoff = now - timedelta(hours=HP_CUTOFF_HOURS)
+        due = await daily_due_clauses(db, "last_hp_refresh", now)
         stale_lock_before = now - timedelta(minutes=HP_STALE_CLAIM_MINUTES)
 
         # One sync per account at a time. HotProspector rate-limits per API
@@ -527,11 +529,7 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                     "user_id": {"$nin": list(busy_users)},
                     "call_log_provider": "hotprospector",
                     "ghl_location_id": {"$exists": True, "$ne": None},
-                    "$or": [
-                        {"last_hp_refresh": {"$lt": cutoff}},
-                        {"last_hp_refresh": {"$exists": False}},
-                        {"last_hp_refresh": None},
-                    ],
+                    "$or": due,
                     "$and": [
                         {
                             "$or": [
