@@ -2,9 +2,10 @@
 Saved views for the hub tables (Clients, Leads, Marketing, Sales), made from chat.
 
 A saved view is a named column set. The columns a hub offers are built in the
-browser (GHL custom fields and tags among them), so the chat request carries a
-`view_catalogues` map the frontend collected from every hub the user has
-opened:
+browser (GHL custom fields and tags among them), so each hub saves its list to
+the user's account when it renders (users.view_catalogues), and the chat
+request also carries the lists this browser has seen, which win as the
+freshest:
 
     { "<page key>": { "label": "Leads Hub", "path": "/contacts",
                       "columns": [ { "id", "label", "source" }, ... ] } }
@@ -16,15 +17,35 @@ append to, so the open page can show and apply a new view without a reload.
 from fastapi import HTTPException
 
 from ai.tools.registry import registry
-from services.page_views_service import create_page_view, set_default_page_view
+from services.page_views_service import create_page_view, get_view_catalogues, set_default_page_view
 
 LIST_TOOL = "list_view_columns"
 CREATE_TOOL = "create_saved_view"
 PAGE_VIEW_TOOL_NAMES = {LIST_TOOL, CREATE_TOOL}
 
 
-def _pages(view_catalogues) -> dict:
-    return view_catalogues if isinstance(view_catalogues, dict) else {}
+async def _pages(db, user_id, view_catalogues) -> dict:
+    sent = view_catalogues if isinstance(view_catalogues, dict) else {}
+    return {**await get_view_catalogues(db, user_id), **sent}
+
+
+def _resolve(page, pages: dict):
+    """A page key, or the hub's name as the user said it ("marketing hub")."""
+    if page in pages:
+        return page, None
+    needle = " ".join(str(page or "").lower().replace("_", " ").split())
+    if not needle:
+        return None, None
+    hits = [k for k, v in pages.items()
+            if str(v.get("label", "")).lower() == needle
+            or str(v.get("label", "")).lower().startswith(needle)]
+    if len(hits) == 1:
+        return hits[0], None
+    if hits:
+        options = ", ".join(f'{k} ({pages[k].get("label", k)})' for k in hits)
+        return None, {"ok": False, "error": f'"{page}" matches several tables: {options}. '
+                                            "Ask which one, or pick the one the user means."}
+    return None, None
 
 
 def _no_page(page, pages: dict) -> dict:
@@ -32,13 +53,13 @@ def _no_page(page, pages: dict) -> dict:
     return {
         "ok": False,
         "error": f'No column list for page "{page}". Known pages: {known}. '
-                 "If the hub the user means is missing, ask them to open it once "
-                 "so Birdy can learn its columns.",
+                 "If the hub the user means is missing, it has not been opened since "
+                 "this feature shipped: ask them to open (or reload) that hub once.",
     }
 
 
 async def list_view_columns(db, user_id, view_catalogues=None, page=None, search=None, **_):
-    pages = _pages(view_catalogues)
+    pages = await _pages(db, user_id, view_catalogues)
     if not page:
         return {
             "ok": True,
@@ -47,8 +68,12 @@ async def list_view_columns(db, user_id, view_catalogues=None, page=None, search
                 for k, v in pages.items()
             ],
         }
-    if page not in pages:
+    key, ambiguous = _resolve(page, pages)
+    if ambiguous:
+        return ambiguous
+    if key is None:
         return _no_page(page, pages)
+    page = key
     columns = pages[page].get("columns") or []
     if search:
         needle = search.lower()
@@ -59,9 +84,13 @@ async def list_view_columns(db, user_id, view_catalogues=None, page=None, search
 
 async def create_saved_view(db, user_id, view_catalogues=None, page_view_ops_sink=None,
                             page=None, name=None, column_ids=None, make_default=False, **_):
-    pages = _pages(view_catalogues)
-    if page not in pages:
+    pages = await _pages(db, user_id, view_catalogues)
+    key, ambiguous = _resolve(page, pages)
+    if ambiguous:
+        return ambiguous
+    if key is None:
         return _no_page(page, pages)
+    page = key
     entry = pages[page]
     known = {c.get("id") for c in entry.get("columns") or []}
 

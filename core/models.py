@@ -100,6 +100,13 @@ class DefaultPageViewRequest(BaseModel):
     view_id: Optional[str] = None   # None clears the default
 
 
+# A hub table's column list, saved for Birdy's saved-view tools.
+class ViewCatalogueRequest(BaseModel):
+    label: Optional[str] = None
+    path: Optional[str] = None
+    columns: list
+
+
 class AlertCondition(BaseModel):
     metric: str
     operator: str

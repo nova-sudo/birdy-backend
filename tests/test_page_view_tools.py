@@ -51,7 +51,7 @@ async def test_unknown_page_names_the_known_ones(mock_db):
     out = await create_saved_view(mock_db, USER, view_catalogues=CATALOGUES, page="cc_leads",
                                   name="x", column_ids=["name"])
     assert out["ok"] is False
-    assert "Leads Hub" in out["error"] and "open it once" in out["error"]
+    assert "Leads Hub" in out["error"] and "open (or reload) that hub" in out["error"]
     out = await list_view_columns(mock_db, USER, view_catalogues=None, page="contacts")
     assert out["ok"] is False and "none yet" in out["error"]
 
@@ -143,3 +143,46 @@ def test_hub_pages_offer_the_tools_and_models_carry_the_fields():
     assert not PAGE_VIEW_TOOL_NAMES & set(_PAGE_TOOLS["dashboards"])
     assert ChatRequest(message="hi", view_catalogues=CATALOGUES).view_catalogues == CATALOGUES
     assert ChatResponse(reply="ok").model_dump()["page_view_ops"] == []
+
+
+# ── column lists saved to the account ───────────────────────────────────────
+
+
+async def test_saved_catalogues_work_without_the_browser_sending_any(mock_db):
+    from services.page_views_service import save_view_catalogue
+    await save_view_catalogue(mock_db, USER, "clients", {
+        "label": "Clients Hub", "path": "/clients",
+        "columns": [{"id": "spend", "label": "Spend", "source": "meta"}, {"id": "cpl", "label": "CPL"}],
+    })
+    pages = await list_view_columns(mock_db, USER, view_catalogues=None)
+    assert pages["pages"] == [{"page": "clients", "label": "Clients Hub", "column_count": 2}]
+    out = await create_saved_view(mock_db, USER, page="clients", name="Media buyer", column_ids=["spend", "cpl"])
+    assert out["ok"] is True and out["columns"] == ["Spend", "CPL"]
+
+
+async def test_sent_catalogues_win_over_saved_ones(mock_db):
+    from services.page_views_service import save_view_catalogue
+    await save_view_catalogue(mock_db, USER, "contacts", {"label": "Old", "columns": [{"id": "old"}]})
+    out = await list_view_columns(mock_db, USER, view_catalogues=CATALOGUES, page="contacts")
+    assert out["label"] == "Leads Hub" and len(out["columns"]) == 4
+
+
+async def test_pages_resolve_by_hub_name(mock_db):
+    cats = {**CATALOGUES, "mktg_ads": {"label": "Marketing Hub · Ads", "columns": [{"id": "spend"}]}}
+    out = await list_view_columns(mock_db, USER, view_catalogues=cats, page="Leads hub")
+    assert out["page"] == "contacts"
+    out = await list_view_columns(mock_db, USER, view_catalogues=cats, page="marketing hub")
+    assert out["ok"] is False and "mktg_campaigns" in out["error"] and "mktg_ads" in out["error"]
+    out = await create_saved_view(mock_db, USER, view_catalogues=cats, page="Marketing Hub · Campaigns",
+                                  name="MB", column_ids=["spend"])
+    assert out["ok"] is True and out["page_label"] == "Marketing Hub · Campaigns"
+
+
+async def test_catalogue_validation(mock_db):
+    from fastapi import HTTPException
+    from services.page_views_service import clean_view_catalogue
+    for page, cols in (("bad.page", [{"id": "a"}]), ("clients", []), ("clients", [{"label": "x"}])):
+        with pytest.raises(HTTPException):
+            clean_view_catalogue(page, "L", None, cols)
+    many = clean_view_catalogue("clients", None, None, [{"id": f"c{i}"} for i in range(500)])
+    assert len(many["columns"]) == 400 and many["label"] == "clients"

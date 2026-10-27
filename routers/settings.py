@@ -12,6 +12,7 @@ from core.models import (
     CreatePageViewRequest,
     UpdatePageViewRequest,
     DefaultPageViewRequest,
+    ViewCatalogueRequest,
 )
 from dependencies import get_mongo_client, get_current_user
 from services import capabilities_service
@@ -22,6 +23,7 @@ from services.page_views_service import (  # noqa: F401 (limits re-exported for 
     clean_view_name as _clean_view_name,
     create_page_view as _create_page_view,
     get_page_bucket as _get_page_bucket,
+    save_view_catalogue as _save_view_catalogue,
     set_default_page_view as _set_default_page_view,
 )
 
@@ -515,6 +517,24 @@ async def set_default_page_view(
 
 MAX_NAME_LENGTH = 120
 MIN_PASSWORD_LENGTH = 8
+
+
+@router.put("/api/user/view-catalogues/{page}")
+async def put_view_catalogue(
+    page: str,
+    request: ViewCatalogueRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Save the column list a hub table offers, for Birdy's saved-view tools."""
+    async with get_mongo_client() as mongo_client:
+        try:
+            await _save_view_catalogue(mongo_client[DB_NAME], current_user, page, request.model_dump())
+            return {"success": True, "page": page}
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error saving view catalogue for {current_user}: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.get("/api/user/profile")
