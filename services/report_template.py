@@ -131,6 +131,10 @@ CATALOG: dict[str, dict] = {
 SOURCE_LABELS = {"meta": "Meta Ads", "ghl_opp": "CRM pipeline", "hp_call": "Call centre", "combined": "Meta + CRM"}
 
 SPECIAL_TOKENS = ("ranking", "breakdown", "alerts", "flagged_ads", "birdy_take", "period", "date", "client_count")
+# Filled from the Birdy event that sent the report (services/report_events.py);
+# blank in a scheduled report.
+EVENT_TOKENS = {"event": "the event", "alert_name": "alert name", "alert_message": "alert message",
+                "account_name": "account name", "metric_name": "metric name"}
 
 _TOKEN_RE = re.compile(r"\{\{\s*([a-z_]+)((?:\s+[a-z_]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s}]+))*)\s*\}\}")
 _OPT_RE = re.compile(r"([a-z_]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s}]+))")
@@ -224,11 +228,11 @@ def _check_token(tok: dict, clients: dict[str, str] | None) -> list[str]:
     elif name in ("alerts", "flagged_ads"):
         if opts.get("show", "summary") not in ("summary", "count", "list"):
             errs.append(f"{where}: show must be summary, count or list")
-    elif name in ("birdy_take", "period", "date", "client_count"):
+    elif name in ("birdy_take", "period", "date", "client_count") or name in EVENT_TOKENS:
         pass
     else:
         errs.append(f"{where}: unknown placeholder; metrics are {', '.join(CATALOG)}, "
-                    f"others are {', '.join(SPECIAL_TOKENS)}")
+                    f"others are {', '.join((*SPECIAL_TOKENS, *EVENT_TOKENS))}")
     return errs
 
 
@@ -605,6 +609,7 @@ class Context:
         self.sample = sample
         self.preview = preview  # a preview, not a send: explain what can't be shown yet
         self.values: dict[str, float] = {}   # this send's figures, for the next send's show=change
+        self.event: dict[str, str] = {}      # the event that sent it, if one did
         self._views: dict[str, dict] = {}
 
     def views(self, preset):
@@ -740,6 +745,8 @@ def _resolve(tok: dict, ctx: Context) -> str:
         return ctx.now_utc.strftime("%a %-d %b")
     if name == "client_count":
         return str(len(ctx.groups))
+    if name in EVENT_TOKENS:
+        return ctx.event.get(name) or (f"‹{EVENT_TOKENS[name]}›" if ctx.preview else "")
     return ""
 
 
@@ -943,4 +950,5 @@ PLACEHOLDER_GUIDE = """Placeholders: {{name key=value key="value with spaces"}}
 - {{breakdown metrics="<m1>,<m2>" [clients="<name>,<name>"] [sort=<m1>] [order=worst] [limit=10] [period=…]}} → one bullet per client
 - {{alerts}} / {{flagged_ads}} with show=<summary|count|list> [limit=5]
 - {{birdy_take focus="…"}} → a short written read of the numbers (at most one)
-- {{period}} → "Yesterday"/"Last 7 days", {{date}} → "Mon 13 Oct", {{client_count}}"""
+- {{period}} → "Yesterday"/"Last 7 days", {{date}} → "Mon 13 Oct", {{client_count}}
+- Reports sent by a Birdy event only: {{event}} → "Alert: CPL above £40", {{alert_name}}, {{alert_message}}, {{account_name}}, {{metric_name}} (blank in scheduled reports)"""

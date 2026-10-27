@@ -1209,6 +1209,7 @@ async def import_subaccounts(
         }
 
         imported, skipped_existing, skipped_limit = [], [], []
+        imported_names: list[str] = []
         seen_this_batch = set()
         for account in body.accounts:
             if account.location_id in already or account.location_id in seen_this_batch:
@@ -1280,12 +1281,16 @@ async def import_subaccounts(
 
             seen_this_batch.add(account.location_id)
             result = {"group_id": group_id, "location_id": account.location_id}
+            imported_names.append(account.name)
             if meta_skipped:
                 result["meta_skipped_reason"] = "shared_account"
             imported.append(result)
 
         if imported:
             background_tasks.add_task(_mint_location_tokens, current_user, imported)
+            # One event for the batch, so an import posts one report, not one per account.
+            from services.report_events import emit, names_label
+            await emit(db, current_user, "account_created", {"account_name": names_label(imported_names)})
 
         return {
             "imported": imported,

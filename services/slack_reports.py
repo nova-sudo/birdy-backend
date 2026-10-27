@@ -23,8 +23,8 @@ default report (sync_default_from_brief), and accounts that never had one
 synced are migrated on the next tick. The scheduler only ever reads reports.
 
 Each send is claimed by inserting a row into `slack_report_runs` with
-_id = "<report id>:<key>" — the local date for a schedule, the event id for an
-event — so two ticks racing each other cannot both send. A failed post deletes
+_id = "<report id>:<key>" — the local date for a schedule, "event:<id>" for an
+event (services/report_events.py) — so two ticks racing each other cannot both send. A failed post deletes
 its row so the next tick retries; a skipped one (no Slack, no clients) keeps it.
 """
 
@@ -171,7 +171,7 @@ async def sync_default_from_brief(db, user_id: str) -> dict | None:
 
     last_sent = slack_bot.get("brief_last_sent")
     if last_sent:
-        await _claim(db, report, last_sent, status=SENT, migrated=True)
+        await claim(db, report, last_sent, status=SENT, migrated=True)
     logger.info("slack reports: migrated the brief of %s into report %s", user_id, report["id"])
     return report
 
@@ -220,7 +220,7 @@ def due_key(report: dict, account_tz: str | None, now_utc: datetime) -> str | No
 # ── Claims ────────────────────────────────────────────────────────────────────
 
 
-async def _claim(db, report: dict, key: str, *, status: str = "claimed", **extra) -> bool:
+async def claim(db, report: dict, key: str, *, status: str = "claimed", **extra) -> bool:
     try:
         await db[RUNS].insert_one({
             "_id": f"{report['id']}:{key}", "report_id": report["id"], "user_id": report["user_id"],
@@ -231,17 +231,17 @@ async def _claim(db, report: dict, key: str, *, status: str = "claimed", **extra
         return False
 
 
-async def _finish(db, report: dict, key: str, status: str, error: str | None = None) -> None:
+async def finish(db, report: dict, key: str, status: str, error: str | None = None) -> None:
     now = datetime.utcnow()
     if status == FAILED:
         await db[RUNS].delete_one({"_id": f"{report['id']}:{key}"})  # free it for a retry
     else:
         await db[RUNS].update_one({"_id": f"{report['id']}:{key}"},
                                   {"$set": {"status": status, "at": now, "error": error}})
-    await db[REPORTS].update_one(
-        {"id": report["id"]},
-        {"$set": {"last_run": {"at": now, "key": key, "status": status, "error": error}}},
-    )
+    fields = {"last_run": {"at": now, "key": key, "status": status, "error": error}}
+    if status == SENT:
+        fields["last_sent_at"] = now
+    await db[REPORTS].update_one({"id": report["id"]}, {"$set": fields})
 
 
 # ── Sending ───────────────────────────────────────────────────────────────────
@@ -263,10 +263,12 @@ async def _target(db, report: dict) -> tuple[str | None, str | None]:
     return decrypt(token_enc), channel
 
 
-async def send_report(db, report: dict, now_utc: datetime, key: str | None = None) -> tuple[str, str | None]:
+async def send_report(db, report: dict, now_utc: datetime, key: str | None = None,
+                      event: dict | None = None) -> tuple[str, str | None]:
     """
     Build and post one report. Returns (status, error): SENT, SKIPPED (nothing
     to send to or about — not worth retrying) or FAILED (Slack refused).
+    `event` fills the event placeholders (services/report_events.py).
     """
     template = rt.normalize(report.get("template"))
     if not rt.has_content(template):
@@ -280,6 +282,7 @@ async def send_report(db, report: dict, now_utc: datetime, key: str | None = Non
     key = key or now_utc.date().isoformat()
     previous = rt.previous_for(report.get("last_figures"), key, frequency)
     ctx = await rt.build_context(db, report["user_id"], template, now_utc, previous=previous)
+    ctx.event = event or {}
     if not ctx.groups:
         return SKIPPED, "no active clients"
 
@@ -308,14 +311,14 @@ def _slack_error(e: Exception) -> str:
     return code or type(e).__name__
 
 
-async def run_claimed(db, report: dict, key: str, now_utc: datetime) -> str:
+async def run_claimed(db, report: dict, key: str, now_utc: datetime, event: dict | None = None) -> str:
     """Send a report whose run is already claimed, and record how it went."""
     try:
-        status, error = await send_report(db, report, now_utc, key=key)
+        status, error = await send_report(db, report, now_utc, key=key, event=event)
     except Exception as e:
         logger.error("slack report %s failed: %s", report["id"], e, exc_info=True)
         status, error = FAILED, type(e).__name__
-    await _finish(db, report, key, status, error)
+    await finish(db, report, key, status, error)
     return status
 
 
@@ -334,10 +337,16 @@ async def send_due_reports(db, now_utc: datetime | None = None) -> dict:
     for report in reports:
         stats["checked"] += 1
         key = due_key(report, zones.get(report["user_id"]) or DEFAULT_TIMEZONE, now_utc)
-        if not key or not await _claim(db, report, key):
+        if not key or not await claim(db, report, key):
             continue
         stats["due"] += 1
         stats[await run_claimed(db, report, key, now_utc)] += 1
+
+    from services.report_events import sweep_events
+    try:
+        stats["events_swept"] = await sweep_events(db, now_utc)
+    except Exception as e:
+        logger.error("slack reports: event sweep failed: %s", e, exc_info=True)
 
     logger.info("slack reports: %s", stats)
     return stats

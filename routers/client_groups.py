@@ -896,6 +896,9 @@ async def create_client_group_optimized(
 
             await client_groups_collection.insert_one(client_group)
             logger.info(f"Created client group {group_id}")
+            from services.report_events import emit
+            await emit(mongo_client[DB_NAME], current_user, "account_created",
+                       {"account_name": client_group.get("name")})
 
             converted: list = []
             if live_campaigns is not None:

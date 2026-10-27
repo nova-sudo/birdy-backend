@@ -40,6 +40,9 @@ async def evaluate_all_alerts():
                         "updated_at": datetime.utcnow(),
                     }
 
+                    from services.report_events import alert_fired
+                    await alert_fired(db, alert, eval_result, wait=True)
+
                     if eval_result["triggered"]:
                         update["status"] = "triggered"
                         update["last_triggered_at"] = datetime.utcnow()

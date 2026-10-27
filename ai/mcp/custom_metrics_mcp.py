@@ -392,6 +392,8 @@ async def create_custom_metric(
         {"$push": {"custom_metrics": metric_doc}},
         upsert=True,
     )
+    from services.report_events import emit
+    await emit(db, user_id, "metric_created", {"metric_name": metric_doc["name"]})
 
     return {"success": True, "metric": metric_doc}
 

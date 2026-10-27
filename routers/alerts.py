@@ -360,6 +360,9 @@ async def evaluate_alert_now(alert_id: str, current_user: str = Depends(get_curr
 
         eval_result = await evaluate_alert(alert, mongo_client)
 
+        from services.report_events import alert_fired
+        await alert_fired(db, alert, eval_result)
+
         update = {
             "last_evaluated_at":  datetime.utcnow(),
             "last_eval_result":   eval_result,

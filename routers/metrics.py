@@ -194,6 +194,8 @@ async def create_custom_metric(
         )
 
         logger.info(f"Created custom metric {metric_id} for user {current_user}")
+        from services.report_events import emit
+        await emit(db, current_user, "metric_created", {"metric_name": request.name})
         return {"success": True, "metric": metric_doc}
 
 
