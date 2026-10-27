@@ -32,7 +32,8 @@ START = END - timedelta(days=29)  # 2026-09-26
 
 def _row(gid, ad_id, adset_id, campaign_id, day, spend, leads):
     return {
-        "client_group_id": gid, "ad_id": ad_id, "adset_id": adset_id, "campaign_id": campaign_id,
+        "user_id": USER, "client_group_id": gid, "ad_id": ad_id, "adset_id": adset_id,
+        "campaign_id": campaign_id,
         "ad_name": f"Ad {ad_id}", "campaign_name": f"Camp {campaign_id}", "date_start": day.isoformat(),
         "updated_at": datetime(2026, 10, 25),
         "insight_data": {"spend": str(spend), "actions": [{"action_type": "lead", "value": str(leads)}]},

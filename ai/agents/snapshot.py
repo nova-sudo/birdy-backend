@@ -88,6 +88,7 @@ def leads_from_insight(insight_data: dict) -> int:
 async def load_ad_days(db, user_id: str, client_group_id: str, start: date, end: date) -> dict[str, list[AdDay]]:
     """Per-ad daily rows in [start, end], sorted by day; one row per (ad, day), latest updated_at wins."""
     q = {
+        "user_id": user_id,
         "client_group_id": client_group_id,
         "date_start": {"$gte": start.isoformat(), "$lte": end.isoformat()},
     }

@@ -14,7 +14,7 @@ GID = "cg1"
 def _row(ad_id, day, spend, leads, updated=datetime(2026, 10, 21)):
     r = json.loads(json.dumps(FIXTURE))
     r.pop("_comment", None)
-    r.update(client_group_id=GID, ad_id=ad_id, date_start=day, updated_at=updated)
+    r.update(user_id="u", client_group_id=GID, ad_id=ad_id, date_start=day, updated_at=updated)
     r["insight_data"].update(ad_id=ad_id, spend=str(spend), date_start=day)
     r["insight_data"]["actions"] = [{"action_type": "lead", "value": str(leads)}]
     return r

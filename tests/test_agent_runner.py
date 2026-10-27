@@ -28,8 +28,8 @@ AS_OF = date(2026, 10, 25)  # a Sunday
 
 def _insight(gid, ad_id, adset_id, day, spend, leads, ad_name=None):
     return {
-        "client_group_id": gid, "ad_id": ad_id, "adset_id": adset_id, "campaign_id": f"c_{gid}",
-        "ad_name": ad_name or f"Ad {ad_id}", "campaign_name": "Camp", "date_start": day.isoformat(),
+        "user_id": USER, "client_group_id": gid, "ad_id": ad_id, "adset_id": adset_id,
+        "campaign_id": f"c_{gid}", "ad_name": ad_name or f"Ad {ad_id}", "campaign_name": "Camp", "date_start": day.isoformat(),
         "updated_at": datetime(2026, 10, 25),
         "insight_data": {"spend": str(spend), "actions": [{"action_type": "lead", "value": str(leads)}]},
     }

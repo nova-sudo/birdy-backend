@@ -238,6 +238,10 @@ async def create_agent_indexes(mongo_client):
     await db[PRACTICE].create_index("agent_id")
     await db[PROPOSALS].create_index([("agent_id", 1), ("status", 1)])
     await db[JOBS].create_index([("agent_id", 1), ("status", 1)])
+    # Imported here: ai.agents.history imports AGENTS from this module.
+    from ai.agents.history import HISTORY
+    await db[HISTORY].create_index([("status", 1), ("claimed_at", 1)])
+    await db[HISTORY].create_index("user_id")
     await db[JOBS].create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)
