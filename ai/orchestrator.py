@@ -12,6 +12,7 @@ from ai.prompts import agent_training as agent_training_prompt
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
+from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
 from ai.prompts.rich_output import with_rich_output
 from ai.tools.render_ui_tools import RENDER_UI_TOOL_NAME, materialize as materialize_ui
 from ai import mcp_client
@@ -139,6 +140,11 @@ _PAGE_TOOLS = {
         "render_ui",
     ],
 }
+
+# Saved table views can be made from any hub page's chat (and the general
+# chat, which gets every tool); the browser sends the column lists they need.
+for _page in ("dashboard", "campaigns", "leads", "opportunities", "call_center", "client_detail"):
+    _PAGE_TOOLS[_page].extend(sorted(PAGE_VIEW_TOOL_NAMES))
 
 # Output budget per page. The default suits answers; the report copilot writes
 # whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
@@ -542,6 +548,7 @@ async def run_chat(
     source: str = conversation_log.SOURCE_BIRDY,
     dashboard_id: Optional[str] = None,
     dashboard_summary: Optional[str] = None,
+    view_catalogues: Optional[dict] = None,
 ) -> dict:
     # Restore or create session
     session_id, history = await session_store.get_or_create(db, session_id, user_id)
@@ -598,6 +605,8 @@ async def run_chat(
     # append to this list themselves (see ai/tools/dashboard_tools.py), so the
     # ops survive even when the model-facing result is truncated.
     dashboard_ops: list = []
+    # {type: "view_created", page, view, ...} for the hub tables to apply.
+    page_view_ops: list = []
     # Rendered visuals from render_ui, in order; the final reply's [[viz:N]]
     # placeholders are swapped for these (see ai/tools/render_ui_tools.py).
     ui_blocks: list = []
@@ -751,6 +760,7 @@ async def run_chat(
                     "tools_used": tools_used,
                     "session_id": session_id,
                     "dashboard_ops": dashboard_ops,
+            "page_view_ops": page_view_ops,
             "agent_changes": agent_changes,
                     **(await _resolve_turn_scope()),
                 }
@@ -819,6 +829,9 @@ async def run_chat(
                         # list. Overrides anything the model passed under these names.
                         call_args = {**args, "dashboard_id": dashboard_id,
                                      "summary": dashboard_summary, "dashboard_ops_sink": dashboard_ops}
+                    elif tc.name in PAGE_VIEW_TOOL_NAMES:
+                        call_args = {**args, "view_catalogues": view_catalogues,
+                                     "page_view_ops_sink": page_view_ops}
                     elif tc.name == RENDER_UI_TOOL_NAME:
                         call_args = {**args, "ui_blocks_sink": ui_blocks}
                     result = await tool_registry.execute(
@@ -870,6 +883,7 @@ async def run_chat(
             "tools_used": tools_used,
             "session_id": session_id,
             "dashboard_ops": dashboard_ops,
+            "page_view_ops": page_view_ops,
             "agent_changes": agent_changes,
             **(await _resolve_turn_scope()),
         }

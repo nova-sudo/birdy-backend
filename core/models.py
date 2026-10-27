@@ -179,6 +179,9 @@ class ChatRequest(BaseModel):
     # `summarize(doc)` of it (unsaved edits included) for dashboard_describe.
     dashboard_id: Optional[str] = None
     summary: Optional[str] = None
+    # Hub table column lists the browser has seen, keyed by saved-view page
+    # ({label, path, columns: [{id, label, source}]}), for create_saved_view.
+    view_catalogues: Optional[dict] = None
 
 
 class ChatResponse(BaseModel):
@@ -195,6 +198,8 @@ class ChatResponse(BaseModel):
     # dashkit edit ops for the dashboards editor to apply, in order (empty
     # unless a dashboard tool succeeded this turn).
     dashboard_ops: list = []
+    # Saved views made this turn ({type: "view_created", page, view, ...}).
+    page_view_ops: list = []
     # {tool, changed} for each agent training tool that changed the playbook.
     agent_changes: list = []
 

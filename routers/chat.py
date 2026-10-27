@@ -25,6 +25,7 @@ from ai.tools.report_designer_tools import register_report_designer_tools
 from ai.tools.dashboard_tools import register_dashboard_tools
 from ai.tools.agent_tools import register_agent_tools
 from ai.tools.render_ui_tools import register_render_ui_tools
+from ai.tools.page_view_tools import register_page_view_tools
 from ai.orchestrator import run_chat
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ register_report_designer_tools()
 register_dashboard_tools()
 register_agent_tools()
 register_render_ui_tools()
+register_page_view_tools()
 
 
 async def _onboarding_complete(db, user_id: str) -> bool:
@@ -84,6 +86,7 @@ async def chat(
                 client_name=request.client_name,
                 dashboard_id=request.dashboard_id,
                 dashboard_summary=request.summary,
+                view_catalogues=request.view_catalogues,
             )
             return ChatResponse(**result)
         except HTTPException:
