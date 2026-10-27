@@ -12,6 +12,7 @@ from ai.agents.store import create_agent
 from ai.suggestions import store as sstore
 from dependencies import get_current_user
 from main import app
+from agent_history_helpers import ad_days
 
 U = "u1@example.com"
 OTHER = "u2@example.com"
@@ -42,7 +43,7 @@ async def _insights(db, ad_id, start: date, days: int, spend: float, leads: int,
                     gid="g1", adset_id="as1", campaign_id="c1"):
     for i in range(days):
         d = start + timedelta(days=i)
-        await db["facebook_ad_insights"].insert_one({
+        await ad_days(db).insert_one({
             "user_id": U, "client_group_id": gid, "ad_id": ad_id, "adset_id": adset_id,
             "campaign_id": campaign_id, "date_start": d.isoformat(),
             "insight_data": {"spend": str(spend),
@@ -111,7 +112,7 @@ async def test_pause_outcome_account_cpl_before_after(mock_db):
 async def test_revive_outcome(mock_db):
     await _group(mock_db, currency="USD")
     await _insights(mock_db, "a3", date(2026, 10, 11), 7, 30, 0)
-    await mock_db["facebook_ad_insights"].update_many(
+    await ad_days(mock_db).update_many(
         {"ad_id": "a3", "date_start": {"$in": ["2026-10-12", "2026-10-14", "2026-10-16"]}},
         {"$set": {"insight_data.actions": [{"action_type": "lead", "value": "1"}]}})
     await _suggestion(mock_db, "s2", atype="enable_ads", targets=[AD("a3")])

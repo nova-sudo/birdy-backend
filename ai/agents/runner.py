@@ -124,7 +124,7 @@ async def _evaluate_client(db, mongo_client, agent: dict, rules: list[dict], mem
 
     if live:
         await refresh_meta_state(db, mongo_client, user_id, gid, account, today=as_of)
-        await backfill_paused_at(db, gid)
+        await backfill_paused_at(db, user_id, gid)
 
     ctx = await load_client_ctx(db, user_id, gid, agent)
     ad_days = await load_ad_days(db, user_id, gid, as_of - timedelta(days=HISTORY_DAYS), as_of)

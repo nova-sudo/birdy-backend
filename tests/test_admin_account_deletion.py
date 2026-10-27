@@ -129,6 +129,20 @@ async def test_the_account_and_all_its_data_go(admin_api, mock_db):
 
 
 @pytest.mark.asyncio
+async def test_the_agents_daily_ad_rows_go_too(admin_api, mock_db):
+    await an_owner(mock_db)
+    await mock_db["agent_ad_days"].insert_many([
+        {"user_id": OWNER, "client_group_id": "g1", "ad_id": "a1", "date_start": "2026-10-01"},
+        {"user_id": "neighbour@agency.com", "client_group_id": "g2", "ad_id": "a1", "date_start": "2026-10-01"},
+    ])
+
+    await delete_account()
+
+    assert await mock_db["agent_ad_days"].count_documents({"user_id": OWNER}) == 0
+    assert await mock_db["agent_ad_days"].count_documents({}) == 1
+
+
+@pytest.mark.asyncio
 async def test_other_accounts_are_untouched(admin_api, mock_db):
     await an_owner(mock_db)
     await an_owner(mock_db, email="neighbour@agency.com")

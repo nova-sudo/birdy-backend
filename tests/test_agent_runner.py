@@ -16,7 +16,7 @@ from ai.agents.meta_state import MetaTokenError
 from ai.agents.store import add_memory, create_agent, list_rules, update_agent, update_rule
 from ai.suggestions import actions
 from ai.suggestions import store as sstore
-from agent_history_helpers import seed_history
+from agent_history_helpers import ad_days, seed_ad_days, seed_history
 from ai.suggestions.contracts import Evidence, Finding, Action, ACTION_PAUSE_ADS
 
 USER = "u1"
@@ -62,7 +62,7 @@ async def _seed_client(db, gid, *, target=20, meta=True, last_day=AS_OF, extra_n
         rows.append(_insight(gid, f"{gid}_good", f"{gid}_s2", d, 10, 2, "Good ad"))  # CPL £5
         if extra_near:
             rows.append(_insight(gid, f"{gid}_near", f"{gid}_s3", d, 10, 0, "Near ad"))  # £70/7d, 0 leads
-    await db.facebook_ad_insights.insert_many(rows)
+    await seed_ad_days(db, rows)
 
 
 async def _agent(db, gids):
@@ -86,7 +86,7 @@ def meta_calls(monkeypatch):
         calls.append(("refresh", gid, ad_account_id, today))
         return {"ads": 0, "adsets": 0}
 
-    async def fake_backfill(db, gid):
+    async def fake_backfill(db, user_id, gid):
         calls.append(("backfill", gid))
         return 0
 
@@ -199,7 +199,7 @@ async def test_memory_filter_weekend_skip(mock_db, mock_mongo_client, meta_calls
     assert await _docs(mock_db, agent="media_buying:pause_over_target") == []
 
     # Monday: the filter no longer matches.
-    await mock_db.facebook_ad_insights.insert_one(
+    await ad_days(mock_db).insert_one(
         _insight("cg1", "cg1_bad", "cg1_s1", AS_OF + timedelta(days=1), 30, 0, "Bad ad"))
     res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF + timedelta(days=1))
     assert [f for f in res.findings if f.agent == "media_buying:pause_over_target"]
@@ -308,7 +308,7 @@ async def test_meta_token_and_other_errors_are_per_client(mock_db, mock_mongo_cl
             raise RuntimeError("Meta Graph error")
         return {}
 
-    async def backfill(db, gid):
+    async def backfill(db, user_id, gid):
         return 0
 
     monkeypatch.setattr(runner, "refresh_meta_state", refresh)

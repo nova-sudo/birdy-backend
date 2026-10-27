@@ -6,6 +6,7 @@ from ai.agents.snapshot import (
     AdDay, AdState, AdsetState, ClientCtx,
     leads_from_insight, load_ad_days, load_client_ctx, load_state,
 )
+from agent_history_helpers import seed_ad_days
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures" / "ad_insight_row.json").read_text())
 GID = "cg1"
@@ -27,7 +28,7 @@ def test_leads_from_insight_reads_lead_results():
 
 
 async def test_load_ad_days_sorts_and_dedups(mock_db):
-    await mock_db.facebook_ad_insights.insert_many([
+    await seed_ad_days(mock_db, [
         _row("a1", "2026-10-02", 10, 1),
         _row("a1", "2026-10-01", 5, 0),
         _row("a1", "2026-10-02", 99, 9, updated=datetime(2026, 10, 25)),  # newer dup wins

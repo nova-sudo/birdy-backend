@@ -11,6 +11,7 @@ from datetime import date, datetime
 
 import httpx
 
+from ai.agents.store import AD_DAYS
 from integrations.facebook_utils.facebook import get_facebook_token
 
 logger = logging.getLogger(__name__)
@@ -135,15 +136,17 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
     return {"ads": len(ads), "adsets": len(adsets)}
 
 
-async def backfill_paused_at(db, client_group_id: str) -> int:
+async def backfill_paused_at(db, user_id: str, client_group_id: str) -> int:
     """Paused ads with no paused_at: the day after their last day with spend > 0. Returns count set."""
     set_count = 0
     q = {"client_group_id": client_group_id, "paused_at": None,
          "effective_status": {"$nin": ["ACTIVE", ""]}}
     async for ad in db[AD_STATE].find(q):
         last = None
-        async for row in db["facebook_ad_insights"].find(
-                {"client_group_id": client_group_id, "ad_id": ad["ad_id"]}):
+        # (user_id, client_group_id, ad_id, date_start) is the agent_ad_days unique index.
+        async for row in db[AD_DAYS].find(
+                {"user_id": user_id, "client_group_id": client_group_id, "ad_id": ad["ad_id"]},
+                {"date_start": 1, "insight_data.spend": 1}):
             try:
                 spend = float((row.get("insight_data") or {}).get("spend") or 0)
             except (TypeError, ValueError):

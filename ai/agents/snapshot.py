@@ -9,7 +9,7 @@ target, per-client rule overrides).
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
-from ai.agents.store import RULES
+from ai.agents.store import AD_DAYS, RULES
 from ai.suggestions.agents.useless_ad_purger import _symbol
 from core.utils import get_result_value
 
@@ -93,7 +93,7 @@ async def load_ad_days(db, user_id: str, client_group_id: str, start: date, end:
         "date_start": {"$gte": start.isoformat(), "$lte": end.isoformat()},
     }
     latest: dict[tuple, dict] = {}
-    async for row in db["facebook_ad_insights"].find(q):
+    async for row in db[AD_DAYS].find(q):
         day = _to_date(row.get("date_start"))
         if day is None or not row.get("ad_id"):
             continue

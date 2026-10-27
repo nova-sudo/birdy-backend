@@ -15,6 +15,7 @@ from fastapi.testclient import TestClient
 import jobs.agent_history_jobs as jobs_mod
 from ai.agents import history
 from integrations.facebook_utils.meta_ad_daily import MetaPermissionError
+from agent_history_helpers import ad_days
 
 TODAY = date(2026, 10, 27)
 D = lambda s: date.fromisoformat(s)  # noqa: E731
@@ -104,8 +105,8 @@ async def test_backfill_walks_newest_first_in_30_day_chunks_until_395_days(mock_
     assert doc["claimed_at"] is None
     assert doc["state_refreshed_at"] is not None and meta.refreshed == ["g1"]
     assert out == {"claimed": 1, "chunks": 14, "topups": 0, "ready": 1, "errors": 0}
-    assert await mock_db.facebook_ad_insights.count_documents(
-        {"client_group_id": "g1", "source": "agent_history"}) == 14
+    assert await ad_days(mock_db).count_documents({"client_group_id": "g1", "user_id": "u1"}) == 14
+    assert await mock_db.facebook_ad_insights.count_documents({}) == 0
 
     # Nothing more to do on the next tick (top-up not due, state fresh).
     again = await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
@@ -162,9 +163,11 @@ async def test_campaign_scope_change_resets_history(mock_db, mock_mongo_client, 
     await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
     assert all(c == ["c1"] for *_, c in meta.fetches)
     assert (await _doc(mock_db, "g1"))["oldest_done"] == "2026-08-29"
-    await mock_db.facebook_ad_insights.insert_many([
-        {"client_group_id": "g1", "ad_id": "x", "date_start": "2026-10-01", "source": "meta_cache"},
-        {"client_group_id": "g2", "ad_id": "y", "date_start": "2026-10-01", "source": "agent_history"},
+    await mock_db.facebook_ad_insights.insert_one(
+        {"client_group_id": "g1", "ad_id": "x", "date_start": "2026-10-01"})
+    await ad_days(mock_db).insert_many([
+        {"user_id": "u1", "client_group_id": "g2", "ad_id": "y", "date_start": "2026-10-01"},
+        {"user_id": "u2", "client_group_id": "g1", "ad_id": "z", "date_start": "2026-10-01"},
     ])
 
     # The group now also owns c2 on the shared account.
@@ -179,12 +182,12 @@ async def test_campaign_scope_change_resets_history(mock_db, mock_mongo_client, 
     doc = await _doc(mock_db, "g1")
     assert doc["campaign_ids"] == ["c1", "c2"]
     assert doc["oldest_done"] == "2026-08-29" and doc["status"] == "running"
-    hist_rows = await mock_db.facebook_ad_insights.find(
-        {"client_group_id": "g1", "source": "agent_history"}).to_list(None)
+    hist_rows = await ad_days(mock_db).find({"client_group_id": "g1", "user_id": "u1"}).to_list(None)
     assert sorted((r["ad_id"], r["date_start"]) for r in hist_rows) == [
         ("new_ad", "2026-09-27"), ("new_ad", "2026-10-27")]                    # no old-scope rows
-    assert await mock_db.facebook_ad_insights.count_documents({"source": "meta_cache"}) == 1
-    assert await mock_db.facebook_ad_insights.count_documents({"client_group_id": "g2"}) == 1
+    assert await mock_db.facebook_ad_insights.count_documents({}) == 1        # shared cache untouched
+    assert await ad_days(mock_db).count_documents({"client_group_id": "g2"}) == 1
+    assert await ad_days(mock_db).count_documents({"user_id": "u2"}) == 1     # only this user's rows
 
 
 async def test_one_client_without_access_does_not_stop_others(mock_db, mock_mongo_client, monkeypatch):

@@ -355,6 +355,7 @@ ACCOUNT_DATA_COLLECTIONS = [
     "ai_usage",
     "mcp_tokens",
     "meta_refresh_jobs",
+    "agent_ad_days",
 ]
 
 

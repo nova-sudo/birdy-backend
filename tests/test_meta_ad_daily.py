@@ -14,6 +14,7 @@ import httpx
 import pytest
 
 from ai.agents.snapshot import load_ad_days
+from ai.agents.store import AD_DAYS, create_agent_indexes
 from integrations.facebook_utils.meta_ad_daily import (
     MetaPermissionError,
     fetch_ad_daily,
@@ -122,8 +123,8 @@ async def test_store_rows_load_back_through_load_ad_days(mock_db):
     assert [(d.day.isoformat(), d.spend, d.leads) for d in days["a1"]] == [
         ("2026-10-01", 12.5, 0), ("2026-10-02", 8.0, 2)]
 
-    doc = await mock_db["facebook_ad_insights"].find_one({"ad_id": "a1", "date_start": "2026-10-01"})
-    assert doc["source"] == "agent_history"
+    doc = await mock_db[AD_DAYS].find_one({"ad_id": "a1", "date_start": "2026-10-01"})
+    assert doc["user_id"] == "u" and doc["client_group_id"] == "g"
     assert doc["date_stop"] == "2026-10-01"
     assert doc["ad_account_id"] == "act_1"
     assert doc["insight_data"] == {"spend": "12.50", "actions": []}
@@ -131,7 +132,8 @@ async def test_store_rows_load_back_through_load_ad_days(mock_db):
     # Re-storing the same days overwrites rather than duplicating.
     rows[0]["spend"] = "20"
     assert await store_ad_daily(mock_db, rows=rows, **kw) == 2
-    assert await mock_db["facebook_ad_insights"].count_documents({}) == 2
+    assert await mock_db[AD_DAYS].count_documents({}) == 2
+    assert await mock_db["facebook_ad_insights"].count_documents({}) == 0   # never the shared cache
     days = await load_ad_days(mock_db, "u", "g", date(2026, 9, 30), date(2026, 10, 3))
     assert days["a1"][0].spend == 20.0
 
@@ -140,3 +142,18 @@ async def test_store_rows_load_back_through_load_ad_days(mock_db):
 async def test_store_empty_rows_writes_nothing(mock_db):
     assert await store_ad_daily(mock_db, user_id="u", client_group_id="g",
                                 ad_account_id="act_1", rows=[]) == 0
+
+
+@pytest.mark.asyncio
+async def test_two_groups_of_one_user_store_the_same_ad_day(mock_mongo_client, mock_db):
+    """Two client groups on one shared ad account both keep their own row for an ad/day."""
+    await create_agent_indexes(mock_mongo_client)
+    row = [{"ad_id": "a1", "date_start": "2026-10-01", "spend": "5", "campaign_id": "c1"}]
+    for gid in ("A", "B"):
+        assert await store_ad_daily(mock_db, user_id="u", client_group_id=gid,
+                                    ad_account_id="act_shared", rows=row) == 1
+    stored = [d["client_group_id"] async for d in mock_db[AD_DAYS].find({"ad_id": "a1"})]
+    assert sorted(stored) == ["A", "B"]
+    for gid in ("A", "B"):
+        days = await load_ad_days(mock_db, "u", gid, date(2026, 10, 1), date(2026, 10, 1))
+        assert [d.spend for d in days["a1"]] == [5.0]

@@ -1,7 +1,7 @@
 """Ad-history sync state, one doc per watched client group.
 
 The collection (`_id` = client_group_id) tracks how far each client's daily ad rows
-have been pulled from Meta into `facebook_ad_insights`: a newest-first backfill over
+have been pulled from Meta into `agent_ad_days`: a newest-first backfill over
 HISTORY_TOTAL_DAYS, then a rolling top-up of the last TOPUP_DAYS. The cron pass
 (jobs/agent_history_jobs.py) claims groups through `claim`/`release`; the runner
 asks `statuses`/`is_ready` whether a client's history is usable yet.

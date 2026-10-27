@@ -4,7 +4,7 @@ jobs/agent_history_jobs.py
 The ad-history sync pass meta-tick runs every minute for the Media Buying Agent.
 
 For each watched client group (ai/agents/history.py holds the per-group state) it
-pulls daily ad rows from Meta into `facebook_ad_insights`: a newest-first backfill in
+pulls daily ad rows from Meta into `agent_ad_days`: a newest-first backfill in
 HISTORY_CHUNK_DAYS chunks back to history.window_start(today), then a top-up of the
 last TOPUP_DAYS every TOPUP_EVERY. Up to AGENT_HISTORY_GROUPS_PER_TICK groups run in
 parallel; each is claimed by CAS so overlapping ticks never work the same group.
@@ -25,8 +25,7 @@ from ai.agents.meta_state import backfill_paused_at, refresh_meta_state
 from core.database import DB_NAME
 from integrations.facebook_utils.facebook import get_facebook_token
 from integrations.facebook_utils.meta_ad_daily import (
-    COLLECTION as AD_INSIGHTS,
-    SOURCE as HISTORY_SOURCE,
+    COLLECTION as AD_DAYS,
     MetaPermissionError,
     fetch_ad_daily,
     store_ad_daily,
@@ -48,7 +47,7 @@ async def _check_scope(db, doc: dict) -> dict:
     if campaign_ids == doc.get("campaign_ids") and ad_account_id == doc.get("ad_account_id"):
         return doc
 
-    await db[AD_INSIGHTS].delete_many({"client_group_id": doc["_id"], "source": HISTORY_SOURCE})
+    await db[AD_DAYS].delete_many({"user_id": doc["user_id"], "client_group_id": doc["_id"]})
     reset = {"campaign_ids": campaign_ids, "ad_account_id": ad_account_id,
              "status": history.STATUS_PENDING, "oldest_done": None, "newest_done": None,
              "last_topup_at": None, "error": None}
@@ -66,7 +65,7 @@ async def _refresh_state(db, mongo_client, doc: dict, *, today: date, now: datet
     gid = doc["_id"]
     try:
         await refresh_meta_state(db, mongo_client, doc["user_id"], gid, doc["ad_account_id"], today=today)
-        await backfill_paused_at(db, gid)
+        await backfill_paused_at(db, doc["user_id"], gid)
     except Exception as e:
         logger.warning("[agent-history] %s: ad state refresh failed: %s", gid, e)
     await db[history.HISTORY].update_one({"_id": gid}, {"$set": {"state_refreshed_at": now}})

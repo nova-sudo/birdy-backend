@@ -5,7 +5,8 @@ import pytest
 
 from ai.agents import meta_state
 from ai.agents.meta_state import MetaTokenError, backfill_paused_at, refresh_meta_state
-from ai.agents.store import create_agent_indexes
+from ai.agents.store import AD_DAYS, create_agent_indexes
+from agent_history_helpers import seed_ad_days
 
 GID = "cg1"
 
@@ -94,13 +95,15 @@ async def test_backfill_paused_at_from_last_spend_day(mock_db):
         {"client_group_id": GID, "ad_id": "a3", "effective_status": "ACTIVE", "paused_at": None},
         {"client_group_id": GID, "ad_id": "a4", "effective_status": "PAUSED", "paused_at": None},
     ])
-    def row(ad, day, spend):
-        return {"client_group_id": GID, "ad_id": ad, "date_start": day, "insight_data": {"spend": spend}}
-    await mock_db.facebook_ad_insights.insert_many([
+    def row(ad, day, spend, user="u"):
+        return {"user_id": user, "client_group_id": GID, "ad_id": ad, "date_start": day,
+                "insight_data": {"spend": spend}}
+    await seed_ad_days(mock_db, [
         row("a1", "2026-10-01", "5.0"), row("a1", "2026-10-03", "2.0"), row("a1", "2026-10-04", "0"),
         row("a4", "2026-10-02", "0"),
+        row("a1", "2026-10-09", "9.0", user="someone_else"),   # another user's row is never read
     ])
-    n = await backfill_paused_at(mock_db, GID)
+    n = await backfill_paused_at(mock_db, "u", GID)
     assert n == 1
     assert (await mock_db.meta_ad_state.find_one({"ad_id": "a1"}))["paused_at"] == "2026-10-04"
     assert (await mock_db.meta_ad_state.find_one({"ad_id": "a2"}))["paused_at"] == "2026-09-01"
@@ -112,3 +115,11 @@ async def test_state_indexes_created(mock_mongo_client, mock_db):
     for coll in ("meta_ad_state", "meta_adset_state"):
         infos = await mock_db[coll].index_information()
         assert any(i.get("unique") for i in infos.values()), coll
+
+
+async def test_ad_days_indexes_created(mock_mongo_client, mock_db):
+    await create_agent_indexes(mock_mongo_client)
+    infos = (await mock_db[AD_DAYS].index_information()).values()
+    keys = {tuple(k for k, _ in i["key"]): bool(i.get("unique")) for i in infos}
+    assert keys[("user_id", "client_group_id", "ad_id", "date_start")] is True
+    assert ("client_group_id", "ad_id", "date_start") in keys

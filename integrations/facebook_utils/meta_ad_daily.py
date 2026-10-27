@@ -2,8 +2,9 @@
 Daily ad-level Meta insights for the Media Buying Agent's ad history.
 
 One row per (ad, day) with spend > 0, fetched from `/{act}/insights` at
-level=ad, stored in `facebook_ad_insights` in the shape
-ai.agents.snapshot.load_ad_days reads. Spend stays in the ad account's own
+level=ad, stored in the agent's own `agent_ad_days` collection (keyed by user,
+client group, ad and day, so two groups on one shared ad account never collide) in
+the shape ai.agents.snapshot.load_ad_days reads. Spend stays in the ad account's own
 currency. Meta omits `actions` on a day with no leads, so a stored row with an
 empty `actions` list is a real zero-lead day.
 """
@@ -16,6 +17,7 @@ from typing import Dict, List, Optional
 import httpx
 from pymongo import UpdateOne
 
+from ai.agents.store import AD_DAYS as COLLECTION
 from integrations.facebook_utils._api_helpers import api_get_with_backoff
 from services.meta_campaign_scope import campaign_filter
 
@@ -23,8 +25,6 @@ logger = logging.getLogger(__name__)
 
 GRAPH = "https://graph.facebook.com/v25.0"
 PAGE_LIMIT = 500
-COLLECTION = "facebook_ad_insights"
-SOURCE = "agent_history"
 FIELDS = "ad_id,ad_name,adset_id,campaign_id,campaign_name,spend,actions,date_start"
 # Meta error codes for "no permission": 200 (permissions error), 10 (app lacks permission).
 PERMISSION_CODES = (200, 10)
@@ -120,7 +120,6 @@ async def store_ad_daily(db, *, user_id: str, client_group_id: str,
             "ad_name": row.get("ad_name"),
             "date_stop": row["date_start"],
             "insight_data": {"spend": row["spend"], "actions": row.get("actions", [])},
-            "source": SOURCE,
             "updated_at": now,
         }}, upsert=True))
     await db[COLLECTION].bulk_write(ops, ordered=False)

@@ -19,7 +19,7 @@ from ai.agents.snapshot import AdDay, AdState
 from ai.agents.store import JOBS, create_agent, update_agent
 from dependencies import get_current_user
 from main import app
-from agent_history_helpers import seed_history
+from agent_history_helpers import seed_ad_days, seed_history
 
 USER = "u1"
 OTHER = "u2"
@@ -74,8 +74,8 @@ async def _adset(db, gid, adset_id, campaign_id, *, status="ACTIVE", budget=50.0
 
 
 async def _spend(db, gid, ad_id, adset_id, campaign_id, first, last, spend, leads):
-    await db.facebook_ad_insights.insert_many(
-        [_row(gid, ad_id, adset_id, campaign_id, d, spend, leads) for d in _days(first, last)])
+    await seed_ad_days(
+        db, [_row(gid, ad_id, adset_id, campaign_id, d, spend, leads) for d in _days(first, last)])
 
 
 async def _agent(db, gids, user=USER):

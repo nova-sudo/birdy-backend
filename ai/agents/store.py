@@ -11,6 +11,7 @@ Collections:
   agent_practice       practice cases used to build confidence
   agent_proposals      rule-change proposals raised from repeated reasons
   agent_jobs           scheduled / queued runs
+  agent_ad_days        daily Meta ad rows per (user, client group, ad, day) for the agent
 
 Same per-request Motor pattern as ai/suggestions/store.py: raw dicts, no ODM.
 """
@@ -39,6 +40,7 @@ MEMORY = "agent_memory"
 PRACTICE = "agent_practice"
 PROPOSALS = "agent_proposals"
 JOBS = "agent_jobs"
+AD_DAYS = "agent_ad_days"
 
 
 AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training"}
@@ -242,6 +244,9 @@ async def create_agent_indexes(mongo_client):
     from ai.agents.history import HISTORY
     await db[HISTORY].create_index([("status", 1), ("claimed_at", 1)])
     await db[HISTORY].create_index("user_id")
+    await db[AD_DAYS].create_index(
+        [("user_id", 1), ("client_group_id", 1), ("ad_id", 1), ("date_start", 1)], unique=True)
+    await db[AD_DAYS].create_index([("client_group_id", 1), ("ad_id", 1), ("date_start", 1)])
     await db[JOBS].create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)

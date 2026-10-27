@@ -3,6 +3,7 @@ from datetime import date, datetime, timedelta
 
 from ai.agents import history
 from ai.agents.snapshot import load_ad_days
+from agent_history_helpers import seed_ad_days
 
 NOW = datetime(2026, 10, 27, 12, 0)
 
@@ -117,6 +118,6 @@ async def test_load_ad_days_only_reads_this_users_rows(mock_db):
     def row(user, ad):
         return {"user_id": user, "client_group_id": "cg", "ad_id": ad, "date_start": "2026-10-01",
                 "insight_data": {"spend": "5"}}
-    await mock_db.facebook_ad_insights.insert_many([row("u1", "mine"), row("u2", "theirs")])
+    await seed_ad_days(mock_db, [row("u1", "mine"), row("u2", "theirs")])
     out = await load_ad_days(mock_db, "u1", "cg", date(2026, 10, 1), date(2026, 10, 2))
     assert set(out) == {"mine"}
