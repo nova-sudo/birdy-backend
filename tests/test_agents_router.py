@@ -362,3 +362,33 @@ async def test_deny_note_length_capped(api, mock_db):
     await _suggestion(mock_db)
     r = api.post("/api/dashboard/suggestions/s1/deny", json={"reason_code": "other", "note": "x" * 2001})
     assert r.status_code == 422
+
+
+async def test_delete_draft_agent_starts_over(api, mock_db):
+    a = make_agent(api)
+    for coll in ("agent_practice", "agent_memory", "agent_proposals", "agent_jobs", "agent_rule_versions"):
+        await mock_db[coll].insert_one({"_id": f"{coll}-1", "agent_id": a["id"]})
+    await mock_db["agent_practice"].insert_one({"_id": "keep", "agent_id": "someone-else"})
+
+    api.state["user"] = OTHER
+    assert api.delete(f"/api/agents/{a['id']}").status_code == 404
+    api.state["user"] = U
+
+    r = api.delete(f"/api/agents/{a['id']}")
+    assert r.status_code == 200, r.text
+    assert api.get("/api/agents").json() == []
+    assert await mock_db["agent_rules"].count_documents({"agent_id": a["id"]}) == 0
+    for coll in ("agent_practice", "agent_memory", "agent_proposals", "agent_jobs", "agent_rule_versions"):
+        assert await mock_db[coll].count_documents({"agent_id": a["id"]}) == 0
+    assert await mock_db["agent_practice"].count_documents({"_id": "keep"}) == 1
+
+    b = make_agent(api)  # setup can begin again with a fresh agent
+    assert b["id"] != a["id"] and b["status"] == "draft"
+
+
+async def test_delete_refuses_an_active_agent(api, mock_db):
+    a = make_agent(api)
+    await mock_db["agents"].update_one({"_id": a["id"]}, {"$set": {"status": "active"}})
+    r = api.delete(f"/api/agents/{a['id']}")
+    assert r.status_code == 409
+    assert api.get(f"/api/agents/{a['id']}").status_code == 200

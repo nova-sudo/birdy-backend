@@ -107,6 +107,26 @@ async def create_agent(db, user_id: str, *, type: str = "media_buying", tz: str 
     return agent
 
 
+class AgentActive(Exception):
+    """The agent is switched on; only a draft can be deleted."""
+
+
+async def delete_draft_agent(db, user_id: str, agent_id: str) -> bool:
+    """Delete a draft agent and everything it owns, so setup can start over.
+    False when the user has no such agent; AgentActive when it is switched on."""
+    agent = await db[AGENTS].find_one({"_id": agent_id, "user_id": user_id})
+    if agent is None:
+        return False
+    if agent.get("status") == "active":
+        raise AgentActive(agent_id)
+    res = await db[AGENTS].delete_one({"_id": agent_id, "user_id": user_id, "status": {"$ne": "active"}})
+    if res.deleted_count == 0:
+        raise AgentActive(agent_id)  # switched on between the read and the delete
+    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS):
+        await db[coll].delete_many({"agent_id": agent_id})
+    return True
+
+
 async def get_agent(db, user_id: str, agent_id: str) -> dict | None:
     return await db[AGENTS].find_one({"_id": agent_id, "user_id": user_id})
 
