@@ -171,6 +171,9 @@ async def _auto_apply(db, mongo_client, user_id: str, suggestion_id: str, result
 async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
                     mode: Literal["live", "replay"] = "live", near_miss: bool = False,
                     force_stale: bool = False) -> RunResult:
+    """Run the agent over its clients. Replay mode does not filter clients by ad-history
+    readiness (only live runs skip a client whose history is still syncing); replay callers
+    pick their clients themselves."""
     if mode not in ("live", "replay"):
         raise ValueError(f"unknown mode: {mode}")
     live = mode == "live"

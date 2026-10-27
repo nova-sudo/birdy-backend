@@ -233,6 +233,7 @@ async def test_failure_keeps_progress_and_none_leaves_running(mock_db, mock_mong
     doc = await _doc(mock_db, "g2")
     assert len(meta.windows("act_2")) == 1
     assert doc["status"] == "running" and doc["oldest_done"] is None and doc["claimed_at"] is None
+    assert doc["failures"] == 1 and doc["retry_at"] > datetime.utcnow()
 
 
 async def test_state_refresh_failure_does_not_stop_history(mock_db, mock_mongo_client, monkeypatch):
@@ -270,6 +271,165 @@ async def test_overlapping_ticks_never_work_the_same_group(mock_db, mock_mongo_c
         assert len(w) == 14 and len(set(w)) == 14       # worked once, by one pass
     assert meta.windows("act_busy") == []               # a fresh claim is left alone
     assert (await _doc(mock_db, "stale"))["status"] == "ready"
+
+
+async def _let_retry(db, *gids):
+    """Move each doc's retry_at into the past, as if its backoff had elapsed."""
+    await db[history.HISTORY].update_many({"_id": {"$in": list(gids)}},
+                                          {"$set": {"retry_at": datetime.utcnow() - timedelta(seconds=1)}})
+
+
+async def test_docs_that_keep_failing_back_off_and_never_starve_a_good_one(mock_db, mock_mongo_client,
+                                                                          monkeypatch):
+    bad = ["bad0", "bad1", "bad2"]
+    meta = FakeMeta(monkeypatch, fail_for={f"act_{g}": "none" for g in bad})
+    await _watch(mock_db, *[_group(g, f"act_{g}") for g in bad], _group("good", "act_good"))
+
+    for _ in range(2):
+        await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert (await _doc(mock_db, "good"))["status"] == "ready"           # progressed despite 3 bad docs
+    for g in bad:
+        assert len(meta.windows(f"act_{g}")) == 1                       # not re-fetched before retry_at
+        d = await _doc(mock_db, g)
+        assert d["failures"] == 1 and d["status"] == "running" and d["claimed_at"] is None
+        wait = d["retry_at"] - datetime.utcnow()
+        assert timedelta(minutes=4) < wait <= timedelta(minutes=5)
+
+    for n in range(2, 6):
+        await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+        assert all(len(meta.windows(f"act_{g}")) == n - 1 for g in bad)  # still waiting
+        await _let_retry(mock_db, *bad)
+        await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+        assert all(len(meta.windows(f"act_{g}")) == n for g in bad)
+        if n < 5:
+            d = await _doc(mock_db, "bad0")
+            assert d["failures"] == n and d["status"] == "running"
+            wait = d["retry_at"] - datetime.utcnow()
+            assert timedelta(minutes=5 * 2 ** (n - 1) - 1) < wait <= timedelta(minutes=5 * 2 ** (n - 1))
+
+    for g in bad:
+        d = await _doc(mock_db, g)
+        assert (d["status"], d["error"], d["failures"]) == ("error", "failed", 5)
+    await _let_retry(mock_db, *bad)
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert all(len(meta.windows(f"act_{g}")) == 5 for g in bad)         # error waits its own retry
+
+
+def test_backoff_doubles_from_five_minutes_and_caps_at_six_hours():
+    assert [jobs_mod._backoff(n) for n in (1, 2, 3, 4, 5)] == [
+        timedelta(minutes=m) for m in (5, 10, 20, 40, 80)]
+    assert jobs_mod._backoff(12) == timedelta(hours=6)
+
+
+async def test_a_good_chunk_resets_failures(mock_db, mock_mongo_client, monkeypatch):
+    FakeMeta(monkeypatch)
+    await _watch(mock_db, _group("g1", "act_1"))
+    await history.ensure_docs(mock_db)
+    await mock_db[history.HISTORY].update_one({"_id": "g1"}, {"$set": {
+        "status": "running", "failures": 3, "retry_at": datetime.utcnow() - timedelta(seconds=1)}})
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    d = await _doc(mock_db, "g1")
+    assert d["status"] == "ready" and d["failures"] == 0 and d["retry_at"] is None
+
+
+async def test_topup_failure_backs_off_and_success_resets(mock_db, mock_mongo_client, monkeypatch):
+    meta = FakeMeta(monkeypatch, fail_for={"act_1": "none"})
+    now = datetime.utcnow()
+    await _watch(mock_db, _group("g1", "act_1"))
+    await mock_db[history.HISTORY].insert_one({
+        "_id": "g1", "user_id": "u1", "ad_account_id": "act_1", "campaign_ids": None, "status": "ready",
+        "oldest_done": "2025-09-28", "newest_done": "2026-10-20", "state_refreshed_at": now, "error": None,
+        "claimed_at": None, "last_topup_at": now - timedelta(hours=6), "failures": 1})
+
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    d = await _doc(mock_db, "g1")
+    assert d["status"] == "ready" and d["failures"] == 2 and d["claimed_at"] is None
+    assert d["retry_at"] > datetime.utcnow() + timedelta(minutes=9)
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert len(meta.fetches) == 1                                       # not re-claimed every minute
+
+    meta.fail_for.clear()
+    await _let_retry(mock_db, "g1")
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    d = await _doc(mock_db, "g1")
+    assert d["failures"] == 0 and d["retry_at"] is None and d["newest_done"] == "2026-10-27"
+
+
+async def test_in_flight_docs_take_turns(mock_db, mock_mongo_client, monkeypatch):
+    """More running docs than slots: every one gets worked, none hogs the front."""
+    meta = FakeMeta(monkeypatch, clock_step=100.0)
+    gids = [f"g{i}" for i in range(5)]
+    await _watch(mock_db, *[_group(g, f"act_{g}") for g in gids])
+    for _ in range(3):
+        await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
+    assert all(meta.windows(f"act_{g}") for g in gids)
+
+
+async def test_a_fetch_past_the_budget_times_out_and_counts_as_a_failure(mock_db, mock_mongo_client,
+                                                                        monkeypatch):
+    FakeMeta(monkeypatch)
+    started = []
+
+    async def slow(*a, **k):
+        started.append(1)
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(jobs_mod, "fetch_ad_daily", slow)
+    monkeypatch.setattr(jobs_mod, "FETCH_GRACE_SECONDS", 0.05)
+    await _watch(mock_db, _group("g1", "act_1"))
+
+    out = await asyncio.wait_for(
+        jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=0.05, today=TODAY), timeout=5)
+    assert started == [1] and out["chunks"] == 0
+    d = await _doc(mock_db, "g1")
+    assert d["status"] == "running" and d["failures"] == 1 and d["retry_at"] is not None
+    assert d["claimed_at"] is None
+
+
+async def test_unwatched_client_stops_syncing_after_its_draft_agent_is_deleted(mock_db, mock_mongo_client,
+                                                                             monkeypatch):
+    from ai.agents.store import delete_draft_agent
+
+    meta = FakeMeta(monkeypatch, clock_step=100.0)
+    await mock_db.client_groups.insert_one(_group("g1", "act_1"))
+    await mock_db.agents.insert_one({"_id": "a1", "user_id": "u1", "status": "draft",
+                                     "scope": {"client_group_ids": ["g1"]}})
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
+    assert len(meta.fetches) == 2
+
+    assert await delete_draft_agent(mock_db, "u1", "a1") is True
+    out = await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
+    assert out["claimed"] == 0 and len(meta.fetches) == 2
+    assert (await _doc(mock_db, "g1"))["status"] == "orphaned"
+
+
+async def test_rewatched_finished_backfill_turns_ready_without_refetching(mock_db, mock_mongo_client,
+                                                                         monkeypatch):
+    meta = FakeMeta(monkeypatch)
+    now = datetime.utcnow()
+    await _watch(mock_db, _group("g1", "act_1"))
+    await mock_db[history.HISTORY].insert_one({
+        "_id": "g1", "user_id": "u1", "ad_account_id": "act_1", "campaign_ids": None, "status": "orphaned",
+        "oldest_done": "2025-09-28", "newest_done": "2026-10-27", "state_refreshed_at": now, "error": None,
+        "claimed_at": None, "last_topup_at": now - timedelta(hours=1)})
+
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    d = await _doc(mock_db, "g1")
+    assert d["status"] == "ready" and meta.fetches == []
+
+
+async def test_campaign_scope_reorder_keeps_history(mock_db, mock_mongo_client, monkeypatch):
+    meta = FakeMeta(monkeypatch, clock_step=100.0)
+    await _watch(mock_db, _group("g1", "act_1", campaigns=["c1", "c2"]))
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
+    rows = await ad_days(mock_db).count_documents({"client_group_id": "g1"})
+    assert rows == 2
+
+    await mock_db.client_groups.update_one({"id": "g1"}, {"$set": {"meta_campaign_ids": ["c2", "c1"]}})
+    await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=150, today=TODAY)
+    assert meta.windows()[2][1] == D("2026-08-28")                     # resumed, not restarted
+    assert (await _doc(mock_db, "g1"))["oldest_done"] == "2026-06-30"
+    assert await ad_days(mock_db).count_documents({"client_group_id": "g1"}) == 4
 
 
 # ---------------------------------------------------------------------------

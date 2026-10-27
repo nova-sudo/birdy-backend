@@ -107,6 +107,31 @@ async def test_fetch_permission_error_raises(patch_client, code):
         await fetch_ad_daily("act_1", "T", D1, D2, campaign_ids=None)
 
 
+NEXT = "https://graph.facebook.com/v25.0/act_1/insights?after=CURSOR&access_token=T"
+PAGE_1 = {"body": {"data": [{"ad_id": "a1", "date_start": "2026-10-01", "spend": "5"}],
+                   "paging": {"next": NEXT}}}
+
+
+@pytest.mark.asyncio
+async def test_page_two_failure_returns_none_not_a_short_list(patch_client):
+    seen = []
+    patch_client([PAGE_1, {"status": 500, "body": {"error": {"code": 1, "message": "boom"}}}], seen)
+
+    assert await fetch_ad_daily("act_1", "T", D1, D2, campaign_ids=None) is None
+    assert len(seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_page_two_permission_error_raises(patch_client):
+    seen = []
+    patch_client([PAGE_1, {"status": 403, "body": {"error": {"code": 200, "message": "no ads_read"}}}],
+                 seen)
+
+    with pytest.raises(MetaPermissionError, match="ads_read"):
+        await fetch_ad_daily("act_1", "T", D1, D2, campaign_ids=None)
+    assert len(seen) == 2
+
+
 @pytest.mark.asyncio
 async def test_store_rows_load_back_through_load_ad_days(mock_db):
     base = {"ad_id": "a1", "ad_name": "Ad", "adset_id": "s1",

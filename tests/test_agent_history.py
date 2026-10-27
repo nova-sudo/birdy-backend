@@ -121,3 +121,75 @@ async def test_load_ad_days_only_reads_this_users_rows(mock_db):
     await seed_ad_days(mock_db, [row("u1", "mine"), row("u2", "theirs")])
     out = await load_ad_days(mock_db, "u1", "cg", date(2026, 10, 1), date(2026, 10, 2))
     assert set(out) == {"mine"}
+
+
+# ---------------------------------------------------------------------------
+# backoff, fair ordering, orphaned docs
+# ---------------------------------------------------------------------------
+
+async def test_claim_skips_docs_waiting_for_retry_at(mock_db):
+    await _doc(mock_db, "backing_off", status="running", retry_at=NOW + timedelta(minutes=5))
+    await _doc(mock_db, "retry_passed", status="running", retry_at=NOW - timedelta(seconds=1))
+    await _doc(mock_db, "ready_backing_off", status="ready", last_topup_at=NOW - timedelta(hours=6),
+               state_refreshed_at=NOW, retry_at=NOW + timedelta(minutes=5))
+    ids = {d["_id"] for d in await history.claim(mock_db, NOW, 10)}
+    assert ids == {"retry_passed"}
+
+
+async def test_claim_orders_oldest_updated_first_within_each_group(mock_db):
+    await _doc(mock_db, "run_new", status="running", updated_at=NOW - timedelta(minutes=1))
+    await _doc(mock_db, "run_old", status="running", updated_at=NOW - timedelta(minutes=30))
+    await _doc(mock_db, "pend_mid", status="pending", updated_at=NOW - timedelta(minutes=10))
+    await _doc(mock_db, "ready_old", status="ready", last_topup_at=NOW - timedelta(hours=6),
+               state_refreshed_at=NOW, updated_at=NOW - timedelta(days=1))
+    got = [d["_id"] for d in await history.claim(mock_db, NOW, 10)]
+    assert got == ["run_old", "pend_mid", "run_new", "ready_old"]
+    assert await history.claim(mock_db, NOW + timedelta(minutes=5), 10) == []      # all held
+
+
+async def test_claim_never_returns_orphaned_docs(mock_db):
+    await _doc(mock_db, "orph", status="orphaned", updated_at=NOW - timedelta(days=3),
+               last_topup_at=NOW - timedelta(days=3), state_refreshed_at=NOW - timedelta(days=3))
+    assert await history.claim(mock_db, NOW, 10) == []
+
+
+async def test_ensure_docs_orphans_unwatched_and_revives_rewatched(mock_db):
+    await _seed_groups(mock_db)
+    await mock_db.agents.insert_one(
+        {"_id": "a1", "user_id": "u1", "status": "draft", "scope": {"client_group_ids": ["g1", "g2"]}})
+    await history.ensure_docs(mock_db)
+    done = {"status": "ready", "oldest_done": "2025-09-28", "newest_done": "2026-10-27",
+            "last_topup_at": NOW, "failures": 2, "retry_at": NOW + timedelta(minutes=10)}
+    await mock_db[history.HISTORY].update_one({"_id": "g1"}, {"$set": done})
+
+    # g1 no longer watched by any agent (any status): orphaned, never claimed.
+    await mock_db.agents.update_one({"_id": "a1"}, {"$set": {"scope.client_group_ids": ["g2"]}})
+    await history.ensure_docs(mock_db)
+    g1 = await mock_db[history.HISTORY].find_one({"_id": "g1"})
+    assert g1["status"] == "orphaned"
+    assert (await mock_db[history.HISTORY].find_one({"_id": "g2"}))["status"] == "pending"
+    assert "g1" not in {d["_id"] for d in await history.claim(mock_db, NOW + timedelta(days=2), 10)}
+
+    # Watched again: back to pending with its progress kept, and claimable at once.
+    await mock_db.agents.insert_one(
+        {"_id": "a2", "user_id": "u1", "status": "active", "scope": {"client_group_ids": ["g1"]}})
+    await history.ensure_docs(mock_db)
+    g1 = await mock_db[history.HISTORY].find_one({"_id": "g1"})
+    assert g1["status"] == "pending"
+    assert (g1["oldest_done"], g1["newest_done"], g1["last_topup_at"]) == ("2025-09-28", "2026-10-27", NOW)
+    assert g1["failures"] == 0 and g1["retry_at"] is None
+    assert "g1" in {d["_id"] for d in await history.claim(mock_db, NOW, 10)}
+
+
+async def test_ensure_docs_orphans_everything_when_no_agent_watches(mock_db):
+    await _doc(mock_db, "g1", status="running")
+    await history.ensure_docs(mock_db)
+    assert (await mock_db[history.HISTORY].find_one({"_id": "g1"}))["status"] == "orphaned"
+
+
+async def test_statuses_reports_an_orphaned_doc_as_pending(mock_db):
+    """A client just added back to an agent's scope is pending until the next pass revives it."""
+    await _doc(mock_db, "g1", status="orphaned", oldest_done="2025-09-28", last_topup_at=NOW)
+    out = await history.statuses(mock_db, ["g1"])
+    assert out["g1"]["status"] == "pending"
+    assert not history.is_ready(out["g1"])
