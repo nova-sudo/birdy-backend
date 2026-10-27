@@ -87,11 +87,17 @@ async def test_new_report_without_content_gets_the_default_template(db, client):
     rep = client.post("/api/slack-reports", json={
         "name": "New accounts", "trigger": {"type": "event", "event": "account_created"}}).json()["report"]
     assert rep["template"]["blocks"] and rep["template"]["frequency"] == "daily" and rep["channel_id"] is None
+    # An event report's standard content says what happened first.
+    assert rep["template"]["blocks"][0]["text"]["text"] == "{{event}}"
+    alert = client.post("/api/slack-reports", json={
+        "name": "Alerts", "trigger": {"type": "event", "event": "alert_fired"}}).json()["report"]
+    assert [b["text"]["text"] for b in alert["template"]["blocks"][:2]] == ["{{event}}", "{{alert_message}}"]
 
     # A data window alone keeps the content and only changes what the numbers cover.
     weekly = client.post("/api/slack-reports", json={
         "name": "Wrap", "trigger": SCHEDULE, "template": {"frequency": "weekly"}}).json()["report"]
     assert weekly["template"]["frequency"] == "weekly" and weekly["template"]["blocks"]
+    assert weekly["template"]["blocks"][0]["text"]["text"] == "Birdy brief · {{period}}"
     custom = client.patch(f"/api/slack-reports/{rep['id']}", json={"template": {"frequency": "daily", "blocks": BLOCKS}}).json()["report"]
     again = client.patch(f"/api/slack-reports/{rep['id']}", json={"template": {"frequency": "weekly"}}).json()["report"]
     assert again["template"] == {**custom["template"], "frequency": "weekly"}

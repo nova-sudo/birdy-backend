@@ -85,11 +85,24 @@ def _clean_trigger(t: Trigger) -> dict:
             "alert_id": (t.alert_id or None) if t.event == "alert_fired" else None}
 
 
-async def _clean_template(db, user_id: str, raw: dict, blocks: list | None = None) -> dict:
+def _standard_blocks(trigger: dict | None) -> list:
+    """The standard brief. An event report leads with what happened instead of
+    the brief's title, or its message would read like any other day's brief."""
+    blocks = rt.default_template()["blocks"]
+    if (trigger or {}).get("type") != "event":
+        return blocks
+    lead = [{"type": "header", "text": {"type": "plain_text", "text": "{{event}}"}}]
+    if trigger.get("event") == "alert_fired":
+        lead.append({"type": "section", "text": {"type": "mrkdwn", "text": "{{alert_message}}"}})
+    return lead + blocks[1:]
+
+
+async def _clean_template(db, user_id: str, raw: dict, blocks: list | None = None,
+                          trigger: dict | None = None) -> dict:
     """A validated template. Without blocks of its own it keeps `blocks` (the
     report's current content), or starts from the standard brief."""
     if not raw.get("blocks"):
-        raw = {**raw, "blocks": blocks or rt.default_template()["blocks"]}
+        raw = {**raw, "blocks": blocks or _standard_blocks(trigger)}
     names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
         {"user_id": user_id}, {"_id": 0, "id": 1, "name": 1}) if g.get("id")}
     try:
@@ -144,7 +157,7 @@ async def create_report(body: ReportBody, current_user: str = Depends(get_curren
         if await db[sr.REPORTS].count_documents({"user_id": current_user}) >= sr.MAX_REPORTS:
             raise HTTPException(400, f"You can have up to {sr.MAX_REPORTS} reports")
         trigger = _clean_trigger(body.trigger)
-        template = await _clean_template(db, current_user, body.template or {"frequency": "daily"})
+        template = await _clean_template(db, current_user, body.template or {"frequency": "daily"}, trigger=trigger)
         report = sr.new_report(current_user, name=body.name.strip(), trigger=trigger, template=template,
                                channel_id=body.channel_id, channel_name=body.channel_name,
                                enabled=True if body.enabled is None else body.enabled)
