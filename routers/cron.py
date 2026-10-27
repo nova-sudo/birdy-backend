@@ -144,59 +144,78 @@ async def meta_tick(authorization: str | None = Header(default=None)):
         execute_refresh,
     )
 
+    from jobs.agent_history_jobs import advance_agent_history
+    from ai.agents.history import AGENT_HISTORY_BUDGET_SECONDS
+
     tick_start = time.monotonic()
     async with get_mongo_client() as mongo_client:
-        # 1. Schedule new work
-        scheduled = await schedule_stale_groups(
-            mongo_client,
-            cutoff_hours=META_ONGOING_CUTOFF_HOURS,
-            presets=META_ONGOING_PRESETS,
-            limit=20,
-        )
-
-        # 1b. Mop up static presets whose monthly sweep missed them.
-        #
-        # meta-static-tick fires once a month, and a group that happens to have
-        # an open job at that moment is skipped — its Last Month / Last Quarter
-        # / Last Year then read £0 for another 28 days, because nothing else
-        # schedules them. Checking here too means a group is at most a few
-        # minutes stale rather than up to a month, and it is what heals the 14
-        # groups that never had these presets written at all.
-        #
-        # This costs one indexed-range query a minute and, because the cutoff
-        # is 28 days, schedules a given group roughly once a month — the same
-        # Meta call volume the monthly cron was always meant to make. The small
-        # limit keeps a tick from filling with static work.
-        scheduled += await schedule_stale_groups(
-            mongo_client,
-            cutoff_hours=META_STATIC_CUTOFF_HOURS,
-            presets=META_STATIC_PRESETS,
-            limit=3,
-            stale_field="last_meta_static_refresh",
-        )
-
-        # 2. Claim and work
-        jobs = await claim_next_jobs(mongo_client, n=META_GROUPS_PER_TICK)
-        if jobs:
-            await asyncio.gather(
-                *[
-                    execute_refresh(
-                        j["job_id"],
-                        mongo_client,
-                        max_seconds=META_BUDGET_PER_JOB_SECONDS,
-                    )
-                    for j in jobs
-                ],
-                return_exceptions=True,  # one bad job doesn't take down the tick
+        async def refresh_jobs():
+            # 1. Schedule new work
+            scheduled = await schedule_stale_groups(
+                mongo_client,
+                cutoff_hours=META_ONGOING_CUTOFF_HOURS,
+                presets=META_ONGOING_PRESETS,
+                limit=20,
             )
 
-    elapsed = time.monotonic() - tick_start
-    return {
-        "ok": True,
-        "scheduled": len(scheduled),
-        "worked": len(jobs),
-        "elapsed_seconds": round(elapsed, 2),
-    }
+            # 1b. Mop up static presets whose monthly sweep missed them.
+            #
+            # meta-static-tick fires once a month, and a group that happens to have
+            # an open job at that moment is skipped — its Last Month / Last Quarter
+            # / Last Year then read £0 for another 28 days, because nothing else
+            # schedules them. Checking here too means a group is at most a few
+            # minutes stale rather than up to a month, and it is what heals the 14
+            # groups that never had these presets written at all.
+            #
+            # This costs one indexed-range query a minute and, because the cutoff
+            # is 28 days, schedules a given group roughly once a month — the same
+            # Meta call volume the monthly cron was always meant to make. The small
+            # limit keeps a tick from filling with static work.
+            scheduled += await schedule_stale_groups(
+                mongo_client,
+                cutoff_hours=META_STATIC_CUTOFF_HOURS,
+                presets=META_STATIC_PRESETS,
+                limit=3,
+                stale_field="last_meta_static_refresh",
+            )
+
+            # 2. Claim and work
+            jobs = await claim_next_jobs(mongo_client, n=META_GROUPS_PER_TICK)
+            if jobs:
+                await asyncio.gather(
+                    *[
+                        execute_refresh(
+                            j["job_id"],
+                            mongo_client,
+                            max_seconds=META_BUDGET_PER_JOB_SECONDS,
+                        )
+                        for j in jobs
+                    ],
+                    return_exceptions=True,  # one bad job doesn't take down the tick
+                )
+            return scheduled, jobs
+
+        # The refresh jobs and the agent ad-history pass run side by side; either
+        # one raising is logged and must not 500 the tick or stop the other.
+        refresh, agent_history = await asyncio.gather(
+            refresh_jobs(),
+            advance_agent_history(mongo_client, max_seconds=AGENT_HISTORY_BUDGET_SECONDS),
+            return_exceptions=True,
+        )
+
+    out = {"ok": True, "scheduled": 0, "worked": 0}
+    if isinstance(refresh, BaseException):
+        logger.error(f"[meta-tick] refresh jobs raised: {refresh!r}", exc_info=refresh)
+        out["refresh_error"] = repr(refresh)
+    else:
+        scheduled, jobs = refresh
+        out.update(scheduled=len(scheduled), worked=len(jobs))
+    if isinstance(agent_history, BaseException):
+        logger.error(f"[meta-tick] agent history pass raised: {agent_history!r}", exc_info=agent_history)
+        agent_history = repr(agent_history)
+    out["agent_history"] = agent_history
+    out["elapsed_seconds"] = round(time.monotonic() - tick_start, 2)
+    return out
 
 
 @router.get("/meta-static-tick")
