@@ -5,10 +5,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 
-async def api_get_with_backoff(client, url, params=None, max_retries=4):
+async def api_get_with_backoff(client, url, params=None, max_retries=4, return_error=False):
     """
     GET with exponential backoff on Meta rate-limit responses (code 17 / HTTP 429).
     Returns (response_ok: bool, data: dict | None).
+
+    With return_error=True, a failed HTTP response returns (False, <parsed JSON
+    error body or None>) instead of (False, None), so a caller can tell a
+    permission error (code 200 / 10) from an outage. Default behaviour is
+    unchanged.
     """
     for attempt in range(max_retries):
         try:
@@ -35,6 +40,12 @@ async def api_get_with_backoff(client, url, params=None, max_retries=4):
                 continue
 
             logger.error(f"❌ API error {resp.status_code}: {body[:300]}")
+            if return_error:
+                try:
+                    err = resp.json()
+                except Exception:
+                    err = None
+                return False, err if isinstance(err, dict) else None
             return False, None
 
         except Exception as e:
