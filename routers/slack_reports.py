@@ -57,7 +57,7 @@ class ReportBody(BaseModel):
     trigger: Optional[Trigger] = None
     channel_id: Optional[str] = None
     channel_name: Optional[str] = Field(default=None, max_length=120)
-    template: Optional[dict] = None   # {frequency: data window, blocks}
+    template: Optional[dict] = None   # {frequency: data window, blocks}; no blocks = keep / standard
 
 
 def _clean_trigger(t: Trigger) -> dict:
@@ -85,7 +85,11 @@ def _clean_trigger(t: Trigger) -> dict:
             "alert_id": (t.alert_id or None) if t.event == "alert_fired" else None}
 
 
-async def _clean_template(db, user_id: str, raw: dict) -> dict:
+async def _clean_template(db, user_id: str, raw: dict, blocks: list | None = None) -> dict:
+    """A validated template. Without blocks of its own it keeps `blocks` (the
+    report's current content), or starts from the standard brief."""
+    if not raw.get("blocks"):
+        raw = {**raw, "blocks": blocks or rt.default_template()["blocks"]}
     names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
         {"user_id": user_id}, {"_id": 0, "id": 1, "name": 1}) if g.get("id")}
     try:
@@ -140,7 +144,7 @@ async def create_report(body: ReportBody, current_user: str = Depends(get_curren
         if await db[sr.REPORTS].count_documents({"user_id": current_user}) >= sr.MAX_REPORTS:
             raise HTTPException(400, f"You can have up to {sr.MAX_REPORTS} reports")
         trigger = _clean_trigger(body.trigger)
-        template = await _clean_template(db, current_user, body.template or rt.default_template())
+        template = await _clean_template(db, current_user, body.template or {"frequency": "daily"})
         report = sr.new_report(current_user, name=body.name.strip(), trigger=trigger, template=template,
                                channel_id=body.channel_id, channel_name=body.channel_name,
                                enabled=True if body.enabled is None else body.enabled)
@@ -171,7 +175,8 @@ async def update_report(report_id: str, body: ReportBody, current_user: str = De
                 raise HTTPException(400, "The daily/weekly brief always runs on a schedule")
             changes["trigger"] = trigger
         if body.template is not None:
-            changes["template"] = await _clean_template(db, current_user, body.template)
+            changes["template"] = await _clean_template(db, current_user, body.template,
+                                                        (report.get("template") or {}).get("blocks"))
         if not changes:
             return {"report": _out(report)}
 

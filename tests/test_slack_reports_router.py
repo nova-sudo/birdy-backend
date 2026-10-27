@@ -86,7 +86,15 @@ async def test_new_report_without_content_gets_the_default_template(db, client):
     await _seed(db, brief=None)
     rep = client.post("/api/slack-reports", json={
         "name": "New accounts", "trigger": {"type": "event", "event": "account_created"}}).json()["report"]
-    assert rep["template"]["blocks"] and rep["channel_id"] is None
+    assert rep["template"]["blocks"] and rep["template"]["frequency"] == "daily" and rep["channel_id"] is None
+
+    # A data window alone keeps the content and only changes what the numbers cover.
+    weekly = client.post("/api/slack-reports", json={
+        "name": "Wrap", "trigger": SCHEDULE, "template": {"frequency": "weekly"}}).json()["report"]
+    assert weekly["template"]["frequency"] == "weekly" and weekly["template"]["blocks"]
+    custom = client.patch(f"/api/slack-reports/{rep['id']}", json={"template": {"frequency": "daily", "blocks": BLOCKS}}).json()["report"]
+    again = client.patch(f"/api/slack-reports/{rep['id']}", json={"template": {"frequency": "weekly"}}).json()["report"]
+    assert again["template"] == {**custom["template"], "frequency": "weekly"}
 
 
 @pytest.mark.parametrize("body, message", [
