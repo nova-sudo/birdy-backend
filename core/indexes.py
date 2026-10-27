@@ -58,6 +58,7 @@ def _load_creators():
     from services.mcp_token_service import create_mcp_tokens_indexes
     from services.slack_bot_service import create_slack_bot_indexes
     from services.slack_interaction_store import create_slack_ui_interaction_indexes
+    from services.slack_reports import create_slack_report_indexes
     from utils.cache_helpers import create_performance_indexes
 
     return [
@@ -74,6 +75,7 @@ def _load_creators():
         create_mcp_tokens_indexes,
         create_slack_bot_indexes,
         create_slack_ui_interaction_indexes,
+        create_slack_report_indexes,
         create_ai_session_indexes,
         create_suggestion_indexes,
         create_agent_indexes,

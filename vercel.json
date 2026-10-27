@@ -74,8 +74,8 @@
       "schedule": "*/5 * * * *"
     },
     {
-      "path": "/api/cron/slack-briefs",
-      "schedule": "0 * * * *"
+      "path": "/api/cron/slack-reports",
+      "schedule": "*/5 * * * *"
     }
   ]
 }

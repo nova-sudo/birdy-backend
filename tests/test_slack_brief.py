@@ -182,8 +182,8 @@ async def test_sends_once_per_period(mock_db, slack):
     assert len(slack) == 1
     assert slack[0]["channel"] == "C123" and slack[0]["token"] == "xoxb-test"
     assert "Glow Clinic" in slack[0]["text"]
-    user = await mock_db["users"].find_one({"user_id": "agency@x.com"})
-    assert user["integrations"]["slack_bot"]["brief_last_sent"] == "2026-09-30"
+    report = await mock_db["slack_reports"].find_one({"user_id": "agency@x.com", "is_default": True})
+    assert report["last_run"]["key"] == "2026-09-30" and report["last_run"]["status"] == "sent"
 
 
 async def test_sends_again_the_next_day(mock_db, slack):
@@ -207,9 +207,8 @@ async def test_a_failed_post_is_retried_next_tick(mock_db, monkeypatch):
     await _seed(mock_db)
 
     first = await sb.send_due_briefs(mock_db, utc(2026, 9, 30, 8, 0))
-    user = await mock_db["users"].find_one({"user_id": "agency@x.com"})
     assert first["failed"] == 1
-    assert user["integrations"]["slack_bot"].get("brief_last_sent") is None   # claim released
+    assert await mock_db["slack_report_runs"].count_documents({}) == 0   # claim released
 
     second = await sb.send_due_briefs(mock_db, utc(2026, 9, 30, 9, 0))
     assert second["sent"] == 1 and len(calls) == 2

@@ -865,12 +865,13 @@ async def health_weekly(authorization: str | None = Header(default=None)):
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
 
 
-@router.get("/slack-briefs")
+@router.get("/slack-reports")
+@router.get("/slack-briefs")  # the old path, until every deploy's cron points at the new one
 async def slack_briefs(authorization: str | None = Header(default=None)):
-    """Posts every scheduled Slack brief that is due. Hourly at :00.
+    """Posts every scheduled Slack report that is due. Every 5 minutes.
 
-    Each account chooses a daily or weekly brief and a time in onboarding or
-    Settings; see services/slack_brief.py for when one counts as due.
+    The brief chosen in onboarding / Settings is the account's default report;
+    see services/slack_reports.py for when one counts as due.
     """
     _verify_cron_auth(authorization)
 

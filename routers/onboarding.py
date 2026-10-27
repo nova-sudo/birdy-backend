@@ -383,6 +383,9 @@ async def set_slack_brief(
             {"user_id": current_user},
             {"$set": {"integrations.slack_bot.brief": brief}},
         )
+        # The brief is the account's default Slack report; keep that in step.
+        from services.slack_reports import sync_default_from_brief
+        await sync_default_from_brief(db, current_user)
         return {"ok": True, "brief": brief}
 
 
