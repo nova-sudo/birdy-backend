@@ -264,11 +264,12 @@ async def _target(db, report: dict) -> tuple[str | None, str | None]:
 
 
 async def send_report(db, report: dict, now_utc: datetime, key: str | None = None,
-                      event: dict | None = None) -> tuple[str, str | None]:
+                      event: dict | None = None, record: bool = True) -> tuple[str, str | None]:
     """
     Build and post one report. Returns (status, error): SENT, SKIPPED (nothing
     to send to or about — not worth retrying) or FAILED (Slack refused).
-    `event` fills the event placeholders (services/report_events.py).
+    `event` fills the event placeholders (services/report_events.py). A test
+    send (record=False) leaves the figures the next send compares with alone.
     """
     template = rt.normalize(report.get("template"))
     if not rt.has_content(template):
@@ -296,8 +297,9 @@ async def send_report(db, report: dict, now_utc: datetime, key: str | None = Non
         logger.warning("slack report %s: post failed: %s", report["id"], e)
         return FAILED, _slack_error(e)
 
-    await db[REPORTS].update_one({"id": report["id"]},
-                                 {"$set": {"last_figures": rt.snapshot(ctx, key)}})
+    if record:
+        await db[REPORTS].update_one({"id": report["id"]},
+                                     {"$set": {"last_figures": rt.snapshot(ctx, key)}})
     return SENT, None
 
 
