@@ -111,8 +111,26 @@ async def test_calls_match_by_id_phone_or_email(mock_db):
 
 @pytest.mark.asyncio
 async def test_time_to_close_for_won_opportunity(mock_db):
+    await _seed_contact(mock_db, {"dateAdded": "2026-07-17T12:00:00Z", "opportunities": [
+        {"id": "o1", "status": "won", "lastStatusChangeAt": "2026-07-17T14:34:00Z"}]})
+    r = await build_lead_detail(mock_db, USER, "c1")
+    assert r["engagement"]["time_to_close_seconds"] == 9240
+
+
+@pytest.mark.asyncio
+async def test_time_to_close_none_without_contact_date_added(mock_db):
     await _seed_contact(mock_db, {"opportunities": [
         {"id": "o1", "status": "won", "dateAdded": "2026-07-17T12:00:00Z",
          "lastStatusChangeAt": "2026-07-17T14:34:00Z"}]})
     r = await build_lead_detail(mock_db, USER, "c1")
-    assert r["engagement"]["time_to_close_seconds"] == 9240
+    assert r["engagement"]["time_to_close_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_naive_started_at_serialised_as_utc(mock_db):
+    await mock_db["call_logs"].insert_one({
+        "user_id": USER, "contact_id": "c1", "direction": "outbound", "status": "completed",
+        "started_at": datetime(2026, 7, 1, 9, 30)})
+    await _seed_contact(mock_db)
+    r = await build_lead_detail(mock_db, USER, "c1")
+    assert r["calls"][0]["started_at"].endswith("+00:00")

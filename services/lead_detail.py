@@ -26,7 +26,7 @@ def _parse_dt(value):
 
 def _iso(value):
     if isinstance(value, datetime):
-        return value.isoformat()
+        return _parse_dt(value).isoformat()  # naive Mongo datetimes are UTC
     return value
 
 
@@ -157,7 +157,7 @@ def _time_to_close(contact: dict):
     if not won:
         return None
     opp = won[0]
-    start = _parse_dt(opp.get("dateAdded") or opp.get("createdAt"))
+    start = _parse_dt(contact.get("dateAdded"))
     end = _parse_dt(opp.get("lastStatusChangeAt"))
     if not start or not end:
         return None
