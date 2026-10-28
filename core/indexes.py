@@ -53,6 +53,7 @@ def _load_creators():
     from services.call_logs_service import create_call_logs_indexes
     from services.dashboards_briefing import create_dashboard_briefing_indexes
     from services.meta_campaign_scope import create_client_groups_scope_indexes
+    from services.lead_summary import create_lead_summary_indexes
     from services.landing_funnel import create_landing_funnel_indexes
     from services.tracked_leads import create_tracked_leads_indexes
     from services.mcp_token_service import create_mcp_tokens_indexes
@@ -87,6 +88,7 @@ def _load_creators():
         create_client_groups_scope_indexes,
         create_dashboards_indexes,
         create_dashboard_briefing_indexes,
+        create_lead_summary_indexes,
     ]
 
 

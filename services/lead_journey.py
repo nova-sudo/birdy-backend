@@ -1,0 +1,241 @@
+"""Lead journey: a newest-first timeline of one lead, from data Birdy stores
+plus live GHL opportunities and appointments. Nothing here is persisted."""
+import asyncio
+import logging
+import math
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
+
+from services.ghl_live import live_appointments, safe_token_for
+from services.ghl_pipelines import stage_lookup
+from services import lead_detail
+from services.lead_detail import _calls, _find_entity, _parse_dt, resolve_opportunities
+from utils.phone_normalize import compute_match_keys
+
+logger = logging.getLogger(__name__)
+
+# Worst last: "reconnect" is the actionable one, so it wins over "unavailable".
+_SEVERITY = {"ok": 0, "unavailable": 1, "reconnect": 2}
+_MISSED = {"cancelled": "Appointment cancelled", "canceled": "Appointment cancelled",
+           "noshow": "Appointment no-show", "no_show": "Appointment no-show", "no-show": "Appointment no-show"}
+_CALL_STATUS = {"no-answer": "no answer", "busy": "busy", "failed": "failed", "canceled": "cancelled"}
+_STAGE_GAP = timedelta(minutes=1)  # GHL stamps lastStageChangeAt just after createdAt on creation
+
+
+def _worse(a: str, b: str) -> str:
+    return a if _SEVERITY[a] >= _SEVERITY[b] else b
+
+
+def _event(id_, kind, title, detail, at, **extra):
+    dt = _parse_dt(at)
+    if not dt:
+        return None  # unparseable or missing: never sort to 1970
+    return {"id": id_, "kind": kind, "title": title, "detail": detail,
+            "at": dt.astimezone(timezone.utc).isoformat(), **extra}
+
+
+def _path(url) -> str:
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    url = url.strip()
+    if "://" not in url and not url.startswith("/"):
+        url = "//" + url  # scheme-less "site.com/quote"
+    return urlparse(url).path or "/"
+
+
+def _host(url) -> str:
+    if not isinstance(url, str) or not url.strip():
+        return ""
+    url = url.strip()
+    if "://" not in url and not url.startswith("/"):
+        url = "//" + url
+    host = urlparse(url).netloc.lower()
+    return host[4:] if host.startswith("www.") else host
+
+
+def _duration(seconds) -> str:
+    seconds = int(seconds)
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def _lead_event(contact: dict):
+    src = contact.get("attributionSource") or {}
+    detail = (contact.get("source") or "").strip() or src.get("utmSource") or src.get("campaign") or "GoHighLevel"
+    return _event(f"lead:{contact.get('id')}", "lead", "Lead created", detail, contact.get("dateAdded"))
+
+
+async def _meta_events(db, user_id, doc, keys):
+    if not keys:
+        return []
+    query = {"user_id": user_id, "match_keys": {"$in": keys}}
+    if doc.get("client_group_id"):
+        # Same rule as the detail's attribution: pre-grouping Meta leads stay matchable.
+        query["client_group_id"] = {"$in": [doc["client_group_id"], None, ""]}
+    rows = await db["facebook_leads"].find(query).to_list(None)
+    group = None
+    if rows and doc.get("client_group_id"):
+        group = await db["client_groups"].find_one({"id": doc["client_group_id"], "user_id": user_id})
+    out = []
+    for r in rows:
+        ld = r.get("lead_data") or {}
+        channel = "Instagram" if ld.get("platform") == "ig" else "Meta Ads"
+        ad_name = ld.get("ad_name") or _find_entity(group, "ads", ld.get("ad_id")).get("name")
+        detail = f"{channel} · {ad_name}" if ad_name else channel
+        out.append(_event(f"meta:{r['_id']}", "conversion", "Meta lead form submitted", detail,
+                          ld.get("created_time")))
+    return out
+
+
+async def _website_events(db, user_id, group_id, keys):
+    if not keys or not group_id:
+        return []
+    out = []
+    rows = await db["tracked_leads"].find(
+        {"user_id": user_id, "client_group_id": group_id, "match_keys": {"$in": keys}}).to_list(None)
+    for r in rows:
+        parts = [p for p in (_path(r.get("landing_page")), r.get("utm_source")) if p]
+        out.append(_event(f"form:{r['_id']}", "conversion", "Website form submitted",
+                          " · ".join(parts), r.get("created_at") or r.get("submitted_at")))
+    return out
+
+
+async def _visit_events(db, user_id, group_id, contact_id, keys):
+    if not group_id:
+        return []
+    ors = []
+    if keys:
+        ors.append({"match_keys": {"$in": keys}})
+    matches = await db["attribution_matches"].find(
+        {"user_id": user_id, "client_group_id": group_id, "ghl_contact_id": contact_id}).to_list(None)
+    ids = [m["visitor_id"] for m in matches if m.get("visitor_id")]
+    if ids:
+        ors.append({"_id": {"$in": ids}})
+    if not ors:
+        return []
+    visitors = await db["attribution_visitors"].find(
+        {"user_id": user_id, "client_group_id": group_id, "$or": ors}).to_list(None)
+
+    out = []
+    for v in visitors:
+        first = v.get("first_touch") or {}
+        paid = v.get("last_paid_touch") or {}
+        touches = [("first", first)]
+        if paid and _parse_dt(paid.get("ts")) != _parse_dt(first.get("ts")):
+            touches.append(("paid", paid))
+        for label, t in touches:
+            path = _path(t.get("landing_page"))
+            origin = _host(t.get("referrer")) or t.get("utm_source") or "Direct"
+            out.append(_event(f"visit:{v['_id']}:{label}", "visit",
+                              f"Visited {path}" if path else "Visited website", f"From {origin}", t.get("ts")))
+    return out
+
+
+def _call_events(calls):
+    out = []
+    for c in calls:
+        direction = (c.get("direction") or "").capitalize()
+        status = c.get("status")
+        status = _CALL_STATUS.get(status, status)
+        title = " ".join(p for p in (direction, status) if p) or "Call"
+        seconds = c.get("duration_seconds")
+        extra = {}
+        if isinstance(seconds, (int, float)) and math.isfinite(seconds) and seconds > 0:
+            title += f" · {_duration(seconds)}"
+            extra["duration_seconds"] = int(seconds)
+        out.append(_event(f"call:{c['id']}", "call", title, "Call", c.get("started_at"), **extra))
+    return out
+
+
+def _wall_clock(value):
+    """(iso, is_local) for an appointment start, or None.
+
+    GHL sends "2026-07-20 10:00:00": the clock time at the business location,
+    no offset. Keep that as a naive ISO string (is_local=True) so the UI never
+    shifts it into the viewer's timezone. Values with an offset stay instants.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo:
+        return dt.isoformat(), False
+    return dt.replace(microsecond=0).isoformat(), True
+
+
+def _appointment_events(appointments):
+    out = []
+    for i, a in enumerate(appointments):
+        title = (a.get("title") or "").strip() or "Appointment"
+        status = str(a.get("appointmentStatus") or a.get("status") or "").lower()
+        missed = _MISSED.get(status)
+        appt_status = {"Appointment cancelled": "cancelled", "Appointment no-show": "noshow"}.get(missed, "booked")
+        at = (a.get("dateUpdated") or a.get("dateAdded")) if missed else a.get("dateAdded")
+        # `at` (dateAdded/dateUpdated): a naive value is read as UTC, like every other timestamp here.
+        starts = _wall_clock(a.get("startTime"))
+        extra = {"starts_at": starts[0], "starts_at_local": starts[1]} if starts else {}
+        out.append(_event(f"appt:{a.get('id') or i}", "appointment", missed or "Appointment booked", title, at,
+                          appointment_status=appt_status, **extra))
+    return out
+
+
+def _stage_events(opps, stages):
+    out = []
+    for i, o in enumerate(opps):
+        info = stages.get(o.get("pipelineStageId")) or {}
+        pipeline, stage = info.get("pipeline_name"), info.get("stage_name")
+        oid = o.get("id") if o.get("id") is not None else i
+        detail = " · ".join(p for p in (pipeline, stage) if p)
+        out.append(_event(f"opp:{oid}:created", "stage", "Opportunity created", detail, o.get("createdAt")))
+        status = o.get("status")
+        if status and status != "open":
+            out.append(_event(f"opp:{oid}:{status}", "stage", f"Opportunity {status}",
+                              o.get("name") or pipeline or "", o.get("lastStatusChangeAt")))
+        moved, created = _parse_dt(o.get("lastStageChangeAt")), _parse_dt(o.get("createdAt"))
+        if moved and (created is None or moved - created > _STAGE_GAP):
+            out.append(_event(f"opp:{oid}:moved", "stage", f"Moved to {stage}" if stage else "Moved stage",
+                              pipeline or "", o.get("lastStageChangeAt")))
+    return out
+
+
+async def _no_stages():
+    return {}
+
+
+async def build_lead_journey(db, user_id: str, contact_id: str) -> dict | None:
+    doc = await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
+    if not doc:
+        return None
+    contact = doc.get("contact_data") or {}
+    location_id, group_id = doc.get("location_id"), doc.get("client_group_id")
+    keys = doc.get("match_keys") or compute_match_keys(contact.get("email"), contact.get("phone"))
+
+    async def _ghl():
+        token = await safe_token_for(db, user_id, location_id)
+        (opp_status, opps), (appt_status, appointments), stages = await asyncio.gather(
+            resolve_opportunities(db, user_id, doc, contact, token=token),
+            live_appointments(db, user_id, location_id, contact_id, token=token),
+            stage_lookup(db, user_id, location_id) if location_id else _no_stages(),
+        )
+        return opp_status, opps, appt_status, appointments, stages
+
+    try:
+        opp_status, opps, appt_status, appointments, stages = await asyncio.wait_for(
+            _ghl(), lead_detail.GHL_BUDGET_SECONDS)
+    except asyncio.TimeoutError:
+        opp_status = appt_status = "unavailable"
+        opps = [o for o in contact.get("opportunities") or [] if isinstance(o, dict)]
+        appointments, stages = [], {}
+
+    events = [_lead_event(contact)]
+    events += await _meta_events(db, user_id, doc, keys)
+    events += await _website_events(db, user_id, group_id, keys)
+    events += await _visit_events(db, user_id, group_id, contact_id, keys)
+    events += _call_events(await _calls(db, user_id, contact))
+    events += _appointment_events(appointments)
+    events += _stage_events(opps, stages or {})
+
+    events = [e for e in events if e]
+    events.sort(key=lambda e: (_parse_dt(e["at"]), e["id"]), reverse=True)
+    return {"events": events, "ghl": _worse(opp_status, appt_status)}
