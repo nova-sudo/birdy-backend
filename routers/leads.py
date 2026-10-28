@@ -22,15 +22,15 @@ POST /api/leads/contact/{contact_id}/messages
 
 from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Path, Response
 from pydantic import BaseModel, Field, StringConstraints
 from typing_extensions import Annotated
 
 from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
 from services.ghl_messages import (
-    MessagingFailed, MessagingReconnect, MessagingUnavailable, MessagingUnconfirmed,
-    fetch_lead_messages, send_lead_message,
+    MessagingFailed, MessagingReconnect, MessagingUnavailable, MessagingUnconfirmed, RecordingNotFound,
+    fetch_call_recording, fetch_call_transcript, fetch_lead_messages, send_lead_message,
 )
 from services.lead_detail import build_lead_detail
 from services.lead_journey import build_lead_journey
@@ -129,3 +129,35 @@ async def send_lead_message_endpoint(contact_id: str, body: SendMessageBody,
         except MessagingFailed:
             raise HTTPException(status_code=502, detail="GoHighLevel rejected the message.")
     return {"message": message}
+
+
+# GHL message ids are short alphanumeric strings; anything else never reaches GHL.
+MessageId = Annotated[str, Path(pattern=r"^[A-Za-z0-9_-]{1,64}$")]
+
+
+async def _call_media(contact_id: str, message_id: str, user_id: str, fetch):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        doc = await _find_contact(db, user_id, contact_id)
+        try:
+            return await fetch(db, user_id, doc.get("location_id"), contact_id, message_id)
+        except RecordingNotFound:
+            raise HTTPException(status_code=404, detail="Recording not found")
+        except (MessagingReconnect, MessagingUnavailable):
+            raise HTTPException(status_code=409, detail="Reconnect GoHighLevel to play call recordings")
+        except MessagingFailed:
+            raise HTTPException(status_code=502, detail="GoHighLevel couldn't return the recording.")
+
+
+@router.get("/contact/{contact_id}/calls/{message_id}/recording")
+async def get_call_recording(contact_id: str, message_id: MessageId,
+                             current_user: str = Depends(get_current_user)):
+    audio, content_type = await _call_media(contact_id, message_id, current_user, fetch_call_recording)
+    return Response(content=audio, media_type=content_type,
+                    headers={"Cache-Control": "private, max-age=3600"})
+
+
+@router.get("/contact/{contact_id}/calls/{message_id}/transcript")
+async def get_call_transcript(contact_id: str, message_id: MessageId,
+                              current_user: str = Depends(get_current_user)):
+    return {"transcript": await _call_media(contact_id, message_id, current_user, fetch_call_transcript)}

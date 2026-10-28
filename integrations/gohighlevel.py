@@ -1076,6 +1076,82 @@ class GHLIntegration:
             logger.error("Failed to export messages for location %s: %s", location_id, type(e).__name__)
             return 0, {}
 
+    async def get_message(self, access_token: str, message_id: str) -> Tuple[int, Dict]:
+        """One message (GET /conversations/messages/{id}).
+
+        Returns (status_code, message); status 0 on network error/timeout.
+        """
+        url = f"https://services.leadconnectorhq.com/conversations/messages/{message_id}"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-04-15",
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("GHL get message returned %s", resp.status_code)
+                return resp.status_code, {}
+            body = resp.json() or {}
+            # Documented as the message itself; some responses wrap it.
+            message = body.get("message") if isinstance(body.get("message"), dict) else body
+            return 200, message
+        except Exception as e:
+            logger.error("Failed to get GHL message: %s", type(e).__name__)
+            return 0, {}
+
+    async def fetch_call_recording(
+            self, location_id: str, access_token: str, message_id: str
+    ) -> Tuple[int, bytes, str]:
+        """A call's audio (GET /conversations/messages/{id}/locations/{loc}/recording).
+
+        Returns (status_code, audio, content_type); status 0 on network error/timeout.
+        """
+        url = (f"https://services.leadconnectorhq.com/conversations/messages/"
+               f"{message_id}/locations/{location_id}/recording")
+        headers = {"Authorization": f"Bearer {access_token}", "Version": "2021-04-15"}
+        try:
+            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("GHL call recording returned %s for location %s", resp.status_code, location_id)
+                return resp.status_code, b"", ""
+            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+            return 200, resp.content, content_type
+        except Exception as e:
+            logger.error("Failed to fetch GHL call recording for location %s: %s", location_id, type(e).__name__)
+            return 0, b"", ""
+
+    async def fetch_call_transcription(
+            self, location_id: str, access_token: str, message_id: str
+    ) -> Tuple[int, list]:
+        """A call's transcript sentences
+        (GET /conversations/locations/{loc}/messages/{id}/transcription).
+
+        Returns (status_code, sentences); status 0 on network error/timeout.
+        """
+        url = (f"https://services.leadconnectorhq.com/conversations/locations/"
+               f"{location_id}/messages/{message_id}/transcription")
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-04-15",
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("GHL call transcription returned %s for location %s", resp.status_code, location_id)
+                return resp.status_code, []
+            body = resp.json()
+            if isinstance(body, dict):
+                body = body.get("transcription") or body.get("sentences") or []
+            return 200, body if isinstance(body, list) else []
+        except Exception as e:
+            logger.error("Failed to fetch GHL call transcription for location %s: %s", location_id, type(e).__name__)
+            return 0, []
+
     async def send_message(self, access_token: str, payload: dict) -> Tuple[int, Dict]:
         """Send an SMS/Email (POST /conversations/messages).
 

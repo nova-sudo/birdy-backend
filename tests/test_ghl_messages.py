@@ -84,13 +84,13 @@ async def test_auth_failure_means_reconnect(ghl, mock_mongo_client, code):
     export, _ = ghl
     export.return_value = (code, {})
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
-    assert out == {"status": "reconnect", "messages": []}
+    assert out == {"status": "reconnect", "messages": [], "calls": []}
 
 
 async def test_no_location_means_unavailable_without_ghl_call(ghl, mock_mongo_client):
     export, _ = ghl
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", None, "c1")
-    assert out == {"status": "unavailable", "messages": []}
+    assert out == {"status": "unavailable", "messages": [], "calls": []}
     export.assert_not_called()
 
 
@@ -98,7 +98,7 @@ async def test_timeout_means_unavailable(ghl, mock_mongo_client):
     export, _ = ghl
     export.return_value = (0, {})
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
-    assert out == {"status": "unavailable", "messages": []}
+    assert out == {"status": "unavailable", "messages": [], "calls": []}
 
 
 async def test_email_html_stripped_and_subject_kept(ghl, mock_mongo_client):
@@ -211,7 +211,7 @@ async def test_auth_failure_on_one_channel_is_reconnect(ghl, mock_mongo_client):
 
     export.side_effect = side
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
-    assert out == {"status": "reconnect", "messages": []}
+    assert out == {"status": "reconnect", "messages": [], "calls": []}
 
 
 async def test_no_token_for_location_means_unavailable(ghl, monkeypatch, mock_mongo_client):
@@ -222,7 +222,7 @@ async def test_no_token_for_location_means_unavailable(ghl, monkeypatch, mock_mo
 
     monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
-    assert out == {"status": "unavailable", "messages": []}
+    assert out == {"status": "unavailable", "messages": [], "calls": []}
     export.assert_not_called()
 
 
