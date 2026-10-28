@@ -89,6 +89,7 @@ def _form_answers(field_data) -> list[dict]:
 
 
 _AD_LOOKUP_TTL = timedelta(hours=24)  # Meta CDN creative URLs are signed and expire
+_AD_LOOKUP_MISS_TTL = timedelta(hours=1)  # don't re-wait on Meta every view for an ad it can't return
 _AD_LOOKUP_TIMEOUT = 4.0
 
 
@@ -101,8 +102,10 @@ async def _lookup_ad(db, user_id: str, ad_id: str) -> dict:
     try:
         cached = await db["meta_ad_lookups"].find_one({"user_id": user_id, "ad_id": ad_id})
         fetched = _parse_dt((cached or {}).get("fetched_at"))
-        if cached and fetched and datetime.now(timezone.utc) - fetched < _AD_LOOKUP_TTL:
-            return cached.get("data") or {}
+        if cached and fetched:
+            ttl = _AD_LOOKUP_TTL if cached.get("data") else _AD_LOOKUP_MISS_TTL
+            if datetime.now(timezone.utc) - fetched < ttl:
+                return cached.get("data") or {}
 
         async def _live():
             token = await get_facebook_token(user_id, db.client)
@@ -111,15 +114,16 @@ async def _lookup_ad(db, user_id: str, ad_id: str) -> dict:
                 return None
             return await fetch_ad_identity(ad_id, access_token)
 
-        data = await asyncio.wait_for(_live(), timeout=_AD_LOOKUP_TIMEOUT)
-        if not data:
-            return {}
+        try:
+            data = await asyncio.wait_for(_live(), timeout=_AD_LOOKUP_TIMEOUT)
+        except asyncio.TimeoutError:
+            data = None
         await db["meta_ad_lookups"].update_one(
             {"user_id": user_id, "ad_id": ad_id},
-            {"$set": {"data": data, "fetched_at": datetime.now(timezone.utc)}},
+            {"$set": {"data": data or None, "fetched_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
-        return data
+        return data or {}
     except Exception:
         return {}
 
@@ -131,7 +135,7 @@ def _platform_from_source(src: dict) -> str | None:
             return "ig"
     for key in ("utmSource", "medium", "adSource"):
         v = str(src.get(key) or "").strip().lower()
-        if "facebook" in v or "fb" in v:
+        if "facebook" in v or v == "fb":
             return "meta"
     if str(src.get("sessionSource") or "").strip().lower() == "paid social" and src.get("adId"):
         return "meta"
@@ -180,7 +184,7 @@ async def _attribution(db, user_id: str, doc: dict, contact: dict):
         "adset_name": ld.get("adset_name") or adset.get("name") or live.get("adset_name") or src.get("utmMedium") or None,
         "campaign_name": ld.get("campaign_name") or campaign.get("name") or live.get("campaign_name") or src.get("campaign") or None,
         "campaign_id": campaign_id or None,
-        **{k: ad.get(k) or live.get(k) or ad.get(k)
+        **{k: ad.get(k) or live.get(k)
            for k in ("creative_title", "creative_body", "creative_image", "creative_thumbnail")},
         "submitted_at": submitted_at,
         "form_answers": _form_answers(ld.get("field_data")),

@@ -425,6 +425,29 @@ async def test_live_failure_leaves_fields_unchanged(mock_db, live_calls):
 
 
 @pytest.mark.asyncio
+async def test_failed_lookup_not_retried_for_an_hour(mock_db, live_calls):
+    calls, state = live_calls
+    state["result"] = None
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await build_lead_detail(mock_db, USER, "c1")
+    await build_lead_detail(mock_db, USER, "c1")
+    assert calls == ["a9"]
+
+
+@pytest.mark.asyncio
+async def test_failed_lookup_retried_after_an_hour(mock_db, live_calls):
+    from datetime import timedelta
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await mock_db["meta_ad_lookups"].insert_one({
+        "user_id": USER, "ad_id": "a9", "data": None,
+        "fetched_at": datetime.now(timezone.utc) - timedelta(minutes=61)})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == ["a9"]
+    assert a["creative_image"] == "https://cdn/img"
+
+
+@pytest.mark.asyncio
 async def test_live_exception_leaves_fields_unchanged(mock_db, live_calls):
     _, state = live_calls
     state["result"] = RuntimeError("boom")
@@ -470,6 +493,7 @@ async def test_no_meta_token_means_no_live_call(mock_db, live_calls, token):
     ({"sessionSource": "Paid Social", "adId": "a1"}, "meta"),
     ({"sessionSource": "Paid Social"}, None),
     ({"utmSource": "google", "adId": "a1"}, None),
+    ({"utmSource": "newsfbeed"}, None),
 ])
 async def test_platform_derived_without_meta_lead(mock_db, live_calls, src, expected):
     await _seed_contact(mock_db, {"attributionSource": {"campaign": "C", **src}})
