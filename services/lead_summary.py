@@ -25,7 +25,7 @@ from pymongo.errors import DuplicateKeyError
 
 from ai.config import LEAD_SUMMARY_MODEL, OPENAI_API_KEY
 from core.database import get_db
-from services.ghl_messages import fetch_lead_messages
+from services.ghl_messages import drop_logged_calls, fetch_lead_messages
 from services.lead_detail import build_lead_detail
 from services.lead_journey import build_lead_journey
 
@@ -121,7 +121,7 @@ def build_summary_input(detail: dict, journey: dict | None, messages: dict | Non
         sections.append("PIPELINE\n" + "\n".join(f"- {o}" for o in opps))
 
     # Calls made in GHL come with the messages; count them like call_logs calls.
-    ghl_calls = (messages or {}).get("calls") or []
+    ghl_calls = drop_logged_calls((messages or {}).get("calls") or [], detail.get("calls") or [])
     eng = dict(detail.get("engagement") or {})
     if ghl_calls:
         for key, n in (

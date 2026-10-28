@@ -65,8 +65,10 @@ def _plain_text(body: str) -> str:
 
 # Real calls. Voicemail drops and manual call tasks are not dials.
 CALL_TYPES = {"TYPE_CALL", "TYPE_IVR_CALL", "TYPE_CUSTOM_CALL", "TYPE_CAMPAIGN_CALL"}
-# Within this many seconds, a GHL call and a webhook-logged call are one call.
+# Within this many seconds, a GHL call and a logged call are one call.
 SAME_CALL_SECONDS = 60
+# A webhook row with no call time is stamped on arrival, after the call ends.
+ESTIMATED_SLACK_SECONDS = 180
 
 
 def _is_call(raw: dict) -> bool:
@@ -213,6 +215,30 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
     except Exception as e:
         logger.warning("fetch_lead_messages failed for location %s: %s", location_id, type(e).__name__)
         return {"status": "unavailable", "messages": [], "calls": []}
+
+
+def is_same_call(ghl_call: dict, logged: dict) -> bool:
+    """Whether a GHL call message and a call_logs call (any source) are one call.
+
+    Same direction (when both say), and close in time: within SAME_CALL_SECONDS,
+    or for a row stamped on arrival (started_at_estimated), arriving after the
+    call started but no later than its duration plus ESTIMATED_SLACK_SECONDS.
+    """
+    a, b = (ghl_call.get("direction") or "").lower(), (logged.get("direction") or "").lower()
+    if a and b and a != b:
+        return False
+    ghl_at, logged_at = _parse_dt(ghl_call.get("started_at")), _parse_dt(logged.get("started_at"))
+    if not ghl_at or not logged_at:
+        return False
+    gap = (logged_at - ghl_at).total_seconds()
+    if logged.get("started_at_estimated"):
+        return 0 <= gap <= (ghl_call.get("duration_seconds") or 0) + ESTIMATED_SLACK_SECONDS
+    return abs(gap) <= SAME_CALL_SECONDS
+
+
+def drop_logged_calls(ghl_calls: list, logged_calls: list) -> list:
+    """GHL calls that aren't already among the lead's call_logs calls."""
+    return [c for c in ghl_calls if not any(is_same_call(c, l) for l in logged_calls or [])]
 
 
 async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> list:

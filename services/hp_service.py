@@ -373,6 +373,13 @@ def _hp_call_source_event_id(call: dict, user_id: str) -> str:
     return f"hp_h_{digest}"
 
 
+def _hp_lead_number(call: dict):
+    """The lead's number on an HP call. On an outbound call from_number is the agency's line."""
+    if (call.get("call_status") or "").lower() == "outbound":
+        return call.get("to_number") or call.get("from_number") or None
+    return call.get("from_number") or call.get("to_number") or None
+
+
 def _parse_iso_maybe(value):
     """Best-effort ISO-8601 string → datetime; returns None on any failure."""
     if not value:
@@ -405,7 +412,8 @@ async def _persist_hp_calls_to_call_logs(
         source_event_id → HP recordingId (or fallback hash — see above)
         contact_id      → matched_lead_id (NULL for unmatched calls; they
                           land under the "Unmatched" pseudo-lead in the UI)
-        contact_phone   → from_number or to_number, whichever we've got
+        contact_phone   → the lead's end of the call: to_number on outbound,
+                          from_number otherwise (whichever we've got)
         direction       → call_status ("inbound" / "outbound")
         duration_seconds→ duration (already seconds per HP API convention)
         started_at      → parsed call_time_iso
@@ -434,7 +442,7 @@ async def _persist_hp_calls_to_call_logs(
             "user_id": user_id,
             "location_id": location_id,
             "contact_id": str(matched) if matched is not None else None,
-            "contact_phone": c.get("from_number") or c.get("to_number") or None,
+            "contact_phone": _hp_lead_number(c),
             "contact_email": None,
             "direction": (c.get("call_status") or None),
             "status": None,
