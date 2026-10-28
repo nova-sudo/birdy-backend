@@ -388,3 +388,40 @@ async def test_send_message_request_shape_and_non_json_2xx(monkeypatch):
 async def test_send_message_network_error(monkeypatch):
     _patch_httpx(monkeypatch, error=httpx.ConnectError("down"))
     assert await gh.ghl_integration.send_message("t", {}) == (0, {})
+
+
+async def test_search_contact_opportunities_request_shape(monkeypatch):
+    factory, client = _patch_httpx(monkeypatch, _resp(200, {"opportunities": [{"id": "o1"}]}))
+    code, opps = await gh.ghl_integration.search_contact_opportunities("loc1", "tok", "c1")
+    assert (code, opps) == (200, [{"id": "o1"}])
+    assert factory.call_args.kwargs["timeout"] == 5.0
+    args, kwargs = client.get.call_args
+    assert args[0] == "https://services.leadconnectorhq.com/opportunities/search"
+    assert kwargs["headers"]["Version"] == "2021-07-28"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok"
+    assert kwargs["params"] == {"location_id": "loc1", "contact_id": "c1", "limit": 20}
+
+
+async def test_search_contact_opportunities_status_and_network_error(monkeypatch):
+    _patch_httpx(monkeypatch, _resp(403))
+    assert await gh.ghl_integration.search_contact_opportunities("l", "t", "c") == (403, [])
+    _patch_httpx(monkeypatch, error=httpx.ReadTimeout("slow"))
+    assert await gh.ghl_integration.search_contact_opportunities("l", "t", "c") == (0, [])
+
+
+async def test_fetch_contact_appointments_request_shape(monkeypatch):
+    factory, client = _patch_httpx(monkeypatch, _resp(200, {"events": [{"id": "e1"}]}))
+    code, events = await gh.ghl_integration.fetch_contact_appointments("tok", "c1")
+    assert (code, events) == (200, [{"id": "e1"}])
+    assert factory.call_args.kwargs["timeout"] == 5.0
+    args, kwargs = client.get.call_args
+    assert args[0] == "https://services.leadconnectorhq.com/contacts/c1/appointments"
+    assert kwargs["headers"]["Version"] == "2021-07-28"
+    assert kwargs["headers"]["Authorization"] == "Bearer tok"
+
+
+async def test_fetch_contact_appointments_status_and_network_error(monkeypatch):
+    _patch_httpx(monkeypatch, _resp(401))
+    assert await gh.ghl_integration.fetch_contact_appointments("t", "c") == (401, [])
+    _patch_httpx(monkeypatch, error=httpx.ConnectError("down"))
+    assert await gh.ghl_integration.fetch_contact_appointments("t", "c") == (0, [])

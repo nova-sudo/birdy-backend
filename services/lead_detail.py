@@ -39,20 +39,20 @@ def _contact_name(contact: dict) -> str:
     return f"{first} {last}".strip()
 
 
-def _opportunities(contact: dict, stages: dict) -> list[dict]:
+def _opportunities(opps: list, stages: dict) -> list[dict]:
     rows = []
-    for opp in contact.get("opportunities") or []:
-        if not isinstance(opp, dict):
-            continue
+    for opp in opps:
         stage = stages.get(opp.get("pipelineStageId")) or {}
         rows.append({
             "id": opp.get("id"),
+            "name": opp.get("name"),
             "status": opp.get("status"),
             "monetary_value": opp.get("monetaryValue"),
             "pipeline_name": stage.get("pipeline_name"),
             "stage_name": stage.get("stage_name"),
             "created_at": opp.get("createdAt") or opp.get("dateAdded"),
             "last_status_change_at": opp.get("lastStatusChangeAt"),
+            "last_stage_change_at": opp.get("lastStageChangeAt"),
         })
     rows.sort(key=lambda r: _parse_dt(r["created_at"]) or datetime.min.replace(tzinfo=timezone.utc),
               reverse=True)
@@ -169,29 +169,39 @@ async def _calls(db, user_id: str, contact: dict) -> list[dict]:
     return out
 
 
-def _time_to_close(contact: dict):
-    won = [o for o in contact.get("opportunities") or []
-           if isinstance(o, dict) and o.get("status") == "won"]
-    won.sort(key=lambda o: _parse_dt(o.get("lastStatusChangeAt")) or datetime.min.replace(tzinfo=timezone.utc),
-             reverse=True)
-    if not won:
-        return None
-    opp = won[0]
+def _time_to_close(contact: dict, opps: list):
+    """Seconds from the contact being added to the earliest won opportunity."""
+    ends = [_parse_dt(o.get("lastStatusChangeAt")) for o in opps if o.get("status") == "won"]
+    ends = [e for e in ends if e]
     start = _parse_dt(contact.get("dateAdded"))
-    end = _parse_dt(opp.get("lastStatusChangeAt"))
-    if not start or not end:
+    if not ends or not start:
         return None
-    return int((end - start).total_seconds())
+    seconds = int((min(ends) - start).total_seconds())
+    return seconds if seconds >= 0 else None
 
 
-def _engagement(contact: dict, calls: list[dict]) -> dict:
+def _engagement(contact: dict, calls: list[dict], opps: list) -> dict:
     return {
         "dials": sum(1 for c in calls if c.get("direction") == "outbound"),
         "calls": len(calls),
         "answered": sum(1 for c in calls if c.get("status") in ANSWERED),
-        "time_to_close_seconds": _time_to_close(contact),
+        "time_to_close_seconds": _time_to_close(contact, opps),
         "touchpoints": len(calls),
     }
+
+
+async def resolve_opportunities(db, user_id: str, doc: dict, contact: dict):
+    """(status, raw opportunities): live from GHL when it answers, else the stored ones.
+
+    status is ok | reconnect | unavailable; the list is always usable.
+    """
+    from services.lead_journey import live_opportunities  # lead_journey imports this module
+
+    stored = [o for o in contact.get("opportunities") or [] if isinstance(o, dict)]
+    if not doc.get("location_id"):
+        return "unavailable", stored
+    status, live = await live_opportunities(db, user_id, doc["location_id"], contact.get("id"))
+    return (status, live) if status == "ok" else (status, stored)
 
 
 async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
@@ -200,8 +210,8 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
         return None
     contact = doc.get("contact_data") or {}
 
-    has_opps = any(isinstance(o, dict) for o in contact.get("opportunities") or [])
-    stages = await stage_lookup(db, user_id, doc.get("location_id")) if (has_opps and doc.get("location_id")) else {}
+    _, opps = await resolve_opportunities(db, user_id, doc, contact)
+    stages = await stage_lookup(db, user_id, doc.get("location_id")) if (opps and doc.get("location_id")) else {}
     calls = await _calls(db, user_id, contact)
 
     return {
@@ -221,8 +231,8 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
             "group_name": doc.get("client_group_name"),
             "type": classify_contact_type(contact),
         },
-        "opportunities": _opportunities(contact, stages or {}),
+        "opportunities": _opportunities(opps, stages or {}),
         "attribution": await _attribution(db, user_id, doc, contact),
         "calls": calls,
-        "engagement": _engagement(contact, calls),
+        "engagement": _engagement(contact, calls, opps),
     }

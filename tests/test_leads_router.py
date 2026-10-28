@@ -183,3 +183,23 @@ async def test_send_unconfirmed_504(api, mock_mongo_client, send):
     assert resp.status_code == 504
     assert resp.json() == {
         "detail": "We couldn't confirm the message was sent. Check the thread before sending again."}
+
+
+async def test_get_lead_journey_200(api, mock_mongo_client):
+    await _seed_contact(mock_mongo_client)
+
+    resp = api.get("/api/leads/contact/c1/journey")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["ghl"] == "unavailable"  # no location on the seeded contact
+    assert [e["kind"] for e in body["events"]] == []  # contact has no dateAdded, so no lead event
+
+
+async def test_get_lead_journey_404_for_unknown_and_other_users(api, mock_mongo_client):
+    await _seed_contact(mock_mongo_client, contact_id="c2", user="someone-else")
+
+    for contact_id in ("does-not-exist", "c2"):
+        resp = api.get(f"/api/leads/contact/{contact_id}/journey")
+        assert resp.status_code == 404
+        assert resp.json() == {"detail": "Lead not found"}

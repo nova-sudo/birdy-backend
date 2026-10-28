@@ -13,7 +13,11 @@ def _no_ghl(monkeypatch):
     async def _empty(db, user_id, location_id):
         return {}
 
+    async def _no_live(db, user_id, location_id, contact_id):
+        return "unavailable", []
+
     monkeypatch.setattr("services.lead_detail.stage_lookup", _empty)
+    monkeypatch.setattr("services.lead_journey.live_opportunities", _no_live)
 
 
 async def _seed_contact(db, contact=None, user_id=USER, **extra):
@@ -209,3 +213,87 @@ async def test_no_stage_lookup_without_opportunities(mock_db, monkeypatch):
     await _seed_contact(mock_db)
     r = await build_lead_detail(mock_db, USER, "c1")
     assert r["opportunities"] == []
+
+
+def _live(monkeypatch, status, rows=()):
+    async def _fn(db, user_id, location_id, contact_id):
+        return status, list(rows)
+
+    monkeypatch.setattr("services.lead_journey.live_opportunities", _fn)
+
+
+STORED = {"opportunities": [{"id": "old", "pipelineStageId": "s1", "status": "won", "monetaryValue": 9}],
+          "dateAdded": "2026-07-01T00:00:00Z"}
+
+
+@pytest.mark.asyncio
+async def test_live_opportunities_used_with_stage_names_and_time_to_close(mock_db, monkeypatch):
+    async def _lookup(db, user_id, location_id):
+        return {"s2": {"stage_name": "Won Deals", "pipeline_id": "p1", "pipeline_name": "Main"}}
+
+    monkeypatch.setattr("services.lead_detail.stage_lookup", _lookup)
+    _live(monkeypatch, "ok", [{
+        "id": "o1", "name": "Ann deal", "status": "won", "pipelineId": "p1", "pipelineStageId": "s2",
+        "monetaryValue": 500, "createdAt": "2026-07-02T00:00:00Z",
+        "lastStatusChangeAt": "2026-07-04T00:00:00Z", "lastStageChangeAt": "2026-07-03T00:00:00Z"}])
+    await _seed_contact(mock_db, STORED)
+    r = await build_lead_detail(mock_db, USER, "c1")
+    assert [o["id"] for o in r["opportunities"]] == ["o1"]
+    o = r["opportunities"][0]
+    assert (o["name"], o["stage_name"], o["pipeline_name"], o["monetary_value"]) == ("Ann deal", "Won Deals", "Main", 500)
+    assert o["last_stage_change_at"] == "2026-07-03T00:00:00Z"
+    assert r["engagement"]["time_to_close_seconds"] == 3 * 86400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["unavailable", "reconnect"])
+async def test_live_failure_falls_back_to_stored(mock_db, monkeypatch, status):
+    async def _lookup(db, user_id, location_id):
+        return {"s1": {"stage_name": "Spicy Leads", "pipeline_id": "p1", "pipeline_name": "Main"}}
+
+    monkeypatch.setattr("services.lead_detail.stage_lookup", _lookup)
+    _live(monkeypatch, status)
+    await _seed_contact(mock_db, STORED)
+    r = await build_lead_detail(mock_db, USER, "c1")
+    assert [o["id"] for o in r["opportunities"]] == ["old"]
+    assert r["opportunities"][0]["stage_name"] == "Spicy Leads"
+    assert r["engagement"]["time_to_close_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_earliest_won_wins(mock_db, monkeypatch):
+    _live(monkeypatch, "ok", [
+        {"id": "a", "status": "won", "lastStatusChangeAt": "2026-07-10T00:00:00Z"},
+        {"id": "b", "status": "won", "lastStatusChangeAt": "2026-07-03T00:00:00Z"},
+        {"id": "c", "status": "lost", "lastStatusChangeAt": "2026-07-02T00:00:00Z"}])
+    await _seed_contact(mock_db, {"dateAdded": "2026-07-01T00:00:00Z"})
+    assert (await build_lead_detail(mock_db, USER, "c1"))["engagement"]["time_to_close_seconds"] == 2 * 86400
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("opp,added", [
+    ({"status": "won", "lastStatusChangeAt": "2026-06-01T00:00:00Z"}, "2026-07-01T00:00:00Z"),  # negative
+    ({"status": "won"}, "2026-07-01T00:00:00Z"),  # no date
+    ({"status": "won", "lastStatusChangeAt": "garbage"}, "2026-07-01T00:00:00Z"),
+    ({"status": "won", "lastStatusChangeAt": "2026-07-03T00:00:00Z"}, None),  # contact has no dateAdded
+    ({"status": "open", "lastStatusChangeAt": "2026-07-03T00:00:00Z"}, "2026-07-01T00:00:00Z"),
+])
+async def test_time_to_close_null_cases(mock_db, monkeypatch, opp, added):
+    _live(monkeypatch, "ok", [{"id": "a", **opp}])
+    await _seed_contact(mock_db, {"dateAdded": added} if added else {})
+    assert (await build_lead_detail(mock_db, USER, "c1"))["engagement"]["time_to_close_seconds"] is None
+
+
+@pytest.mark.asyncio
+async def test_stage_lookup_called_for_live_opportunities(mock_db, monkeypatch):
+    called = []
+
+    async def _lookup(db, user_id, location_id):
+        called.append(location_id)
+        return {}
+
+    monkeypatch.setattr("services.lead_detail.stage_lookup", _lookup)
+    _live(monkeypatch, "ok", [{"id": "a", "status": "open"}])
+    await _seed_contact(mock_db)
+    await build_lead_detail(mock_db, USER, "c1")
+    assert called == ["loc1"]

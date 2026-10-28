@@ -10,6 +10,8 @@ GET /api/leads/contact/{contact_id}
 
 GET  /api/leads/contact/{contact_id}/messages
     Live GHL messages for the lead (services/ghl_messages.py).
+GET  /api/leads/contact/{contact_id}/journey
+    Newest-first timeline of the lead (services/lead_journey.py); 404 unknown lead.
 POST /api/leads/contact/{contact_id}/messages
     Send an SMS or email to the lead. 201 {"message": ...}; 404 unknown lead;
     422 missing subject/phone/email; 409 reconnect GHL; 502 GHL failure.
@@ -28,6 +30,7 @@ from services.ghl_messages import (
     fetch_lead_messages, send_lead_message,
 )
 from services.lead_detail import build_lead_detail
+from services.lead_journey import build_lead_journey
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -40,6 +43,16 @@ async def get_lead_detail(contact_id: str, current_user: str = Depends(get_curre
     if detail is None:
         raise HTTPException(status_code=404, detail="Lead not found")
     return detail
+
+
+@router.get("/contact/{contact_id}/journey")
+async def get_lead_journey(contact_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        journey = await build_lead_journey(db, current_user, contact_id)
+    if journey is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return journey
 
 
 class SendMessageBody(BaseModel):

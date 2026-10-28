@@ -976,6 +976,61 @@ class GHLIntegration:
             logger.error("Failed to fetch pipelines for location %s: %s", location_id, e, exc_info=True)
             return False, []
 
+    async def search_contact_opportunities(
+            self,
+            location_id: str,
+            access_token: str,
+            contact_id: str,
+    ) -> Tuple[int, List[Dict]]:
+        """A contact's opportunities (GET /opportunities/search, snake_case params).
+
+        Returns (status_code, opportunities); status 0 on network error/timeout.
+        """
+        url = "https://services.leadconnectorhq.com/opportunities/search"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        }
+        params = {"location_id": location_id, "contact_id": contact_id, "limit": 20}
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                logger.warning("GHL opportunities search returned %s for location %s",
+                               resp.status_code, location_id)
+                return resp.status_code, []
+            return 200, (resp.json() or {}).get("opportunities") or []
+        except Exception as e:
+            logger.error("Failed to search opportunities for location %s: %s", location_id, type(e).__name__)
+            return 0, []
+
+    async def fetch_contact_appointments(
+            self,
+            access_token: str,
+            contact_id: str,
+    ) -> Tuple[int, List[Dict]]:
+        """A contact's appointments (GET /contacts/{contactId}/appointments).
+
+        Returns (status_code, events); status 0 on network error/timeout.
+        """
+        url = f"https://services.leadconnectorhq.com/contacts/{urllib.parse.quote(contact_id, safe='')}/appointments"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-07-28",
+            "Accept": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(url, headers=headers)
+            if resp.status_code != 200:
+                logger.warning("GHL appointments fetch returned %s", resp.status_code)
+                return resp.status_code, []
+            return 200, (resp.json() or {}).get("events") or []
+        except Exception as e:
+            logger.error("Failed to fetch contact appointments: %s", type(e).__name__)
+            return 0, []
+
     async def export_messages(
             self,
             location_id: str,
