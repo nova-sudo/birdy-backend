@@ -27,6 +27,10 @@ load_dotenv()
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# Call recordings are buffered in memory before they're returned.
+MAX_RECORDING_BYTES = 50 * 1024 * 1024
+RECORDING_TOO_LARGE = 413
+
 # GHL OAuth configuration
 OAUTH_CONFIG = {
     "auth_url": "https://marketplace.gohighlevel.com/oauth/chooselocation",
@@ -1106,19 +1110,32 @@ class GHLIntegration:
     ) -> Tuple[int, bytes, str]:
         """A call's audio (GET /conversations/messages/{id}/locations/{loc}/recording).
 
-        Returns (status_code, audio, content_type); status 0 on network error/timeout.
+        Returns (status_code, audio, content_type); status 0 on network error/timeout,
+        RECORDING_TOO_LARGE past MAX_RECORDING_BYTES (the file is buffered whole).
         """
         url = (f"https://services.leadconnectorhq.com/conversations/messages/"
                f"{message_id}/locations/{location_id}/recording")
         headers = {"Authorization": f"Bearer {access_token}", "Version": "2021-04-15"}
         try:
             async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
-                resp = await client.get(url, headers=headers)
-            if resp.status_code != 200:
-                logger.warning("GHL call recording returned %s for location %s", resp.status_code, location_id)
-                return resp.status_code, b"", ""
-            content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
-            return 200, resp.content, content_type
+                async with client.stream("GET", url, headers=headers) as resp:
+                    if resp.status_code != 200:
+                        logger.warning("GHL call recording returned %s for location %s",
+                                       resp.status_code, location_id)
+                        return resp.status_code, b"", ""
+                    content_type = (resp.headers.get("content-type") or "").split(";")[0].strip()
+                    declared = resp.headers.get("content-length")
+                    if declared and declared.isdigit() and int(declared) > MAX_RECORDING_BYTES:
+                        logger.warning("GHL call recording too large for location %s", location_id)
+                        return RECORDING_TOO_LARGE, b"", ""
+                    chunks, size = [], 0
+                    async for chunk in resp.aiter_bytes():
+                        size += len(chunk)
+                        if size > MAX_RECORDING_BYTES:
+                            logger.warning("GHL call recording too large for location %s", location_id)
+                            return RECORDING_TOO_LARGE, b"", ""
+                        chunks.append(chunk)
+            return 200, b"".join(chunks), content_type
         except Exception as e:
             logger.error("Failed to fetch GHL call recording for location %s: %s", location_id, type(e).__name__)
             return 0, b"", ""

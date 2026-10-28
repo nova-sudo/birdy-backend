@@ -91,7 +91,53 @@ async def test_calls_already_logged_by_webhook_are_dropped(ghl, mock_mongo_clien
     assert [c["ghl_message_id"] for c in out["calls"]] == ["m2", "m3"]
 
 
+async def test_only_real_calls_count_and_status_is_the_call_outcome(ghl, mock_mongo_client):
+    ghl["export_messages"].return_value = (200, {"messages": [
+        _call("m1", "2026-01-01T10:00:00.000Z", status="delivered"),
+        _call("v1", "2026-01-01T11:00:00.000Z", messageType="TYPE_CAMPAIGN_VOICEMAIL"),
+        _call("t1", "2026-01-01T12:00:00.000Z", messageType="TYPE_CAMPAIGN_MANUAL_CALL"),
+        _call("i1", "2026-01-01T13:00:00.000Z", messageType="TYPE_IVR_CALL"),
+    ], "nextCursor": None})
+
+    out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
+
+    assert [c["ghl_message_id"] for c in out["calls"]] == ["m1", "i1"]
+    assert out["calls"][0]["status"] is None
+    assert out["messages"] == []
+
+
+async def test_logged_call_matched_by_payload_id_or_time(ghl, mock_mongo_client):
+    db = mock_mongo_client["db"]
+    from datetime import datetime, timezone
+    await db["call_logs"].insert_many([
+        # Webhook body whose top-level id isn't the message id.
+        {"user_id": "u1", "source": "ghl", "source_event_id": "wf-123", "raw_payload": {"messageId": "m1"}},
+        # Same contact, same direction, 40s apart: the same call.
+        {"user_id": "u1", "source": "ghl", "contact_id": "c1", "direction": "outbound",
+         "started_at": datetime(2026, 1, 1, 11, 0, 40, tzinfo=timezone.utc)},
+        # Another contact at the same moment: a different call.
+        {"user_id": "u1", "source": "ghl", "contact_id": "c2", "direction": "outbound",
+         "started_at": datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)},
+    ])
+    ghl["export_messages"].return_value = (200, {"messages": [
+        _call("m1", "2026-01-01T10:00:00.000Z"),
+        _call("m2", "2026-01-01T11:00:00.000Z"),
+        _call("m3", "2026-01-01T12:00:00.000Z"),
+    ], "nextCursor": None})
+
+    out = await gm.fetch_lead_messages(db, "u1", LOC, "c1")
+
+    assert [c["ghl_message_id"] for c in out["calls"]] == ["m3"]
+
+
 # ── recording ───────────────────────────────────────────────────────────────
+
+async def test_oversized_recording_fails(ghl, mock_mongo_client):
+    import integrations.gohighlevel as gh
+    ghl["fetch_call_recording"].return_value = (gh.RECORDING_TOO_LARGE, b"", "")
+    with pytest.raises(gm.MessagingFailed):
+        await gm.fetch_call_recording(mock_mongo_client["db"], "u1", LOC, "c1", "m1")
+
 
 async def test_recording_returned_for_own_call(ghl, mock_mongo_client):
     audio, ctype = await gm.fetch_call_recording(mock_mongo_client["db"], "u1", LOC, "c1", "m1")
@@ -159,6 +205,17 @@ async def test_transcript_joined_in_sentence_order(ghl, mock_mongo_client):
     assert text == "Hi, is that Rebecca?\nGreat, see you then."
 
 
+async def test_transcript_with_string_indexes(ghl, mock_mongo_client):
+    ghl["fetch_call_transcription"].return_value = (200, [
+        {"sentenceIndex": "10", "transcript": "Third"},
+        {"sentenceIndex": 2, "transcript": "Second"},
+        {"sentenceIndex": "1", "transcript": "First"},
+        {"transcript": "Unindexed"},
+    ])
+    text = await gm.fetch_call_transcript(mock_mongo_client["db"], "u1", LOC, "c1", "m1")
+    assert text == "First\nSecond\nThird\nUnindexed"
+
+
 async def test_no_transcript_is_none(ghl, mock_mongo_client):
     ghl["fetch_call_transcription"].return_value = (404, [])
     assert await gm.fetch_call_transcript(mock_mongo_client["db"], "u1", LOC, "c1", "m1") is None
@@ -193,7 +250,7 @@ async def test_recording_route_streams_audio(api, mock_mongo_client, monkeypatch
     assert resp.status_code == 200
     assert resp.content == WAV
     assert resp.headers["content-type"] == "audio/wav"
-    assert resp.headers["cache-control"] == "private, max-age=3600"
+    assert resp.headers["cache-control"] == "private, no-store"
     assert fetch.await_args.args[1:] == ("u1", LOC, "c1", "m1")
 
 
@@ -232,3 +289,34 @@ async def test_transcript_route(api, mock_mongo_client, monkeypatch):
     resp = api.get("/api/leads/contact/c1/calls/m1/transcript")
     assert resp.status_code == 200
     assert resp.json() == {"transcript": "Hello"}
+
+
+# ── integration: the size cap ───────────────────────────────────────────────
+
+@pytest.fixture
+def ghl_transport(monkeypatch):
+    import httpx
+    import integrations.gohighlevel as gh
+
+    def use(handler):
+        real = httpx.AsyncClient
+
+        def client(*args, **kwargs):
+            return real(*args, transport=httpx.MockTransport(handler), **kwargs)
+
+        monkeypatch.setattr(gh.httpx, "AsyncClient", client)
+        return gh
+    return use
+
+
+async def test_integration_streams_recording_under_cap(ghl_transport):
+    import httpx
+    gh = ghl_transport(lambda req: httpx.Response(200, content=WAV, headers={"content-type": "audio/x-wav"}))
+    assert await gh.ghl_integration.fetch_call_recording(LOC, "tok", "m1") == (200, WAV, "audio/x-wav")
+
+
+async def test_integration_rejects_oversized_recording(ghl_transport, monkeypatch):
+    import httpx
+    gh = ghl_transport(lambda req: httpx.Response(200, content=b"x" * 100, headers={"content-type": "audio/wav"}))
+    monkeypatch.setattr(gh, "MAX_RECORDING_BYTES", 50)
+    assert await gh.ghl_integration.fetch_call_recording(LOC, "tok", "m1") == (gh.RECORDING_TOO_LARGE, b"", "")

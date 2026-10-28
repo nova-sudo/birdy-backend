@@ -63,16 +63,28 @@ def _plain_text(body: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
+# Real calls. Voicemail drops and manual call tasks are not dials.
+CALL_TYPES = {"TYPE_CALL", "TYPE_IVR_CALL", "TYPE_CUSTOM_CALL", "TYPE_CAMPAIGN_CALL"}
+# Within this many seconds, a GHL call and a webhook-logged call are one call.
+SAME_CALL_SECONDS = 60
+
+
 def _is_call(raw: dict) -> bool:
+    """Any call-like row: kept out of the messages either way."""
     mtype = (raw.get("messageType") or "").upper()
     return "CALL" in mtype or "VOICEMAIL" in mtype
+
+
+def _is_real_call(raw: dict) -> bool:
+    return (raw.get("messageType") or "").upper() in CALL_TYPES
 
 
 def _call_meta(raw: dict):
     """(status, duration_seconds) from either meta shape GHL sends."""
     meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
     call = meta.get("call") if isinstance(meta.get("call"), dict) else {}
-    status = call.get("status") or meta.get("callStatus") or raw.get("status")
+    # Not the message's own `status`: that is delivery ("delivered"), not the call outcome.
+    status = call.get("status") or meta.get("callStatus") or None
     duration = call.get("duration", meta.get("callDuration"))
     try:
         duration = int(float(duration)) if duration not in (None, "") else None
@@ -178,7 +190,7 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
                 if not isinstance(r, dict) or r.get("id") in seen:
                     continue
                 if _is_call(r):
-                    c = _normalize_call(r)
+                    c = _normalize_call(r) if _is_real_call(r) else None
                     if c:
                         seen.add(r["id"])
                         calls.append(c)
@@ -189,7 +201,7 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
                 seen.add(m["id"])
                 messages.append(m)
         messages.sort(key=_sort_key)
-        calls = await _without_logged(db, user_id, calls)
+        calls = await _without_logged(db, user_id, contact_id, calls)
         calls.sort(key=lambda c: _parse_dt(c["started_at"]))
         return {
             "status": "ok",
@@ -203,19 +215,48 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
         return {"status": "unavailable", "messages": [], "calls": []}
 
 
-async def _without_logged(db, user_id: str, calls: list) -> list:
-    """Drop GHL calls a workflow webhook already put in call_logs (shown from there)."""
+async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> list:
+    """Drop GHL calls a workflow webhook already put in call_logs (shown from there).
+
+    Webhook bodies are user-configured, so the stored id may not be the GHL
+    message id: match the id fields we keep, else the same direction within
+    SAME_CALL_SECONDS on this contact.
+    """
     if not calls:
         return calls
+    ids = [c["ghl_message_id"] for c in calls]
     try:
-        ids = [c["ghl_message_id"] for c in calls]
-        logged = await db["call_logs"].distinct(
-            "source_event_id", {"user_id": user_id, "source": "ghl", "source_event_id": {"$in": ids}})
+        rows = await db["call_logs"].find(
+            {"user_id": user_id, "source": "ghl", "$or": [
+                {"source_event_id": {"$in": ids}},
+                {"raw_payload.messageId": {"$in": ids}},
+                {"raw_payload.callId": {"$in": ids}},
+                {"contact_id": contact_id},
+            ]},
+            {"source_event_id": 1, "raw_payload.messageId": 1, "raw_payload.callId": 1,
+             "contact_id": 1, "direction": 1, "started_at": 1},
+        ).to_list(None)
     except Exception as e:
         logger.warning("call_logs de-duplication failed: %s", type(e).__name__)
         return calls
-    logged = set(logged)
-    return [c for c in calls if c["ghl_message_id"] not in logged]
+
+    logged_ids, timed = set(), []
+    for r in rows:
+        raw = r.get("raw_payload") or {}
+        logged_ids.update(str(v) for v in (r.get("source_event_id"), raw.get("messageId"), raw.get("callId")) if v)
+        at = _parse_dt(r.get("started_at"))
+        if r.get("contact_id") == contact_id and at:
+            timed.append(((r.get("direction") or "").lower(), at))
+
+    def logged(call) -> bool:
+        if call["ghl_message_id"] in logged_ids:
+            return True
+        at, direction = _parse_dt(call["started_at"]), (call.get("direction") or "").lower()
+        return any(
+            abs((at - t).total_seconds()) <= SAME_CALL_SECONDS and (not d or not direction or d == direction)
+            for d, t in timed)
+
+    return [c for c in calls if not logged(c)]
 
 
 def _sniff_audio(data: bytes):
@@ -241,7 +282,7 @@ async def _owned_call(token: str, location_id: str, contact_id: str, message_id:
         raise MessagingFailed()
     if (message.get("contactId") != contact_id
             or (message.get("locationId") and message.get("locationId") != location_id)
-            or not _is_call(message)):
+            or not _is_real_call(message)):
         raise RecordingNotFound()
 
 
@@ -268,7 +309,7 @@ async def fetch_call_recording(db, user_id: str, location_id, contact_id: str, m
         raise MessagingReconnect()
     if code in (400, 404, 422) or (code == 200 and not audio):
         raise RecordingNotFound()
-    if code != 200:
+    if code != 200:  # includes RECORDING_TOO_LARGE
         raise MessagingFailed()
     if not content_type.startswith("audio/"):
         # GHL may label the file generically; the browser needs a real audio type.
@@ -276,6 +317,14 @@ async def fetch_call_recording(db, user_id: str, location_id, contact_id: str, m
         if not content_type:
             raise MessagingFailed()
     return audio, content_type
+
+
+def _sentence_index(value) -> float:
+    """GHL documents sentenceIndex as a number but examples send strings."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("inf")
 
 
 async def fetch_call_transcript(db, user_id: str, location_id, contact_id: str, message_id: str):
@@ -293,7 +342,7 @@ async def fetch_call_transcript(db, user_id: str, location_id, contact_id: str, 
     if code != 200:
         raise MessagingFailed()
     rows = [s for s in sentences if isinstance(s, dict) and str(s.get("transcript") or "").strip()]
-    rows.sort(key=lambda s: (s.get("sentenceIndex") is None, s.get("sentenceIndex") or 0))
+    rows.sort(key=lambda s: _sentence_index(s.get("sentenceIndex")))
     return "\n".join(str(s["transcript"]).strip() for s in rows) or None
 
 

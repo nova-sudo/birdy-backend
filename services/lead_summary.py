@@ -120,7 +120,16 @@ def build_summary_input(detail: dict, journey: dict | None, messages: dict | Non
     if opps:
         sections.append("PIPELINE\n" + "\n".join(f"- {o}" for o in opps))
 
-    eng = detail.get("engagement") or {}
+    # Calls made in GHL come with the messages; count them like call_logs calls.
+    ghl_calls = (messages or {}).get("calls") or []
+    eng = dict(detail.get("engagement") or {})
+    if ghl_calls:
+        for key, n in (
+            ("calls", len(ghl_calls)), ("touchpoints", len(ghl_calls)),
+            ("dials", sum(1 for c in ghl_calls if c.get("direction") == "outbound")),
+            ("answered", sum(1 for c in ghl_calls if c.get("status") in ("completed", "answered"))),
+        ):
+            eng[key] = (eng.get(key) or 0) + n
     engagement = _line(
         ("Calls", eng.get("calls")), ("Outbound dials", eng.get("dials")),
         ("Answered", eng.get("answered")), ("Touchpoints", eng.get("touchpoints")),
@@ -138,8 +147,11 @@ def build_summary_input(detail: dict, journey: dict | None, messages: dict | Non
     if events:
         sections.append("JOURNEY (newest first)\n" + "\n".join(events))
 
+    all_calls = sorted(
+        [*(detail.get("calls") or []), *ghl_calls],
+        key=lambda c: c.get("started_at") or "", reverse=True)
     calls = []
-    for c in (detail.get("calls") or [])[:MAX_CALLS]:
+    for c in all_calls[:MAX_CALLS]:
         text = _line(("Direction", c.get("direction")), ("Status", c.get("status")),
                      ("Seconds", c.get("duration_seconds")), ("At", c.get("started_at")),
                      ("Transcript", _clip(c.get("transcript"), MAX_TRANSCRIPT_CHARS)))

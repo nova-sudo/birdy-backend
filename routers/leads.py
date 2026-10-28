@@ -154,7 +154,7 @@ async def get_call_recording(contact_id: str, message_id: MessageId,
                              current_user: str = Depends(get_current_user)):
     audio, content_type = await _call_media(contact_id, message_id, current_user, fetch_call_recording)
     return Response(content=audio, media_type=content_type,
-                    headers={"Cache-Control": "private, max-age=3600"})
+                    headers={"Cache-Control": "private, no-store"})
 
 
 @router.get("/contact/{contact_id}/calls/{message_id}/transcript")

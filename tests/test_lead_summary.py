@@ -387,3 +387,20 @@ async def test_index_failure_is_logged_and_does_not_block(env, monkeypatch):
     monkeypatch.setattr(ls, "_ensure_index", boom)
     assert (await ls.get_lead_summary(env.db, USER, CID))["status"] == "ok"
     assert ls._index_ready is True
+
+
+def test_brief_counts_and_lists_ghl_calls():
+    from services.lead_summary import build_summary_input
+    detail = {
+        "contact": {"name": "Ada"},
+        "engagement": {"calls": 1, "dials": 1, "answered": 0, "touchpoints": 1},
+        "calls": [{"direction": "outbound", "status": "no-answer", "started_at": "2026-01-01T09:00:00+00:00"}],
+    }
+    messages = {"status": "ok", "messages": [], "calls": [
+        {"direction": "outbound", "status": "completed", "duration_seconds": 95,
+         "started_at": "2026-01-02T09:00:00+00:00"},
+    ]}
+    brief = build_summary_input(detail, None, messages)
+    assert "Calls: 2" in brief and "Outbound dials: 2" in brief and "Answered: 1" in brief
+    calls = brief.split("CALLS (newest first)\n")[1].split("\n\n")[0].splitlines()
+    assert "completed" in calls[0] and "no-answer" in calls[1]
