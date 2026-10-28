@@ -1,8 +1,10 @@
 """Assemble the single-lead detail payload from data Birdy already stores."""
+import asyncio
 import re
 from datetime import datetime, timezone
 
 from services.contact_classifier import classify_contact_type
+from services.ghl_live import live_opportunities
 from services.ghl_pipelines import stage_lookup
 from utils.phone_normalize import compute_match_keys, normalize_phone
 
@@ -190,17 +192,15 @@ def _engagement(contact: dict, calls: list[dict], opps: list) -> dict:
     }
 
 
-async def resolve_opportunities(db, user_id: str, doc: dict, contact: dict):
+async def resolve_opportunities(db, user_id: str, doc: dict, contact: dict, **live_kwargs):
     """(status, raw opportunities): live from GHL when it answers, else the stored ones.
 
     status is ok | reconnect | unavailable; the list is always usable.
     """
-    from services.lead_journey import live_opportunities  # lead_journey imports this module
-
     stored = [o for o in contact.get("opportunities") or [] if isinstance(o, dict)]
     if not doc.get("location_id"):
         return "unavailable", stored
-    status, live = await live_opportunities(db, user_id, doc["location_id"], contact.get("id"))
+    status, live = await live_opportunities(db, user_id, doc["location_id"], contact.get("id"), **live_kwargs)
     return (status, live) if status == "ok" else (status, stored)
 
 
@@ -210,9 +210,12 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
         return None
     contact = doc.get("contact_data") or {}
 
-    _, opps = await resolve_opportunities(db, user_id, doc, contact)
+    (_, opps), calls, attribution = await asyncio.gather(
+        resolve_opportunities(db, user_id, doc, contact),
+        _calls(db, user_id, contact),
+        _attribution(db, user_id, doc, contact),
+    )
     stages = await stage_lookup(db, user_id, doc.get("location_id")) if (opps and doc.get("location_id")) else {}
-    calls = await _calls(db, user_id, contact)
 
     return {
         "contact": {
@@ -232,7 +235,7 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
             "type": classify_contact_type(contact),
         },
         "opportunities": _opportunities(opps, stages or {}),
-        "attribution": await _attribution(db, user_id, doc, contact),
+        "attribution": attribution,
         "calls": calls,
         "engagement": _engagement(contact, calls, opps),
     }

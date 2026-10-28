@@ -1,12 +1,13 @@
 """Lead journey: a newest-first timeline of one lead, from data Birdy stores
 plus live GHL opportunities and appointments. Nothing here is persisted."""
+import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
-from integrations.gohighlevel import ghl_integration, get_subaccount_tokens
+from services.ghl_live import live_appointments, safe_token_for
 from services.ghl_pipelines import stage_lookup
-from services.lead_detail import _calls, _iso, _parse_dt, resolve_opportunities
+from services.lead_detail import _calls, _parse_dt, resolve_opportunities
 from utils.phone_normalize import compute_match_keys
 
 logger = logging.getLogger(__name__)
@@ -15,52 +16,12 @@ logger = logging.getLogger(__name__)
 _SEVERITY = {"ok": 0, "unavailable": 1, "reconnect": 2}
 _MISSED = {"cancelled": "Appointment cancelled", "canceled": "Appointment cancelled",
            "noshow": "Appointment no-show", "no_show": "Appointment no-show", "no-show": "Appointment no-show"}
-
-
-def _status_for(code: int) -> str:
-    if code == 200:
-        return "ok"
-    return "reconnect" if code in (401, 403) else "unavailable"
+_CALL_STATUS = {"no-answer": "no answer", "busy": "busy", "failed": "failed", "canceled": "cancelled"}
+_STAGE_GAP = timedelta(minutes=1)  # GHL stamps lastStageChangeAt just after createdAt on creation
 
 
 def _worse(a: str, b: str) -> str:
     return a if _SEVERITY[a] >= _SEVERITY[b] else b
-
-
-async def _token_for(db, user_id: str, location_id):
-    if not location_id:
-        return None
-    tokens = await get_subaccount_tokens(user_id, db.client)
-    return (tokens or {}).get(location_id, {}).get("access_token")
-
-
-async def live_opportunities(db, user_id: str, location_id, contact_id):
-    """(status, raw GHL opportunities). status: ok | reconnect | unavailable. Never raises."""
-    try:
-        token = await _token_for(db, user_id, location_id)
-        if not token or not contact_id:
-            return "unavailable", []
-        code, rows = await ghl_integration.search_contact_opportunities(location_id, token, contact_id)
-        if code != 200:
-            return _status_for(code), []
-        return "ok", [r for r in rows if isinstance(r, dict)]
-    except Exception as e:
-        logger.warning("live_opportunities failed for location %s: %s", location_id, type(e).__name__)
-        return "unavailable", []
-
-
-async def _live_appointments(db, user_id: str, location_id, contact_id):
-    try:
-        token = await _token_for(db, user_id, location_id)
-        if not token or not contact_id:
-            return "unavailable", []
-        code, rows = await ghl_integration.fetch_contact_appointments(token, contact_id)
-        if code != 200:
-            return _status_for(code), []
-        return "ok", [r for r in rows if isinstance(r, dict)]
-    except Exception as e:
-        logger.warning("live_appointments failed for location %s: %s", location_id, type(e).__name__)
-        return "unavailable", []
 
 
 def _event(id_, kind, title, detail, at, **extra):
@@ -74,13 +35,19 @@ def _event(id_, kind, title, detail, at, **extra):
 def _path(url) -> str:
     if not isinstance(url, str) or not url.strip():
         return ""
-    return urlparse(url.strip()).path or "/"
+    url = url.strip()
+    if "://" not in url and not url.startswith("/"):
+        url = "//" + url  # scheme-less "site.com/quote"
+    return urlparse(url).path or "/"
 
 
 def _host(url) -> str:
     if not isinstance(url, str) or not url.strip():
         return ""
-    host = urlparse(url.strip()).netloc.lower()
+    url = url.strip()
+    if "://" not in url and not url.startswith("/"):
+        url = "//" + url
+    host = urlparse(url).netloc.lower()
     return host[4:] if host.startswith("www.") else host
 
 
@@ -160,7 +127,9 @@ def _call_events(calls):
     out = []
     for c in calls:
         direction = (c.get("direction") or "").capitalize()
-        title = " ".join(p for p in (direction, c.get("status")) if p) or "Call"
+        status = c.get("status")
+        status = _CALL_STATUS.get(status, status)
+        title = " ".join(p for p in (direction, status) if p) or "Call"
         seconds = c.get("duration_seconds")
         extra = {}
         if isinstance(seconds, (int, float)) and seconds > 0:
@@ -170,15 +139,36 @@ def _call_events(calls):
     return out
 
 
+def _wall_clock(value):
+    """(iso, is_local) for an appointment start, or None.
+
+    GHL sends "2026-07-20 10:00:00": the clock time at the business location,
+    no offset. Keep that as a naive ISO string (is_local=True) so the UI never
+    shifts it into the viewer's timezone. Values with an offset stay instants.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo:
+        return dt.isoformat(), False
+    return dt.replace(microsecond=0).isoformat(), True
+
+
 def _appointment_events(appointments):
     out = []
-    for a in appointments:
+    for i, a in enumerate(appointments):
         title = (a.get("title") or "").strip() or "Appointment"
         status = str(a.get("appointmentStatus") or a.get("status") or "").lower()
         missed = _MISSED.get(status)
         at = (a.get("dateUpdated") or a.get("dateAdded")) if missed else a.get("dateAdded")
-        out.append(_event(f"appt:{a.get('id')}", "appointment", missed or "Appointment booked", title, at,
-                          starts_at=_iso(a.get("startTime"))))
+        # `at` (dateAdded/dateUpdated): a naive value is read as UTC, like every other timestamp here.
+        starts = _wall_clock(a.get("startTime"))
+        extra = {"starts_at": starts[0], "starts_at_local": starts[1]} if starts else {}
+        out.append(_event(f"appt:{a.get('id') or i}", "appointment", missed or "Appointment booked", title, at,
+                          **extra))
     return out
 
 
@@ -195,7 +185,7 @@ def _stage_events(opps, stages):
             out.append(_event(f"opp:{oid}:{status}", "stage", f"Opportunity {status}",
                               o.get("name") or pipeline or "", o.get("lastStatusChangeAt")))
         moved, created = _parse_dt(o.get("lastStageChangeAt")), _parse_dt(o.get("createdAt"))
-        if moved and moved != created:
+        if moved and (created is None or moved - created > _STAGE_GAP):
             out.append(_event(f"opp:{oid}:moved", "stage", f"Moved to {stage}" if stage else "Moved stage",
                               pipeline or "", o.get("lastStageChangeAt")))
     return out
@@ -209,8 +199,11 @@ async def build_lead_journey(db, user_id: str, contact_id: str) -> dict | None:
     location_id, group_id = doc.get("location_id"), doc.get("client_group_id")
     keys = doc.get("match_keys") or compute_match_keys(contact.get("email"), contact.get("phone"))
 
-    opp_status, opps = await resolve_opportunities(db, user_id, doc, contact)
-    appt_status, appointments = await _live_appointments(db, user_id, location_id, contact_id)
+    token = await safe_token_for(db, user_id, location_id)
+    (opp_status, opps), (appt_status, appointments) = await asyncio.gather(
+        resolve_opportunities(db, user_id, doc, contact, token=token),
+        live_appointments(db, user_id, location_id, contact_id, token=token),
+    )
     stages = await stage_lookup(db, user_id, location_id) if (opps and location_id) else {}
 
     events = [_lead_event(contact)]

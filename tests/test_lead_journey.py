@@ -10,8 +10,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import services.ghl_live as gl
 import services.lead_journey as lj
-from services.lead_journey import build_lead_journey, live_opportunities
+from services.ghl_live import live_opportunities
+from services.lead_journey import build_lead_journey
 
 USER = "u1"
 LOC = "loc1"
@@ -22,8 +24,8 @@ KEYS = ["email:ann@x.com", "phone:7393421825"]
 def ghl(monkeypatch):
     opps = AsyncMock(return_value=(200, []))
     appts = AsyncMock(return_value=(200, []))
-    monkeypatch.setattr(lj.ghl_integration, "search_contact_opportunities", opps)
-    monkeypatch.setattr(lj.ghl_integration, "fetch_contact_appointments", appts)
+    monkeypatch.setattr(gl.ghl_integration, "search_contact_opportunities", opps)
+    monkeypatch.setattr(gl.ghl_integration, "fetch_contact_appointments", appts)
 
     async def tokens(user_id, client):
         return {LOC: {"access_token": "tok"}}
@@ -31,7 +33,7 @@ def ghl(monkeypatch):
     async def no_stages(db, user_id, location_id):
         return {}
 
-    monkeypatch.setattr(lj, "get_subaccount_tokens", tokens)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
     monkeypatch.setattr(lj, "stage_lookup", no_stages)
     return opps, appts
 
@@ -71,7 +73,7 @@ async def test_live_opportunities_no_token_or_location_or_error(mock_db, ghl, mo
     async def boom(user_id, client):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(lj, "get_subaccount_tokens", boom)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", boom)
     assert await live_opportunities(mock_db, USER, LOC, "c1") == ("unavailable", [])
 
 
@@ -195,7 +197,7 @@ async def test_call_events(mock_db, ghl):
     ])
     events = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "call")
     assert [(e["title"], e["detail"], e["at"], e.get("duration_seconds")) for e in events] == [
-        ("Inbound no-answer", "Call", "2026-07-12T10:00:00+00:00", None),
+        ("Inbound no answer", "Call", "2026-07-12T10:00:00+00:00", None),
         ("Outbound completed · 2:05", "Call", "2026-07-11T10:00:00+00:00", 125),
     ]
 
@@ -212,10 +214,10 @@ async def test_appointment_events(mock_db, ghl):
          "startTime": "2026-07-22T10:00:00Z", "dateAdded": "2026-07-11T10:00:00Z"},
     ])
     events = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "appointment")
-    assert [(e["title"], e["detail"], e["at"], e["starts_at"]) for e in events] == [
-        ("Appointment cancelled", "Call back", "2026-07-12T09:00:00+00:00", "2026-07-21T10:00:00Z"),
-        ("Appointment no-show", "Survey", "2026-07-11T10:00:00+00:00", "2026-07-22T10:00:00Z"),
-        ("Appointment booked", "Site visit", "2026-07-11T08:00:00+00:00", "2026-07-20 10:00:00"),
+    assert [(e["title"], e["detail"], e["at"], e["starts_at"], e["starts_at_local"]) for e in events] == [
+        ("Appointment cancelled", "Call back", "2026-07-12T09:00:00+00:00", "2026-07-21T10:00:00+00:00", False),
+        ("Appointment no-show", "Survey", "2026-07-11T10:00:00+00:00", "2026-07-22T10:00:00+00:00", False),
+        ("Appointment booked", "Site visit", "2026-07-11T08:00:00+00:00", "2026-07-20T10:00:00", True),
     ]
 
 
@@ -283,8 +285,78 @@ async def test_live_failure_keeps_stored_events(mock_db, ghl):
 
 async def test_no_location_means_unavailable(mock_db, ghl):
     await _seed(mock_db, location_id=None)
-    await mock_db["ghl_contacts"].update_one({}, {"$set": {"location_id": None}})
     j = await build_lead_journey(mock_db, USER, "c1")
     assert j["ghl"] == "unavailable"
     ghl[0].assert_not_awaited()
     ghl[1].assert_not_awaited()
+
+
+@pytest.mark.parametrize("start,expected", [
+    ("2026-07-20 10:00:00", ("2026-07-20T10:00:00", True)),
+    ("2026-07-20T10:00:00", ("2026-07-20T10:00:00", True)),
+    ("2026-07-20T10:00:00Z", ("2026-07-20T10:00:00+00:00", False)),
+    ("2026-07-20T10:00:00+01:00", ("2026-07-20T10:00:00+01:00", False)),
+])
+async def test_appointment_start_wall_clock(mock_db, ghl, start, expected):
+    await _seed(mock_db)
+    ghl[1].return_value = (200, [{"id": "a", "title": "t", "startTime": start, "dateAdded": "2026-07-11 08:00:00"}])
+    (e,) = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "appointment")
+    assert (e["starts_at"], e["starts_at_local"]) == expected
+    assert e["at"] == "2026-07-11T08:00:00+00:00"  # naive dateAdded is read as UTC
+
+
+@pytest.mark.parametrize("start", ["garbage", None, ""])
+async def test_appointment_bad_start_omits_fields(mock_db, ghl, start):
+    await _seed(mock_db)
+    ghl[1].return_value = (200, [{"id": "a", "title": "t", "startTime": start, "dateAdded": "2026-07-11T08:00:00Z"}])
+    (e,) = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "appointment")
+    assert "starts_at" not in e and "starts_at_local" not in e
+
+
+async def test_appointment_without_id_gets_index_ids(mock_db, ghl):
+    await _seed(mock_db)
+    ghl[1].return_value = (200, [{"title": "a", "dateAdded": "2026-07-11T08:00:00Z"},
+                                 {"title": "b", "dateAdded": "2026-07-12T08:00:00Z"}])
+    ids = [e["id"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "appointment")]
+    assert sorted(ids) == ["appt:0", "appt:1"]
+
+
+async def test_moved_event_needs_a_real_gap(mock_db, ghl, monkeypatch):
+    await _seed(mock_db)
+    ghl[0].return_value = (200, [{"id": "o", "status": "open", "createdAt": "2026-07-11T00:00:00Z",
+                                  "lastStageChangeAt": "2026-07-11T00:00:30Z"}])
+    titles = [e["title"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "stage")]
+    assert titles == ["Opportunity created"]
+
+
+async def test_call_status_labels(mock_db, ghl):
+    await _seed(mock_db)
+    await mock_db["call_logs"].insert_many([
+        {"user_id": USER, "contact_id": "c1", "direction": "outbound", "status": s,
+         "started_at": datetime(2026, 7, 11, 10, i)} for i, s in enumerate(["no-answer", "busy", "failed", "canceled", "completed"])])
+    titles = [e["title"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "call")]
+    assert titles == ["Outbound completed", "Outbound cancelled", "Outbound failed", "Outbound busy", "Outbound no answer"]
+
+
+async def test_schemeless_landing_page_path(mock_db, ghl):
+    await _seed(mock_db)
+    await mock_db["tracked_leads"].insert_one(
+        {"user_id": USER, "client_group_id": "g1", "match_keys": ["email:ann@x.com"],
+         "created_at": datetime(2026, 7, 10, 9, 30), "landing_page": "site.com/quote"})
+    (e,) = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "conversion")
+    assert e["detail"] == "/quote"
+
+
+async def test_token_fetched_once_for_both_live_calls(mock_db, ghl, monkeypatch):
+    await _seed(mock_db)
+    calls = []
+
+    async def tokens(user_id, client):
+        calls.append(1)
+        return {LOC: {"access_token": "tok"}}
+
+    monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
+    await build_lead_journey(mock_db, USER, "c1")
+    assert len(calls) == 1
+    ghl[0].assert_awaited_once()
+    ghl[1].assert_awaited_once()

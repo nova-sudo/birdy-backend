@@ -5,7 +5,8 @@ import logging
 import re
 from datetime import datetime, timezone
 
-from integrations.gohighlevel import ghl_integration, get_subaccount_tokens
+from integrations.gohighlevel import ghl_integration
+from services.ghl_live import token_for as _token_for
 from services.lead_detail import _parse_dt
 
 logger = logging.getLogger(__name__)
@@ -84,13 +85,6 @@ def _normalize(raw: dict):
         "attachments": [a for a in (raw.get("attachments") or []) if isinstance(a, str)],
         "source": raw.get("source"),
     }
-
-
-async def _token_for(db, user_id: str, location_id):
-    if not location_id:
-        return None
-    tokens = await get_subaccount_tokens(user_id, db.client)
-    return (tokens or {}).get(location_id, {}).get("access_token")
 
 
 async def _export_all(token: str, location_id: str, contact_id: str, channel):

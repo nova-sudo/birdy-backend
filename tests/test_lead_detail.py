@@ -17,7 +17,7 @@ def _no_ghl(monkeypatch):
         return "unavailable", []
 
     monkeypatch.setattr("services.lead_detail.stage_lookup", _empty)
-    monkeypatch.setattr("services.lead_journey.live_opportunities", _no_live)
+    monkeypatch.setattr("services.lead_detail.live_opportunities", _no_live)
 
 
 async def _seed_contact(db, contact=None, user_id=USER, **extra):
@@ -219,7 +219,7 @@ def _live(monkeypatch, status, rows=()):
     async def _fn(db, user_id, location_id, contact_id):
         return status, list(rows)
 
-    monkeypatch.setattr("services.lead_journey.live_opportunities", _fn)
+    monkeypatch.setattr("services.lead_detail.live_opportunities", _fn)
 
 
 STORED = {"opportunities": [{"id": "old", "pipelineStageId": "s1", "status": "won", "monetaryValue": 9}],
@@ -297,3 +297,10 @@ async def test_stage_lookup_called_for_live_opportunities(mock_db, monkeypatch):
     await _seed_contact(mock_db)
     await build_lead_detail(mock_db, USER, "c1")
     assert called == ["loc1"]
+
+
+@pytest.mark.asyncio
+async def test_live_ok_but_empty_replaces_stored_opportunities(mock_db, monkeypatch):
+    _live(monkeypatch, "ok", [])  # GHL is the source of truth
+    await _seed_contact(mock_db, STORED)
+    assert (await build_lead_detail(mock_db, USER, "c1"))["opportunities"] == []

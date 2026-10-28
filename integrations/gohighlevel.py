@@ -992,7 +992,11 @@ class GHLIntegration:
             "Version": "2021-07-28",
             "Accept": "application/json",
         }
-        params = {"location_id": location_id, "contact_id": contact_id, "limit": 20}
+        params = {
+            "location_id": location_id, "contact_id": contact_id, "limit": 20,
+            "status": "all",  # won/lost are needed for time to close
+            "getTasks": "false", "getNotes": "false", "getCalendarEvents": "false",
+        }
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(url, headers=headers, params=params)

@@ -12,6 +12,7 @@ import httpx
 import pytest
 
 import integrations.gohighlevel as gh
+import services.ghl_live as gl
 import services.ghl_messages as gm
 
 LOC = "loc1"
@@ -27,7 +28,7 @@ def ghl(monkeypatch):
     async def tokens(user_id, client):
         return {LOC: {"access_token": "tok"}}
 
-    monkeypatch.setattr(gm, "get_subaccount_tokens", tokens)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
     return export, send
 
 
@@ -219,7 +220,7 @@ async def test_no_token_for_location_means_unavailable(ghl, monkeypatch, mock_mo
     async def tokens(user_id, client):
         return {"other": {"access_token": "x"}}
 
-    monkeypatch.setattr(gm, "get_subaccount_tokens", tokens)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
     out = await gm.fetch_lead_messages(mock_mongo_client["db"], "u1", LOC, "c1")
     assert out == {"status": "unavailable", "messages": []}
     export.assert_not_called()
@@ -308,7 +309,7 @@ async def test_send_token_lookup_error_is_not_a_500(ghl, monkeypatch, mock_mongo
     async def boom(user_id, client):
         raise RuntimeError("db down")
 
-    monkeypatch.setattr(gm, "get_subaccount_tokens", boom)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", boom)
     with pytest.raises(gm.MessagingFailed):
         await gm.send_lead_message(mock_mongo_client["db"], "u1", LOC, "c1", "SMS", "x")
 
@@ -317,7 +318,7 @@ async def test_send_no_token_for_location_unavailable(ghl, monkeypatch, mock_mon
     async def tokens(user_id, client):
         return {}
 
-    monkeypatch.setattr(gm, "get_subaccount_tokens", tokens)
+    monkeypatch.setattr(gl, "get_subaccount_tokens", tokens)
     with pytest.raises(gm.MessagingUnavailable):
         await gm.send_lead_message(mock_mongo_client["db"], "u1", LOC, "c1", "SMS", "x")
 
@@ -399,7 +400,8 @@ async def test_search_contact_opportunities_request_shape(monkeypatch):
     assert args[0] == "https://services.leadconnectorhq.com/opportunities/search"
     assert kwargs["headers"]["Version"] == "2021-07-28"
     assert kwargs["headers"]["Authorization"] == "Bearer tok"
-    assert kwargs["params"] == {"location_id": "loc1", "contact_id": "c1", "limit": 20}
+    assert kwargs["params"] == {"location_id": "loc1", "contact_id": "c1", "limit": 20, "status": "all",
+        "getTasks": "false", "getNotes": "false", "getCalendarEvents": "false"}
 
 
 async def test_search_contact_opportunities_status_and_network_error(monkeypatch):

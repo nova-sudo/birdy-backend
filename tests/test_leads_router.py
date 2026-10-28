@@ -187,13 +187,16 @@ async def test_send_unconfirmed_504(api, mock_mongo_client, send):
 
 async def test_get_lead_journey_200(api, mock_mongo_client):
     await _seed_contact(mock_mongo_client)
+    await mock_mongo_client[DB_NAME]["ghl_contacts"].update_one(
+        {}, {"$set": {"contact_data.dateAdded": "2026-07-10T09:00:00Z"}})
 
     resp = api.get("/api/leads/contact/c1/journey")
 
     assert resp.status_code == 200
     body = resp.json()
     assert body["ghl"] == "unavailable"  # no location on the seeded contact
-    assert [e["kind"] for e in body["events"]] == []  # contact has no dateAdded, so no lead event
+    assert body["events"] == [{"id": "lead:c1", "kind": "lead", "title": "Lead created",
+                               "detail": "GoHighLevel", "at": "2026-07-10T09:00:00+00:00"}]
 
 
 async def test_get_lead_journey_404_for_unknown_and_other_users(api, mock_mongo_client):
