@@ -28,7 +28,11 @@ class MessagingReconnect(Exception):
 
 
 class MessagingFailed(Exception):
-    """GHL returned another error, or the request failed."""
+    """GHL definitely rejected the message (4xx), or it was never sent."""
+
+
+class MessagingUnconfirmed(Exception):
+    """Network error, timeout or GHL 5xx: the message may still have been sent."""
 
 
 def channel_for(message_type: str) -> str:
@@ -168,6 +172,8 @@ async def send_lead_message(db, user_id: str, location_id, contact_id: str, chan
     code, body = await ghl_integration.send_message(token, payload)
     if code in (401, 403):
         raise MessagingReconnect()
+    if code == 0 or code >= 500:
+        raise MessagingUnconfirmed()
     if not 200 <= code < 300:
         raise MessagingFailed()
 

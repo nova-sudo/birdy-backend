@@ -173,3 +173,13 @@ async def test_send_failure_502(api, mock_mongo_client, send):
     send.side_effect = gm.MessagingFailed()
     resp = api.post("/api/leads/contact/c1/messages", json={"channel": "SMS", "message": "hi"})
     assert resp.status_code == 502
+    assert resp.json() == {"detail": "GoHighLevel rejected the message."}
+
+
+async def test_send_unconfirmed_504(api, mock_mongo_client, send):
+    await _seed_full(mock_mongo_client)
+    send.side_effect = gm.MessagingUnconfirmed()
+    resp = api.post("/api/leads/contact/c1/messages", json={"channel": "SMS", "message": "hi"})
+    assert resp.status_code == 504
+    assert resp.json() == {
+        "detail": "We couldn't confirm the message was sent. Check the thread before sending again."}

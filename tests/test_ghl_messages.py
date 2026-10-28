@@ -159,12 +159,18 @@ async def test_send_errors(ghl, mock_mongo_client):
     send.return_value = (403, {})
     with pytest.raises(gm.MessagingReconnect):
         await gm.send_lead_message(db, "u1", LOC, "c1", "SMS", "x")
-    send.return_value = (500, {})
-    with pytest.raises(gm.MessagingFailed):
-        await gm.send_lead_message(db, "u1", LOC, "c1", "SMS", "x")
-    send.return_value = (0, {})
-    with pytest.raises(gm.MessagingFailed):
-        await gm.send_lead_message(db, "u1", LOC, "c1", "SMS", "x")
+    for code in (400, 422, 429):
+        send.return_value = (code, {})
+        with pytest.raises(gm.MessagingFailed):
+            await gm.send_lead_message(db, "u1", LOC, "c1", "SMS", "x")
+
+
+@pytest.mark.parametrize("code", [0, 500, 502, 504])
+async def test_send_unknown_outcome_is_unconfirmed(ghl, mock_mongo_client, code):
+    _, send = ghl
+    send.return_value = (code, {})
+    with pytest.raises(gm.MessagingUnconfirmed):
+        await gm.send_lead_message(mock_mongo_client["db"], "u1", LOC, "c1", "SMS", "x")
 
 
 async def test_email_failure_keeps_default_messages(ghl, mock_mongo_client):

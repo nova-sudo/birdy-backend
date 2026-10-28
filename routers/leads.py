@@ -24,7 +24,7 @@ from typing_extensions import Annotated
 from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
 from services.ghl_messages import (
-    MessagingFailed, MessagingReconnect, MessagingUnavailable,
+    MessagingFailed, MessagingReconnect, MessagingUnavailable, MessagingUnconfirmed,
     fetch_lead_messages, send_lead_message,
 )
 from services.lead_detail import build_lead_detail
@@ -86,6 +86,10 @@ async def send_lead_message_endpoint(contact_id: str, body: SendMessageBody,
                 body.channel, body.message, subject)
         except (MessagingReconnect, MessagingUnavailable):
             raise HTTPException(status_code=409, detail="Reconnect GoHighLevel to send messages")
+        except MessagingUnconfirmed:
+            raise HTTPException(
+                status_code=504,
+                detail="We couldn't confirm the message was sent. Check the thread before sending again.")
         except MessagingFailed:
-            raise HTTPException(status_code=502, detail="Could not send the message")
+            raise HTTPException(status_code=502, detail="GoHighLevel rejected the message.")
     return {"message": message}
