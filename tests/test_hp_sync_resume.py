@@ -248,3 +248,53 @@ async def test_hp_tick_records_a_partial_run_for_the_next_tick(mock_mongo_client
     assert g["hp_sync_progress"] == {"leads_offset": 300, "windows_done": ["w"]}
     assert g.get("hp_backfill_status") != "complete"
     assert g["last_hp_refresh"] is None
+
+
+# ── the Sales-Hub request: a live refresh, not a full sync ───────────────────
+# A client with 1,000+ leads needs 11 lead pages; at ~5 requests a minute the
+# in-request sync always ran out of time, never stamped a refresh, and every
+# request started it again.
+
+from datetime import datetime, timedelta
+
+from services.hp_service import claim_hp_live_refresh
+
+
+async def test_live_refresh_fetches_recent_calls_only(mock_mongo_client, mock_db):
+    await _group(mock_db)
+    await _sync(mock_mongo_client, FakeHP([_raw_lead(1), _raw_lead(2)], [_raw_call(1, 1)]))
+    nightly = (await mock_db["client_groups"].find_one({"id": "g1"}))["last_hp_refresh"]
+
+    hp = FakeHP([], [_raw_call(2, 2)])
+    out = await _sync(mock_mongo_client, hp, mode="live", time_budget=20)
+
+    assert out["complete"] is True
+    assert hp.max_backoff == 20                                    # a 429 can't hold the page for minutes
+    assert hp.lead_offsets == []                                   # no lead pages
+    assert len(hp.window_calls) <= 2                               # the last few days, not 400
+    for lead_id in ("L1", "L2"):
+        lead = await mock_db["hotprospector_leads"].find_one({"lead_data.id": lead_id})
+        assert lead["lead_data"]["call_logs_count"] == 1
+    g = await mock_db["client_groups"].find_one({"id": "g1"})
+    assert g["last_hp_refresh"] == nightly                         # nightly stamp untouched
+    assert g["last_hp_live_refresh"] is not None
+    assert g["hotprospector_cache"]["metrics"]["total_calls"] == 2
+    assert await mock_db["call_logs"].count_documents({"source_event_id": "hp_R2"}) == 1
+
+
+async def test_one_live_refresh_at_a_time(mock_db):
+    await _group(mock_db)
+    groups, now = mock_db["client_groups"], datetime(2026, 10, 28, 12, 0)
+
+    assert await claim_hp_live_refresh(groups, "g1", USER, now) is True
+    assert await claim_hp_live_refresh(groups, "g1", USER, now + timedelta(seconds=5)) is False
+    # A request that died without releasing its claim doesn't block for good.
+    assert await claim_hp_live_refresh(groups, "g1", USER, now + timedelta(minutes=10)) is True
+
+
+async def test_no_live_refresh_while_the_cron_syncs_the_account(mock_db):
+    await _group(mock_db)
+    now = datetime(2026, 10, 28, 12, 0)
+    await mock_db["client_groups"].insert_one({"id": "g2", "user_id": USER, "ghl_location_id": "loc2",
+                                               "hp_refresh_status": "running", "_hp_claimed_at": now})
+    assert await claim_hp_live_refresh(mock_db["client_groups"], "g1", USER, now) is False

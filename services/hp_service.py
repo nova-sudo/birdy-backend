@@ -498,6 +498,32 @@ async def _persist_hp_calls_to_call_logs(
         await col.bulk_write(ops[i:i + BATCH], ordered=False)
 
 
+# One live refresh per client at a time, and none while hp-tick syncs the
+# account: HotProspector's rate limit is per API key, shared by its clients.
+HP_LIVE_CLAIM_SECONDS = 120
+HP_CRON_CLAIM_MINUTES = 10  # routers/cron.py HP_STALE_CLAIM_MINUTES
+
+
+async def claim_hp_live_refresh(client_groups, group_id: str, user_id: str, now: datetime) -> bool:
+    """True when this request may run the live refresh for the group."""
+    cron_running = await client_groups.find_one(
+        {"user_id": user_id, "hp_refresh_status": "running",
+         "_hp_claimed_at": {"$gte": now - timedelta(minutes=HP_CRON_CLAIM_MINUTES)}},
+        {"_id": 1},
+    )
+    if cron_running:
+        return False
+    claimed = await client_groups.find_one_and_update(
+        {"id": group_id, "$or": [
+            {"_hp_live_claimed_at": None},
+            {"_hp_live_claimed_at": {"$lt": now - timedelta(seconds=HP_LIVE_CLAIM_SECONDS)}},
+        ]},
+        {"$set": {"_hp_live_claimed_at": now}},
+        projection={"_id": 1},
+    )
+    return claimed is not None
+
+
 async def fetch_and_cache_hp_call_center(
         user_id: str,
         ghl_location_id: str,
@@ -580,15 +606,26 @@ async def fetch_and_cache_hp_call_center(
         mapping = await get_client_group_mapping(user_id, mongo_client)
         client_group_name = mapping.get(ghl_location_id)
 
+    # mode="live" is the Sales-Hub request's refresh: the last few days of calls
+    # against the stored leads. Re-paging every lead under the rate limit takes
+    # minutes, so that stays with the nightly cron.
+    live = mode == "live"
+    if live:
+        # Someone is waiting on the page: a rate limit gives up, not sleeps.
+        integration.max_backoff = min(integration.max_backoff, budget)
+
     # 1. Leads — resuming from where a previous partial run stopped. The save
     #    is an upsert that never deletes, so pages fetched in earlier runs stay.
-    success, leads_info = await integration.fetch_all_leads_from_ghl_location(
-        ghl_location_id, with_meta=True,
-        start_offset=int(resume.get("leads_offset") or 0), deadline=deadline,
-    )
-    if not success:
-        logger.warning(f"HP leads fetch failed for {ghl_location_id}: {leads_info}")
-        return _fail(leads_info.get("error") if isinstance(leads_info, dict) else "fetch_failed")
+    if live:
+        leads_info = {"leads": [], "total_count": None}
+    else:
+        success, leads_info = await integration.fetch_all_leads_from_ghl_location(
+            ghl_location_id, with_meta=True,
+            start_offset=int(resume.get("leads_offset") or 0), deadline=deadline,
+        )
+        if not success:
+            logger.warning(f"HP leads fetch failed for {ghl_location_id}: {leads_info}")
+            return _fail(leads_info.get("error") if isinstance(leads_info, dict) else "fetch_failed")
 
     hp_leads = leads_info["leads"]
     total_lead_count = leads_info["total_count"]
@@ -622,13 +659,21 @@ async def fetch_and_cache_hp_call_center(
         if lead.get("id") is not None:
             leads_by_id[str(lead["id"])] = lead
     normalized_leads = list(leads_by_id.values())
+    if live:
+        # HotProspector's own count, from the last lead sync.
+        group = await client_groups_collection.find_one(
+            {"user_id": user_id, "ghl_location_id": ghl_location_id},
+            {"hotprospector_cache.metrics.total_leads": 1},
+        )
+        stored_total = (((group or {}).get("hotprospector_cache") or {}).get("metrics") or {}).get("total_leads")
+        total_lead_count = stored_total if stored_total is not None else len(normalized_leads)
 
     # 2. Call logs, merged into what is already stored — never replacing it.
     existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
     windows_done = set(resume.get("windows_done") or [])
-    if mode == "incremental":
+    if mode in ("incremental", "live"):
         rec_ok, recent_raw = await integration.fetch_call_logs_for_location(
-            ghl_location_id, lookback_days=recent_days
+            ghl_location_id, lookback_days=recent_days, **({"deadline": deadline} if live else {})
         )
         if not rec_ok:
             logger.warning(f"HP incremental call fetch failed for {ghl_location_id}")
@@ -685,12 +730,19 @@ async def fetch_and_cache_hp_call_center(
     for lead in normalized_leads:
         lead["call_logs_count"] = len(lead["call_logs"])
 
+    # A live refresh only rewrites what it fetched: the calls, and the leads
+    # (and Unmatched bucket) they landed on. Nothing else changed.
+    fetched_ids = {_call_identity(c) for c in fetched_norm}
+
+    def _touched(calls):
+        return not live or any(_call_identity(c) in fetched_ids for c in calls)
+
     # 3c. Persist EVERY call (matched or not) as its own document in the
     #     shared call_logs collection. Sales-Hub doesn't consume this yet
     #     (it reads /api/hotprospector/call-center), but /api/call_logs now
     #     serves HP rows for future unification with the GHL webhook feed.
     await _persist_hp_calls_to_call_logs(
-        normalized_calls,
+        [c for c in normalized_calls if _touched([c])],
         user_id=user_id,
         location_id=ghl_location_id,
         mongo_client=mongo_client,
@@ -744,9 +796,9 @@ async def fetch_and_cache_hp_call_center(
     daily_call_series = _compute_daily_call_series(normalized_calls)
 
     # 5. Persist leads (with nested call logs) to the cache collection.
-    await save_hotprospector_leads_to_collection(
-        user_id, ghl_location_id, normalized_leads, mongo_client
-    )
+    to_save = [l for l in normalized_leads if _touched(l["call_logs"])]
+    if to_save:
+        await save_hotprospector_leads_to_collection(user_id, ghl_location_id, to_save, mongo_client)
 
     # 6. Refresh metrics + per-preset call stats + freshness on every
     #    client_group at this location (dot-notation so presets don't clobber).
@@ -762,7 +814,11 @@ async def fetch_and_cache_hp_call_center(
     }
     # Only a complete sync counts as a refresh. Stamping a partial one made it
     # look done, so hp-tick waited 24 hours and then fetched only recent days.
-    if complete:
+    # A live refresh has its own stamp: it must not stand in for the nightly one.
+    if live:
+        if complete:
+            set_fields["last_hp_live_refresh"] = datetime.utcnow()
+    elif complete:
         set_fields["last_hp_refresh"] = datetime.utcnow()
     for preset, stats in call_cache.items():
         set_fields[f"hotprospector_call_cache.{preset}"] = stats
