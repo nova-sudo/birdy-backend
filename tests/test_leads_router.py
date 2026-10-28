@@ -206,3 +206,40 @@ async def test_get_lead_journey_404_for_unknown_and_other_users(api, mock_mongo_
         resp = api.get(f"/api/leads/contact/{contact_id}/journey")
         assert resp.status_code == 404
         assert resp.json() == {"detail": "Lead not found"}
+
+
+# ── AI summary ────────────────────────────────────────────────────────────────
+
+SUMMARY = {"status": "ok", "summary": "Ada is warm.", "generated_at": "2026-10-28T10:00:00+00:00", "stale": False}
+
+
+def test_summary_get_and_post_pass_refresh_flag(api, monkeypatch):
+    seen = []
+
+    async def fake(db, user_id, contact_id, *, refresh=False):
+        seen.append((user_id, contact_id, refresh))
+        return SUMMARY
+
+    monkeypatch.setattr(leads_router, "get_lead_summary", fake)
+
+    got = api.get("/api/leads/contact/c1/summary")
+    posted = api.post("/api/leads/contact/c1/summary")
+
+    assert got.status_code == posted.status_code == 200
+    assert got.json() == posted.json() == SUMMARY
+    assert seen == [(USER, "c1", False), (USER, "c1", True)]
+
+
+@pytest.mark.parametrize("method", ["get", "post"])
+def test_summary_404_for_unknown_lead(api, monkeypatch, method):
+    async def fake(*a, **k):
+        return None
+
+    monkeypatch.setattr(leads_router, "get_lead_summary", fake)
+    resp = getattr(api, method)("/api/leads/contact/nope/summary")
+    assert resp.status_code == 404 and resp.json() == {"detail": "Lead not found"}
+
+
+async def test_summary_404_for_another_users_contact(api, mock_mongo_client):
+    await _seed_contact(mock_mongo_client, user="someone-else")
+    assert api.get("/api/leads/contact/c1/summary").status_code == 404

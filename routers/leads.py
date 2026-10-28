@@ -12,6 +12,9 @@ GET  /api/leads/contact/{contact_id}/messages
     Live GHL messages for the lead (services/ghl_messages.py).
 GET  /api/leads/contact/{contact_id}/journey
     Newest-first timeline of the lead (services/lead_journey.py); 404 unknown lead.
+GET  /api/leads/contact/{contact_id}/summary
+    Cached AI summary (generated on first view); POST regenerates it.
+    200 {status: ok|blocked|unavailable|failed, summary, generated_at, stale}; 404 unknown lead.
 POST /api/leads/contact/{contact_id}/messages
     Send an SMS or email to the lead. 201 {"message": ...}; 404 unknown lead;
     422 missing subject/phone/email; 409 reconnect GHL; 502 GHL failure.
@@ -31,6 +34,7 @@ from services.ghl_messages import (
 )
 from services.lead_detail import build_lead_detail
 from services.lead_journey import build_lead_journey
+from services.lead_summary import get_lead_summary
 
 router = APIRouter(prefix="/api/leads", tags=["leads"])
 
@@ -53,6 +57,25 @@ async def get_lead_journey(contact_id: str, current_user: str = Depends(get_curr
     if journey is None:
         raise HTTPException(status_code=404, detail="Lead not found")
     return journey
+
+
+async def _summary(contact_id: str, user_id: str, refresh: bool):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        result = await get_lead_summary(db, user_id, contact_id, refresh=refresh)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Lead not found")
+    return result
+
+
+@router.get("/contact/{contact_id}/summary")
+async def get_lead_summary_endpoint(contact_id: str, current_user: str = Depends(get_current_user)):
+    return await _summary(contact_id, current_user, refresh=False)
+
+
+@router.post("/contact/{contact_id}/summary")
+async def refresh_lead_summary_endpoint(contact_id: str, current_user: str = Depends(get_current_user)):
+    return await _summary(contact_id, current_user, refresh=True)
 
 
 class SendMessageBody(BaseModel):

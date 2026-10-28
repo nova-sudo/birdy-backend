@@ -56,6 +56,10 @@ CALL_ANALYSIS_SUMMARY_MODEL = os.getenv("CALL_ANALYSIS_SUMMARY_MODEL", "gpt-4o-m
 # the agent offers a "next batch" instead of one huge run.
 CALL_ANALYSIS_MAX_CALLS = 15
 
+# ── Lead summary (Lead Detail page) ─────────────────────────────────────────
+# One short cached summary per lead, on the account OPENAI_API_KEY.
+LEAD_SUMMARY_MODEL = os.getenv("LEAD_SUMMARY_MODEL", "gpt-4o-mini")
+
 # ── BYOK curated model lists ────────────────────────────────────────────────
 # Only models known to support tool/function calling. Users pick one of
 # these when connecting their own Anthropic/OpenAI key (see
