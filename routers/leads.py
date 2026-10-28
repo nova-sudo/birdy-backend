@@ -18,7 +18,7 @@ POST /api/leads/contact/{contact_id}/messages
 from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, StringConstraints
+from pydantic import BaseModel, Field, StringConstraints
 from typing_extensions import Annotated
 
 from core.database import DB_NAME
@@ -45,7 +45,7 @@ async def get_lead_detail(contact_id: str, current_user: str = Depends(get_curre
 class SendMessageBody(BaseModel):
     channel: Literal["SMS", "Email"]
     message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1600)]
-    subject: Optional[str] = None
+    subject: Optional[str] = Field(default=None, max_length=300)
 
 
 async def _find_contact(db, user_id: str, contact_id: str) -> dict:

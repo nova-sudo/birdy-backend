@@ -998,7 +998,7 @@ class GHLIntegration:
             "contactId": contact_id,
             "limit": 500,
             "sortBy": "createdAt",
-            "sortOrder": "asc",
+            "sortOrder": "desc",  # newest first so the caller's page cap keeps the latest
         }
         if channel:
             params["channel"] = channel
@@ -1033,7 +1033,11 @@ class GHLIntegration:
             if not 200 <= resp.status_code < 300:
                 logger.warning("GHL send message returned %s", resp.status_code)
                 return resp.status_code, {}
-            return resp.status_code, resp.json() or {}
+            try:
+                data = resp.json() or {}
+            except ValueError:
+                data = {}  # sent; keep the real status so the caller doesn't retry
+            return resp.status_code, data
         except Exception as e:
             logger.error("Failed to send GHL message: %s", type(e).__name__)
             return 0, {}

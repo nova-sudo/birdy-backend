@@ -142,6 +142,15 @@ async def test_send_email_without_email_422(api, mock_mongo_client, send):
     await _seed_full(mock_mongo_client, email=None)
     resp = api.post("/api/leads/contact/c1/messages", json={"channel": "Email", "message": "hi", "subject": "s"})
     assert resp.status_code == 422
+    send.assert_not_called()
+
+
+async def test_send_subject_too_long_422(api, mock_mongo_client, send):
+    await _seed_full(mock_mongo_client)
+    resp = api.post("/api/leads/contact/c1/messages",
+                    json={"channel": "Email", "message": "hi", "subject": "s" * 301})
+    assert resp.status_code == 422
+    send.assert_not_called()
 
 
 async def test_send_404_for_other_user(api, mock_mongo_client, send):
