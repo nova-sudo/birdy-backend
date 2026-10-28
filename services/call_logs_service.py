@@ -94,20 +94,31 @@ def _normalize_ghl(payload: dict) -> dict:
 
     GHL workflow bodies are user-configured in the workflow builder, so we
     look for several common key spellings (snake / camel / GHL-native) and
-    fall through gracefully when a field isn't present.
+    fall through gracefully when a field isn't present. GHL's standard
+    webhook nests the location as `location.id` and puts the fields the
+    workflow adds under `customData`, so those are read too (top level wins).
     """
+    custom = payload.get("customData") if isinstance(payload.get("customData"), dict) else {}
+    location = payload.get("location") if isinstance(payload.get("location"), dict) else {}
+    merged = {**custom, **{k: v for k, v in payload.items() if v not in (None, "")}}
+
+    direction = _first(merged, "direction", "callDirection")
+    direction = str(direction).strip().lower() if direction else None
+    # The lead's number: the contact's own phone, else the far end of the call.
+    far_end = _first(custom, "phoneTo", "to") if direction == "outbound" else _first(custom, "phoneFrom", "from")
+
     return {
-        "source_event_id": str(_first(payload, "id", "callId", "eventId", "messageId") or "") or None,
-        "location_id":     _first(payload, "locationId", "location_id"),
-        "contact_id":      _first(payload, "contactId", "contact_id"),
-        "contact_phone":   _first(payload, "phone", "phoneNumber", "contactPhone", "from"),
-        "contact_email":   _first(payload, "email", "contactEmail"),
-        "direction":       _first(payload, "direction", "callDirection"),
-        "status":          _first(payload, "status", "callStatus"),
-        "duration_seconds": _parse_int(_first(payload, "duration", "durationSeconds", "callDuration")),
-        "started_at":      _parse_dt(_first(payload, "startedAt", "callStartTime", "dateAdded", "createdAt")),
-        "ended_at":        _parse_dt(_first(payload, "endedAt", "callEndTime")),
-        "recording_url":   _first(payload, "recordingUrl", "recording_url"),
+        "source_event_id": str(_first(merged, "id", "callId", "eventId", "messageId") or "") or None,
+        "location_id":     _first(merged, "locationId", "location_id") or location.get("id") or None,
+        "contact_id":      _first(merged, "contactId", "contact_id"),
+        "contact_phone":   _first(merged, "phone", "phoneNumber", "contactPhone") or far_end or _first(merged, "from"),
+        "contact_email":   _first(merged, "email", "contactEmail"),
+        "direction":       direction,
+        "status":          _first(merged, "status", "callStatus"),
+        "duration_seconds": _parse_int(_first(merged, "duration", "durationSeconds", "callDuration")),
+        "started_at":      _parse_dt(_first(merged, "startedAt", "callStartTime", "dateAdded", "createdAt")),
+        "ended_at":        _parse_dt(_first(merged, "endedAt", "callEndTime")),
+        "recording_url":   _first(merged, "recordingUrl", "recording_url"),
     }
 
 
@@ -162,6 +173,11 @@ async def save_call_log(
     user_id = await resolve_user_id_from_location(normalized.get("location_id"), mongo_client)
 
     now = datetime.utcnow()
+    if not normalized.get("started_at"):
+        # GHL's call workflows fire when the call ends and send no call time;
+        # the arrival time is the closest we have.
+        normalized["started_at"] = now
+        normalized["started_at_estimated"] = True
     doc = {
         "source": source,
         "user_id": user_id,

@@ -228,6 +228,8 @@ async def _calls(db, user_id: str, contact: dict) -> list[dict]:
         }
         if "transcript" in r:
             row["transcript"] = r["transcript"]
+        if r.get("started_at_estimated"):
+            row["started_at_estimated"] = True  # stamped on arrival, not the call time
         out.append(row)
     out.sort(key=lambda c: (c["_sort"], c["id"]), reverse=True)
     for c in out:
