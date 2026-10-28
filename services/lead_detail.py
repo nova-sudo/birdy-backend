@@ -86,7 +86,8 @@ async def _attribution(db, user_id: str, doc: dict, contact: dict):
     if keys:
         query = {"user_id": user_id, "match_keys": {"$in": keys}}
         if doc.get("client_group_id"):
-            query["client_group_id"] = doc["client_group_id"]
+            # Some Meta leads were stored before grouping; keep them matchable.
+            query["client_group_id"] = {"$in": [doc["client_group_id"], None, ""]}
         meta = await db["facebook_leads"].find_one(query, sort=[("lead_data.created_time", -1)])
     src = contact.get("attributionSource") or {}
     if not meta and not (src.get("adId") or src.get("campaign") or src.get("utmSource")):

@@ -181,6 +181,18 @@ async def test_meta_lead_in_other_client_group_ignored(mock_db):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("group", ["missing", None, ""])
+async def test_ungrouped_meta_lead_still_matches(mock_db, group):
+    await _seed_contact(mock_db)
+    doc = {"user_id": USER, "match_keys": ["email:ann@x.com"],
+           "lead_data": {"ad_id": "loose", "created_time": "2026-07-17T10:00:00+0000"}}
+    if group != "missing":
+        doc["client_group_id"] = group
+    await mock_db["facebook_leads"].insert_one(doc)
+    assert (await build_lead_detail(mock_db, USER, "c1"))["attribution"]["ad_id"] == "loose"
+
+
+@pytest.mark.asyncio
 async def test_newest_meta_lead_wins(mock_db):
     await _seed_contact(mock_db)
     await _seed_lead(mock_db, lead_data={"ad_id": "old", "created_time": "2026-07-01T10:00:00+0000"})
