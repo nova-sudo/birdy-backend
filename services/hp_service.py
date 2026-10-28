@@ -8,7 +8,8 @@ import hashlib
 import os
 import logging
 from collections import Counter
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pymongo import UpdateOne
 
@@ -380,6 +381,28 @@ def _hp_lead_number(call: dict):
     return call.get("from_number") or call.get("to_number") or None
 
 
+# HotProspector shows call times in the account's local time with no zone
+# ("Oct 27, 2026 1:30 pm"). Read them in the owner's timezone, else this one.
+HP_DEFAULT_TIMEZONE = "Europe/London"
+
+
+def _hp_zone(name):
+    try:
+        return ZoneInfo(name or HP_DEFAULT_TIMEZONE)
+    except (ZoneInfoNotFoundError, ValueError):
+        return ZoneInfo(HP_DEFAULT_TIMEZONE)
+
+
+def _hp_started_at(call, zone):
+    """The call's start as naive UTC, the way call_logs stores times."""
+    dt = _parse_iso_maybe(call.get("call_time_iso") or call.get("call_time"))
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=zone)
+    return dt.astimezone(timezone.utc).replace(tzinfo=None)
+
+
 def _parse_iso_maybe(value):
     """Best-effort ISO-8601 string → datetime; returns None on any failure."""
     if not value:
@@ -416,7 +439,7 @@ async def _persist_hp_calls_to_call_logs(
                           from_number otherwise (whichever we've got)
         direction       → call_status ("inbound" / "outbound")
         duration_seconds→ duration (already seconds per HP API convention)
-        started_at      → parsed call_time_iso
+        started_at      → call_time_iso read in the owner's timezone, as UTC
         recording_url   → recording_url
         raw_payload     → full normalized call (keeps transfer, group,
                           city, state, speed_to_lead, etc. for debug)
@@ -429,6 +452,8 @@ async def _persist_hp_calls_to_call_logs(
         return
 
     col = mongo_client[DB_NAME]["call_logs"]
+    owner = await mongo_client[DB_NAME]["users"].find_one({"user_id": user_id}, {"timezone": 1})
+    zone = _hp_zone((owner or {}).get("timezone"))
     now = datetime.utcnow()
     ops = []
 
@@ -447,7 +472,7 @@ async def _persist_hp_calls_to_call_logs(
             "direction": (c.get("call_status") or None),
             "status": None,
             "duration_seconds": int(c.get("duration") or 0),
-            "started_at": _parse_iso_maybe(c.get("call_time_iso") or c.get("call_time")),
+            "started_at": _hp_started_at(c, zone),
             "ended_at": None,
             "recording_url": c.get("recording_url") or None,
             "raw_payload": c,

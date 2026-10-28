@@ -122,3 +122,41 @@ def test_drop_logged_calls_keeps_unmatched():
     other = {**GHL_CALL, "started_at": "2026-10-26T09:00:00+00:00"}
     logged = [{"direction": "outbound", "started_at": "2026-10-25T13:00:05+00:00"}]
     assert drop_logged_calls([GHL_CALL, other], logged) == [other]
+
+
+def test_ghl_stamps_the_call_at_its_end():
+    # HotProspector logged 13:30 (to the minute), 341s; GHL logged it at 13:36:18.
+    hp = {"direction": "outbound", "started_at": "2026-10-27T13:30:00+00:00", "duration_seconds": 341}
+    ghl = {"direction": "outbound", "started_at": "2026-10-27T13:36:18+00:00"}
+    assert is_same_call(ghl, hp)
+    # A call GHL logged well after that one ended is another call.
+    assert not is_same_call({**ghl, "started_at": "2026-10-27T13:40:00+00:00"}, hp)
+    # Nor one from before it started.
+    assert not is_same_call({**ghl, "started_at": "2026-10-27T13:28:30+00:00"}, hp)
+
+
+# ── HotProspector call times ────────────────────────────────────────────────
+
+from services.hp_service import _hp_started_at, _hp_zone, _persist_hp_calls_to_call_logs
+
+
+def test_hp_time_is_read_in_the_owner_zone():
+    london = _hp_zone(None)
+    # British Summer Time: 10:07 in London is 09:07 UTC.
+    assert _hp_started_at({"call_time_iso": "2026-10-23T10:07:00"}, london) == datetime(2026, 10, 23, 9, 7)
+    # After the clocks go back, London is UTC.
+    assert _hp_started_at({"call_time_iso": "2026-10-27T13:30:00"}, london) == datetime(2026, 10, 27, 13, 30)
+    assert _hp_started_at({"call_time_iso": "2026-10-23T10:07:00"}, _hp_zone("Africa/Cairo")) == datetime(2026, 10, 23, 7, 7)
+    assert _hp_started_at({}, london) is None
+    assert _hp_zone("Not/AZone").key == "Europe/London"
+
+
+async def test_hp_persist_stores_utc(mock_mongo_client):
+    db = mock_mongo_client[DB_NAME]
+    await db["users"].insert_one({"user_id": "u1", "timezone": "Europe/London"})
+    await _persist_hp_calls_to_call_logs(
+        [{"recording_id": "r1", "call_time_iso": "2026-10-23T10:07:00", "call_status": "outbound",
+          "to_number": LEAD, "duration": 23}],
+        user_id="u1", location_id="loc1", mongo_client=mock_mongo_client)
+    row = await db["call_logs"].find_one({"source": "hotprospector"})
+    assert row["started_at"] == datetime(2026, 10, 23, 9, 7)

@@ -65,9 +65,12 @@ def _plain_text(body: str) -> str:
 
 # Real calls. Voicemail drops and manual call tasks are not dials.
 CALL_TYPES = {"TYPE_CALL", "TYPE_IVR_CALL", "TYPE_CUSTOM_CALL", "TYPE_CAMPAIGN_CALL"}
-# Within this many seconds, a GHL call and a logged call are one call.
+# GHL stamps a call message when the call is logged, at or after its end; a
+# dialer stamps the start (HotProspector only to the minute). A GHL call is a
+# logged call when its time falls from SAME_CALL_SECONDS before the logged start
+# to the logged call's end plus ESTIMATED_SLACK_SECONDS.
 SAME_CALL_SECONDS = 60
-# A webhook row with no call time is stamped on arrival, after the call ends.
+# Also the slack for a webhook row with no call time, stamped on arrival.
 ESTIMATED_SLACK_SECONDS = 180
 
 
@@ -220,9 +223,10 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
 def is_same_call(ghl_call: dict, logged: dict) -> bool:
     """Whether a GHL call message and a call_logs call (any source) are one call.
 
-    Same direction (when both say), and close in time: within SAME_CALL_SECONDS,
-    or for a row stamped on arrival (started_at_estimated), arriving after the
-    call started but no later than its duration plus ESTIMATED_SLACK_SECONDS.
+    Same direction (when both say), and the GHL time inside the logged call:
+    from SAME_CALL_SECONDS before its start to its end plus
+    ESTIMATED_SLACK_SECONDS. A row stamped on arrival (started_at_estimated)
+    instead arrives after the GHL call, no later than its duration plus the slack.
     """
     a, b = (ghl_call.get("direction") or "").lower(), (logged.get("direction") or "").lower()
     if a and b and a != b:
@@ -233,7 +237,7 @@ def is_same_call(ghl_call: dict, logged: dict) -> bool:
     gap = (logged_at - ghl_at).total_seconds()
     if logged.get("started_at_estimated"):
         return 0 <= gap <= (ghl_call.get("duration_seconds") or 0) + ESTIMATED_SLACK_SECONDS
-    return abs(gap) <= SAME_CALL_SECONDS
+    return -SAME_CALL_SECONDS <= -gap <= (logged.get("duration_seconds") or 0) + ESTIMATED_SLACK_SECONDS
 
 
 def drop_logged_calls(ghl_calls: list, logged_calls: list) -> list:
@@ -245,8 +249,8 @@ async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> lis
     """Drop GHL calls a workflow webhook already put in call_logs (shown from there).
 
     Webhook bodies are user-configured, so the stored id may not be the GHL
-    message id: match the id fields we keep, else the same direction within
-    SAME_CALL_SECONDS on this contact.
+    message id: match the id fields we keep, else is_same_call against this
+    contact's rows.
     """
     if not calls:
         return calls
@@ -260,7 +264,8 @@ async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> lis
                 {"contact_id": contact_id},
             ]},
             {"source_event_id": 1, "raw_payload.messageId": 1, "raw_payload.callId": 1,
-             "contact_id": 1, "direction": 1, "started_at": 1},
+             "contact_id": 1, "direction": 1, "started_at": 1, "started_at_estimated": 1,
+             "duration_seconds": 1},
         ).to_list(None)
     except Exception as e:
         logger.warning("call_logs de-duplication failed: %s", type(e).__name__)
@@ -270,17 +275,11 @@ async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> lis
     for r in rows:
         raw = r.get("raw_payload") or {}
         logged_ids.update(str(v) for v in (r.get("source_event_id"), raw.get("messageId"), raw.get("callId")) if v)
-        at = _parse_dt(r.get("started_at"))
-        if r.get("contact_id") == contact_id and at:
-            timed.append(((r.get("direction") or "").lower(), at))
+        if r.get("contact_id") == contact_id:
+            timed.append(r)
 
     def logged(call) -> bool:
-        if call["ghl_message_id"] in logged_ids:
-            return True
-        at, direction = _parse_dt(call["started_at"]), (call.get("direction") or "").lower()
-        return any(
-            abs((at - t).total_seconds()) <= SAME_CALL_SECONDS and (not d or not direction or d == direction)
-            for d, t in timed)
+        return call["ghl_message_id"] in logged_ids or any(is_same_call(call, r) for r in timed)
 
     return [c for c in calls if not logged(c)]
 
