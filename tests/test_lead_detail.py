@@ -39,6 +39,7 @@ async def test_bare_contact_renders_nulls(mock_db):
     await _seed_contact(mock_db)
     r = await build_lead_detail(mock_db, USER, "c1")
     assert r["contact"]["name"] == "Ann Lee"
+    assert isinstance(r["ghl"], str)  # opportunities source status
     assert r["contact"]["group_name"] == "Group One"
     assert r["opportunities"] == []
     assert r["attribution"] is None

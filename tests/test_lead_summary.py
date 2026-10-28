@@ -19,6 +19,7 @@ from core.database import DB_NAME
 USER, CID = "u1", "c1"
 
 DETAIL = {
+    "ghl": "ok",
     "contact": {"id": CID, "name": "Ada Lovelace", "group_name": "Acme Dental", "date_added": "2026-10-01",
                 "source": "Facebook", "tags": [], "location_id": "loc1", "type": "lead"},
     "opportunities": [{"pipeline_name": "Sales", "stage_name": "Booked", "status": "open", "monetary_value": 900}],
@@ -85,6 +86,20 @@ def test_brief_truncates_and_caps():
     assert "ev24" in brief and "ev25" not in brief
     assert brief.count("Body:") == 20 and "d29" in brief and "d9;" not in brief
     assert "b" * 301 not in brief
+
+
+def test_brief_labels_business_and_deal_status():
+    brief = ls.build_summary_input(
+        {"contact": {"name": "Ada", "group_name": "Glow Test Clinic"},
+         "opportunities": [{"pipeline_name": "Sales", "stage_name": "Won", "status": "won"}]}, None, None)
+    assert "Business: Glow Test Clinic" in brief and "Client:" not in brief
+    assert "Deal status: won" in brief
+
+
+def test_prompt_frames_lead_as_business_prospect_and_handles_closed_deals():
+    p = ls.SYSTEM_PROMPT
+    assert "prospect of that business" in p and "never say \"we\"" in p
+    assert "won or lost" in p and "do not suggest selling steps for a won deal" in p
 
 
 def test_hash_is_stable_sha256():
@@ -234,13 +249,87 @@ async def test_expired_lease_is_reclaimed(env):
     assert out["status"] == "ok" and env.create.await_count == 1
 
 
+async def _own_contact(env):
+    await env.db["ghl_contacts"].insert_one({"user_id": USER, "contact_data": {"id": CID}})
+
+
+async def _hold_lease(env, token="other"):
+    await env.db["lead_summaries"].update_one(
+        {"contact_id": CID}, {"$set": {"generating_until": datetime.utcnow() + timedelta(seconds=20),
+                                       "lease_id": token}})
+
+
 async def test_live_lease_returns_generating_with_cached(env):
     await ls.get_lead_summary(env.db, USER, CID)
-    await env.db["lead_summaries"].update_one(
-        {"contact_id": CID}, {"$set": {"generating_until": datetime.utcnow() + timedelta(seconds=20)}})
-    out = await ls.get_lead_summary(env.db, USER, CID, refresh=True)
-    assert out["status"] == "generating" and out["summary"] == "Ada came from a Facebook ad."
+    await _own_contact(env)
+    await _hold_lease(env)
+    for refresh in (False, True):
+        out = await ls.get_lead_summary(env.db, USER, CID, refresh=refresh)
+        assert out["status"] == "generating" and out["summary"] == "Ada came from a Facebook ad."
     assert env.create.await_count == 1
+
+
+async def test_live_lease_skips_all_gathering(env):
+    await ls.get_lead_summary(env.db, USER, CID)
+    await _own_contact(env)
+    await _hold_lease(env)
+    for m in (env.detail, env.journey, env.messages):
+        m.reset_mock()
+    await ls.get_lead_summary(env.db, USER, CID)
+    env.detail.assert_not_called()
+    env.journey.assert_not_called()
+    env.messages.assert_not_called()
+
+
+async def test_live_lease_for_foreign_contact_is_none(env):
+    await ls.get_lead_summary(env.db, USER, CID)
+    await _hold_lease(env)  # no ghl_contacts row for this user
+    assert await ls.get_lead_summary(env.db, USER, CID) is None
+
+
+async def test_cancelled_generation_releases_lease(env):
+    env.create.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await ls.get_lead_summary(env.db, USER, CID)
+    doc = await env.db["lead_summaries"].find_one({"contact_id": CID})
+    assert "generating_until" not in doc and "lease_id" not in doc
+
+
+async def test_release_is_owner_scoped(env):
+    coll = env.db["lead_summaries"]
+    await coll.insert_one({"user_id": USER, "contact_id": CID, "lease_id": "B",
+                           "generating_until": datetime.utcnow() + timedelta(seconds=20)})
+    await ls._release(coll, {"user_id": USER, "contact_id": CID}, "A", {"summary": "stale write"})
+    doc = await coll.find_one({"contact_id": CID})
+    assert doc["lease_id"] == "B" and "generating_until" in doc and "summary" not in doc
+
+
+async def test_model_call_is_time_boxed(env, monkeypatch):
+    monkeypatch.setattr(ls, "OPENAI_TIMEOUT_SECONDS", 0.05)
+
+    async def hang(*a, **k):
+        await asyncio.sleep(1)
+    env.create.side_effect = hang
+    out = await ls.get_lead_summary(env.db, USER, CID)
+    assert out["status"] == "failed"
+    doc = await env.db["lead_summaries"].find_one({"contact_id": CID})
+    assert "generating_until" not in doc
+
+
+async def test_detail_builder_exception_is_failed(env):
+    env.detail.side_effect = RuntimeError("mongo down")
+    assert (await ls.get_lead_summary(env.db, USER, CID))["status"] == "failed"
+    env.create.assert_not_called()
+
+
+async def test_detail_ghl_fallback_and_partial_messages_are_degraded(env):
+    await ls.get_lead_summary(env.db, USER, CID)
+    env.detail.return_value = {**DETAIL, "ghl": "unavailable",
+                               "opportunities": [{"pipeline_name": "Other", "status": "open"}]}
+    assert (await ls.get_lead_summary(env.db, USER, CID))["stale"] is False
+    env.detail.return_value = DETAIL
+    env.messages.return_value = {"status": "ok", "partial": True, "messages": []}
+    assert (await ls.get_lead_summary(env.db, USER, CID))["stale"] is False
 
 
 async def test_model_failure_clears_lease(env):
@@ -267,19 +356,34 @@ async def test_openai_client_has_no_retries(env):
 async def test_cache_write_failure_still_meters_and_returns_ok(env, monkeypatch):
     real = ls._release
 
-    async def flaky(coll, key, extra_set=None):
+    async def flaky(coll, key, token, extra_set=None):
         if extra_set:
             raise RuntimeError("write down")
-        return await real(coll, key, extra_set)
+        return await real(coll, key, token, extra_set)
     monkeypatch.setattr(ls, "_release", flaky)
     out = await ls.get_lead_summary(env.db, USER, CID)
     assert out["status"] == "ok" and env.usage.await_count == 1
 
 
-async def test_cache_read_failure_is_failed_not_500(env, monkeypatch):
-    async def boom(coll):
-        raise RuntimeError("db")
-    monkeypatch.setattr(ls, "_index_ready", False)
-    monkeypatch.setattr(ls, "_ensure_index", boom)
-    assert (await ls.get_lead_summary(env.db, USER, CID))["status"] == "failed"
+async def test_cache_read_failure_is_failed_not_500(env):
+    class Boom:
+        async def create_index(self, *a, **k):
+            pass
+
+        async def find_one(self, *a, **k):
+            raise RuntimeError("db")
+
+    class FakeDb:
+        def __getitem__(self, name):
+            return Boom()
+    assert (await ls.get_lead_summary(FakeDb(), USER, CID))["status"] == "failed"
     env.create.assert_not_called()
+    env.detail.assert_not_called()
+
+
+async def test_index_failure_is_logged_and_does_not_block(env, monkeypatch):
+    async def boom(coll):
+        raise RuntimeError("dupes")
+    monkeypatch.setattr(ls, "_ensure_index", boom)
+    assert (await ls.get_lead_summary(env.db, USER, CID))["status"] == "ok"
+    assert ls._index_ready is True

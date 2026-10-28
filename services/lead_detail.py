@@ -230,7 +230,7 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
         return None
     contact = doc.get("contact_data") or {}
 
-    (_, opps), calls, attribution, stages = await asyncio.gather(
+    (opp_status, opps), calls, attribution, stages = await asyncio.gather(
         _opportunities_within_budget(db, user_id, doc, contact),
         _calls(db, user_id, contact),
         _attribution(db, user_id, doc, contact),
@@ -238,6 +238,7 @@ async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
     )
 
     return {
+        "ghl": opp_status,  # "ok" when the opportunities came live from GHL
         "contact": {
             "id": contact.get("id"),
             "name": _contact_name(contact),

@@ -16,6 +16,7 @@ Never logs the brief, the summary or any lead data.
 import asyncio
 import hashlib
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from openai import AsyncOpenAI
@@ -40,11 +41,14 @@ MAX_MESSAGES = 20
 MAX_MESSAGE_CHARS = 300
 
 SYSTEM_PROMPT = (
-    "You summarise one sales lead for a marketing agency. Write 2–4 sentences in British "
-    "English, plain text, no lists or headings. Cover where the lead came from, how they've "
-    "engaged (calls, messages, bookings), and how ready they look to buy, ending with the "
-    "clearest next step if one is obvious. Use only facts in the brief; never invent names, "
-    "prices, times or outcomes. If the brief is thin, say so briefly."
+    "You summarise one lead for the business named in the brief (\"Business\"). The lead is a "
+    "prospect of that business, not of the marketing agency that runs its ads: refer to the "
+    "business by name and never say \"we\", \"our\" or \"our agency\". Write 2–4 sentences in "
+    "British English, plain text, no lists or headings. Cover where the lead came from, how "
+    "they've engaged (calls, messages, bookings) and where they stand with the business. If a "
+    "deal's status is won or lost, say so plainly and do not suggest selling steps for a won "
+    "deal; otherwise end with the clearest next step if one is obvious. Use only facts in the "
+    "brief; never invent names, prices, times or outcomes. If the brief is thin, say so briefly."
 )
 
 
@@ -84,7 +88,7 @@ def build_summary_input(detail: dict, journey: dict | None, messages: dict | Non
 
     lead = _line(
         ("Name", contact.get("name")),
-        ("Client", contact.get("group_name")),
+        ("Business", contact.get("group_name")),
         ("Created", contact.get("date_added")),
         ("Source", contact.get("source")),
         ("Type", contact.get("type")),
@@ -109,7 +113,7 @@ def build_summary_input(detail: dict, journey: dict | None, messages: dict | Non
         sections.append("ATTRIBUTION\n" + origin)
 
     opps = [_line(("Pipeline", o.get("pipeline_name")), ("Stage", o.get("stage_name")),
-                  ("Status", o.get("status")), ("Value", o.get("monetary_value")),
+                  ("Deal status", o.get("status")), ("Value", o.get("monetary_value")),
                   ("Changed", o.get("last_status_change_at") or o.get("last_stage_change_at")))
             for o in detail.get("opportunities") or []]
     opps = [o for o in opps if o]
@@ -192,7 +196,7 @@ async def _gather_inputs(db, user_id: str, contact_id: str):
     if isinstance(journey, BaseException):
         logger.warning("lead summary: journey unavailable (%s)", type(journey).__name__)
         journey = None
-    degraded = journey is None or journey.get("ghl") != "ok"
+    degraded = journey is None or journey.get("ghl") != "ok" or detail.get("ghl") != "ok"
 
     location_id = (detail.get("contact") or {}).get("location_id")
     messages = None
@@ -204,6 +208,8 @@ async def _gather_inputs(db, user_id: str, contact_id: str):
         if (messages or {}).get("status") != "ok":
             messages = None
             degraded = True
+        elif messages.get("partial"):
+            degraded = True  # one channel didn't answer
     return detail, journey, messages, degraded
 
 
@@ -226,7 +232,7 @@ def _utcnow():
     return datetime.now(timezone.utc).replace(tzinfo=None)  # Mongo stores naive UTC
 
 
-async def _claim(coll, key: dict) -> dict | None:
+async def _claim(coll, key: dict, token: str) -> dict | None:
     """The doc (after claiming) if we now hold the generation lease, else None."""
     now = _utcnow()
     try:
@@ -234,43 +240,73 @@ async def _claim(coll, key: dict) -> dict | None:
             {**key, "$or": [{"generating_until": {"$exists": False}},
                             {"generating_until": None},
                             {"generating_until": {"$lt": now}}]},
-            {"$set": {"generating_until": now + timedelta(seconds=LEASE_SECONDS)}},
+            {"$set": {"generating_until": now + timedelta(seconds=LEASE_SECONDS), "lease_id": token}},
             upsert=True, return_document=ReturnDocument.AFTER)
     except DuplicateKeyError:  # the doc exists and someone else holds the lease
         return None
 
 
-async def _release(coll, key: dict, extra_set: dict | None = None):
-    update = {"$unset": {"generating_until": ""}}
+async def _release(coll, key: dict, token: str, extra_set: dict | None = None):
+    """Release (and optionally write) only while we still own the lease."""
+    update = {"$unset": {"generating_until": "", "lease_id": ""}}
     if extra_set:
         update["$set"] = extra_set
-    await coll.update_one(key, update)
+    await coll.update_one({**key, "lease_id": token}, update)
+
+
+def _lease_live(doc) -> bool:
+    until = (doc or {}).get("generating_until")
+    return isinstance(until, datetime) and until > _utcnow()
 
 
 async def get_lead_summary(db, user_id: str, contact_id: str, *, refresh: bool = False) -> dict | None:
     """None when the contact isn't the user's; else the status payload
     {"status": ok|blocked|unavailable|failed|generating, "summary", "generated_at", "stale"}.
     "generating": another request holds the lease; nothing was charged here."""
-    detail, journey, messages, degraded = await _gather_inputs(db, user_id, contact_id)
+    global _index_ready
+    key = {"user_id": user_id, "contact_id": contact_id}
+    coll = db[COLLECTION]
+
+    if not _index_ready:
+        try:
+            await _ensure_index(coll)
+        except Exception as e:
+            # Keep serving; without the unique index the claim is weaker.
+            logger.error("lead summary: index creation failed, continuing without it (%s)",
+                         type(e).__name__)
+            _index_ready = True
+    try:
+        cached = await coll.find_one(key)
+    except Exception as e:
+        logger.warning("lead summary: cache read failed (%s)", type(e).__name__)
+        return _payload("failed", None)
+
+    if _lease_live(cached):
+        # Someone is writing it: answer without any GHL work, after an ownership check.
+        try:
+            owned = await db["ghl_contacts"].find_one(
+                {"user_id": user_id, "contact_data.id": contact_id}, {"_id": 1})
+        except Exception as e:
+            logger.warning("lead summary: ownership check failed (%s)", type(e).__name__)
+            return _payload("failed", cached)
+        if not owned:
+            return None
+        return _payload("generating", cached)
+
+    try:
+        detail, journey, messages, degraded = await _gather_inputs(db, user_id, contact_id)
+    except Exception as e:
+        logger.warning("lead summary: inputs failed (%s)", type(e).__name__)
+        return _payload("failed", cached)
     if detail is None:
         return None
 
     brief = build_summary_input(detail, journey, messages)
     current = input_hash(brief)
-    key = {"user_id": user_id, "contact_id": contact_id}
-    coll = db[COLLECTION]
 
     def stale_for(doc):
         # An unknown state (GHL didn't answer) is not "new activity".
         return bool(doc) and not degraded and doc.get("input_hash") != current
-
-    try:
-        if not _index_ready:
-            await _ensure_index(coll)
-        cached = await coll.find_one(key)
-    except Exception as e:
-        logger.warning("lead summary: cache read failed (%s)", type(e).__name__)
-        return _payload("failed", None)
 
     if cached and cached.get("summary") and not refresh:
         return _payload("ok", cached, stale_for(cached))
@@ -281,33 +317,38 @@ async def get_lead_summary(db, user_id: str, contact_id: str, *, refresh: bool =
     if not OPENAI_API_KEY:
         return _payload("unavailable", cached, stale_for(cached))
 
+    token = uuid.uuid4().hex
     try:
-        claimed = await _claim(coll, key)
+        claimed = await _claim(coll, key, token)
     except Exception as e:
         logger.warning("lead summary: claim failed (%s)", type(e).__name__)
         return _payload("failed", cached, stale_for(cached))
     if claimed is None:
         return _payload("generating", cached, stale_for(cached))
 
+    released = False
     try:
         if not refresh and claimed.get("summary"):
             # Someone finished between our read and our claim.
-            await _release(coll, key)
+            await _release(coll, key, token)
+            released = True
             return _payload("ok", claimed, stale_for(claimed))
 
         try:
-            text, usage = await _generate(brief)
+            text, usage = await asyncio.wait_for(_generate(brief), OPENAI_TIMEOUT_SECONDS)
             if not text:
                 raise ValueError("empty summary")
         except Exception as e:
             logger.warning("lead summary generation failed (%s)", type(e).__name__)
-            await _release(coll, key)
+            await _release(coll, key, token)
+            released = True
             return _payload("failed", cached, stale_for(cached))
 
         doc = {"summary": text, "generated_at": datetime.now(timezone.utc),
                "input_hash": current, "model": LEAD_SUMMARY_MODEL}
         try:
-            await _release(coll, key, doc)
+            await _release(coll, key, token, doc)
+            released = True
         except Exception as e:
             logger.warning("lead summary: cache write failed (%s)", type(e).__name__)
 
@@ -327,8 +368,10 @@ async def get_lead_summary(db, user_id: str, contact_id: str, *, refresh: bool =
         return _payload("ok", doc)
     except Exception as e:
         logger.warning("lead summary failed (%s)", type(e).__name__)
-        try:
-            await _release(coll, key)
-        except Exception:
-            pass
         return _payload("failed", cached, stale_for(cached))
+    finally:
+        if not released:
+            try:
+                await asyncio.shield(_release(coll, key, token))
+            except BaseException:
+                pass
