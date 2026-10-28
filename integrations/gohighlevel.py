@@ -974,6 +974,70 @@ class GHLIntegration:
             logger.error("Failed to fetch pipelines for location %s: %s", location_id, e, exc_info=True)
             return False, []
 
+    async def export_messages(
+            self,
+            location_id: str,
+            access_token: str,
+            contact_id: str,
+            channel: Optional[str] = None,
+            cursor: Optional[str] = None,
+    ) -> Tuple[int, Dict]:
+        """One page of a contact's messages (GET /conversations/messages/export).
+
+        Returns (status_code, body); status 0 on network error/timeout.
+        Without `channel` GHL returns all non-email channels; pass "Email" for email.
+        """
+        url = "https://services.leadconnectorhq.com/conversations/messages/export"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-04-15",
+            "Accept": "application/json",
+        }
+        params = {
+            "locationId": location_id,
+            "contactId": contact_id,
+            "limit": 500,
+            "sortBy": "createdAt",
+            "sortOrder": "asc",
+        }
+        if channel:
+            params["channel"] = channel
+        if cursor:
+            params["cursor"] = cursor
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.get(url, headers=headers, params=params)
+            if resp.status_code != 200:
+                logger.warning("GHL messages export returned %s for location %s", resp.status_code, location_id)
+                return resp.status_code, {}
+            return 200, resp.json() or {}
+        except Exception as e:
+            logger.error("Failed to export messages for location %s: %s", location_id, type(e).__name__)
+            return 0, {}
+
+    async def send_message(self, access_token: str, payload: dict) -> Tuple[int, Dict]:
+        """Send an SMS/Email (POST /conversations/messages).
+
+        Returns (status_code, body); status 0 on network error/timeout.
+        """
+        url = "https://services.leadconnectorhq.com/conversations/messages"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Version": "2021-04-15",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, headers=headers, json=payload)
+            if not 200 <= resp.status_code < 300:
+                logger.warning("GHL send message returned %s", resp.status_code)
+                return resp.status_code, {}
+            return resp.status_code, resp.json() or {}
+        except Exception as e:
+            logger.error("Failed to send GHL message: %s", type(e).__name__)
+            return 0, {}
+
     async def fetch_opportunity_stats(
             self,
             location_id: str,
