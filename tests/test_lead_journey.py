@@ -360,3 +360,61 @@ async def test_token_fetched_once_for_both_live_calls(mock_db, ghl, monkeypatch)
     assert len(calls) == 1
     ghl[0].assert_awaited_once()
     ghl[1].assert_awaited_once()
+
+
+async def test_slow_ghl_degrades_to_unavailable_with_stored_opportunities(mock_db, ghl, monkeypatch):
+    import asyncio
+
+    async def slow(*a, **k):
+        await asyncio.sleep(5)
+        return 200, []
+
+    monkeypatch.setattr(lj.lead_detail, "GHL_BUDGET_SECONDS", 0.05)
+    ghl[1].side_effect = slow
+    await _seed(mock_db, {"opportunities": [{"id": "stored", "status": "open",
+                                             "createdAt": "2026-07-11T00:00:00Z"}]})
+    j = await asyncio.wait_for(build_lead_journey(mock_db, USER, "c1"), 2)
+    assert j["ghl"] == "unavailable"
+    assert [e["id"] for e in _by_kind(j, "stage")] == ["opp:stored:created"]
+    assert _by_kind(j, "appointment") == []
+
+
+async def test_appointment_status_field(mock_db, ghl):
+    await _seed(mock_db)
+    ghl[1].return_value = (200, [
+        {"id": "a1", "appointmentStatus": "confirmed", "dateAdded": "2026-07-11T08:00:00Z"},
+        {"id": "a2", "appointmentStatus": "cancelled", "dateAdded": "2026-07-11T09:00:00Z"},
+        {"id": "a3", "appointmentStatus": "no_show", "dateAdded": "2026-07-11T10:00:00Z"}])
+    got = {e["id"]: e["appointment_status"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "appointment")}
+    assert got == {"appt:a1": "booked", "appt:a2": "cancelled", "appt:a3": "noshow"}
+
+
+async def test_meta_event_ad_name_from_group_cache(mock_db, ghl):
+    await _seed(mock_db)
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": USER,
+        "facebook_cache": {"entities": {"ads": [{"id": "ad9", "name": "Cached Ad"}]}}})
+    await mock_db["facebook_leads"].insert_many([
+        {"user_id": USER, "client_group_id": "g1", "match_keys": ["email:ann@x.com"],
+         "lead_data": {"ad_id": "ad9", "platform": "fb", "created_time": "2026-07-10T08:00:00+0000"}},
+        {"user_id": USER, "client_group_id": "g1", "match_keys": ["email:ann@x.com"],
+         "lead_data": {"ad_id": "nope", "platform": "ig", "created_time": "2026-07-09T08:00:00+0000"}}])
+    details = [e["detail"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "conversion")]
+    assert details == ["Meta Ads · Cached Ad", "Instagram"]
+
+
+async def test_idless_opportunities_get_distinct_event_ids(mock_db, ghl):
+    await _seed(mock_db)
+    ghl[0].return_value = (200, [{"status": "open", "createdAt": "2026-07-11T00:00:00Z"},
+                                 {"status": "open", "createdAt": "2026-07-12T00:00:00Z"}])
+    ids = [e["id"] for e in _by_kind(await build_lead_journey(mock_db, USER, "c1"), "stage")]
+    assert sorted(ids) == ["opp:0:created", "opp:1:created"]
+
+
+async def test_infinite_call_duration_does_not_raise(mock_db, ghl):
+    await _seed(mock_db)
+    await mock_db["call_logs"].insert_one(
+        {"user_id": USER, "contact_id": "c1", "direction": "outbound", "status": "completed",
+         "duration_seconds": float("inf"), "started_at": datetime(2026, 7, 11, 10, 0)})
+    (e,) = _by_kind(await build_lead_journey(mock_db, USER, "c1"), "call")
+    assert e["title"] == "Outbound completed" and "duration_seconds" not in e

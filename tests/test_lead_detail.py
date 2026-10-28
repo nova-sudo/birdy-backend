@@ -205,14 +205,42 @@ async def test_newest_meta_lead_wins(mock_db):
 
 
 @pytest.mark.asyncio
-async def test_no_stage_lookup_without_opportunities(mock_db, monkeypatch):
+async def test_no_stage_lookup_without_location(mock_db, monkeypatch):
     async def _boom(*a, **k):
         raise AssertionError("stage_lookup must not be called")
 
     monkeypatch.setattr("services.lead_detail.stage_lookup", _boom)
     await _seed_contact(mock_db)
+    await mock_db["ghl_contacts"].update_one({"user_id": USER}, {"$unset": {"location_id": ""}})
     r = await build_lead_detail(mock_db, USER, "c1")
     assert r["opportunities"] == []
+
+
+@pytest.mark.asyncio
+async def test_slow_ghl_falls_back_to_stored_opportunities(mock_db, monkeypatch):
+    import asyncio
+
+    async def _slow(*a, **k):
+        await asyncio.sleep(5)
+        return "ok", [{"id": "live"}]
+
+    async def _slow_stages(*a, **k):
+        await asyncio.sleep(5)
+        return {"s1": {"stage_name": "X", "pipeline_id": "p", "pipeline_name": "P"}}
+
+    monkeypatch.setattr(lead_detail, "GHL_BUDGET_SECONDS", 0.05)
+    monkeypatch.setattr("services.lead_detail.live_opportunities", _slow)
+    monkeypatch.setattr("services.lead_detail.stage_lookup", _slow_stages)
+    await _seed_contact(mock_db, {"opportunities": [
+        {"id": "stored", "pipelineStageId": "s1", "status": "open", "monetaryValue": 5}]})
+    r = await asyncio.wait_for(build_lead_detail(mock_db, USER, "c1"), 2)
+    assert [o["id"] for o in r["opportunities"]] == ["stored"]
+
+
+@pytest.mark.asyncio
+async def test_parse_dt_out_of_range_number_is_none():
+    assert lead_detail._parse_dt(1e18) is None
+    assert lead_detail._parse_dt(float("inf")) is None
 
 
 def _live(monkeypatch, status, rows=()):

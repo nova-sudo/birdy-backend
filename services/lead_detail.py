@@ -10,13 +10,17 @@ from utils.phone_normalize import compute_match_keys, normalize_phone
 
 
 ANSWERED = {"completed", "answered"}
+GHL_BUDGET_SECONDS = 3.0  # overall cap on live GHL work before a page falls back to stored data
 
 
 def _parse_dt(value):
     if isinstance(value, datetime):
         return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
     if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value / 1000 if value > 1e11 else value, tz=timezone.utc)
+        try:
+            return datetime.fromtimestamp(value / 1000 if value > 1e11 else value, tz=timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
     if isinstance(value, str) and value.strip():
         try:
             dt = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
@@ -204,18 +208,34 @@ async def resolve_opportunities(db, user_id: str, doc: dict, contact: dict, **li
     return (status, live) if status == "ok" else (status, stored)
 
 
+async def _opportunities_within_budget(db, user_id: str, doc: dict, contact: dict):
+    try:
+        return await asyncio.wait_for(resolve_opportunities(db, user_id, doc, contact), GHL_BUDGET_SECONDS)
+    except asyncio.TimeoutError:
+        return "unavailable", [o for o in contact.get("opportunities") or [] if isinstance(o, dict)]
+
+
+async def _stages_within_budget(db, user_id: str, location_id):
+    if not location_id:
+        return {}
+    try:
+        return await asyncio.wait_for(stage_lookup(db, user_id, location_id), GHL_BUDGET_SECONDS)
+    except asyncio.TimeoutError:
+        return {}
+
+
 async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
     doc = await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
     if not doc:
         return None
     contact = doc.get("contact_data") or {}
 
-    (_, opps), calls, attribution = await asyncio.gather(
-        resolve_opportunities(db, user_id, doc, contact),
+    (_, opps), calls, attribution, stages = await asyncio.gather(
+        _opportunities_within_budget(db, user_id, doc, contact),
         _calls(db, user_id, contact),
         _attribution(db, user_id, doc, contact),
+        _stages_within_budget(db, user_id, doc.get("location_id")),  # only needs the location
     )
-    stages = await stage_lookup(db, user_id, doc.get("location_id")) if (opps and doc.get("location_id")) else {}
 
     return {
         "contact": {
