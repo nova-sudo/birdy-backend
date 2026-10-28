@@ -731,6 +731,45 @@ def _creative_fields(creative: dict) -> dict:
     }
 
 
+async def fetch_ad_identity(ad_id: str, access_token: str) -> dict | None:
+    """One ad's names and creative straight from Meta, for ads the stored
+    cache doesn't hold (older or since-removed from the cached window).
+
+    Best-effort and bounded: any failure returns None, and the token is never
+    logged. Callers treat the result as gap-filling only.
+    """
+    if not ad_id or not access_token:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=4.0) as client:
+            resp = await client.get(
+                f"https://graph.facebook.com/v25.0/{ad_id}",
+                params={
+                    "fields": f"name,adset{{id,name}},campaign{{id,name}},{_ADS_CREATIVE_FIELDS}",
+                    "access_token": access_token,
+                },
+            )
+        if resp.status_code != 200:
+            logger.warning("Ad lookup HTTP %s for ad %s", resp.status_code, ad_id)
+            return None
+        data = resp.json()
+        if not isinstance(data, dict):
+            return None
+        adset = data.get("adset") or {}
+        campaign = data.get("campaign") or {}
+        return {
+            "name": data.get("name"),
+            "adset_id": adset.get("id"),
+            "adset_name": adset.get("name"),
+            "campaign_id": campaign.get("id"),
+            "campaign_name": campaign.get("name"),
+            **_creative_fields(data.get("creative")),
+        }
+    except Exception as e:
+        logger.warning("Ad lookup failed for ad %s (%s)", ad_id, type(e).__name__)
+        return None
+
+
 def _classify_meta_error(status_code: int, body: str) -> str | None:
     """
     Return "auth", "rate_limit", or None. Shared error classification for

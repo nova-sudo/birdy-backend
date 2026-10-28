@@ -333,3 +333,192 @@ async def test_live_ok_but_empty_replaces_stored_opportunities(mock_db, monkeypa
     _live(monkeypatch, "ok", [])  # GHL is the source of truth
     await _seed_contact(mock_db, STORED)
     assert (await build_lead_detail(mock_db, USER, "c1"))["opportunities"] == []
+
+
+# --- live ad lookup / platform / submitted fallbacks -------------------------
+
+_SRC = {"adId": "a9", "campaign": "C", "campaignId": "k9", "utmContent": "utm-ad", "utmMedium": "utm-set",
+        "utmSource": "facebook", "medium": "facebook", "sessionSource": "Paid Social"}
+_LIVE = {"name": "Live Ad", "adset_id": "s9", "adset_name": "Live Set", "campaign_id": "k9",
+         "campaign_name": "Live Camp", "creative_title": "T", "creative_body": "Live body",
+         "creative_image": "https://cdn/img", "creative_thumbnail": "https://cdn/thumb",
+         "creative_video_id": ""}
+
+
+@pytest.fixture
+def live_calls(monkeypatch):
+    """Stub the Meta token + lookup; never touches the network."""
+    calls = []
+    state = {"token": {"access_token": "tok"}, "result": dict(_LIVE)}
+
+    async def _token(user_id, client):
+        return state["token"]
+
+    async def _fetch(ad_id, access_token):
+        calls.append(ad_id)
+        if isinstance(state["result"], Exception):
+            raise state["result"]
+        return state["result"]
+
+    monkeypatch.setattr("services.lead_detail.get_facebook_token", _token)
+    monkeypatch.setattr("services.lead_detail.fetch_ad_identity", _fetch)
+    return calls, state
+
+
+@pytest.mark.asyncio
+async def test_uncached_ad_creative_fetched_live(mock_db, live_calls):
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == ["a9"]
+    assert a["creative_image"] == "https://cdn/img"
+    assert a["creative_body"] == "Live body"
+    # lead/source names keep priority over live ones
+    assert a["ad_name"] == "Live Ad"  # no lead_data or cache name; live beats UTM
+    assert a["campaign_id"] == "k9"
+
+
+@pytest.mark.asyncio
+async def test_cached_creative_skips_live_lookup(mock_db, live_calls):
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": USER,
+        "facebook_cache": {"entities": {"ads": [{"id": "a9", "name": "Cached", "creative_image": "img"}]}}})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == []
+    assert a["ad_name"] == "Cached"
+    assert a["creative_image"] == "img"
+
+
+@pytest.mark.asyncio
+async def test_live_lookup_cached_for_a_day(mock_db, live_calls):
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await build_lead_detail(mock_db, USER, "c1")
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == ["a9"]
+    assert a["creative_image"] == "https://cdn/img"
+
+
+@pytest.mark.asyncio
+async def test_stale_live_lookup_refetched(mock_db, live_calls):
+    from datetime import timedelta
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await mock_db["meta_ad_lookups"].insert_one({
+        "user_id": USER, "ad_id": "a9", "data": {"creative_image": "old"},
+        "fetched_at": datetime.now(timezone.utc) - timedelta(hours=25)})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == ["a9"]
+    assert a["creative_image"] == "https://cdn/img"
+
+
+@pytest.mark.asyncio
+async def test_live_failure_leaves_fields_unchanged(mock_db, live_calls):
+    _, state = live_calls
+    state["result"] = None
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["ad_name"] == "utm-ad"
+    assert not a["creative_image"] and not a["creative_body"]
+
+
+@pytest.mark.asyncio
+async def test_failed_lookup_not_retried_for_an_hour(mock_db, live_calls):
+    calls, state = live_calls
+    state["result"] = None
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await build_lead_detail(mock_db, USER, "c1")
+    await build_lead_detail(mock_db, USER, "c1")
+    assert calls == ["a9"]
+
+
+@pytest.mark.asyncio
+async def test_failed_lookup_retried_after_an_hour(mock_db, live_calls):
+    from datetime import timedelta
+    calls, _ = live_calls
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    await mock_db["meta_ad_lookups"].insert_one({
+        "user_id": USER, "ad_id": "a9", "data": None,
+        "fetched_at": datetime.now(timezone.utc) - timedelta(minutes=61)})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == ["a9"]
+    assert a["creative_image"] == "https://cdn/img"
+
+
+@pytest.mark.asyncio
+async def test_live_exception_leaves_fields_unchanged(mock_db, live_calls):
+    _, state = live_calls
+    state["result"] = RuntimeError("boom")
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["ad_name"] == "utm-ad"
+    assert not a["creative_image"]
+
+
+@pytest.mark.asyncio
+async def test_slow_live_lookup_bounded(mock_db, live_calls, monkeypatch):
+    import asyncio
+
+    async def _slow(ad_id, access_token):
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr("services.lead_detail.fetch_ad_identity", _slow)
+    monkeypatch.setattr("services.lead_detail._AD_LOOKUP_TIMEOUT", 0.05)
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["ad_name"] == "utm-ad"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", [None, {}, {"access_token": ""}])
+async def test_no_meta_token_means_no_live_call(mock_db, live_calls, token):
+    calls, state = live_calls
+    state["token"] = token
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert calls == []
+    assert a["ad_name"] == "utm-ad"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("src,expected", [
+    ({"utmSource": "facebook"}, "meta"),
+    ({"utmSource": "fb"}, "meta"),
+    ({"medium": "Facebook"}, "meta"),
+    ({"utmSource": "Instagram"}, "ig"),
+    ({"utmSource": "ig"}, "ig"),
+    ({"adSource": "instagram_reels", "medium": "facebook"}, "ig"),
+    ({"sessionSource": "Paid Social", "adId": "a1"}, "meta"),
+    ({"sessionSource": "Paid Social"}, None),
+    ({"utmSource": "google", "adId": "a1"}, None),
+    ({"utmSource": "newsfbeed"}, None),
+])
+async def test_platform_derived_without_meta_lead(mock_db, live_calls, src, expected):
+    await _seed_contact(mock_db, {"attributionSource": {"campaign": "C", **src}})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["platform"] == expected
+
+
+@pytest.mark.asyncio
+async def test_meta_lead_platform_not_overridden(mock_db, live_calls):
+    await _seed_contact(mock_db, {"attributionSource": {"utmSource": "instagram"}})
+    await _seed_lead(mock_db, lead_data={"ad_id": "a1", "platform": "fb",
+                                         "created_time": "2026-07-17T10:00:00+0000"})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["platform"] == "fb"
+    assert a["submitted_at"].startswith("2026-07-17")
+
+
+@pytest.mark.asyncio
+async def test_submitted_falls_back_to_date_added(mock_db, live_calls):
+    await _seed_contact(mock_db, {"attributionSource": _SRC, "dateAdded": "2026-07-01T09:30:00.000Z"})
+    a = (await build_lead_detail(mock_db, USER, "c1"))["attribution"]
+    assert a["submitted_at"].startswith("2026-07-01T09:30:00")
+
+
+@pytest.mark.asyncio
+async def test_submitted_none_without_date_added(mock_db, live_calls):
+    await _seed_contact(mock_db, {"attributionSource": _SRC})
+    assert (await build_lead_detail(mock_db, USER, "c1"))["attribution"]["submitted_at"] is None

@@ -1,11 +1,13 @@
 """Assemble the single-lead detail payload from data Birdy already stores."""
 import asyncio
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from services.contact_classifier import classify_contact_type
 from services.ghl_live import live_opportunities
+from integrations.facebook_utils.facebook import get_facebook_token
 from services.ghl_pipelines import stage_lookup
+from services.meta_service import fetch_ad_identity
 from utils.phone_normalize import compute_match_keys, normalize_phone
 
 
@@ -86,6 +88,60 @@ def _form_answers(field_data) -> list[dict]:
     return answers
 
 
+_AD_LOOKUP_TTL = timedelta(hours=24)  # Meta CDN creative URLs are signed and expire
+_AD_LOOKUP_MISS_TTL = timedelta(hours=1)  # don't re-wait on Meta every view for an ad it can't return
+_AD_LOOKUP_TIMEOUT = 4.0
+
+
+def _has_creative(ad: dict) -> bool:
+    return any(ad.get(k) for k in ("creative_image", "creative_thumbnail", "creative_body"))
+
+
+async def _lookup_ad(db, user_id: str, ad_id: str) -> dict:
+    """Live Meta identity + creative for an ad the cache lacks; {} on any miss."""
+    try:
+        cached = await db["meta_ad_lookups"].find_one({"user_id": user_id, "ad_id": ad_id})
+        fetched = _parse_dt((cached or {}).get("fetched_at"))
+        if cached and fetched:
+            ttl = _AD_LOOKUP_TTL if cached.get("data") else _AD_LOOKUP_MISS_TTL
+            if datetime.now(timezone.utc) - fetched < ttl:
+                return cached.get("data") or {}
+
+        async def _live():
+            token = await get_facebook_token(user_id, db.client)
+            access_token = (token or {}).get("access_token")
+            if not access_token:
+                return None
+            return await fetch_ad_identity(ad_id, access_token)
+
+        try:
+            data = await asyncio.wait_for(_live(), timeout=_AD_LOOKUP_TIMEOUT)
+        except asyncio.TimeoutError:
+            data = None
+        await db["meta_ad_lookups"].update_one(
+            {"user_id": user_id, "ad_id": ad_id},
+            {"$set": {"data": data or None, "fetched_at": datetime.now(timezone.utc)}},
+            upsert=True,
+        )
+        return data or {}
+    except Exception:
+        return {}
+
+
+def _platform_from_source(src: dict) -> str | None:
+    for key in ("utmSource", "medium", "adSource"):
+        v = str(src.get(key) or "").strip().lower()
+        if "instagram" in v or v == "ig":
+            return "ig"
+    for key in ("utmSource", "medium", "adSource"):
+        v = str(src.get(key) or "").strip().lower()
+        if "facebook" in v or v == "fb":
+            return "meta"
+    if str(src.get("sessionSource") or "").strip().lower() == "paid social" and src.get("adId"):
+        return "meta"
+    return None
+
+
 async def _attribution(db, user_id: str, doc: dict, contact: dict):
     keys = doc.get("match_keys") or compute_match_keys(contact.get("email"), contact.get("phone"))
     meta = None
@@ -105,27 +161,31 @@ async def _attribution(db, user_id: str, doc: dict, contact: dict):
     if doc.get("client_group_id"):
         group = await db["client_groups"].find_one({"id": doc["client_group_id"], "user_id": user_id})
     ad = _find_entity(group, "ads", ad_id)
-    adset_id = ld.get("adset_id") or ad.get("adset_id")
-    campaign_id = ld.get("campaign_id") or src.get("campaignId") or ad.get("campaign_id")
+    live = {}
+    if ad_id and not _has_creative(ad):
+        live = await _lookup_ad(db, user_id, str(ad_id))
+    adset_id = ld.get("adset_id") or ad.get("adset_id") or live.get("adset_id")
+    campaign_id = ld.get("campaign_id") or src.get("campaignId") or ad.get("campaign_id") or live.get("campaign_id")
     adset = _find_entity(group, "adsets", adset_id)
     campaign = _find_entity(group, "campaigns", campaign_id)
 
     created = ld.get("created_time")
     parsed = _parse_dt(created)
     submitted_at = _iso(parsed) if parsed else created
+    if not meta and not submitted_at:
+        added = _parse_dt(contact.get("dateAdded"))
+        submitted_at = _iso(added) if added else None
 
     return {
-        "platform": ld.get("platform"),
+        "platform": ld.get("platform") or (None if meta else _platform_from_source(src)),
         "is_organic": ld.get("is_organic"),
         "ad_id": str(ad_id) if ad_id else None,
-        "ad_name": ld.get("ad_name") or ad.get("name") or src.get("utmContent") or None,
-        "adset_name": ld.get("adset_name") or adset.get("name") or src.get("utmMedium") or None,
-        "campaign_name": ld.get("campaign_name") or campaign.get("name") or src.get("campaign") or None,
+        "ad_name": ld.get("ad_name") or ad.get("name") or live.get("name") or src.get("utmContent") or None,
+        "adset_name": ld.get("adset_name") or adset.get("name") or live.get("adset_name") or src.get("utmMedium") or None,
+        "campaign_name": ld.get("campaign_name") or campaign.get("name") or live.get("campaign_name") or src.get("campaign") or None,
         "campaign_id": campaign_id or None,
-        "creative_title": ad.get("creative_title"),
-        "creative_body": ad.get("creative_body"),
-        "creative_image": ad.get("creative_image"),
-        "creative_thumbnail": ad.get("creative_thumbnail"),
+        **{k: ad.get(k) or live.get(k)
+           for k in ("creative_title", "creative_body", "creative_image", "creative_thumbnail")},
         "submitted_at": submitted_at,
         "form_answers": _form_answers(ld.get("field_data")),
         "utm": {
