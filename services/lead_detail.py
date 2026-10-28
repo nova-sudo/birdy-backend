@@ -169,7 +169,7 @@ async def _calls(db, user_id: str, contact: dict) -> list[dict]:
         if "transcript" in r:
             row["transcript"] = r["transcript"]
         out.append(row)
-    out.sort(key=lambda c: c["_sort"], reverse=True)
+    out.sort(key=lambda c: (c["_sort"], c["id"]), reverse=True)
     for c in out:
         del c["_sort"]
     return out

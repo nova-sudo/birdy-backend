@@ -14,7 +14,7 @@ GET  /api/leads/contact/{contact_id}/journey
     Newest-first timeline of the lead (services/lead_journey.py); 404 unknown lead.
 GET  /api/leads/contact/{contact_id}/summary
     Cached AI summary (generated on first view); POST regenerates it.
-    200 {status: ok|blocked|unavailable|failed, summary, generated_at, stale}; 404 unknown lead.
+    200 {status: ok|blocked|unavailable|failed|generating, summary, generated_at, stale}; 404 unknown lead.
 POST /api/leads/contact/{contact_id}/messages
     Send an SMS or email to the lead. 201 {"message": ...}; 404 unknown lead;
     422 missing subject/phone/email; 409 reconnect GHL; 502 GHL failure.

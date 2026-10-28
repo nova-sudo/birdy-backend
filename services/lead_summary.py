@@ -16,9 +16,11 @@ Never logs the brief, the summary or any lead data.
 import asyncio
 import hashlib
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from openai import AsyncOpenAI
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from ai.config import LEAD_SUMMARY_MODEL, OPENAI_API_KEY
 from core.database import get_db
@@ -30,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 COLLECTION = "lead_summaries"
 OPENAI_TIMEOUT_SECONDS = 20
+LEASE_SECONDS = 30
 MAX_JOURNEY_EVENTS = 25
 MAX_CALLS = 5
 MAX_TRANSCRIPT_CHARS = 600
@@ -45,11 +48,19 @@ SYSTEM_PROMPT = (
 )
 
 
+_index_ready = False
+
+
+async def _ensure_index(coll):
+    global _index_ready
+    await coll.create_index([("user_id", 1), ("contact_id", 1)], unique=True)
+    _index_ready = True
+
+
 async def create_lead_summary_indexes(mongo_client):
     """One cached summary per (user, contact). Called from core.indexes."""
     try:
-        await get_db(mongo_client)[COLLECTION].create_index(
-            [("user_id", 1), ("contact_id", 1)], unique=True)
+        await _ensure_index(get_db(mongo_client)[COLLECTION])
     except Exception as e:
         logger.warning(f"Could not create lead_summaries indexes: {e}")
 
@@ -158,43 +169,46 @@ def _iso(value):
     return value.astimezone(timezone.utc).isoformat()
 
 
-def _payload(status: str, cached: dict | None, current_hash: str, stale: bool | None = None) -> dict:
+def _payload(status: str, cached: dict | None, stale: bool = False) -> dict:
     text = (cached or {}).get("summary")
-    if stale is None:
-        stale = bool(cached) and cached.get("input_hash") != current_hash
     return {
         "status": status,
         "summary": text,
         "generated_at": _iso((cached or {}).get("generated_at")) if text else None,
-        "stale": bool(stale),
+        "stale": bool(stale and text),
     }
 
 
 async def _gather_inputs(db, user_id: str, contact_id: str):
-    detail = await build_lead_detail(db, user_id, contact_id)
+    """(detail, journey, messages, degraded). degraded: a live-GHL-backed source
+    didn't answer, so the brief can't be compared reliably with the cached one."""
+    detail, journey = await asyncio.gather(
+        build_lead_detail(db, user_id, contact_id),
+        build_lead_journey(db, user_id, contact_id), return_exceptions=True)
+    if isinstance(detail, BaseException):
+        raise detail
     if detail is None:
-        return None, None, None
-    location_id = (detail.get("contact") or {}).get("location_id")
-
-    async def _messages():
-        if not location_id:
-            return None
-        return await fetch_lead_messages(db, user_id, location_id, contact_id)
-
-    journey, messages = await asyncio.gather(
-        build_lead_journey(db, user_id, contact_id), _messages(), return_exceptions=True)
+        return None, None, None, False
     if isinstance(journey, BaseException):
         logger.warning("lead summary: journey unavailable (%s)", type(journey).__name__)
         journey = None
-    if isinstance(messages, BaseException) or (messages or {}).get("status") != "ok":
-        if isinstance(messages, BaseException):
-            logger.warning("lead summary: messages unavailable (%s)", type(messages).__name__)
-        messages = None
-    return detail, journey, messages
+    degraded = journey is None or journey.get("ghl") != "ok"
+
+    location_id = (detail.get("contact") or {}).get("location_id")
+    messages = None
+    if location_id:
+        try:
+            messages = await fetch_lead_messages(db, user_id, location_id, contact_id)
+        except Exception as e:
+            logger.warning("lead summary: messages unavailable (%s)", type(e).__name__)
+        if (messages or {}).get("status") != "ok":
+            messages = None
+            degraded = True
+    return detail, journey, messages, degraded
 
 
 async def _generate(brief: str):
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS)
+    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=OPENAI_TIMEOUT_SECONDS, max_retries=0)
     resp = await client.chat.completions.create(
         model=LEAD_SUMMARY_MODEL,
         messages=[
@@ -208,50 +222,113 @@ async def _generate(brief: str):
     return text, getattr(resp, "usage", None)
 
 
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)  # Mongo stores naive UTC
+
+
+async def _claim(coll, key: dict) -> dict | None:
+    """The doc (after claiming) if we now hold the generation lease, else None."""
+    now = _utcnow()
+    try:
+        return await coll.find_one_and_update(
+            {**key, "$or": [{"generating_until": {"$exists": False}},
+                            {"generating_until": None},
+                            {"generating_until": {"$lt": now}}]},
+            {"$set": {"generating_until": now + timedelta(seconds=LEASE_SECONDS)}},
+            upsert=True, return_document=ReturnDocument.AFTER)
+    except DuplicateKeyError:  # the doc exists and someone else holds the lease
+        return None
+
+
+async def _release(coll, key: dict, extra_set: dict | None = None):
+    update = {"$unset": {"generating_until": ""}}
+    if extra_set:
+        update["$set"] = extra_set
+    await coll.update_one(key, update)
+
+
 async def get_lead_summary(db, user_id: str, contact_id: str, *, refresh: bool = False) -> dict | None:
     """None when the contact isn't the user's; else the status payload
-    {"status": ok|blocked|unavailable|failed, "summary", "generated_at", "stale"}."""
-    detail, journey, messages = await _gather_inputs(db, user_id, contact_id)
+    {"status": ok|blocked|unavailable|failed|generating, "summary", "generated_at", "stale"}.
+    "generating": another request holds the lease; nothing was charged here."""
+    detail, journey, messages, degraded = await _gather_inputs(db, user_id, contact_id)
     if detail is None:
         return None
 
     brief = build_summary_input(detail, journey, messages)
     current = input_hash(brief)
     key = {"user_id": user_id, "contact_id": contact_id}
-    cached = await db[COLLECTION].find_one(key)
+    coll = db[COLLECTION]
+
+    def stale_for(doc):
+        # An unknown state (GHL didn't answer) is not "new activity".
+        return bool(doc) and not degraded and doc.get("input_hash") != current
+
+    try:
+        if not _index_ready:
+            await _ensure_index(coll)
+        cached = await coll.find_one(key)
+    except Exception as e:
+        logger.warning("lead summary: cache read failed (%s)", type(e).__name__)
+        return _payload("failed", None)
 
     if cached and cached.get("summary") and not refresh:
-        return _payload("ok", cached, current)
+        return _payload("ok", cached, stale_for(cached))
 
     from credits import is_blocked, record_usage
     if await is_blocked(db, user_id):
-        return _payload("blocked", cached, current)
+        return _payload("blocked", cached, stale_for(cached))
     if not OPENAI_API_KEY:
-        return _payload("unavailable", cached, current)
+        return _payload("unavailable", cached, stale_for(cached))
 
     try:
-        text, usage = await _generate(brief)
-        if not text:
-            raise ValueError("empty summary")
+        claimed = await _claim(coll, key)
     except Exception as e:
-        logger.warning("lead summary generation failed (%s)", type(e).__name__)
-        return _payload("failed", cached, current)
-
-    now = datetime.now(timezone.utc)
-    doc = {"summary": text, "generated_at": now, "input_hash": current, "model": LEAD_SUMMARY_MODEL}
-    await db[COLLECTION].update_one(key, {"$set": doc}, upsert=True)
+        logger.warning("lead summary: claim failed (%s)", type(e).__name__)
+        return _payload("failed", cached, stale_for(cached))
+    if claimed is None:
+        return _payload("generating", cached, stale_for(cached))
 
     try:
-        await record_usage(
-            db, user_id,
-            model=LEAD_SUMMARY_MODEL,
-            prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
-            completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
-            model_calls=1,
-            mode="managed",
-            feature="lead_summary",
-        )
-    except Exception:
-        logger.debug("Lead summary credit metering skipped", exc_info=True)
+        if not refresh and claimed.get("summary"):
+            # Someone finished between our read and our claim.
+            await _release(coll, key)
+            return _payload("ok", claimed, stale_for(claimed))
 
-    return _payload("ok", doc, current, stale=False)
+        try:
+            text, usage = await _generate(brief)
+            if not text:
+                raise ValueError("empty summary")
+        except Exception as e:
+            logger.warning("lead summary generation failed (%s)", type(e).__name__)
+            await _release(coll, key)
+            return _payload("failed", cached, stale_for(cached))
+
+        doc = {"summary": text, "generated_at": datetime.now(timezone.utc),
+               "input_hash": current, "model": LEAD_SUMMARY_MODEL}
+        try:
+            await _release(coll, key, doc)
+        except Exception as e:
+            logger.warning("lead summary: cache write failed (%s)", type(e).__name__)
+
+        try:
+            await record_usage(
+                db, user_id,
+                model=LEAD_SUMMARY_MODEL,
+                prompt_tokens=getattr(usage, "prompt_tokens", 0) or 0,
+                completion_tokens=getattr(usage, "completion_tokens", 0) or 0,
+                model_calls=1,
+                mode="managed",
+                feature="lead_summary",
+            )
+        except Exception:
+            logger.debug("Lead summary credit metering skipped", exc_info=True)
+
+        return _payload("ok", doc)
+    except Exception as e:
+        logger.warning("lead summary failed (%s)", type(e).__name__)
+        try:
+            await _release(coll, key)
+        except Exception:
+            pass
+        return _payload("failed", cached, stale_for(cached))
