@@ -36,6 +36,10 @@ class MessagingUnconfirmed(Exception):
     """Network error, timeout or GHL 5xx: the message may still have been sent."""
 
 
+class RecordingNotFound(Exception):
+    """No such call for this lead, or GHL holds no recording for it."""
+
+
 def channel_for(message_type: str) -> str:
     t = (message_type or "").upper()
     if t == "TYPE_RCS" or "SMS" in t:
@@ -59,10 +63,60 @@ def _plain_text(body: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(text)).strip()
 
 
+# Real calls. Voicemail drops and manual call tasks are not dials.
+CALL_TYPES = {"TYPE_CALL", "TYPE_IVR_CALL", "TYPE_CUSTOM_CALL", "TYPE_CAMPAIGN_CALL"}
+# Within this many seconds, a GHL call and a webhook-logged call are one call.
+SAME_CALL_SECONDS = 60
+
+
+def _is_call(raw: dict) -> bool:
+    """Any call-like row: kept out of the messages either way."""
+    mtype = (raw.get("messageType") or "").upper()
+    return "CALL" in mtype or "VOICEMAIL" in mtype
+
+
+def _is_real_call(raw: dict) -> bool:
+    return (raw.get("messageType") or "").upper() in CALL_TYPES
+
+
+def _call_meta(raw: dict):
+    """(status, duration_seconds) from either meta shape GHL sends."""
+    meta = raw.get("meta") if isinstance(raw.get("meta"), dict) else {}
+    call = meta.get("call") if isinstance(meta.get("call"), dict) else {}
+    # Not the message's own `status`: that is delivery ("delivered"), not the call outcome.
+    status = call.get("status") or meta.get("callStatus") or None
+    duration = call.get("duration", meta.get("callDuration"))
+    try:
+        duration = int(float(duration)) if duration not in (None, "") else None
+    except (TypeError, ValueError):
+        duration = None
+    return status, duration
+
+
+def _normalize_call(raw: dict):
+    """A GHL call message in the shape of a call_logs row (plus ghl_message_id)."""
+    if not raw.get("id"):
+        return None
+    status, duration = _call_meta(raw)
+    dt = _parse_dt(raw.get("dateAdded") or raw.get("createdAt"))
+    if not dt:
+        return None
+    return {
+        "id": f"ghl:{raw['id']}",
+        "ghl_message_id": raw["id"],
+        "source": "ghl",
+        "direction": raw.get("direction"),
+        "status": status,
+        "duration_seconds": duration,
+        "started_at": dt.astimezone(timezone.utc).isoformat(),
+        "recording_url": None,
+    }
+
+
 def _normalize(raw: dict):
     mtype = (raw.get("messageType") or "").upper()
-    if "CALL" in mtype or "VOICEMAIL" in mtype:
-        return None  # calls already come from call_logs
+    if _is_call(raw):
+        return None  # returned separately as calls
     if mtype.startswith("TYPE_ACTIVITY_") or mtype in NON_MESSAGE_TYPES or not raw.get("id"):
         return None
     channel = channel_for(mtype)
@@ -108,7 +162,9 @@ def _sort_key(message: dict):
 
 
 async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) -> dict:
-    """{"status": ok|reconnect|unavailable, "messages": [...]}. Never raises.
+    """{"status": ok|reconnect|unavailable, "messages": [...], "calls": [...]}. Never raises.
+
+    "calls" are the GHL call messages not already in call_logs, oldest first.
 
     "ok" may carry partial=True (one channel call failed) and truncated=True
     (page cap hit; oldest messages omitted).
@@ -116,36 +172,178 @@ async def fetch_lead_messages(db, user_id: str, location_id, contact_id: str) ->
     try:
         token = await _token_for(db, user_id, location_id)
         if not token:
-            return {"status": "unavailable", "messages": []}
+            return {"status": "unavailable", "messages": [], "calls": []}
 
         results = await asyncio.gather(
             _export_all(token, location_id, contact_id, None),
             _export_all(token, location_id, contact_id, "Email"),
         )
         if any(code in (401, 403) for code, _, _ in results):
-            return {"status": "reconnect", "messages": []}
+            return {"status": "reconnect", "messages": [], "calls": []}
         good = [r for r in results if r[0] == 200]
         if not good:
-            return {"status": "unavailable", "messages": []}
+            return {"status": "unavailable", "messages": [], "calls": []}
 
-        seen, messages = set(), []
+        seen, messages, calls = set(), [], []
         for _, rows, _ in good:
             for r in rows:
-                m = _normalize(r) if isinstance(r, dict) else None
-                if m is None or m["id"] in seen:
+                if not isinstance(r, dict) or r.get("id") in seen:
+                    continue
+                if _is_call(r):
+                    c = _normalize_call(r) if _is_real_call(r) else None
+                    if c:
+                        seen.add(r["id"])
+                        calls.append(c)
+                    continue
+                m = _normalize(r)
+                if m is None:
                     continue
                 seen.add(m["id"])
                 messages.append(m)
         messages.sort(key=_sort_key)
+        calls = await _without_logged(db, user_id, contact_id, calls)
+        calls.sort(key=lambda c: _parse_dt(c["started_at"]))
         return {
             "status": "ok",
             "messages": messages,
+            "calls": calls,
             "partial": len(good) < len(results),
             "truncated": any(t for _, _, t in good),
         }
     except Exception as e:
         logger.warning("fetch_lead_messages failed for location %s: %s", location_id, type(e).__name__)
-        return {"status": "unavailable", "messages": []}
+        return {"status": "unavailable", "messages": [], "calls": []}
+
+
+async def _without_logged(db, user_id: str, contact_id: str, calls: list) -> list:
+    """Drop GHL calls a workflow webhook already put in call_logs (shown from there).
+
+    Webhook bodies are user-configured, so the stored id may not be the GHL
+    message id: match the id fields we keep, else the same direction within
+    SAME_CALL_SECONDS on this contact.
+    """
+    if not calls:
+        return calls
+    ids = [c["ghl_message_id"] for c in calls]
+    try:
+        rows = await db["call_logs"].find(
+            {"user_id": user_id, "source": "ghl", "$or": [
+                {"source_event_id": {"$in": ids}},
+                {"raw_payload.messageId": {"$in": ids}},
+                {"raw_payload.callId": {"$in": ids}},
+                {"contact_id": contact_id},
+            ]},
+            {"source_event_id": 1, "raw_payload.messageId": 1, "raw_payload.callId": 1,
+             "contact_id": 1, "direction": 1, "started_at": 1},
+        ).to_list(None)
+    except Exception as e:
+        logger.warning("call_logs de-duplication failed: %s", type(e).__name__)
+        return calls
+
+    logged_ids, timed = set(), []
+    for r in rows:
+        raw = r.get("raw_payload") or {}
+        logged_ids.update(str(v) for v in (r.get("source_event_id"), raw.get("messageId"), raw.get("callId")) if v)
+        at = _parse_dt(r.get("started_at"))
+        if r.get("contact_id") == contact_id and at:
+            timed.append(((r.get("direction") or "").lower(), at))
+
+    def logged(call) -> bool:
+        if call["ghl_message_id"] in logged_ids:
+            return True
+        at, direction = _parse_dt(call["started_at"]), (call.get("direction") or "").lower()
+        return any(
+            abs((at - t).total_seconds()) <= SAME_CALL_SECONDS and (not d or not direction or d == direction)
+            for d, t in timed)
+
+    return [c for c in calls if not logged(c)]
+
+
+def _sniff_audio(data: bytes):
+    if data[:4] == b"RIFF" and data[8:12] == b"WAVE":
+        return "audio/wav"
+    if data[:3] == b"ID3" or (len(data) > 1 and data[0] == 0xFF and data[1] & 0xE0 == 0xE0):
+        return "audio/mpeg"
+    if data[:4] == b"OggS":
+        return "audio/ogg"
+    if data[4:8] == b"ftyp":
+        return "audio/mp4"
+    return None
+
+
+async def _owned_call(token: str, location_id: str, contact_id: str, message_id: str) -> None:
+    """Raise unless message_id is a call on this contact in this location."""
+    code, message = await ghl_integration.get_message(token, message_id)
+    if code in (401, 403):
+        raise MessagingReconnect()
+    if code in (400, 404, 422):
+        raise RecordingNotFound()
+    if code != 200:
+        raise MessagingFailed()
+    if (message.get("contactId") != contact_id
+            or (message.get("locationId") and message.get("locationId") != location_id)
+            or not _is_real_call(message)):
+        raise RecordingNotFound()
+
+
+async def _call_token(db, user_id: str, location_id) -> str:
+    try:
+        token = await _token_for(db, user_id, location_id)
+    except Exception as e:
+        logger.warning("call token lookup failed for location %s: %s", location_id, type(e).__name__)
+        raise MessagingFailed()
+    if not token:
+        raise MessagingUnavailable()
+    return token
+
+
+async def fetch_call_recording(db, user_id: str, location_id, contact_id: str, message_id: str):
+    """(audio, content_type) for a GHL call on this lead.
+
+    Raises MessagingUnavailable / MessagingReconnect / RecordingNotFound / MessagingFailed.
+    """
+    token = await _call_token(db, user_id, location_id)
+    await _owned_call(token, location_id, contact_id, message_id)
+    code, audio, content_type = await ghl_integration.fetch_call_recording(location_id, token, message_id)
+    if code in (401, 403):
+        raise MessagingReconnect()
+    if code in (400, 404, 422) or (code == 200 and not audio):
+        raise RecordingNotFound()
+    if code != 200:  # includes RECORDING_TOO_LARGE
+        raise MessagingFailed()
+    if not content_type.startswith("audio/"):
+        # GHL may label the file generically; the browser needs a real audio type.
+        content_type = _sniff_audio(audio)
+        if not content_type:
+            raise MessagingFailed()
+    return audio, content_type
+
+
+def _sentence_index(value) -> float:
+    """GHL documents sentenceIndex as a number but examples send strings."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("inf")
+
+
+async def fetch_call_transcript(db, user_id: str, location_id, contact_id: str, message_id: str):
+    """The call's transcript as text, or None when GHL has none.
+
+    Raises MessagingUnavailable / MessagingReconnect / RecordingNotFound / MessagingFailed.
+    """
+    token = await _call_token(db, user_id, location_id)
+    await _owned_call(token, location_id, contact_id, message_id)
+    code, sentences = await ghl_integration.fetch_call_transcription(location_id, token, message_id)
+    if code in (401, 403):
+        raise MessagingReconnect()
+    if code in (400, 404, 422):
+        return None
+    if code != 200:
+        raise MessagingFailed()
+    rows = [s for s in sentences if isinstance(s, dict) and str(s.get("transcript") or "").strip()]
+    rows.sort(key=lambda s: _sentence_index(s.get("sentenceIndex")))
+    return "\n".join(str(s["transcript"]).strip() for s in rows) or None
 
 
 async def send_lead_message(db, user_id: str, location_id, contact_id: str, channel: str,
