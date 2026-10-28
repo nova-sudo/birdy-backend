@@ -23,7 +23,7 @@ from integrations.hotprospector import (
     get_hotprospector_leads_from_collection,
     get_client_group_mapping,
 )
-from services.hp_service import fetch_and_cache_hp_call_center, _in_window
+from services.hp_service import claim_hp_live_refresh, fetch_and_cache_hp_call_center, _in_window
 from services.hp_members import get_member_dashboard_range
 
 logger = logging.getLogger(__name__)
@@ -33,6 +33,8 @@ router = APIRouter()
 # On-demand freshness: when a single client is opened and its cache is older than
 # this, refetch inline. The hp-tick cron refreshes everything daily in the background.
 HP_CALL_CENTER_TTL = 6 * 3600  # 6 hours
+# The Sales-Hub request's live refresh (recent calls) gives up after this.
+HP_LIVE_BUDGET_SECONDS = float(os.getenv("HP_LIVE_BUDGET_SECONDS", "20"))
 
 
 # ------------------------------------------------------------------
@@ -742,10 +744,11 @@ async def get_hp_call_center(
     Leads-with-call-logs for the Sales-Hub "Leads" tab, read from the
     hotprospector_leads cache.
 
-    - location_id given   → one client (GHL location). Cache-first: if its
-      last_hp_refresh is within HP_CALL_CENTER_TTL we serve from cache, otherwise
-      we fetch fresh (SearchByUserInput + bulk FetchUserCallLog) first.
-      ?refresh=true forces it.
+    - location_id given   → one client (GHL location). Cache-first: if it was
+      refreshed within the TTL we serve from cache. Otherwise one request pulls
+      the last few days of calls first (mode="live") while any others are served
+      the cache; a client never synced in full gets the full sync.
+      ?refresh=true forces a full sync.
     - location_id omitted → all of the user's locations (no on-demand fetch; the
       hp-tick cron keeps them fresh daily).
 
@@ -775,10 +778,11 @@ async def get_hp_call_center(
             if location_id:
                 group = await client_groups_collection.find_one(
                     {"user_id": current_user, "ghl_location_id": location_id},
-                    projection={"last_hp_refresh": 1, "hp_backfill_status": 1},
-                )
-                last_refresh = group.get("last_hp_refresh") if group else None
-                backfilled = (group or {}).get("hp_backfill_status") == "complete"
+                    projection={"id": 1, "last_hp_refresh": 1, "last_hp_live_refresh": 1, "hp_backfill_status": 1},
+                ) or {}
+                stamps = [group.get("last_hp_refresh"), group.get("last_hp_live_refresh")]
+                last_refresh = max((s for s in stamps if s), default=None)
+                backfilled = group.get("hp_backfill_status") == "complete"
                 # Windows that include today/yesterday get a short TTL (near real-time);
                 # purely historical windows use the long TTL.
                 window_has_recent = (not end_date) or end_date >= date.today().isoformat()
@@ -788,7 +792,24 @@ async def get_hp_call_center(
                     and not refresh
                     and (datetime.utcnow() - last_refresh).total_seconds() < ttl
                 )
-                if not is_fresh:
+                if not is_fresh and backfilled and not refresh:
+                    # Only the last few days of calls, by one request at a time;
+                    # the rest are served the cache straight away. A full sync
+                    # pages every lead under HotProspector's rate limit — minutes
+                    # for a big client — so that is hp-tick's job.
+                    if await claim_hp_live_refresh(
+                        client_groups_collection, group.get("id"), current_user, datetime.utcnow(),
+                    ):
+                        try:
+                            await fetch_and_cache_hp_call_center(
+                                current_user, location_id, mongo_client,
+                                mode="live", time_budget=HP_LIVE_BUDGET_SECONDS,
+                            )
+                        finally:
+                            await client_groups_collection.update_one(
+                                {"id": group.get("id")}, {"$unset": {"_hp_live_claimed_at": ""}},
+                            )
+                elif not is_fresh:
                     await fetch_and_cache_hp_call_center(
                         current_user, location_id, mongo_client,
                         mode="incremental" if backfilled else "backfill",

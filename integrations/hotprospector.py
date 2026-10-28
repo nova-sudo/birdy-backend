@@ -175,8 +175,10 @@ class HotProspectorIntegration:
         self.base_url = HOTPROSPECTOR_CONFIG["base_url"]
         self._semaphore = asyncio.Semaphore(HOTPROSPECTOR_CONFIG["max_concurrent_requests"])
         # Cumulative 429-backoff seconds spent by THIS instance (one group's sync),
-        # capped at _HP_MAX_TOTAL_BACKOFF so a burst of rate limits can't run for minutes.
+        # capped at max_backoff so a burst of rate limits can't run for minutes.
+        # A caller with less time (a page request) lowers max_backoff.
         self._backoff_used = 0.0
+        self.max_backoff = _HP_MAX_TOTAL_BACKOFF
 
     # ── v2 Bearer-token management (shared across instances) ─────────────────
     async def _token_lock(self) -> asyncio.Lock:
@@ -454,7 +456,7 @@ class HotProspectorIntegration:
                     delay = min(float(delay) if delay else 60.0, _HP_MAX_429_WAIT)
                     jitter = delay * _HP_JITTER_FRACTION * (2 * random.random() - 1)
                     delay = max(1.0, delay + jitter)
-                    if self._backoff_used + delay > _HP_MAX_TOTAL_BACKOFF:
+                    if self._backoff_used + delay > self.max_backoff:
                         logger.warning(
                             f"HP 429 on '{payload.get('Method')}' but backoff budget "
                             f"exhausted ({self._backoff_used:.0f}s used) — giving up to "
