@@ -90,6 +90,14 @@ GHL_INCREMENTAL_OVERLAP_MINUTES = 15
 # considered crashed and may be retried.
 GHL_STALE_CLAIM_MINUTES = 10
 
+# A group whose sync failed waits this long before the tick claims it again.
+# A failure leaves last_ghl_refresh untouched, so without a wait the failing
+# group stays the oldest due one and is claimed first on every tick. In Oct
+# 2026 two locations GHL had deactivated ("Location is not active") took both
+# GHL_GROUPS_PER_TICK slots every minute for a week, and the other 51 groups
+# never refreshed.
+GHL_FAILURE_BACKOFF_HOURS = 6
+
 # HotProspector refresh — Sales-Hub call-center data. The FIRST sync per group is a
 # full history backfill; every refresh after that is the cheap incremental mode (only
 # re-pulls the last few days of calls), so a sub-daily cadence is fine. Default 12h,
@@ -389,7 +397,14 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                                 {"ghl_refresh_status": {"$ne": "running"}},
                                 {"_ghl_claimed_at": {"$lt": stale_lock_before}},
                             ]
-                        }
+                        },
+                        # Not inside a failure back-off (GHL_FAILURE_BACKOFF_HOURS).
+                        {
+                            "$or": [
+                                {"_ghl_retry_after": None},
+                                {"_ghl_retry_after": {"$lte": now}},
+                            ]
+                        },
                     ],
                 },
                 {
@@ -432,7 +447,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                     stamps["last_ghl_full_refresh"] = finished
                 await client_groups.update_one(
                     {"id": group_id},
-                    {"$set": stamps, "$unset": {"_ghl_claimed_at": ""}},
+                    {"$set": stamps, "$unset": {"_ghl_claimed_at": "", "_ghl_retry_after": ""}},
                 )
                 logger.info(
                     "[ghl-tick] OK '%s' (%s: %s new, %s updated, %s pruned)",
@@ -450,6 +465,7 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                         "$set": {
                             "ghl_refresh_status": "error",
                             "ghl_refresh_error": err,
+                            "_ghl_retry_after": datetime.utcnow() + timedelta(hours=GHL_FAILURE_BACKOFF_HOURS),
                         },
                         "$unset": {"_ghl_claimed_at": ""},
                     },
