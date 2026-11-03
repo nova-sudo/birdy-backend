@@ -9,6 +9,7 @@ client's own account currency.
 from datetime import date, datetime, timedelta
 
 from ai.agents.snapshot import AdDay, AdState, load_ad_days
+from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _history_state
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_zones
 from ai.agents.stock.windows import Window
 
@@ -75,7 +76,10 @@ def totals(days: dict[str, list[AdDay]], start: date, end: date) -> dict[str, tu
 
 async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
     """Everything a card needs about one client. `zones` is None when the client has no usable
-    limits: zone and decision are then "no_zones" and nothing is judged, so the run can flag it."""
+    limits: zone and decision are then "no_zones" and nothing is judged, so the run can flag it.
+    Rows are only trusted once history has synced past the window's end. Before that a day with
+    no row may just be a day not read yet, so nothing is judged either: zone is "no_data" and
+    decision is "no_history" (never fully synced) or "data_late" (synced, but not through the end)."""
     settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
     gid, currency = group.get("id"), group.get("ad_account_currency")
     user_id = agent.get("user_id") or group.get("user_id")
@@ -88,9 +92,11 @@ async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
     prev_spend, prev_leads = sum(s for s, _ in prev.values()), sum(l for _, l in prev.values())
     cur_cpl, prev_cpl = cpl(spend, leads), cpl(prev_spend, prev_leads)
 
-    # A day with no row is a day with no spend.
+    history_state = await _history_state(db, gid, window.end, group.get(ACCOUNT_TZ_FIELD))
+
+    # On ready history, a day with no row is a day with no spend.
     recent = totals(days, window.end - timedelta(days=SPEND_STOPPED_DAYS - 1), window.end)
-    spend_stopped = (spend + prev_spend) > 0 and sum(s for s, _ in recent.values()) <= 0
+    spend_stopped = history_state == "ready" and (spend + prev_spend) > 0 and sum(s for s, _ in recent.values()) <= 0
 
     state = {d["ad_id"]: d async for d in db["meta_ad_state"].find({"client_group_id": gid})}
     live = {a: s for a, s in state.items()
@@ -106,10 +112,12 @@ async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
                         "prev_start": window.prev_start.isoformat(), "prev_end": window.prev_end.isoformat()},
              "spend": spend, "leads": leads, "cpl": cur_cpl,
              "prev_spend": prev_spend, "prev_leads": prev_leads, "prev_cpl": prev_cpl,
-             "ads_live": len(live), "ads": ads, "spend_stopped": spend_stopped,
+             "ads_live": len(live), "ads": ads, "spend_stopped": spend_stopped, "history_state": history_state,
              "zones": None if zones is None else {"green_under": zones.green_under, "red_over": zones.red_over}}
     if zones is None:
         return {**facts, "zone": "no_zones", "decision": "no_zones"}
+    if history_state != "ready":
+        return {**facts, "zone": "no_data", "decision": "data_late" if history_state == "late" else "no_history"}
     z = zone(spend, leads, zones)
     major = settings["creative"]["major_downtrend_pct"]
     return {**facts, "zone": z, "decision": decide(z, prev_cpl, cur_cpl, spend_stopped, major)}
@@ -147,13 +155,13 @@ def follow_ups(card: dict, ad_states: dict[str, AdState], ad_days: dict[str, lis
     back are ok when the ad is live and has spent since the card's date, Remove is ok when the ad
     is off. A flagged Add has no ad id (people create the ad), so it is found by name, and if it
     isn't there yet it shows ok None, "not done yet". Additional changes can't be checked by code
-    (ok None, shown as Check by hand). Lines never applied, and every line of a dismissed card,
-    are skipped."""
+    (ok None, shown as Check by hand). Lines never applied, and every line of a dismissed or
+    superseded card, are skipped."""
     from ai.agents.stock.candidates import normalise_name  # candidates imports this module
 
     since = _card_day(card)
     out = []
-    for line in [] if card.get("status") == "dismissed" else card.get("lines") or []:
+    for line in [] if card.get("status") in ("dismissed", "superseded") else card.get("lines") or []:
         kind, state = line.get("kind"), line.get("state")
         if state not in ("applied", "flagged") or kind not in ("add", "remove", "revive"):
             continue

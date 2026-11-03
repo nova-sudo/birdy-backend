@@ -102,6 +102,7 @@ async def claim(db, now: datetime, n: int) -> list[dict]:
     not_backing_off = {"$or": [{"retry_at": None}, {"retry_at": {"$lte": now}}]}
     in_flight = {"status": {"$in": [STATUS_PENDING, STATUS_RUNNING]}}
     due_later = {"$or": [
+        {"status": STATUS_READY, "topup_requested_at": {"$ne": None}},
         {"status": STATUS_READY, **_older_than("last_topup_at", now - TOPUP_EVERY)},
         {"status": STATUS_READY, **_older_than("state_refreshed_at", now - STATE_REFRESH_EVERY)},
         {"status": STATUS_ERROR, **_older_than("updated_at", now - HISTORY_ERROR_RETRY)},
@@ -126,6 +127,18 @@ async def claim(db, now: datetime, n: int) -> list[dict]:
             if won is not None:
                 claimed.append(won)
     return claimed
+
+
+async def request_topups(db, gids: list[str]) -> list[str]:
+    """Ask the sync pass to top these clients up on its next tick, without waiting out
+    TOPUP_EVERY. Only a ready doc can be asked (a doc in error has its own retry). Returns the
+    gids asked, which are the ones worth waiting for."""
+    if not gids:
+        return []
+    ready = [d["_id"] async for d in db[HISTORY].find({"_id": {"$in": list(gids)}, "status": STATUS_READY}, {"_id": 1})]
+    if ready:
+        await db[HISTORY].update_many({"_id": {"$in": ready}}, {"$set": {"topup_requested_at": datetime.utcnow()}})
+    return ready
 
 
 async def release(db, gid: str, **fields) -> None:

@@ -505,3 +505,9 @@ def test_no_topup_alert_when_not_prepaid_or_unset_and_check_failed_stays_for_unu
     s = {**DEFAULT_SETTINGS, "clients": {GID: {"prepaid": {"is_prepay_account": True, "topups": [{"amount": 1}]}}}}
     codes = _codes(_run(settings=s, account_spend={}))
     assert "check_failed" in codes and "prepaid_no_topups" not in codes
+
+
+async def test_run_alerts_remembers_the_accounts_timezone(mock_db, graph):
+    agent = await _seed(mock_db, gids=("g1",))
+    await run_alerts(mock_db, agent, _token, NOW, ["g1"])
+    assert (await mock_db["client_groups"].find_one({"id": "g1"}))["ad_account_timezone"] == "Europe/London"

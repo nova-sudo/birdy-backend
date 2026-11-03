@@ -2,7 +2,8 @@
 ai/agents/stock/alerts.py
 -------------------------
 The stock agent's daily alert check (spec section 6, Alerts). Pure detection in `health_alerts`,
-reads in `fetch_account_health` and `run_alerts`. Alerts are always Flag: they never change
+reads in `fetch_account_health` and `run_alerts`, which also remembers each account's timezone on
+its client group for the checks that follow. Alerts are always Flag: they never change
 anything in Meta, never use AI and never go through `resolve_mode`.
 
 Prepaid is an estimate from top-ups the agency entered. Meta's `balance` is the bill due, not
@@ -32,6 +33,7 @@ _DISABLE_REASONS = {1: "ads integrity policy", 2: "ad account violation", 3: "ri
                     7: "pending risk review", 8: "pending settlement", 9: "in grace period",
                     10: "temporarily unavailable", 11: "pending closure"}
 _NO_SPEND_DAYS = 2
+ACCOUNT_TZ_FIELD = "ad_account_timezone"  # on client_groups: Meta's timezone_name, set by run_alerts
 
 
 async def fetch_account_health(ad_account_id: str, token: str) -> dict:
@@ -422,6 +424,9 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
             continue
 
         await _prefill_prepaid(db, agent, gid, health.get("is_prepay_account"))
+        if health.get("timezone_name") and group.get(ACCOUNT_TZ_FIELD) != health["timezone_name"]:
+            await db["client_groups"].update_one({"id": gid, "user_id": user_id},
+                                                 {"$set": {ACCOUNT_TZ_FIELD: health["timezone_name"]}})
         cfg = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
         window_days = cfg["creative"]["data_window_days"]
         end = last_full_day(now_utc, health.get("timezone_name"))

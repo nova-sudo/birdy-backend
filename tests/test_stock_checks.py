@@ -2,6 +2,7 @@ from datetime import date, datetime, timezone
 
 import pytest
 
+from agent_history_helpers import seed_history
 from ai.agents.snapshot import AdDay, AdState
 from ai.agents.stock.checks import client_facts, cpl, decide, follow_ups, zone
 from ai.agents.stock.settings import DEFAULT_SETTINGS, Zones
@@ -10,6 +11,12 @@ from ai.agents.store import AD_DAYS
 
 NOW = datetime(2026, 11, 3, 7, tzinfo=timezone.utc)
 WIN = full_day_window(NOW, "UTC")  # 2026-10-27..11-02, previous 10-20..10-26
+
+
+@pytest.fixture(autouse=True)
+async def _synced(mock_db):
+    """g1's ad history is usable and synced after the window's last day."""
+    await seed_history(mock_db, "g1", last_topup_at=datetime(2026, 11, 3, 2))
 
 
 def test_cpl():
@@ -171,3 +178,35 @@ def test_follow_ups_flagged_add_not_there_yet_is_not_a_cross():
 def test_follow_ups_applied_add_with_missing_ad_is_still_a_cross():
     line = {"id": "f", "kind": "add", "ad_name": "Clip", "meta_ids": {"ad_id": "gone"}, "state": "applied"}
     assert follow_ups(_fcard(line), {}, {})[0]["ok"] is False
+
+
+@pytest.mark.parametrize("seed,decision", [
+    ({"last_topup_at": datetime(2026, 11, 2, 20)}, "data_late"),             # synced before the day ended
+    ({"status": "running", "last_topup_at": None}, "no_history"),            # still backfilling
+])
+async def test_spend_stopped_needs_ready_history(mock_db, seed, decision):
+    await seed_history(mock_db, "g1", **seed)
+    await _day(mock_db, "a1", "2026-10-28", 60, 6)  # nothing newer: reads as stopped on stale rows
+    f = await client_facts(mock_db, _agent(), GROUP, WIN)
+    assert f["spend_stopped"] is False and f["decision"] == decision and f["zone"] == "no_data"
+
+
+async def test_no_zones_wins_over_late_data(mock_db):
+    await seed_history(mock_db, "g1", last_topup_at=datetime(2026, 11, 2, 20))
+    f = await client_facts(mock_db, _agent(), {**GROUP, "ad_account_currency": "USD"}, WIN)
+    assert f["decision"] == "no_zones"
+
+
+async def test_history_is_judged_in_the_accounts_timezone(mock_db):
+    # 23:30 UTC on 2 Nov is already 3 Nov in Dubai, so 2 Nov is complete there.
+    await seed_history(mock_db, "g1", last_topup_at=datetime(2026, 11, 2, 23, 30))
+    group = {**GROUP, "ad_account_timezone": "Asia/Dubai"}
+    assert (await client_facts(mock_db, _agent(), group, WIN))["decision"] != "data_late"
+    assert (await client_facts(mock_db, _agent(), GROUP, WIN))["decision"] == "data_late"
+
+
+def test_follow_ups_skip_superseded_cards():
+    states = {"o1": _state("o1", "PAUSED")}
+    line = {"id": "l1", "kind": "remove", "state": "flagged", "meta_ids": ["o1"], "ad_name": "o1"}
+    assert follow_ups(_fcard(line), states, {}) != []
+    assert follow_ups(_fcard(line, status="superseded"), states, {}) == []

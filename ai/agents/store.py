@@ -12,6 +12,8 @@ Collections:
   agent_proposals      rule-change proposals raised from repeated reasons
   agent_jobs           scheduled / queued runs
   agent_ad_days        daily Meta ad rows per (user, client group, ad, day) for the agent
+  agent_runs           the stock agent's daily run state machine (ai/agents/stock/runner.py)
+  agent_cards          the stock agent's client cards, one per client per run
 
 Same per-request Motor pattern as ai/suggestions/store.py: raw dicts, no ODM.
 """
@@ -43,6 +45,8 @@ PRACTICE = "agent_practice"
 PROPOSALS = "agent_proposals"
 JOBS = "agent_jobs"
 AD_DAYS = "agent_ad_days"
+RUNS = "agent_runs"
+CARDS = "agent_cards"
 
 
 TYPE_STOCK = "stock_media_buying"
@@ -146,7 +150,7 @@ async def delete_draft_agent(db, user_id: str, agent_id: str) -> bool:
     res = await db[AGENTS].delete_one({"_id": agent_id, "user_id": user_id, "status": {"$ne": "active"}})
     if res.deleted_count == 0:
         raise AgentActive(agent_id)  # switched on between the read and the delete
-    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS):
+    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS, RUNS, CARDS):
         await db[coll].delete_many({"agent_id": agent_id})
     await claims.release_clients(db, user_id, agent_id)
     return True
@@ -287,5 +291,11 @@ async def create_agent_indexes(mongo_client):
         [("user_id", 1), ("client_group_id", 1), ("ad_id", 1), ("date_start", 1)], unique=True)
     await db[AD_DAYS].create_index([("client_group_id", 1), ("ad_id", 1), ("date_start", 1)])
     await db[JOBS].create_index("created_at", expireAfterSeconds=7 * 24 * 3600)
+    # One scheduled run per agent per day. Previews carry no `scheduled` and don't take the slot.
+    await db[RUNS].create_index([("agent_id", 1), ("local_date", 1)], unique=True, name="agent_daily_run",
+                                partialFilterExpression={"scheduled": True})
+    await db[RUNS].create_index([("agent_id", 1), ("phase", 1)])
+    await db[CARDS].create_index([("run_id", 1), ("client_group_id", 1)], unique=True)
+    await db[CARDS].create_index([("agent_id", 1), ("client_group_id", 1), ("created_at", -1)])
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)

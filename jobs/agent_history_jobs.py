@@ -163,7 +163,7 @@ async def _advance_one(db, mongo_client, doc: dict, *, today: date, now: datetim
             return
 
         last = doc.get("last_topup_at")
-        if last is not None and last >= now - history.TOPUP_EVERY:
+        if last is not None and last >= now - history.TOPUP_EVERY and not doc.get("topup_requested_at"):
             # Claimed for the state refresh only. A finished backfill watched again
             # comes back pending; it is ready as it stands.
             if doc.get("status") in (history.STATUS_PENDING, history.STATUS_RUNNING):
@@ -179,7 +179,8 @@ async def _advance_one(db, mongo_client, doc: dict, *, today: date, now: datetim
         await store_ad_daily(db, user_id=doc["user_id"], client_group_id=gid, ad_account_id=acct, rows=rows)
         out["topups"] += 1
         await history.release(db, gid, status=history.STATUS_READY, error=None, failures=0, retry_at=None,
-                              last_topup_at=datetime.utcnow(), newest_done=today.isoformat())
+                              last_topup_at=datetime.utcnow(), newest_done=today.isoformat(),
+                              topup_requested_at=None)
     except MetaPermissionError as e:
         logger.warning("[agent-history] %s: no Meta access: %s", gid, e)
         out["errors"] += 1

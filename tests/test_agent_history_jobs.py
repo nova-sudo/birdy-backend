@@ -154,6 +154,34 @@ async def test_topup_refetches_last_28_days_only_when_due(mock_db, mock_mongo_cl
     assert fresh["last_topup_at"] < now - timedelta(minutes=59)
 
 
+async def test_requested_topup_runs_early_once_and_is_cleared(mock_db, mock_mongo_client, monkeypatch):
+    meta = FakeMeta(monkeypatch)
+    await _watch(mock_db, _group("g1", "act_1"))
+    now = datetime.utcnow()
+    await mock_db[history.HISTORY].insert_one({
+        "_id": "g1", "user_id": "u1", "ad_account_id": "act_1", "status": "ready", "campaign_ids": None,
+        "oldest_done": "2025-01-01", "newest_done": "2026-10-26", "state_refreshed_at": now, "claimed_at": None,
+        "last_topup_at": now - timedelta(hours=1)})
+
+    out = await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert out["claimed"] == 0  # topped up an hour ago: not due
+
+    assert await history.request_topups(mock_db, ["g1", "unknown"]) == ["g1"]
+    out = await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert out["topups"] == 1 and len(meta.fetches) == 1
+    assert (await _doc(mock_db, "g1"))["topup_requested_at"] is None
+
+    out = await jobs_mod.advance_agent_history(mock_mongo_client, max_seconds=1000, today=TODAY)
+    assert out["claimed"] == 0
+
+
+async def test_topup_is_only_requested_of_a_ready_doc(mock_db):
+    await mock_db[history.HISTORY].insert_many([{"_id": "e", "status": "error", "last_topup_at": datetime.utcnow()},
+                                                {"_id": "r", "status": "running"}])
+    assert await history.request_topups(mock_db, ["e", "r"]) == []
+    assert await history.request_topups(mock_db, []) == []
+
+
 async def test_campaign_scope_change_resets_history(mock_db, mock_mongo_client, monkeypatch):
     tag = {"ad": "old_ad"}
     meta = FakeMeta(monkeypatch, clock_step=100.0, rows_for=lambda acct, since, until: [
