@@ -51,6 +51,7 @@ def _load_creators():
     from services.ad_leads import create_ad_leads_indexes
     from services.attribution_service import create_attribution_indexes
     from services.call_logs_service import create_call_logs_indexes
+    from services.creatives.store import create_creative_indexes
     from services.dashboards_briefing import create_dashboard_briefing_indexes
     from services.meta_campaign_scope import create_client_groups_scope_indexes
     from services.lead_summary import create_lead_summary_indexes
@@ -89,6 +90,7 @@ def _load_creators():
         create_dashboards_indexes,
         create_dashboard_briefing_indexes,
         create_lead_summary_indexes,
+        create_creative_indexes,
     ]
 
 
