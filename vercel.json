@@ -76,6 +76,10 @@
     {
       "path": "/api/cron/slack-reports",
       "schedule": "*/5 * * * *"
+    },
+    {
+      "path": "/api/cron/creatives-tick",
+      "schedule": "* * * * *"
     }
   ]
 }

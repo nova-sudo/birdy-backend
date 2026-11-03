@@ -841,6 +841,23 @@ async def agents_tick(authorization: str | None = Header(default=None)):
     return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
 
 
+@router.get("/creatives-tick")
+async def creatives_tick(authorization: str | None = Header(default=None)):
+    """Every minute: tracks due creative tests (nightly per user) and adopts hand-posted CT- ads."""
+    _verify_cron_auth(authorization)
+
+    from jobs.creative_tracking import run_creatives_tick
+
+    tick_start = time.monotonic()
+    result = None
+    try:
+        result = await run_creatives_tick()
+    except Exception as e:
+        logger.error(f"[creatives-tick] raised: {e}", exc_info=True)
+
+    return {"ok": True, "result": result, "elapsed_seconds": round(time.monotonic() - tick_start, 2)}
+
+
 @router.get("/agents-outcomes")
 async def agents_outcomes(authorization: str | None = Header(default=None)):
     """Daily 05:00 UTC: the 7-day outcome of each applied BirdyHub agent action."""
