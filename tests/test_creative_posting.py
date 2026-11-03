@@ -111,6 +111,8 @@ async def posted(db, creative=IMAGE, n=3):
 
 
 async def tick(db, mc, minutes=0, **kw):
+    # the tick adds real elapsed time to `now` (lease math); freeze the monotonic clock
+    kw.setdefault("clock", lambda: 0.0)
     return await posting.run_post_jobs(db, mc, NOW + timedelta(minutes=minutes), **kw)
 
 
