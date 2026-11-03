@@ -1,14 +1,15 @@
 """
 ai/tools/agent_tools.py
 -----------------------
-Chat tools that let a user train the Media Buying Agent by talking to Birdy
-(page "agent_training"). Each tool resolves the user's agent itself and returns
+Chat tools that let a user train one custom agent by talking to Birdy
+(page "agent_training"). Each tool resolves the agent from current_training_agent (set per request by routers/chat.py) and returns
 {ok, changed: {...}} so the chat can echo the change, or {ok: false, error}
 instead of raising. Rule validation is shared with the PATCH route
 (ai/agents/validation.py).
 """
 
 import copy
+from contextvars import ContextVar
 from typing import Optional
 
 from ai.agents import store, validation
@@ -18,7 +19,12 @@ from ai.tools.registry import registry
 from services import client_targets
 
 TOPICS = ("targets", "pause", "revive", "flags")
-NO_AGENT = "Set up the Media Buying Agent first"
+NO_AGENT = "Set up this agent first"
+
+# The agent the training chat is acting on. routers/chat.py sets it for the
+# duration of one request on page "agent_training" and resets it afterwards;
+# the default None means "no agent", never "the user's first agent".
+current_training_agent: ContextVar[str | None] = ContextVar("current_training_agent", default=None)
 
 
 def _fail(error: str, **extra) -> dict:
@@ -26,8 +32,11 @@ def _fail(error: str, **extra) -> dict:
 
 
 async def _agent(db, user_id):
-    agents = await store.list_agents(db, user_id)
-    return agents[0] if agents else None
+    agent_id = current_training_agent.get()
+    if not agent_id:
+        return None
+    agent = await store.get_agent(db, user_id, agent_id)
+    return agent if agent and agent.get("type") == store.TYPE_CUSTOM else None
 
 
 async def _rule(db, agent_id, kind):
