@@ -354,6 +354,8 @@ async def patch_creative(
         fields = body.model_dump(exclude_unset=True, exclude_none=True)
         if "targets" in fields:
             fields["targets"] = {**(test.get("targets") or {}), **fields["targets"]}
+        if "creative" in fields and test.get("status") != store.DRAFT:
+            raise HTTPException(409, "The creative can only be changed while the test is a draft")
         for locked in ("source", "origin"):
             if locked in fields and test.get("status") != store.DRAFT:
                 raise HTTPException(409, f"{locked.capitalize()} can only be changed while the test is a draft")

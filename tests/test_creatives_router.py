@@ -76,6 +76,16 @@ def test_patch_slug_draft_recomputes_then_409(api, mock_db):
     assert api.patch(f"/api/creatives/{t2['id']}", json={"name": "renamed"}).json()["name"] == "renamed"
 
 
+def test_patch_creative_is_read_only_once_posted(api, mock_db):
+    import asyncio
+    t = make(api)
+    assert api.patch(f"/api/creatives/{t['id']}", json={"creative": {"primary_text": "x"}}).status_code == 200
+    asyncio.run(mock_db[store.TESTS].update_one({"id": t["id"]}, {"$set": {"status": "testing"}}))
+    r = api.patch(f"/api/creatives/{t['id']}", json={"creative": {"primary_text": "y"}})
+    assert r.status_code == 409
+    assert api.patch(f"/api/creatives/{t['id']}", json={"name": "ok"}).status_code == 200
+
+
 def test_patch_source_and_origin_draft_only(api, mock_db):
     import asyncio
     t = make(api)
