@@ -53,7 +53,7 @@ _MONEY_WORDS = re.compile(r"\b(?:cpl|cost|costs|spend|spent|budget|budgets|limit
 _LINK = r"(?:of|at|to|is|was|from|by|around|about|under|over|hit|reached)"
 _LINKED = re.compile(rf"(?:\s*(?:\b{_LINK}\b|[=:]))*\s*", re.I)
 _NEAR = 30
-_COUNTED = re.compile(r"\s?(?:%|percent\b|(?:ads?|leads?|days?|weeks?|hours?|sets?|variants?)\b)", re.I)
+_COUNTED = re.compile(r"\s?(?:%|percent\b|(?:(?!per\b)[A-Za-z]+\s+)?(?:ads?|leads?|days?|weeks?|hours?|sets?|variants?|creatives?|clients?)\b)", re.I)
 _MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
           r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
 _NEXT_MONTH = re.compile(rf"\s?(?:st|nd|rd|th)?\s?{_MONTH}\b", re.I)

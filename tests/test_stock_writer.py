@@ -406,3 +406,16 @@ def test_bare_angle_brackets_survive(text):
     ("<http://x.y> hi", "hi"), ("<https://x.y|click> hi", "hi")])
 def test_slack_tokens_are_stripped(text, left):
     assert check(additional_changes=text)[0]["additional_changes"] == left
+
+
+@pytest.mark.parametrize("text", [
+    "The limit of 4 live ads is reached", "budget of 4 live ads", "limit is 4 live ads",
+    "target of 2 new creatives", "cost of 2 creatives",
+])
+def test_counted_noun_after_one_word_is_not_money(text):
+    assert check(thought_process=text)[0] is not None, text
+
+
+@pytest.mark.parametrize("text", ["budget of 500 pounds", "limit is 11", "spend at 750k", "CPL of 9.99"])
+def test_money_still_rejected_next_to_counted_nouns_rule(text):
+    assert check(thought_process=text)[0] is None, text
