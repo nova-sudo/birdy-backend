@@ -27,6 +27,7 @@ from services.creatives.store import (
 )
 from services.creatives.posting import run_post_jobs
 from services.creatives.reconcile import reconcile_all
+from services.creatives.upload_grant import cleanup_archived_media
 from services.creatives.targets import owning_group, resolve_account_targets
 from services.creatives.verdict import (
     aggregate_days,
@@ -299,4 +300,8 @@ async def run_creatives_tick(now_utc: datetime | None = None) -> dict:
                 claimed = None
         if claimed is not None:
             result["reconcile"] = await reconcile_all(db)
+            try:
+                result["media_cleanup"] = await cleanup_archived_media(db, now_utc)
+            except Exception as e:
+                logger.warning("creative media cleanup failed: %s", e)
         return result

@@ -23,7 +23,7 @@ from integrations.facebook_utils.meta_creative_reader import (
 )
 from jobs.creative_tracking import track_test
 from services.facebook_cache_shape import read_preset
-from services.creatives import posting, reconcile, store
+from services.creatives import posting, reconcile, store, upload_grant
 from services.creatives.naming import meta_ad_name, slugify
 from services.creatives.targets import owning_group, prefill_targets
 
@@ -53,6 +53,11 @@ class PatchBody(BaseModel):
     creative: Optional[dict] = None
     targets: Optional[Targets] = None
     on_verdict: Optional[dict] = None
+
+
+class UploadGrantBody(BaseModel):
+    mime: str
+    bytes: int
 
 
 class AdoptBody(BaseModel):
@@ -131,6 +136,17 @@ async def list_creatives(
 async def adoptable(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         return _json(await reconcile.find_adoptable(mongo_client[DB_NAME], current_user))
+
+
+@router.post("/upload-grant")
+async def create_upload_grant(body: UploadGrantBody, current_user: str = Depends(get_current_user)):
+    try:
+        grant = upload_grant.issue_grant(current_user, body.mime, body.bytes, datetime.now(timezone.utc))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    except RuntimeError as e:
+        raise HTTPException(503, str(e))
+    return {"grant": grant}
 
 
 @router.get("/targets/prefill")

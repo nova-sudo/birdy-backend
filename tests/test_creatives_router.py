@@ -146,3 +146,11 @@ def test_refresh_calls_track_test(api, monkeypatch):
     monkeypatch.setattr(creatives_router, "track_test", fake_track)
     r = api.post(f"/api/creatives/{t['id']}/refresh")
     assert r.status_code == 200 and r.json()["ok"] is True and seen["id"] == t["id"]
+
+
+def test_upload_grant_endpoint(api, monkeypatch):
+    monkeypatch.setenv("CREATIVE_UPLOAD_SECRET", "s")
+    r = api.post("/api/creatives/upload-grant", json={"mime": "image/png", "bytes": 1000})
+    assert r.status_code == 200 and "." in r.json()["grant"]
+    bad = api.post("/api/creatives/upload-grant", json={"mime": "image/gif", "bytes": 1000})
+    assert bad.status_code == 400
