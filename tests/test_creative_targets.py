@@ -50,3 +50,13 @@ def test_resolve_precedence():
     assert resolve_account_targets(t, {"targets_override": {"cpl": 50}}, 42)["metrics"]["cpl"]["value"] == 50
     assert resolve_account_targets(t, {}, None)["metrics"]["cpl"]["value"] == 35
     assert t["metrics"]["cpl"]["value"] == 35  # input not mutated
+
+
+def test_group_cpl_does_not_enable_unset_cpl_check():
+    t = {"mode": "thresholds", "metrics": {"ctr": {"op": "gte", "value": 1.5}}}
+    assert "cpl" not in resolve_account_targets(t, {}, 42)["metrics"]
+    # explicit per-ad override still wins
+    assert resolve_account_targets(t, {"targets_override": {"cpl": 50}}, 42)["metrics"]["cpl"]["value"] == 50
+    # cpl_only mode applies the group CPL
+    c = {"mode": "cpl_only", "metrics": {}}
+    assert resolve_account_targets(c, {}, 42)["metrics"]["cpl"]["value"] == 42

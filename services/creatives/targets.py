@@ -46,8 +46,9 @@ def resolve_account_targets(test_targets: dict, ad: dict, group_cpl: float | Non
     """ad.targets_override > group CPL (cpl only) > test targets. Returns a copy."""
     out = copy.deepcopy(test_targets)
     override = (ad.get("targets_override") or {}).get("cpl")
-    cpl = override if override is not None else group_cpl
+    metrics = out.setdefault("metrics", {})
+    group_applies = "cpl" in metrics or out.get("mode") == "cpl_only"
+    cpl = override if override is not None else (group_cpl if group_applies else None)
     if cpl is not None:
-        metrics = out.setdefault("metrics", {})
         metrics["cpl"] = {**metrics.get("cpl", {"op": "lte"}), "value": cpl}
     return out

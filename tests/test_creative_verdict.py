@@ -142,3 +142,23 @@ async def test_rollup_rate_missing_excludes_money(mock_db, monkeypatch):
     ]
     s = await rollup(mock_db, "u1", ads)
     assert s["spend"] == 100.0 and s["rate_missing"] is True and s["mixed_currency"] is True
+
+
+async def test_rollup_survives_currency_lookup_errors(mock_db, monkeypatch):
+    from utils.currency_exchange import CurrencyService
+
+    for exc in (ValueError("no user"), RuntimeError("db")):
+        async def boom(user_id, _e=exc):
+            raise _e
+
+        monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(boom))
+        s = await rollup(mock_db, "u1", [{"ad_account_id": "a", "score": {"state": "pass", "spend": 10, "leads": 1}}])
+        assert s["currency"] == "GBP" and s["spend"] == 10.0
+
+
+def test_none_targets_use_defaults_and_zero_is_valid():
+    t = {"mode": "cpl_only", "min_spend": None, "min_days": None, "metrics": {"cpl": {"op": "lte", "value": 35}}}
+    assert score_account(tot(spend=100, days_live=3, leads=5), t, fmt="image")["state"] == "scoring"
+    t0 = {**t, "min_spend": 0}
+    assert score_account(tot(spend=0, days_live=0, leads=0), t0, fmt="image")["state"] == "fail"
+    assert verdict_of([{"state": "pass"}, {"state": "pass"}], None) == "winner"

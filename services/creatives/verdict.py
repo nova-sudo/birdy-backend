@@ -18,6 +18,12 @@ def _num(v: Any) -> float:
         return 0.0
 
 
+def _opt(d: dict, key: str, default):
+    """Value of key, with an explicit None treated as the default (0 stays valid)."""
+    v = d.get(key)
+    return default if v is None else v
+
+
 def _action(actions: list[dict] | None, types: tuple[str, ...]) -> list[float]:
     return [_num(a.get("value")) for a in (actions or []) if a.get("action_type") in types]
 
@@ -68,8 +74,8 @@ def _check(metric: str, op: str, target: float, value: float | None) -> dict:
 
 def score_account(totals: dict, targets: dict, *, fmt: str, baseline: dict | None = None) -> dict:
     d = derive(totals)
-    min_spend = targets.get("min_spend", 150)
-    min_days = targets.get("min_days", 7)
+    min_spend = _opt(targets, "min_spend", 150)
+    min_days = _opt(targets, "min_days", 7)
     if _num(d.get("spend")) < min_spend and _num(d.get("days_live")) < min_days:
         return {**d, "state": "scoring", "checks": []}
 
@@ -80,7 +86,7 @@ def score_account(totals: dict, targets: dict, *, fmt: str, baseline: dict | Non
     if mode == "baseline":
         if not baseline or baseline.get("cpl") is None:
             return {**d, "state": "scoring", "checks": []}
-        pct = targets.get("baseline_pct", 15) / 100
+        pct = _opt(targets, "baseline_pct", 15) / 100
         checks.append(_check("cpl", "lte", baseline["cpl"] * (1 - pct), d["cpl"]))
         if metrics.get("ctr") and baseline.get("ctr") is not None:
             checks.append(_check("ctr", "gte", baseline["ctr"] * (1 + pct), d["ctr"]))
@@ -106,6 +112,7 @@ def score_account(totals: dict, targets: dict, *, fmt: str, baseline: dict | Non
 
 
 def test_verdict(scores: list[dict], win_share: float) -> str:
+    win_share = 0.6 if win_share is None else win_share
     scored = [s for s in scores if s.get("state") in ("pass", "fail")]
     if len(scored) < 2:
         return "testing"
@@ -127,7 +134,11 @@ async def rollup(db, user_id: str, ads: list[dict]) -> dict:
     """Test summary across ads, money converted to the user's currency."""
     from utils.currency_exchange import CurrencyService
 
-    user_cur = await CurrencyService.get_user_currency(user_id) or "GBP"
+    try:
+        user_cur = await CurrencyService.get_user_currency(user_id) or "GBP"
+    except (ValueError, RuntimeError) as e:
+        logger.warning(f"creative rollup: user currency lookup failed for {user_id}: {e}")
+        user_cur = "GBP"
     spend = rated_leads = 0.0
     leads = imps = link_clicks = views = video_imps = 0.0
     rate_missing = mixed = False
