@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import httpx
@@ -70,7 +71,8 @@ async def test_refresh_sets_paused_at_on_transition_and_clears_on_reactivate(moc
     assert await mock_db.meta_ad_state.count_documents({}) == 1  # upsert, no dupes
 
     ad_calls = [c for c in graph["calls"] if "/ads" in c[0] and "/adsets" not in c[0]]
-    assert ad_calls[0][1]["fields"] == "id,name,adset_id,campaign_id,effective_status,created_time"
+    assert ad_calls[0][1]["fields"] == meta_state._AD_FIELDS
+    assert "ARCHIVED" in json.loads(ad_calls[0][1]["effective_status"])  # Meta omits archived ads by default
     assert any("page2" in c[0] for c in ad_calls)  # paged
 
 
@@ -123,3 +125,32 @@ async def test_ad_days_indexes_created(mock_mongo_client, mock_db):
     keys = {tuple(k for k, _ in i["key"]): bool(i.get("unique")) for i in infos}
     assert keys[("user_id", "client_group_id", "ad_id", "date_start")] is True
     assert ("client_group_id", "ad_id", "date_start") in keys
+
+
+async def test_refresh_stores_issues_review_feedback_and_creative(mock_db, mock_mongo_client, graph, monkeypatch):
+    ad = {**_ad("WITH_ISSUES"),
+          "issues_info": [{"error_summary": "Pixel", "error_message": "Pixel missing"}],
+          "ad_review_feedback": {"global": {"reason": "text"}},
+          "creative": {"id": "c9", "image_hash": "h1", "body": "top body", "title": "top title",
+                       "object_story_spec": {"page_id": "p1", "link_data": {
+                           "link": "https://x.test", "message": "msg", "name": "nm",
+                           "call_to_action": {"value": {"lead_gen_form_id": "f1"}}}}}}
+
+    async def fake_get(self, url, params=None, **kw):
+        req = httpx.Request("GET", str(url))
+        data = [ad] if "/ads" in str(url) and "/adsets" not in str(url) else []
+        return httpx.Response(200, json={"data": data}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    await refresh_meta_state(mock_db, mock_mongo_client, "u", GID, "act_1", today=date(2026, 10, 1))
+    doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
+    assert doc["issues"] == ad["issues_info"] and doc["review_feedback"] == ad["ad_review_feedback"]
+    assert doc["creative"] == {"id": "c9", "image_hash": "h1", "video_id": None, "page_id": "p1",
+                               "lead_form_id": "f1", "body": "msg", "title": "nm", "link": "https://x.test"}
+
+
+async def test_refresh_without_creative_stores_empty_fields(mock_db, mock_mongo_client, graph):
+    await refresh_meta_state(mock_db, mock_mongo_client, "u", GID, "act_1", today=date(2026, 10, 1))
+    doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
+    assert doc["issues"] == [] and doc["review_feedback"] == {}
+    assert doc["creative"]["id"] is None and doc["creative"]["link"] is None

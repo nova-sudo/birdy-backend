@@ -6,6 +6,7 @@ date an ad was paused, which Meta does not expose. One paged Graph call per
 object type per refresh.
 """
 
+import json
 import logging
 from datetime import date, datetime
 
@@ -19,7 +20,11 @@ logger = logging.getLogger(__name__)
 _GRAPH = "https://graph.facebook.com/v25.0"
 AD_STATE = "meta_ad_state"
 ADSET_STATE = "meta_adset_state"
-_AD_FIELDS = "id,name,adset_id,campaign_id,effective_status,created_time"
+_AD_FIELDS = ("id,name,adset_id,campaign_id,effective_status,created_time,issues_info,ad_review_feedback,"
+              "creative{id,image_hash,video_id,body,title,object_story_spec}")
+# Without this filter Meta leaves ARCHIVED ads out of /ads. DELETED stays out on purpose.
+_AD_STATUSES = ["ACTIVE", "PAUSED", "PENDING_REVIEW", "DISAPPROVED", "PREAPPROVED", "PENDING_BILLING_INFO",
+                "CAMPAIGN_PAUSED", "ARCHIVED", "ADSET_PAUSED", "IN_PROCESS", "WITH_ISSUES"]
 _ADSET_FIELDS = "id,name,campaign_id,effective_status,daily_budget,lifetime_budget,campaign{effective_status}"
 
 
@@ -51,9 +56,26 @@ def _parse_time(v) -> datetime | None:
             return None
 
 
-async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: str) -> list[dict]:
+def _creative(c: dict | None) -> dict:
+    """The parts of an ad's creative the stock agent copies when it re-posts the ad."""
+    c = c or {}
+    spec = c.get("object_story_spec") or {}
+    data = spec.get("link_data") or spec.get("video_data") or {}
+    cta = (data.get("call_to_action") or {}).get("value") or {}
+    return {"id": c.get("id"),
+            "image_hash": c.get("image_hash") or data.get("image_hash"),
+            "video_id": c.get("video_id") or data.get("video_id"),
+            "page_id": spec.get("page_id"),
+            "lead_form_id": cta.get("lead_gen_form_id"),
+            "body": data.get("message") or c.get("body"),
+            "title": data.get("name") or data.get("title") or c.get("title"),
+            "link": data.get("link") or cta.get("link")}
+
+
+async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: str,
+                     extra: dict | None = None) -> list[dict]:
     out: list[dict] = []
-    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": 200, "access_token": token}
+    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": 200, "access_token": token, **(extra or {})}
     while url:
         resp = await client.get(url, params=params)
         if resp.status_code == 401:
@@ -92,7 +114,8 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
 
     acct = ad_account_id if str(ad_account_id).startswith("act_") else f"act_{ad_account_id}"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        ads = await _fetch_all(client, f"{acct}/ads", _AD_FIELDS, token)
+        ads = await _fetch_all(client, f"{acct}/ads", _AD_FIELDS, token,
+                               {"effective_status": json.dumps(_AD_STATUSES)})
         adsets = await _fetch_all(client, f"{acct}/adsets", _ADSET_FIELDS, token)
 
     now = datetime.utcnow()
@@ -113,6 +136,9 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
             "name": ad.get("name") or "",
             "effective_status": status,
             "created_time": _parse_time(ad.get("created_time")),
+            "issues": ad.get("issues_info") or [],
+            "review_feedback": ad.get("ad_review_feedback") or {},
+            "creative": _creative(ad.get("creative")),
             "paused_at": paused_at,
             "updated_at": now,
         }}, upsert=True)
