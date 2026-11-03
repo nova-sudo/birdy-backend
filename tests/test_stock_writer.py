@@ -242,7 +242,7 @@ async def test_memory_from_note_takes_source_author_and_client(mock_db, monkeypa
 # Fix round 1
 
 @pytest.mark.parametrize("text", [
-    "CPL of 9.99", "raise budget to 250", "CPL fell 31% to 4.12 from 9", "spent 1234 so far",
+    "CPL of 9.99", "raise budget to 250", "CPL fell 31% to 4.12 from 9", "spent 1300 so far",
     "a limit of 12 per lead", "target 3.5", "250 budget", "cost 99",
 ])
 def test_bare_money_not_in_facts_is_rejected(text):
