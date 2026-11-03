@@ -160,7 +160,9 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
         score = score_account(totals, targets, fmt=fmt, baseline=baseline)
         score["baseline_cpl"] = baseline["cpl"] if baseline else None
         score["evaluated_at"] = now
-        await db[TEST_ADS].update_one({"id": ad["id"], "user_id": user_id}, {"$set": {"score": score, "updated_at": now}})
+        await db[TEST_ADS].update_one(
+            {"id": ad["id"], "user_id": user_id},
+            {"$set": {"score": score, "currency": grp.get("ad_account_currency"), "updated_at": now}})
         scored_ads.append({**ad, "score": score, "currency": grp.get("ad_account_currency"), "format": fmt})
 
     def _agg(states):

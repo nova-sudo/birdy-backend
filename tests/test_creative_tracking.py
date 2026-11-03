@@ -83,6 +83,7 @@ async def test_track_scores_and_sets_verdict(mock_db, mock_mongo_client, monkeyp
     assert t2["summary"]["accounts_pass"] == 2 and t2["summary"]["updated_at"]
     states = sorted(a["score"]["state"] for a in await list_test_ads(mock_db, t["id"], user_id="u1"))
     assert states == ["fail", "pass", "pass"]
+    assert {a["currency"] for a in await list_test_ads(mock_db, t["id"], user_id="u1")} == {"GBP"}
 
 
 async def test_upsert_is_idempotent(mock_db, mock_mongo_client, monkeypatch):

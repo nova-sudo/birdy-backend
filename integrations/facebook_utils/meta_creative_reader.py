@@ -119,3 +119,55 @@ async def fetch_ad_status(ad_id: str, token: str) -> Optional[str]:
                 return None
             raise
     return data.get("effective_status")
+
+
+# --- wizard reads ----------------------------------------------------------
+
+ADSET_FIELDS = ("id,name,status,effective_status,campaign{id,name,objective},"
+                "optimization_goal,promoted_object")
+
+_ACCEPTED_OBJECTIVES = {
+    "lead_form": ("OUTCOME_LEADS",),
+    "website": ("OUTCOME_LEADS", "OUTCOME_TRAFFIC", "OUTCOME_SALES", "OUTCOME_ENGAGEMENT"),
+    "whatsapp": ("OUTCOME_ENGAGEMENT", "OUTCOME_SALES"),
+}
+
+
+async def _list(url: str, params: dict) -> List[Dict]:
+    rows: List[Dict] = []
+    first = True
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            # params=None on later pages: `next` already carries token and cursor.
+            data = await _get(client, url, params if first else None)
+            first = False
+            rows.extend(data.get("data", []))
+            url = (data.get("paging") or {}).get("next")
+    return rows
+
+
+async def list_adsets(ad_account_id: str, token: str) -> List[Dict]:
+    return await _list(f"{GRAPH}/{ad_account_id}/adsets",
+                       {"access_token": token, "fields": ADSET_FIELDS, "limit": PAGE_LIMIT})
+
+
+async def list_promote_pages(ad_account_id: str, token: str) -> List[Dict]:
+    return await _list(f"{GRAPH}/{ad_account_id}/promote_pages",
+                       {"access_token": token, "fields": "id,name", "limit": PAGE_LIMIT})
+
+
+async def list_lead_forms(page_id: str, token: str) -> List[Dict]:
+    return await _list(f"{GRAPH}/{page_id}/leadgen_forms",
+                       {"access_token": token, "fields": "id,name,status", "limit": PAGE_LIMIT})
+
+
+def adset_compatible(adset: dict, destination: str):
+    """(ok, reason). The campaign objective decides which destinations an ad set can serve."""
+    accepted = _ACCEPTED_OBJECTIVES.get(destination)
+    if accepted is None:
+        return False, f"Unknown destination '{destination}'"
+    objective = (adset.get("campaign") or {}).get("objective")
+    if objective in accepted:
+        return True, None
+    shown = " or ".join(accepted)
+    return False, f"{destination.replace('_', ' ')} ads need a campaign with objective {shown} (this one is {objective or 'unknown'})"
