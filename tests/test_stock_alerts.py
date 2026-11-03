@@ -424,7 +424,8 @@ async def test_stopped_account_still_alerts_when_history_is_current(mock_db, gra
 
 
 async def test_late_sync_gives_spend_data_late_not_spend_alerts(mock_db, graph):
-    agent = await _seed(mock_db, gids=("g1",), newest_done="2026-10-30")
+    agent = await _seed(mock_db, gids=("g1",))
+    await mock_db["agent_ad_history"].update_one({"_id": "g1"}, {"$set": {"last_topup_at": datetime(2026, 10, 30, 5)}})
     await mock_db["meta_ad_state"].update_many({}, {"$set": {"effective_status": "ACTIVE"}})
     await mock_db[AD_DAYS].insert_one({"user_id": "u", "client_group_id": "g1", "ad_id": "g1-a",
                                        "date_start": "2026-10-29", "insight_data": {"spend": "10"}})
@@ -451,3 +452,56 @@ async def test_prefill_with_missing_clients_key_or_gid(mock_db, graph):
     agent = await _seed(mock_db, gids=("g1",), settings=s)
     await run_alerts(mock_db, agent, _token, NOW, ["g1"])
     assert (await mock_db[AGENTS].find_one({"_id": "ag1"}))["settings"]["clients"]["g1"]["prepaid"]["is_prepay_account"] is True
+
+
+@pytest.mark.parametrize("tz, now, fetched, expected", [
+    # Sydney is UTC+11 in Nov: a run at 20:00 UTC Nov 3 is the morning of Nov 4, last full day Nov 3
+    ("Australia/Sydney", datetime(2026, 11, 3, 20, tzinfo=timezone.utc), datetime(2026, 11, 3, 0, 5), "late"),
+    ("Australia/Sydney", datetime(2026, 11, 3, 20, tzinfo=timezone.utc), datetime(2026, 11, 3, 14, 0), "ready"),
+    # Los Angeles is UTC-8 after DST ends on Nov 1: at 07:00 UTC Nov 3 the last full day is Nov 1
+    ("America/Los_Angeles", NOW, datetime(2026, 11, 2, 7, 0), "late"),
+    ("America/Los_Angeles", NOW, datetime(2026, 11, 2, 8, 0), "ready"),
+])
+async def test_history_ready_needs_a_fetch_after_the_account_day_ended(mock_db, tz, now, fetched, expected):
+    from ai.agents.stock.alerts import _history_state
+    from ai.agents.stock.windows import last_full_day
+    await mock_db["agent_ad_history"].insert_one({"_id": "g1", "status": "ready", "newest_done": "2026-11-03",
+                                                  "last_topup_at": fetched})
+    assert await _history_state(mock_db, "g1", last_full_day(now, tz), tz) == expected
+
+
+async def test_history_without_sync_time_is_late_not_ready(mock_db):
+    from ai.agents.stock.alerts import _history_state
+    await mock_db["agent_ad_history"].insert_one({"_id": "g1", "status": "ready", "newest_done": "2026-11-03"})
+    assert await _history_state(mock_db, "g1", date(2026, 11, 2), "Europe/London") == "late"
+
+
+async def test_null_prepaid_on_a_shared_account_does_not_raise(mock_db, graph, insights):
+    s = {**DEFAULT_SETTINGS, "clients": {"g1": {"prepaid": {"topups": [{"date": "2026-10-28", "amount": 200}]}},
+                                         "g2": {"prepaid": None}}}
+    agent = await _seed(mock_db, settings=s)
+    await mock_db["meta_ad_state"].delete_many({})
+    out = await run_alerts(mock_db, agent, _token, NOW, ["g1", "g2"])
+    assert {a["client_group_id"] for a in out if a["code"] == "prepaid_low"} == {"g1"}
+
+
+async def test_null_client_entry_does_not_raise(mock_db, graph, insights):
+    s = {**DEFAULT_SETTINGS, "clients": {"g1": None}}
+    agent = await _seed(mock_db, gids=("g1",), settings=s)
+    await run_alerts(mock_db, agent, _token, NOW, ["g1"])
+
+
+def test_prepaid_account_without_topups_says_it_cannot_estimate():
+    for prepaid in ({"is_prepay_account": True, "topups": []}, {"is_prepay_account": True}):
+        s = {**DEFAULT_SETTINGS, "clients": {GID: {"prepaid": prepaid}}}
+        a = next(a for a in _run(settings=s, account_spend={}) if a["code"] == "prepaid_no_topups")
+        assert a["severity"] == "info" and "top-up" in a["detail"].lower() and "estimate" in a["detail"].lower()
+
+
+def test_no_topup_alert_when_not_prepaid_or_unset_and_check_failed_stays_for_unusable_entries():
+    for prepaid in ({"is_prepay_account": False, "topups": []}, None, {"topups": []}):
+        s = {**DEFAULT_SETTINGS, "clients": {GID: {"prepaid": prepaid}}}
+        assert "prepaid_no_topups" not in _codes(_run(settings=s, account_spend={}))
+    s = {**DEFAULT_SETTINGS, "clients": {GID: {"prepaid": {"is_prepay_account": True, "topups": [{"amount": 1}]}}}}
+    codes = _codes(_run(settings=s, account_spend={}))
+    assert "check_failed" in codes and "prepaid_no_topups" not in codes

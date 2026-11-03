@@ -11,14 +11,14 @@ money remaining, so it is never shown as a balance.
 
 import json
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import httpx
 
 from ai.agents.history import HISTORY, is_ready
 from ai.agents.meta_state import AD_STATE, ADSET_STATE, MetaTokenError, _is_active, _parse_time
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
-from ai.agents.stock.windows import last_full_day
+from ai.agents.stock.windows import _tz, last_full_day
 from ai.agents.store import AD_DAYS, AGENTS
 
 logger = logging.getLogger(__name__)
@@ -277,6 +277,10 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
         out.append(_alert(gid, "check_failed", "warning", "Prepaid top-ups can't be used",
                           "None of the top-ups entered has a valid date and amount, so no prepaid "
                           "estimate was made. Check the top-ups in setup.", today))
+    elif not entered and prepaid.get("is_prepay_account") is True:
+        out.append(_alert(gid, "prepaid_no_topups", "info", "Prepaid account has no top-ups entered",
+                          "Meta says this is a prepaid account. The balance can't be estimated until "
+                          "top-ups are entered in setup.", today))
     elif topups and prepaid.get("is_prepay_account") is not False and account_spend is not None:
         latest = max(t["date"] for t in topups)[:10]
         spend_since = sum(v for d, v in account_spend.items() if d >= latest)
@@ -344,33 +348,20 @@ def _day_of(v) -> date | None:
         return None
 
 
-async def _history_state(db, gid: str, last_full: date) -> str:
-    """"ready" when the client's ad history is usable and synced through the last full day. The
-    sync marker is the history doc's `newest_done`: Meta returns no row for a day with no spend,
-    so the newest ad row would make a stopped account look like a late sync."""
+async def _history_state(db, gid: str, last_full: date, tz_name: str | None) -> str:
+    """"ready" when the client's ad history is usable and was last synced after the end of the
+    account's last full day, in the account's timezone. The sync time is the history doc's
+    `last_topup_at` (naive UTC, set when a first backfill finishes and on every top-up). Not
+    `newest_done`, which is the cron's UTC date, and not the newest ad row: Meta returns no row
+    for a day with no spend. A missing sync time reads as "late"."""
     doc = await db[HISTORY].find_one({"_id": gid})
     if not is_ready(doc):
         return "unready"
-    newest = _day_of(doc.get("newest_done"))
-    return "ready" if newest is not None and newest >= last_full else "late"
-
-
-async def _group_inputs(db, user_id: str, gid: str, since: str) -> tuple[list[dict], dict, list[float]]:
-    ads = [a async for a in db[AD_STATE].find({"client_group_id": gid})]
-    spend: dict[str, dict[str, float]] = {}
-    async for row in db[AD_DAYS].find({"user_id": user_id, "client_group_id": gid}):
-        day = str(row.get("date_start") or "")[:10]
-        if not day or day < since:
-            continue
-        try:
-            v = float((row.get("insight_data") or {}).get("spend") or 0)
-        except (TypeError, ValueError):
-            continue
-        spend.setdefault(row["ad_id"], {})
-        spend[row["ad_id"]][day] = spend[row["ad_id"]].get(day, 0.0) + v
-    budgets = [s.get("daily_budget") or 0 async for s in db[ADSET_STATE].find(
-        {"client_group_id": gid, "effective_status": "ACTIVE", "campaign_status": "ACTIVE"})]
-    return ads, spend, [b for b in budgets if b]
+    synced = doc.get("last_topup_at")
+    if not isinstance(synced, datetime):
+        return "late"
+    local = synced.replace(tzinfo=timezone.utc).astimezone(_tz(tz_name)).date()
+    return "ready" if local > last_full else "late"
 
 
 def _topups_of(settings: dict, gid: str) -> list[dict]:
@@ -436,7 +427,7 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
         end = last_full_day(now_utc, health.get("timezone_name"))
 
         account_spend = None
-        if account in since_by_account and cfg["clients"].get(gid, {}).get("prepaid", {}).get("is_prepay_account") is not False:
+        if account in since_by_account and ((cfg["clients"].get(gid) or {}).get("prepaid") or {}).get("is_prepay_account") is not False:
             if account not in spend_cache:
                 try:
                     spend_cache[account] = await fetch_account_spend(account, token, since_by_account[account], end)
@@ -454,5 +445,5 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
         ads, spend, budgets = await _group_inputs(db, user_id, gid, since)
         out.extend(health_alerts(
             health, ads, spend, cfg, gid, now_utc, daily_budgets=budgets, account_spend=account_spend,
-            campaign_ids=group.get("meta_campaign_ids"), history_state=await _history_state(db, gid, end)))
+            campaign_ids=group.get("meta_campaign_ids"), history_state=await _history_state(db, gid, end, health.get("timezone_name"))))
     return out
