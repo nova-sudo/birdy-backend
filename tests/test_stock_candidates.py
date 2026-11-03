@@ -208,3 +208,45 @@ async def test_empty_campaign_scope_means_no_ads(mock_db):
     await _groups(mock_db, {**DEST, "meta_campaign_ids": []}, SRC)
     await _ad(mock_db, "dest", "x", campaign="dc1")
     assert _ids(await build_candidates(mock_db, AGENT, {**DEST, "meta_campaign_ids": []}, WIN), "remove") == []
+
+
+def test_normalise_keeps_middle_copy_and_non_date_numbers():
+    assert normalise_name("Hook - Copy 1 - Win") != normalise_name("Hook - Copy 2 - Win")
+    assert normalise_name("Promo 123456 A") != normalise_name("Promo 654321 A")
+    assert normalise_name("Hook - Win - Copy 2") == normalise_name("Hook - Win – Copy") == "hook - win"
+    assert normalise_name("Hook Win Copy 2") == "hook win"
+    assert normalise_name("Hook - 20261103 - Win") == "hook - win"
+
+
+def test_creative_key_video_uses_name_even_with_thumbnail_hash():
+    ad = {"name": "Clip - 100926", "creative": {"image_hash": "THUMB", "video_id": "v1"}}
+    assert creative_key(ad) == "name:clip"
+
+
+def test_creative_key_nameless_falls_back_to_ad_id():
+    a = {"ad_id": "1", "name": "", "creative": {"video_id": "v"}}
+    b = {"ad_id": "2", "name": "100926", "creative": {"video_id": "v"}}
+    assert creative_key(a) == "id:1" and creative_key(b) == "id:2"
+
+
+async def test_nameless_ads_do_not_block_each_other(mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _ad(mock_db, "src", "v1", name="100926", vid="V")
+    await _days(mock_db, "src", "v1", 80, 10)
+    await _ad(mock_db, "dest", "d1", name="110326", vid="W", status="PAUSED")
+    assert _ids(await build_candidates(mock_db, AGENT, DEST, WIN)) == ["v1"]
+
+
+async def test_revive_with_null_paused_at_uses_last_spend_day(mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _ad(mock_db, "dest", "old", status="PAUSED", campaign="dc1", img="A", paused_at=None)
+    await _days(mock_db, "dest", "old", 80, 10, day="2026-07-20", campaign="dc1")
+    await _ad(mock_db, "dest", "new", status="PAUSED", campaign="dc1", img="B", paused_at=None)
+    await _days(mock_db, "dest", "new", 80, 10, day="2026-10-25", campaign="dc1")
+    assert _ids(await build_candidates(mock_db, AGENT, DEST, WIN), "revive") == ["old"]
+
+
+async def test_revive_with_no_spend_and_no_paused_at_is_skipped(mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _ad(mock_db, "dest", "x", status="PAUSED", campaign="dc1", img="A", paused_at=None)
+    assert _ids(await build_candidates(mock_db, AGENT, DEST, WIN), "revive") == []

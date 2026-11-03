@@ -143,18 +143,29 @@ def _line_ad_ids(line: dict) -> list[str]:
 
 
 def follow_ups(card: dict, ad_states: dict[str, AdState], ad_days: dict[str, list[AdDay]]) -> list[dict]:
-    """Each line of the last card, checked against Meta: Add and Bring back are ok when the ad is
-    live and has spent since the card's date, Remove is ok when the ad is off. Additional changes
-    can't be checked by code (ok None, shown as Check by hand)."""
+    """Each line of the last card that was applied or flagged, checked against Meta: Add and Bring
+    back are ok when the ad is live and has spent since the card's date, Remove is ok when the ad
+    is off. A flagged Add has no ad id (people create the ad), so it is found by name, and if it
+    isn't there yet it shows ok None, "not done yet". Additional changes can't be checked by code
+    (ok None, shown as Check by hand). Lines never applied, and every line of a dismissed card,
+    are skipped."""
+    from ai.agents.stock.candidates import normalise_name  # candidates imports this module
+
     since = _card_day(card)
     out = []
-    for line in card.get("lines") or []:
+    for line in [] if card.get("status") == "dismissed" else card.get("lines") or []:
         kind, state = line.get("kind"), line.get("state")
-        if state == "undone" or kind not in ("add", "remove", "revive"):
+        if state not in ("applied", "flagged") or kind not in ("add", "remove", "revive"):
             continue
         name = line.get("ad_name") or "Ad"
         ids = _line_ad_ids(line)
         ads = [ad_states[i] for i in ids if i in ad_states]
+        if not ids and kind == "add":
+            want = normalise_name(line.get("ad_name"))
+            ads = [a for a in ad_states.values() if want and normalise_name(a.name) == want]
+            if not ads:
+                out.append({"line_id": line.get("id"), "text": f"{name}: not done yet", "ok": None})
+                continue
         if not ads:
             out.append({"line_id": line.get("id"), "text": f"{name}: not found in Meta", "ok": False})
             continue

@@ -7,7 +7,7 @@ CPL divided by the source client's green limit so currencies never mix. Nothing 
 """
 
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from ai.agents.snapshot import _to_date, load_ad_days
 from ai.agents.stock.checks import cpl, in_scope, scoped_days, totals
@@ -18,25 +18,45 @@ from ai.agents.stock.windows import Window
 REVIVE_LOOKBACK_DAYS = 365
 _REVIVABLE = {"PAUSED", "ADSET_PAUSED", "CAMPAIGN_PAUSED"}  # off by choice; never ARCHIVED
 _NOT_COPYABLE = {"DISAPPROVED"}
-_SEP = re.compile(r"\s*[-–—]\s*")
-_DATE = re.compile(r"\b\d{6}\b|\b\d{8}\b|\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
+_SEP = re.compile(r"\s*[-\u2013\u2014]\s*")
+_DATE_RUN = re.compile(r"(?<!\d)(?:\d{6}|\d{8})(?!\d)")
+_DATE_SEP = re.compile(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
 _COPY = re.compile(r"\s*\(?\bcopy(?:\s*\d+)?\)?\s*$")
+_DATE_FORMATS = {6: ("%d%m%y", "%m%d%y"), 8: ("%d%m%Y", "%m%d%Y", "%Y%m%d")}
+
+
+def _is_date(run: str) -> bool:
+    for fmt in _DATE_FORMATS[len(run)]:
+        try:
+            datetime.strptime(run, fmt)
+            return True
+        except ValueError:
+            pass
+    return False
 
 
 def normalise_name(name: str | None) -> str:
-    """An ad name without its date and copy suffix, so a re-post of a video matches its source."""
-    parts = []
-    for p in _SEP.split(_DATE.sub(" ", str(name or "").lower())):
-        p = " ".join(_COPY.sub("", p).split())
-        if p:
-            parts.append(p)
-    return " - ".join(parts)
+    """An ad name without its date and the "Copy" Meta appends at the end, so a re-post of a video
+    matches its source. A 6 or 8 digit number is dropped only when it is a real date, and Copy
+    only when it is the last segment ("Hook - Copy 1 - Win" stays as it is)."""
+    text = _DATE_SEP.sub(" ", str(name or "").lower())
+    text = _DATE_RUN.sub(lambda m: " " if _is_date(m.group()) else m.group(), text)
+    parts = [" ".join(p.split()) for p in _SEP.split(text)]
+    parts = [p for p in parts if p]
+    if parts:
+        parts[-1] = " ".join(_COPY.sub("", parts[-1]).split())
+    return " - ".join(p for p in parts if p)
 
 
 def creative_key(ad: dict) -> str:
-    """img:<hash> for an image, else name:<normalised name> (Meta video ids differ per account)."""
-    h = (ad.get("creative") or {}).get("image_hash")
-    return f"img:{h}" if h else f"name:{normalise_name(ad.get('name'))}"
+    """img:<hash> for an image ad, else name:<normalised name>. A video's own hash may be its
+    thumbnail and its id differs per account, so videos match by name. With no usable name the
+    ad id keeps nameless ads from blocking each other."""
+    c = ad.get("creative") or {}
+    if c.get("image_hash") and not c.get("video_id"):
+        return f"img:{c['image_hash']}"
+    n = normalise_name(ad.get("name"))
+    return f"name:{n}" if n else f"id:{ad.get('ad_id')}"
 
 
 def _copyable(ad: dict) -> bool:

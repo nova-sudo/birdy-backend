@@ -102,9 +102,9 @@ def _d(ad_id, day, spend):
 
 def _card(**kw):
     return {"created_at": datetime(2026, 10, 30, 8), "additional_changes": "Check the form", "lines": [
-        {"id": "l1", "kind": "add", "ad_name": "New ad", "meta_ids": {"ad_id": "n1"}},
-        {"id": "l2", "kind": "remove", "ad_name": "Old ad", "meta_ids": {"ad_id": "o1"}},
-        {"id": "l3", "kind": "revive", "ad_name": "Back ad", "meta_ids": ["r1"]}], **kw}
+        {"id": "l1", "kind": "add", "ad_name": "New ad", "meta_ids": {"ad_id": "n1"}, "state": "applied"},
+        {"id": "l2", "kind": "remove", "ad_name": "Old ad", "meta_ids": {"ad_id": "o1"}, "state": "applied"},
+        {"id": "l3", "kind": "revive", "ad_name": "Back ad", "meta_ids": ["r1"], "state": "applied"}], **kw}
 
 
 def test_follow_ups_check_each_line():
@@ -128,3 +128,46 @@ def test_follow_up_additional_changes_is_check_by_hand():
 
 def test_no_additional_changes_no_hand_line():
     assert all(o["ok"] is not None for o in follow_ups(_card(additional_changes=""), {}, {}))
+
+
+def test_decide_zero_or_missing_previous_cpl():
+    assert decide("red", 0, 5, False, 30) == "propose"
+    assert decide("red", None, 5, False, 30) == "propose"
+    assert decide("yellow", 0, 9, False, 30) == "propose"
+    assert decide("yellow", None, 9, False, 30) == "none"
+
+
+def _fcard(*lines, **kw):
+    return {"created_at": datetime(2026, 10, 30, 8), "lines": list(lines), **kw}
+
+
+def test_follow_ups_only_check_applied_or_flagged_lines():
+    states = {"n1": _state("n1", "ACTIVE")}
+    lines = [{"id": f"l{i}", "kind": "add", "ad_name": "A", "meta_ids": {"ad_id": "n1"}, "state": st}
+             for i, st in enumerate(["proposed", "queued", "applying", "failed", "needs_file", "blocked",
+                                     "undone"])]
+    assert follow_ups(_fcard(*lines), states, {}) == []
+    assert follow_ups(_fcard(*lines[:1], status="dismissed"), states, {}) == []
+    applied = {"id": "a", "kind": "add", "ad_name": "A", "meta_ids": {"ad_id": "n1"}, "state": "applied"}
+    assert [o["line_id"] for o in follow_ups(_fcard(applied), states, {})] == ["a"]
+    assert follow_ups(_fcard(applied, status="dismissed"), states, {}) == []
+
+
+def test_follow_ups_flagged_add_without_id_found_by_name():
+    line = {"id": "f", "kind": "add", "ad_name": "Clip - 031126", "state": "flagged"}
+    states = {"n9": _state("n9", "ACTIVE")}
+    states["n9"] = AdState("n9", "s", "c1", "Clip - 101026 \u2013 Copy", "ACTIVE", None, None)
+    days = {"n9": [_d("n9", date(2026, 10, 31), 5)]}
+    out = follow_ups(_fcard(line), states, days)
+    assert out[0]["ok"] is True
+
+
+def test_follow_ups_flagged_add_not_there_yet_is_not_a_cross():
+    line = {"id": "f", "kind": "add", "ad_name": "Clip", "state": "flagged"}
+    out = follow_ups(_fcard(line), {"x": _state("x", "ACTIVE")}, {})
+    assert out[0]["ok"] is None and "not done yet" in out[0]["text"]
+
+
+def test_follow_ups_applied_add_with_missing_ad_is_still_a_cross():
+    line = {"id": "f", "kind": "add", "ad_name": "Clip", "meta_ids": {"ad_id": "gone"}, "state": "applied"}
+    assert follow_ups(_fcard(line), {}, {})[0]["ok"] is False
