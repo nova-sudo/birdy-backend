@@ -130,10 +130,18 @@ def test_verdict(scores: list[dict], win_share: float) -> str:
 test_verdict.__test__ = False  # not a pytest test when imported into test modules
 
 
-async def user_currency(user_id: str) -> str:
-    """The user's currency (targets and test totals are in it); GBP when unknown."""
+async def user_currency(user_id: str, db=None) -> str:
+    """The user's currency (targets and test totals are in it); GBP when unknown.
+    With `db`, read `users.default_currency` from it (the field CurrencyService reads)."""
     from utils.currency_exchange import CurrencyService
 
+    if db is not None:
+        try:
+            u = await db["users"].find_one({"user_id": user_id}, {"default_currency": 1})
+        except Exception as e:
+            logger.warning(f"creatives: user currency lookup failed for {user_id}: {e}")
+            u = None
+        return (u or {}).get("default_currency") or "GBP"
     try:
         return await CurrencyService.get_user_currency(user_id) or "GBP"
     except (ValueError, RuntimeError) as e:

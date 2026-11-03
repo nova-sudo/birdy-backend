@@ -12,6 +12,7 @@ import logging
 import re
 from datetime import date, datetime
 
+from ai.suggestions.agents.useless_ad_purger import _symbol
 from ai.tools.registry import registry
 from integrations.facebook_utils.meta_creative_reader import (
     MetaReadError,
@@ -20,6 +21,7 @@ from integrations.facebook_utils.meta_creative_reader import (
 )
 from services.creatives import posting, reads, store
 from services.creatives.targets import owning_group, prefill_targets
+from services.creatives.verdict import user_currency
 
 logger = logging.getLogger(__name__)
 CODE_RE = re.compile(r"^CT-\d+$", re.IGNORECASE)
@@ -152,14 +154,28 @@ def _targets(raw) -> tuple[dict | None, str | None]:
     return out, None
 
 
-def _targets_text(targets: dict) -> str:
+MONEY_METRICS = ("cpl", "cpc")
+
+
+def _opt(d: dict, key: str, default):
+    v = d.get(key)
+    return default if v is None else v
+
+
+def _n(v) -> str:
+    return f"{v:g}" if isinstance(v, (int, float)) and not isinstance(v, bool) else str(v)
+
+
+def _targets_text(targets: dict, sym: str = "") -> str:
+    """Targets are in the user's currency: money metrics and the spend floor carry its symbol."""
     parts = []
     for key, m in (targets.get("metrics") or {}).items():
         if isinstance(m, dict) and m.get("value") is not None:
-            parts.append(f"{key.upper()} {'<=' if m.get('op') == 'lte' else '>='} {m['value']}")
+            money = sym if key in MONEY_METRICS else ""
+            parts.append(f"{key.upper()} {'<=' if m.get('op') == 'lte' else '>='} {money}{_n(m['value'])}")
     if not parts:
         parts.append("no metric targets")
-    parts.append(f"min spend {targets.get('min_spend', 150)} / {targets.get('min_days', 7)} days")
+    parts.append(f"min spend {sym}{_n(_opt(targets, 'min_spend', 150))} / {_n(_opt(targets, 'min_days', 7))} days")
     if targets.get("mode") == "cpl_only":
         parts.append("CPL only")
     elif targets.get("mode") == "baseline":
@@ -259,15 +275,24 @@ async def _resolve_accounts(db, mongo_client, user_id, acts, destination, adset_
     return accounts, needs
 
 
+def _winner_text(targets: dict, sym: str) -> str:
+    share = round(float(_opt(targets, "win_share", 0.6)) * 100)
+    return (f"{share}% of scored accounts pass, after {sym}{_n(_opt(targets, 'min_spend', 150))} "
+            f"spend or {_n(_opt(targets, 'min_days', 7))} days")
+
+
 def _card(test: dict, accounts: list[dict], names: dict, n_accounts: int, warnings: list[str],
-          ready: bool = True) -> dict:
+          ready: bool = True, currency: str | None = None) -> dict:
     creative = test.get("creative") or {}
+    targets = test.get("targets") or {}
+    sym = _symbol(currency) if currency else ""
     return {
         "test_id": test["id"], "code": test["code"], "name": test.get("name"),
         "thumbnail": _thumbnail(test), "origin": test.get("origin"),
         "accounts": [{"name": names.get(a["ad_account_id"], a["ad_account_id"]),
                       "adset_name": a.get("adset_name")} for a in accounts],
-        "targets_text": _targets_text(test.get("targets") or {}),
+        "targets_text": _targets_text(targets, sym),
+        "winner_text": _winner_text(targets, sym),
         "destination_text": _destination_text(creative),
         "warnings": warnings,
         "n_accounts": n_accounts, "ready": ready,
@@ -389,7 +414,8 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
                 warnings.append(f"{a['ad_account_id']}: {posting.VIDEO_NEEDS_UPLOAD}.")
     names = {r["ad_account_id"]: r["name"] for r in await reads.ad_accounts(db, user_id)}
     ready = not needs and bool(accounts)
-    card = _card(test, accounts, names, len(acts), warnings, ready)
+    card = _card(test, accounts, names, len(acts), warnings, ready,
+                 currency=await user_currency(user_id, db))
     out = {
         "draft": {"test_id": test["id"], "code": test["code"], "name": test.get("name"),
                   "status": test.get("status"), "ready": ready},

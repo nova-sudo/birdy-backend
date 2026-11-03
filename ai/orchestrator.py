@@ -467,6 +467,9 @@ _PAGE_SYSTEM_PROMPTS = {
 # behaviour must not change. `None` is the general Ask-Birdy chat.
 # Pages whose chat can draft, post, scale and pause creative tests (campaigns + general chat).
 _CREATIVE_GUIDE_PAGES = {None, "campaigns"}
+# Slack chat runs with page=None (every tool) but has no card to confirm a write from,
+# so it never gets the creative write tools or the guide that drives them.
+_SLACK_EXCLUDED_TOOLS = frozenset(CREATIVE_WRITE_TOOLS)
 _MEDIA_BUYING_PAGES = {None, "campaigns", "dashboard", "client_detail", "opportunities", "leads"}
 
 
@@ -639,7 +642,7 @@ async def run_chat(
             capabilities = await capabilities_service.get_capabilities(db, user_id)
             if capabilities.get("media_buying"):
                 system_content = system_content + "\n\n" + get_media_buying_module()
-        if page in _CREATIVE_GUIDE_PAGES:
+        if page in _CREATIVE_GUIDE_PAGES and source != conversation_log.SOURCE_SLACK:
             system_content = system_content + CREATIVE_TESTS_GUIDE
         history.append({"role": "system", "content": system_content})
 
@@ -761,6 +764,9 @@ async def run_chat(
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
         tool_schemas = registry_schemas + mcp_schemas
+        excluded = _SLACK_EXCLUDED_TOOLS if source == conversation_log.SOURCE_SLACK else frozenset()
+        if excluded:
+            tool_schemas = [s for s in tool_schemas if s["function"]["name"] not in excluded]
         logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
         for iteration in range(MAX_TOOL_ITERATIONS + 1):
@@ -890,7 +896,11 @@ async def run_chat(
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))
 
-                if bad_args:
+                if tc.name in excluded:
+                    result = json.dumps({"error": (
+                        f"{tc.name} isn't available in Slack. Creative tests are drafted, "
+                        "posted and paused from the Birdy app.")})
+                elif bad_args:
                     logger.warning(f"Tool call {tc.name}: arguments were not valid JSON "
                                    f"({len(tc.arguments or '')} chars) — likely cut off")
                     result = json.dumps({"error": (

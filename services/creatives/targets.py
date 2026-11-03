@@ -29,7 +29,7 @@ async def prefill_targets(db, user_id: str, client_group_ids: list[str]) -> dict
     if per_account:
         # Only look the user's currency up when a group has a currency to convert from.
         has_cur = any((by_id.get(gid) or {}).get("ad_account_currency") for gid in per_account)
-        user_cur = await user_currency(user_id) if has_cur else None
+        user_cur = await user_currency(user_id, db) if has_cur else None
         converted = []
         for gid, v in per_account.items():
             rate = fx_rate((by_id.get(gid) or {}).get("ad_account_currency"), user_cur)

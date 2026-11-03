@@ -479,3 +479,19 @@ async def test_pause_passes_empty_list_unchanged(mock_db, monkeypatch):
     assert seen["ids"] == []
     await t.pause_creative_ads(mock_db, U, None, test_id=mine["id"], confirmed=True)
     assert seen["ids"] is None
+
+
+# ── final review M7: the card's winner line and money symbols ───────────────
+
+async def test_card_has_winner_text_and_user_currency_symbol(mock_db, meta):
+    await mock_db["users"].insert_one({"user_id": U, "default_currency": "GBP"})
+    await group(mock_db, "g1", "Acme", "act_1", meta_campaign_ids=["c1"])
+    await seed_session(mock_db, "s", U, [ATT])
+    meta.adsets["act_1"] = [adset(1)]
+    out = await t.draft_creative_test(mock_db, U, None, **{**DRAFT_ARGS, "targets": {
+        "cpl": 25, "metrics": {"cpc": {"op": "lte", "value": 1.5}, "ctr": {"op": "gte", "value": 1}}}})
+    card = out["card"]
+    assert card["winner_text"] == "60% of scored accounts pass, after £150 spend or 7 days"
+    assert "CPL <= £25" in card["targets_text"] and "CPC <= £1.5" in card["targets_text"]
+    assert "CTR >= 1" in card["targets_text"] and "£1 " not in card["targets_text"]
+    assert "min spend £150 / 7 days" in card["targets_text"]
