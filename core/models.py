@@ -127,6 +127,9 @@ class CreateAlertRequest(BaseModel):
     #                the alert triggers (and fires a notification) for every client
     #                that crosses the threshold individually
     tracking_mode: Optional[str] = "total"
+    # "clients" (default) or "creative_tests"
+    scope: Optional[str] = "clients"
+    creative_test_ids: Optional[List[str]] = []
 
 
 class UpdateAlertRequest(BaseModel):
@@ -139,6 +142,8 @@ class UpdateAlertRequest(BaseModel):
     frequency: Optional[str] = None
     status: Optional[str] = None
     tracking_mode: Optional[str] = None
+    scope: Optional[str] = None
+    creative_test_ids: Optional[List[str]] = None
 
 
 class SnoozeAlertRequest(BaseModel):

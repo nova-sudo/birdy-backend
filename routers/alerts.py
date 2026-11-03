@@ -163,6 +163,8 @@ async def create_alert(request: CreateAlertRequest, current_user: str = Depends(
             "notification_channels": request.notification_channels or ["in_app"],
             "frequency":             request.frequency or "daily",
             "tracking_mode":         request.tracking_mode or "total",
+            "scope":                 request.scope or "clients",
+            "creative_test_ids":     request.creative_test_ids or [],
             "status":                "active",
             "last_triggered_at":     None,
             "last_evaluated_at":     None,
@@ -244,6 +246,10 @@ async def update_alert(
             update_fields["status"] = request.status
         if request.tracking_mode is not None:
             update_fields["tracking_mode"] = request.tracking_mode
+        if request.scope is not None:
+            update_fields["scope"] = request.scope
+        if request.creative_test_ids is not None:
+            update_fields["creative_test_ids"] = request.creative_test_ids
 
         await db["alerts"].update_one({"id": alert_id}, {"$set": update_fields})
         updated = await db["alerts"].find_one({"id": alert_id})

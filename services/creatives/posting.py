@@ -40,6 +40,7 @@ from services.creatives.store import (
     add_test_ads,
     get_test,
     list_test_ads,
+    update_test,
 )
 from services.meta_status_service import MetaStatusError, set_object_status
 
@@ -497,6 +498,22 @@ async def _activate(db, mongo_client, user_id: str, test: dict, ads: list[dict],
     return {"activated": activated, "errors": errors}
 
 
+async def _ensure_verdict_alert(db, user_id: str, test: dict) -> None:
+    """Create the "notify when a verdict lands" alert once (stored as on_verdict.alert_id)."""
+    on_verdict = test.get("on_verdict") or {}
+    if not on_verdict.get("notify_channels"):
+        return
+    if on_verdict.get("alert_id") and await db["alerts"].find_one(
+            {"id": on_verdict["alert_id"], "user_id": user_id}, {"id": 1}):
+        return
+    try:
+        from services.creatives.alerts import create_verdict_alert
+        alert_id = await create_verdict_alert(db, user_id, test)
+        await update_test(db, user_id, test["id"], {"on_verdict": {**on_verdict, "alert_id": alert_id}})
+    except Exception as e:
+        logger.error(f"[creatives] verdict alert for {test.get('id')} failed: {e}", exc_info=True)
+
+
 async def go_live(db, mongo_client, user_id: str, test_id: str, *, partial_ok: bool = False,
                   now: datetime | None = None) -> dict:
     now = _naive(now)
@@ -511,6 +528,7 @@ async def go_live(db, mongo_client, user_id: str, test_id: str, *, partial_ok: b
     if waiting and not partial_ok:
         raise PostingError("Some ads are not created yet", 409)
     res = await _activate(db, mongo_client, user_id, test, created, now)
+    await _ensure_verdict_alert(db, user_id, test)
     return {"test_id": test_id, **res}
 
 

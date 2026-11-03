@@ -376,7 +376,7 @@ async def patch_creative(
 async def archive_creative(test_id: str, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        await _owned(db, current_user, test_id)
+        owned = await _owned(db, current_user, test_id)
         updated = await store.update_test(
             db, current_user, test_id,
             {"status": store.ARCHIVED, "archived_at": datetime.now(timezone.utc)},
@@ -386,6 +386,12 @@ async def archive_creative(test_id: str, current_user: str = Depends(get_current
             await close_test_items(db, current_user, test_id, include_adopt=True)
         except Exception as e:
             logger.error(f"[creatives] closing suggestions for {test_id} failed: {e}", exc_info=True)
+        alert_id = (owned.get("on_verdict") or {}).get("alert_id")
+        if alert_id:  # the auto verdict alert goes with the test
+            try:
+                await db["alerts"].delete_one({"id": alert_id, "user_id": current_user})
+            except Exception as e:
+                logger.error(f"[creatives] deleting verdict alert for {test_id} failed: {e}", exc_info=True)
         return _json(updated)
 
 

@@ -341,6 +341,12 @@ METRIC_LABELS = {
     # Legacy aliases (kept for backward compat with existing alerts)
     "lead_count":       "Lead Count",
     "conversion_rate":  "Conversion Rate (%)",
+    # Creative tests (alert scope "creative_tests")
+    "creative_verdict":     "Creative verdict",
+    "creative_cpl":         "Creative CPL",
+    "creative_ctr":         "Creative CTR",
+    "creative_hook_rate":   "Creative hook rate",
+    "creative_post_failed": "Creative post failed",
 }
 
 OPERATOR_LABELS = {

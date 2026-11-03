@@ -461,6 +461,10 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
                                    triggered = True if ANY client crosses threshold.
                                    per_client_results has the full breakdown.
     """
+    if alert.get("scope") == "creative_tests":
+        from services.creatives.alerts import evaluate_creative_alert
+        return await evaluate_creative_alert(alert, mongo_client[DB_NAME])
+
     condition     = alert.get("condition", {})
     metric        = condition.get("metric", "")
     operator      = condition.get("operator", "")
