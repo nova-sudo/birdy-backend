@@ -11,6 +11,7 @@ from ai.prompts.media_buying import get_media_buying_module
 from ai.prompts import agent_training as agent_training_prompt
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
+from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
@@ -464,6 +465,8 @@ _PAGE_SYSTEM_PROMPTS = {
 # may inject the senior-media-buyer analysis module. Deliberately excludes the
 # narrow alerts / custom_metrics assistants (strict single-purpose scopes) — their
 # behaviour must not change. `None` is the general Ask-Birdy chat.
+# Pages whose chat can draft, post, scale and pause creative tests (campaigns + general chat).
+_CREATIVE_GUIDE_PAGES = {None, "campaigns"}
 _MEDIA_BUYING_PAGES = {None, "campaigns", "dashboard", "client_detail", "opportunities", "leads"}
 
 
@@ -589,6 +592,8 @@ async def run_chat(
             capabilities = await capabilities_service.get_capabilities(db, user_id)
             if capabilities.get("media_buying"):
                 system_content = system_content + "\n\n" + get_media_buying_module()
+        if page in _CREATIVE_GUIDE_PAGES:
+            system_content = system_content + CREATIVE_TESTS_GUIDE
         history.append({"role": "system", "content": system_content})
 
     history.append({"role": "user", "content": message})

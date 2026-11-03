@@ -119,7 +119,7 @@ async def enqueue_post(db, user_id: str, test_id: str, *, accounts: list[dict],
         raise PostingError(f"Unknown ad account: {', '.join(missing)}")
     if (test.get("creative") or {}).get("format", "image") != "image":
         for act in acts:
-            if _media_plan(test, act)[0] == "unavailable":
+            if media_plan(test, act)[0] == "unavailable":
                 raise PostingError(f"{VIDEO_NEEDS_UPLOAD} ({act})")
 
     # One atomic claim on the test doc: the status check plus `posted_accounts` make a
@@ -177,7 +177,7 @@ def _norm_act(act) -> str:
     return act[4:] if act.startswith("act_") else act
 
 
-def _media_plan(test: dict, act: str) -> tuple[str, str | None]:
+def media_plan(test: dict, act: str) -> tuple[str, str | None]:
     """How to get media into `act`: ("reuse", id) existing Meta media (no upload);
     ("blob", url) Birdy upload; ("meta_cdn", url) re-upload the source ad's image (revive into
     another account: image hashes / video ids are account-scoped); ("unavailable", None)."""
@@ -261,7 +261,7 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick
     step = "media"
     try:
         if not meta.get("image_hash" if fmt == "image" else "video_id"):
-            how, ref = _media_plan(test, act)
+            how, ref = media_plan(test, act)
             if how == "unavailable":
                 raise MetaWriteError(VIDEO_NEEDS_UPLOAD if fmt != "image"
                                      else "This creative has no image to upload")

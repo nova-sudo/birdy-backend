@@ -69,7 +69,7 @@ async def test_list_adsets_flags_compat_and_rejects_foreign(mock_db, monkeypatch
 
 async def make_test(db, user, **kw):
     return await store.create_test(db, user, name="Hook", origin="new",
-                                   creative={"format": "image", "media": {"image_url": "u"}},
+                                   creative={"format": "image", "destination": "website", "media": {"image_url": "u"}},
                                    targets={}, **kw)
 
 
@@ -365,7 +365,115 @@ def test_write_tools_registered_and_paged():
     assert "user_id" not in schema["properties"]
 
 
-def test_guide_is_in_system_prompt():
-    prompt = get_system_prompt()
-    assert CREATIVE_TESTS_GUIDE in prompt
+def test_guide_content():
     assert "confirmed=true" in CREATIVE_TESTS_GUIDE and ":::creative" in CREATIVE_TESTS_GUIDE
+    assert CREATIVE_TESTS_GUIDE not in get_system_prompt()
+
+
+class _Scripted:
+    def __init__(self, responses):
+        self.responses, self.seen, self.model = list(responses), [], "stub"
+
+    async def chat_completion(self, messages, tools=None, tool_choice="auto", temperature=0.3,
+                              max_tokens=2048):
+        self.seen.append(messages)
+        return self.responses.pop(0)
+
+
+@pytest.mark.parametrize("page,has_guide", [("campaigns", True), (None, True), ("dashboard", False)])
+async def test_guide_only_on_campaigns_and_general_chat(mock_db, page, has_guide):
+    from ai.orchestrator import run_chat
+    from ai.providers.base import ProviderResponse
+    provider = _Scripted([ProviderResponse(content="hi")])
+    await run_chat(provider=provider, tool_registry=ToolRegistry(), db=mock_db, user_id=U,
+                   message="hello", page=page)
+    system = provider.seen[0][0]["content"]
+    assert (CREATIVE_TESTS_GUIDE in system) is has_guide
+
+
+async def test_run_chat_overrides_model_session_id(mock_db):
+    import json
+    from ai.orchestrator import run_chat
+    from ai.providers.base import ProviderResponse, ToolCall
+    got = {}
+
+    async def stub(db, user_id, mongo_client=None, **kw):
+        got.update(kw, user_id=user_id)
+        return {"ok": True}
+
+    reg = ToolRegistry()
+    reg.register(name="draft_creative_test", description="s",
+                 parameters={"type": "object", "properties": {}}, executor=stub)
+    provider = _Scripted([
+        ProviderResponse(content=None, finish_reason="tool_calls", tool_calls=[ToolCall(
+            id="1", name="draft_creative_test",
+            arguments=json.dumps({"session_id": "chat_forged", "name": "x"}))]),
+        ProviderResponse(content="done")])
+    out = await run_chat(provider=provider, tool_registry=reg, db=mock_db, user_id=U,
+                         message="draft", page="campaigns")
+    assert got["session_id"] == out["session_id"] != "chat_forged"
+    assert got["user_id"] == U
+
+
+async def test_post_refuses_draft_with_open_needs_and_update_keeps_requested(mock_db, meta):
+    await group(mock_db, "g1", "Acme", "act_1")
+    await group(mock_db, "g2", "Bolt", "act_2")
+    await seed_session(mock_db, "s", U, [ATT])
+    meta.adsets["act_1"] = [adset(1)]
+    meta.adsets["act_2"] = [adset(2), adset(3)]
+    args = {**DRAFT_ARGS, "ad_account_ids": ["act_1", "act_2"]}
+    out = await t.draft_creative_test(mock_db, U, None, **args)
+    assert out["needs"][0]["ad_account_id"] == "act_2"
+    assert out["card"]["posts_as"] == "Paused, then live together once all 2 accept"
+    posted = []
+
+    async def spy(*a, **k):
+        posted.append(1)
+
+    import services.creatives.posting as posting_mod
+    orig = posting_mod.enqueue_post
+    posting_mod.enqueue_post = spy
+    try:
+        refused = await t.post_creative_test(mock_db, U, None, test_id=out["draft"]["test_id"], confirmed=True)
+        assert refused["error"] == "draft_not_ready" and refused["needs"][0]["ad_account_id"] == "act_2"
+        # an update that omits ad_account_ids keeps act_2 requested (and unresolved)
+        upd = await t.draft_creative_test(mock_db, U, None, **{
+            k: v for k, v in args.items() if k not in ("ad_account_ids", "name")},
+            name="Renamed", test_id=out["draft"]["code"])
+        assert upd["needs"][0]["ad_account_id"] == "act_2"
+        assert upd["card"]["posts_as"].endswith("all 2 accept")
+        assert (await t.post_creative_test(
+            mock_db, U, None, test_id=out["draft"]["test_id"], confirmed=True))["error"] == "draft_not_ready"
+        assert posted == []
+        # resolved: post goes through
+        done = await t.draft_creative_test(mock_db, U, None, **{
+            **{k: v for k, v in args.items() if k != "name"}, "test_id": out["draft"]["code"],
+            "adset_ids": {"act_2": "s3"}, "name": "Renamed"})
+        assert "needs" not in done
+        await t.post_creative_test(mock_db, U, None, test_id=out["draft"]["test_id"], confirmed=True)
+        assert posted == [1]
+    finally:
+        posting_mod.enqueue_post = orig
+
+
+async def test_scale_requires_destination(mock_db, meta):
+    await group(mock_db, "g2", "Bolt", "act_2")
+    test = await store.create_test(mock_db, U, name="x", origin="new", creative={"format": "image"}, targets={})
+    out = await t.scale_creative_test(mock_db, U, None, test_id=test["id"], ad_account_ids=["act_2"],
+                                      confirmed=True)
+    assert "destination" in out["error"]
+
+
+async def test_pause_passes_empty_list_unchanged(mock_db, monkeypatch):
+    mine = await make_test(mock_db, U)
+    seen = {}
+
+    async def spy(db, mc, user_id, test_id, ad_account_ids, **kw):
+        seen["ids"] = ad_account_ids
+        return {}
+
+    monkeypatch.setattr(posting, "pause_ads", spy)
+    await t.pause_creative_ads(mock_db, U, None, test_id=mine["id"], ad_account_ids=[], confirmed=True)
+    assert seen["ids"] == []
+    await t.pause_creative_ads(mock_db, U, None, test_id=mine["id"], confirmed=True)
+    assert seen["ids"] is None

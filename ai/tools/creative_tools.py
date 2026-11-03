@@ -8,6 +8,7 @@ services/creatives/reads.py, shared with routers/creatives.py.
 """
 
 import json
+import logging
 import re
 from datetime import date, datetime
 
@@ -20,6 +21,7 @@ from integrations.facebook_utils.meta_creative_reader import (
 from services.creatives import posting, reads, store
 from services.creatives.targets import owning_group, prefill_targets
 
+logger = logging.getLogger(__name__)
 CODE_RE = re.compile(r"^CT-\d+$", re.IGNORECASE)
 
 
@@ -297,7 +299,8 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
 
     acts = list(ad_account_ids or [])
     if not acts and existing:
-        acts = [a["ad_account_id"] for a in existing.get("draft_accounts") or []]
+        acts = list(existing.get("requested_accounts")
+                    or [a["ad_account_id"] for a in existing.get("draft_accounts") or []])
     if not acts:
         return _fail("ad_account_ids is required (use list_ad_accounts)")
     acts = list(dict.fromkeys(acts))
@@ -341,19 +344,20 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
 
     if not existing:
         if not norm_targets.get("metrics"):
-            try:
-                gids = [a["client_group_id"] for a in accounts if a.get("client_group_id")]
-                pre = await prefill_targets(db, user_id, gids)
-                if (pre["metrics"]["cpl"].get("value")) is not None:
-                    norm_targets["metrics"] = pre["metrics"]
-            except Exception:
-                pass
+            gids = [a["client_group_id"] for a in accounts if a.get("client_group_id")]
+            pre = await prefill_targets(db, user_id, gids)
+            cpl = ((pre.get("metrics") or {}).get("cpl") or {})
+            if cpl.get("value") is not None:
+                norm_targets["metrics"] = pre["metrics"]
         test = await store.create_test(
             db, user_id, name=name.strip(), origin=origin, creative=creative, targets=norm_targets,
             source=source, created_via="chat")
-        test = await store.update_test(db, user_id, test["id"], {"draft_accounts": accounts})
+        test = await store.update_test(
+            db, user_id, test["id"],
+            {"draft_accounts": accounts, "requested_accounts": acts, "draft_needs": needs})
     else:
-        fields = {"creative": creative, "draft_accounts": accounts}
+        fields = {"creative": creative, "draft_accounts": accounts, "requested_accounts": acts,
+                  "draft_needs": needs}
         if name:
             fields["name"] = name.strip()
         if norm_targets:
@@ -379,7 +383,7 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
         warnings.append(f"{need['ad_account_id']} still needs an ad set, page or lead form.")
     if creative.get("format") == "video":
         for a in accounts:
-            if posting._media_plan(test, a["ad_account_id"])[0] == "unavailable":
+            if posting.media_plan(test, a["ad_account_id"])[0] == "unavailable":
                 warnings.append(f"{a['ad_account_id']}: {posting.VIDEO_NEEDS_UPLOAD}.")
     names = {r["ad_account_id"]: r["name"] for r in await reads.ad_accounts(db, user_id)}
     card = _card(test, accounts, names, len(acts), warnings)
@@ -403,6 +407,13 @@ async def post_creative_test(db, user_id, mongo_client=None, test_id=None, confi
     accounts = test.get("draft_accounts") or []
     if not accounts:
         return _fail("This draft has no accounts yet; call draft_creative_test first")
+    requested = test.get("requested_accounts") or [a["ad_account_id"] for a in accounts]
+    resolved = {a["ad_account_id"] for a in accounts}
+    open_needs = test.get("draft_needs") or [{"ad_account_id": a} for a in requested if a not in resolved]
+    if open_needs or not set(requested) <= resolved:
+        return {"error": "draft_not_ready", "needs": open_needs,
+                "message": "Some requested accounts still need an ad set, page or lead form. "
+                           "Ask the user, then call draft_creative_test again. Nothing was posted."}
     try:
         res = await reads.enqueue_accounts(db, user_id, test["id"], accounts, add_accounts=False)
     except posting.PostingError as e:
@@ -420,10 +431,12 @@ async def scale_creative_test(db, user_id, mongo_client=None, test_id=None, ad_a
     acts = list(dict.fromkeys(ad_account_ids or []))
     if not acts:
         return _fail("ad_account_ids is required")
+    destination = (test.get("creative") or {}).get("destination")
+    if destination not in DESTINATIONS:
+        return _fail("This test has no destination, so ad sets cannot be matched")
     try:
         accounts, needs = await _resolve_accounts(
-            db, mongo_client, user_id, acts, (test.get("creative") or {}).get("destination") or "website",
-            adset_ids, page_ids, lead_form_id)
+            db, mongo_client, user_id, acts, destination, adset_ids, page_ids, lead_form_id)
         if needs:
             return {"needs": needs, "message": "Nothing was posted. Ask the user to pick these, "
                     "then call scale_creative_test again."}
@@ -443,7 +456,7 @@ async def pause_creative_ads(db, user_id, mongo_client=None, test_id=None, ad_ac
     if test is None:
         return _fail("Creative test not found")
     try:
-        res = await posting.pause_ads(db, mongo_client, user_id, test["id"], ad_account_ids or None)
+        res = await posting.pause_ads(db, mongo_client, user_id, test["id"], ad_account_ids)
     except posting.PostingError as e:
         return _fail(e.message)
     return _json(res)
