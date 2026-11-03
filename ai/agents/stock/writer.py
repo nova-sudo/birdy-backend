@@ -45,11 +45,20 @@ _SCALE = r"(?:[kK]|[mM]|bn|million|billion|thousand|grand)(?![A-Za-z])"
 _SCALES = {"k": 1000, "thousand": 1000, "grand": 1000, "m": 10**6, "million": 10**6,
            "bn": 10**9, "billion": 10**9}
 _MONEY_KEYS = ("spend", "cpl", "prev_spend", "prev_cpl", "green_under", "red_over")
-# A bare number is money when it sits within this many characters of a money word.
+# A bare number (no currency marker) is money only by shape. Either it directly follows a money
+# word with at most a short linker ("limit is 7", "budget to 250"), or it has a decimal part and
+# sits within _NEAR characters of a money word ("CPL fell 31% to 4.12"). Counted nouns, units,
+# percentages, dates, month names and long ids are never money.
 _MONEY_WORDS = re.compile(r"\b(?:cpl|cost|costs|spend|spent|budget|budgets|limit|limits|target)\b", re.I)
+_LINK = r"(?:of|at|to|is|was|from|by|around|about|under|over|hit|reached)"
+_LINKED = re.compile(rf"(?:\s*(?:\b{_LINK}\b|[=:]))*\s*", re.I)
 _NEAR = 30
-_BARE_NOT_MONEY = re.compile(
-    r"\s?(?:%|percent\b|(?:leads?|ads?|days?|weeks?|clicks|creatives?|clients?|times|x)\b)", re.I)
+_COUNTED = re.compile(r"\s?(?:%|percent\b|(?:ads?|leads?|days?|weeks?|hours?|sets?|variants?)\b)", re.I)
+_MONTH = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
+          r"sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_NEXT_MONTH = re.compile(rf"\s?(?:st|nd|rd|th)?\s?{_MONTH}\b", re.I)
+_PREV_MONTH = re.compile(rf"\b{_MONTH}\s?$", re.I)
+_ISO_DATE = re.compile(r"\d{4}-\d{2}-\d{2}")
 
 
 def _money_re(codes) -> re.Pattern:
@@ -100,14 +109,22 @@ def _money_figures(text: str, codes) -> list[tuple[str, Decimal, int, int, set]]
         out.append((m.group(0).strip(), value, dec, scale, cs))
         spans.append(m.span())
     words = [m.span() for m in _MONEY_WORDS.finditer(text)]
-    bare = re.compile(rf"(?<![\w:.,]){_NUM}(?:\s?{_SCALE})?(?![\w:])")
+    spans += [m.span() for m in _ISO_DATE.finditer(text)]
+    bare = re.compile(rf"(?<![\w:.,-]){_NUM}(?:\s?{_SCALE})?(?![\w:-])")
     for m in bare.finditer(text):
         if any(a < m.end() and m.start() < b for a, b in spans):
             continue
-        if _BARE_NOT_MONEY.match(text, m.end()):
+        digits = re.sub(r"\D", "", m.group(0))
+        if (len(digits) >= 11 or _COUNTED.match(text, m.end()) or _NEXT_MONTH.match(text, m.end())
+                or _PREV_MONTH.search(text[:m.start()])):
             continue
-        if not any(m.start() - e <= _NEAR and m.start() >= e or s - m.end() <= _NEAR and s >= m.end()
-                   for s, e in words):
+        direct = any(e <= m.start() and _LINKED.fullmatch(text[e:m.start()]) for _, e in words)
+        try:
+            decimal = _parse_amount(re.match(_NUM, m.group(0)).group(0))[1] > 0
+        except (InvalidOperation, AttributeError):
+            continue
+        near = any(0 <= m.start() - e <= _NEAR or 0 <= s - m.end() <= _NEAR for s, e in words)
+        if not (direct or (decimal and near)):
             continue
         sm = re.search(_SCALE + "$", m.group(0))
         num = m.group(0)[:sm.start()].strip() if sm else m.group(0)
@@ -176,11 +193,12 @@ def _id_list(raw, key: str, allowed: set[str], errs: list[str]) -> list[str]:
     return out
 
 
-_SLACK_MARKUP = re.compile(r"<[^<>]*>")
+_SLACK_MARKUP = re.compile(r"<(?:![^<>]*|[@#][^<>]*|(?:https?://|mailto:)[^<>]*)>")
 
 
 def _plain(text: str) -> str:
-    """Remove Slack markup (<!channel>, <https://x|y>, <@U1>) from model text."""
+    """Remove Slack-shaped tokens (<!channel>, <@U1>, <#C1>, <https://x|y>, <mailto:x>). A bare
+    < or > is ordinary text and stays."""
     while True:
         out = _SLACK_MARKUP.sub("", text)
         if out == text:

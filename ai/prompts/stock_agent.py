@@ -93,5 +93,6 @@ def build_user_message(facts: dict, candidates: dict, lessons: list, max_live: i
     if problems:
         parts.append("Your previous reply was rejected by the checker:\n- "
                      + "\n- ".join(p.replace("<", "(") for p in problems)
-                     + "\nReply again with corrected JSON.")
+                     + "\nWrite every money figure with its currency symbol or code, and only use figures that appear"
+                     " in the facts or candidates. Reply again with corrected JSON.")
     return "\n\n".join(parts)

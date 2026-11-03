@@ -243,7 +243,7 @@ async def test_memory_from_note_takes_source_author_and_client(mock_db, monkeypa
 
 @pytest.mark.parametrize("text", [
     "CPL of 9.99", "raise budget to 250", "CPL fell 31% to 4.12 from 9", "spent 1300 so far",
-    "a limit of 12 per lead", "target 3.5", "250 budget", "cost 99",
+    "a limit of 12 per lead", "target 3.5", "cost 99", "limit is 11", "CPL was 9.5", "budget is around 250",
 ])
 def test_bare_money_not_in_facts_is_rejected(text):
     facts = {**FACTS, "cpl": 5.5}
@@ -285,7 +285,7 @@ def test_flag_note_goes_through_money_check():
 
 def test_slack_markup_is_stripped_everywhere():
     d, errs = check(additional_changes="<!channel> see <https://evil.example|click> now <@U123>",
-                    thought_process="Fine <!here>", next_steps="<<!everyone>>x",
+                    thought_process="Fine <!here>", next_steps="<!everyone>x",
                     flags=[{"id": "x2", "kind": "city", "note": "Leeds <!channel>"}])
     assert errs == []
     assert d["additional_changes"] == "see  now" or d["additional_changes"].split() == ["see", "now"]
@@ -367,3 +367,42 @@ def test_prompt_has_flags_and_currency_instructions():
     s = writer.prompt.SYSTEM.lower()
     assert "city" in s and "offer" in s and "clinic" in s and '"flags"' in s
     assert "currency symbol or code" in s and "bare number" in s
+
+
+@pytest.mark.parametrize("text", [
+    "Ad 3 of 4 has the highest spend.", "Spend dropped on 12 November", "budget changed in 2026",
+    "Bring back ad 23851234567890 to lower CPL", "CPL was £4.12 on 3 November",
+    "Budget was cut on 2026-11-03", "CPL up since 1 Nov", "CPL over the 7-day window was £4.12",
+    "Spend over 14-day period", "CPL fell for 2 straight weeks", "Spend in week 2",
+    "No spend in the past 24 hours", "Spend in Q4", "The 4 live ads cost £700",
+    "Spend rose across the 2 top ads", "The cost of ad 2 rose", "CPL per 1,000 impressions",
+    "The limit is 4 ads live.", "Spent 7 days below the limit.", "Spend rose 1.5 days after 3 May",
+])
+def test_bare_numbers_that_are_not_money_pass(text):
+    assert check(thought_process=text)[0] is not None, text
+
+
+@pytest.mark.parametrize("text", ["CPL of 9.99", "raise budget to 250", "limit is 11", "CPL was 9.5",
+                                  "CPL fell 31% to 4.12", "spent 1,300.5 so far", "CPL = 9", "cost: 99"])
+def test_bare_money_shapes_are_rejected(text):
+    facts = {**FACTS, "cpl": 5.5}
+    assert validate_draft(draft(thought_process=text), facts, CANDS, 4)[0] is None, text
+
+
+def test_retry_message_explains_the_money_rule():
+    from ai.prompts.stock_agent import build_user_message
+    msg = build_user_message(FACTS, CANDS, [], 4, ["x"])
+    assert "currency symbol or code" in msg and "only use figures that appear in the facts" in msg
+
+
+@pytest.mark.parametrize("text", ["CPL < £4.12 and spend > £700", "spend <£8 and CPL >£5 ok", "if a<b and c>d"])
+def test_bare_angle_brackets_survive(text):
+    d, errs = check(additional_changes=text)
+    assert errs == [] and d["additional_changes"] == text
+
+
+@pytest.mark.parametrize("text, left", [
+    ("<!channel> hi", "hi"), ("<@U1> hi", "hi"), ("<#C1|x> hi", "hi"), ("<mailto:a@b.c|me> hi", "hi"),
+    ("<http://x.y> hi", "hi"), ("<https://x.y|click> hi", "hi")])
+def test_slack_tokens_are_stripped(text, left):
+    assert check(additional_changes=text)[0]["additional_changes"] == left
