@@ -28,9 +28,13 @@ async def find_adoptable(db, user_id: str) -> list[dict]:
     by_code = {t["code"]: t for t in tests}
     if not by_code:
         return []
-    tracked = set(await db[TEST_ADS].distinct("meta.ad_id", {"user_id": user_id}))
+    cached = [(g, ad) async for g, ad, _ in _cached_ads(db, user_id)
+              if parse_code(ad.get("name")) in by_code and ad.get("id")]
+    # Any Birdy user's tracking of the ad counts: ad accounts can be shared across users.
+    tracked = set(await db[TEST_ADS].distinct(
+        "meta.ad_id", {"meta.ad_id": {"$in": [ad["id"] for _, ad in cached]}}))
     out, seen = [], set()
-    async for g, ad, _ in _cached_ads(db, user_id):
+    for g, ad in cached:
         code = parse_code(ad.get("name"))
         ad_id = ad.get("id")
         if code not in by_code or not ad_id or ad_id in tracked or ad_id in seen:
@@ -39,7 +43,7 @@ async def find_adoptable(db, user_id: str) -> list[dict]:
         out.append({
             "test_id": by_code[code]["id"], "code": code, "ad_id": ad_id, "ad_name": ad.get("name"),
             "ad_account_id": g.get("meta_ad_account_id"), "client_group_id": g["id"],
-            "adset_id": ad.get("adset_id"),
+            "adset_id": ad.get("adset_id"), "campaign_id": ad.get("campaign_id"),
         })
     return out
 
@@ -54,12 +58,12 @@ async def adopt(db, user_id: str, test_id: str, ad_id: str) -> dict:
                 raise ValueError(f"ad {ad_id} is named for {item['code']}, not {test['code']}")
             break
     else:
-        if await db[TEST_ADS].find_one({"user_id": user_id, "meta.ad_id": ad_id}):
+        if await db[TEST_ADS].find_one({"meta.ad_id": ad_id}):
             raise ValueError(f"ad {ad_id} is already tracked")
         raise ValueError(f"ad {ad_id} is not an adoptable {test['code']} ad")
     rows = await add_test_ads(db, user_id, test_id, [{
         "client_group_id": item["client_group_id"], "ad_account_id": item["ad_account_id"],
-        "adset_id": item["adset_id"], "meta": {"ad_id": ad_id},
+        "adset_id": item["adset_id"], "campaign_id": item.get("campaign_id"), "meta": {"ad_id": ad_id},
         "post_state": "active", "origin": "adopted",
     }])
     return rows[0]

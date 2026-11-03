@@ -23,7 +23,6 @@ from services.creatives.store import (
     TEST_ADS,
     TESTS,
     TESTING,
-    list_test_ads,
     update_test,
 )
 from services.creatives.reconcile import reconcile_all
@@ -89,9 +88,13 @@ def _baseline(account_rows: list[dict], ad_totals: dict) -> dict | None:
 
 async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     user_id = test["user_id"]
-    ads = await list_test_ads(db, test["id"])
+    ads = [a async for a in db[TEST_ADS].find({"test_id": test["id"], "user_id": user_id})]
+    for a in ads:
+        if a.get("_id") != a.get("id"):
+            a.pop("_id", None)
     live = [a for a in ads if a.get("post_state") == "active" and (a.get("meta") or {}).get("ad_id")]
-    prev_states = {a.get("ad_account_id"): (a.get("score") or {}).get("state") for a in ads}
+    prev_by_ad = {a["id"]: ((a.get("score") or {}).get("state"), a.get("ad_account_id"))
+                  for a in ads if a.get("post_state") == "active"}
     changed: list[dict] = []
 
     fb = await get_facebook_token(user_id, mongo_client)
@@ -119,7 +122,7 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     for ad in live:
         if await fetch_ad_status(ad["meta"]["ad_id"], token) is None:
             await db[TEST_ADS].update_one(
-                {"id": ad["id"]},
+                {"id": ad["id"], "user_id": user_id},
                 {"$set": {"post_state": "removed", "score": {"state": "removed"}}},
             )
         else:
@@ -160,14 +163,26 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
         score = score_account(totals, targets, fmt=fmt, baseline=baseline)
         score["baseline_cpl"] = baseline["cpl"] if baseline else None
         score["evaluated_at"] = now
-        await db[TEST_ADS].update_one({"id": ad["id"]}, {"$set": {"score": score, "updated_at": now}})
+        await db[TEST_ADS].update_one({"id": ad["id"], "user_id": user_id}, {"$set": {"score": score, "updated_at": now}})
         scored_ads.append({**ad, "score": score, "currency": grp.get("ad_account_currency"), "format": fmt})
 
-        before = prev_states.get(ad["ad_account_id"])
-        if score["state"] == "fail" and before == "pass":
-            changed.append({"kind": "account_fail", "ad_account_id": ad["ad_account_id"]})
-        elif score["state"] == "pass" and before == "fail":
-            changed.append({"kind": "account_pass", "ad_account_id": ad["ad_account_id"]})
+    def _agg(states):
+        if "fail" in states:
+            return "fail"
+        return "pass" if "pass" in states else "other"
+
+    before_acct: dict = {}
+    for st, acct in prev_by_ad.values():
+        before_acct.setdefault(acct, []).append(st)
+    after_acct: dict = {}
+    for a in scored_ads:
+        after_acct.setdefault(a["ad_account_id"], []).append(a["score"]["state"])
+    for acct, states in after_acct.items():
+        b, n = _agg(before_acct.get(acct, [])), _agg(states)
+        if b == "pass" and n == "fail":
+            changed.append({"kind": "account_fail", "ad_account_id": acct})
+        elif b == "fail" and n == "pass":
+            changed.append({"kind": "account_pass", "ad_account_id": acct})
 
     # 4. verdict and summary
     win_share = (test.get("targets") or {}).get("win_share")
@@ -185,48 +200,72 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
         if verdict != old_verdict:
             changed.append({"kind": "verdict"})
     elif test.get("status") in FINAL_VERDICTS:
-        fields.update(verdict=None, status=TESTING, verdict_at=None)
+        fields.update(verdict=None, status=TESTING)
     await update_test(db, user_id, test["id"], fields)
     return {"test_id": test["id"], "verdict": verdict, "changed": changed}
+
+
+RETRY_AFTER = timedelta(minutes=20)
 
 
 async def track_due_tests(db, mongo_client, now_utc: datetime, *, deadline: float | None = None) -> dict:
     now = _naive_utc(now_utc)
     today = now.date()
     tz_cache: dict[str, str | None] = {}
+    blocked_users: set[str] = set()
     tracked = skipped = 0
     events: list[dict] = []
 
-    cursor = db[TESTS].find({"status": {"$in": [TESTING, *FINAL_VERDICTS]}})
-    async for doc in cursor:
-        if tracked + skipped >= MAX_TESTS_PER_TICK or (deadline and time.monotonic() > deadline):
+    docs = await db[TESTS].find({"status": {"$in": [TESTING, *FINAL_VERDICTS]}}).to_list(None)
+    docs.sort(key=lambda d: (d.get("tracked_at") is not None, _naive_utc(d["tracked_at"]) if d.get("tracked_at") else datetime.min))
+    for doc in docs:
+        if tracked >= MAX_TESTS_PER_TICK or (deadline and time.monotonic() > deadline):
             break
         test = dict(doc)
         if test.get("_id") != test.get("id"):
             test.pop("_id", None)
-        if test.get("status") == ARCHIVED:
-            continue
         uid = test["user_id"]
+        if uid in blocked_users:
+            continue
+        retry = test.get("retry_after")
+        if retry is not None and _naive_utc(retry) > now:
+            continue
         if uid not in tz_cache:
             u = await db["users"].find_one({"user_id": uid}, {"timezone": 1})
             tz_cache[uid] = (u or {}).get("timezone") or DEFAULT_TIMEZONE
         last = test.get("tracked_at")
         if last is not None and _naive_utc(last) >= last_slot_utc(now, tz_cache[uid]):
             continue
+        key = {"id": test["id"], "user_id": uid}
         try:
             res = await track_test(db, mongo_client, test, today=today)
         except MetaReadError as e:
-            logger.warning(f"[creatives-track] {test['id']} skipped ({'retryable' if e.retryable else 'error'}): {e}")
             skipped += 1
+            if e.retryable:
+                logger.warning(f"[creatives-track] {test['id']} rate limited, retry later: {e}")
+                await db[TESTS].update_one(key, {"$set": {"retry_after": now + RETRY_AFTER}})
+                blocked_users.add(uid)
+            else:
+                logger.warning(f"[creatives-track] {test['id']} failed: {e}")
+                await _stamp_error(db, key, now, getattr(e, "code", None), str(e))
             continue
         except Exception as e:
             logger.error(f"[creatives-track] {test['id']} failed: {e}", exc_info=True)
             skipped += 1
+            await _stamp_error(db, key, now, None, str(e))
             continue
-        await db[TESTS].update_one({"id": test["id"], "user_id": uid}, {"$set": {"tracked_at": now}})
+        await db[TESTS].update_one(key, {"$set": {"tracked_at": now}, "$unset": {"track_error": "", "retry_after": ""}})
         tracked += 1
         events.extend({**ev, "test_id": test["id"], "user_id": uid} for ev in res["changed"])
     return {"tracked": tracked, "skipped": skipped, "events": events}
+
+
+async def _stamp_error(db, key: dict, now: datetime, code, message: str) -> None:
+    """Wait for the next nightly slot instead of retrying every minute."""
+    await db[TESTS].update_one(key, {
+        "$set": {"tracked_at": now, "track_error": {"code": code, "message": message[:300], "at": now}},
+        "$unset": {"retry_after": ""},
+    })
 
 
 async def run_creatives_tick(now_utc: datetime | None = None) -> dict:

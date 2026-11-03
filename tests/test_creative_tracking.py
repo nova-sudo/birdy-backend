@@ -204,3 +204,76 @@ async def test_tick_reconciles_once_per_utc_day(mock_db, mock_mongo_client, monk
     second = await ct.run_creatives_tick(datetime(2026, 11, 3, 18))
     third = await ct.run_creatives_tick(datetime(2026, 11, 4, 0, 5))
     assert len(calls) == 2 and "reconcile" in first and "reconcile" not in second and "reconcile" in third
+
+
+async def _run_due(db, mc, now=datetime(2026, 11, 3, 12)):
+    return await ct.track_due_tests(db, mc, now)
+
+
+async def test_non_retryable_error_waits_for_next_slot(mock_db, mock_mongo_client, monkeypatch):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n_ads=1)
+    m.err["act_0"] = MetaReadError("bad token", code=190)
+    await _run_due(mock_db, mock_mongo_client)
+    got = await get_test(mock_db, "u1", t["id"])
+    assert got["track_error"]["code"] == 190 and got["tracked_at"]
+    res = await _run_due(mock_db, mock_mongo_client, datetime(2026, 11, 3, 12, 1))
+    assert res["tracked"] == 0 and res["skipped"] == 0
+    # success clears the error at the next slot
+    m.err.clear(); m.leads = {"u1-ad0": 5}
+    await _run_due(mock_db, mock_mongo_client, datetime(2026, 11, 4, 12))
+    assert "track_error" not in await get_test(mock_db, "u1", t["id"])
+
+
+async def test_no_token_stamps_error(mock_db, mock_mongo_client, monkeypatch):
+    Meta(monkeypatch)
+    t = await make_test(mock_db, n_ads=1)
+
+    async def none(uid, c):
+        return None
+
+    monkeypatch.setattr(ct, "get_facebook_token", none)
+    await _run_due(mock_db, mock_mongo_client)
+    got = await get_test(mock_db, "u1", t["id"])
+    assert got["track_error"] and got["tracked_at"]
+
+
+async def test_retryable_sets_retry_after_and_blocks_user(mock_db, mock_mongo_client, monkeypatch):
+    m = Meta(monkeypatch)
+    t1 = await make_test(mock_db, n_ads=1, uid="a", accounts=["act_bad"])
+    m.err["act_bad"] = MetaReadError("rate", code=17)
+    now = datetime(2026, 11, 3, 12)
+    res = await _run_due(mock_db, mock_mongo_client, now)
+    got = await get_test(mock_db, "a", t1["id"])
+    assert got["retry_after"] == now + timedelta(minutes=20) and not got.get("tracked_at")
+    res = await _run_due(mock_db, mock_mongo_client, now + timedelta(minutes=5))
+    assert res["skipped"] == 0
+    m.err.clear(); m.leads = {"a-ad0": 5}
+    res = await _run_due(mock_db, mock_mongo_client, now + timedelta(minutes=21))
+    assert res["tracked"] == 1
+
+
+async def test_removed_plus_replacement_same_account_emits_one_fail(mock_db, mock_mongo_client, monkeypatch):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n_ads=1)
+    m.leads = {"u1-ad0": 10}
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    await add_test_ads(mock_db, "u1", t["id"], [{"ad_account_id": "act_0", "client_group_id": "g0",
+                                                 "post_state": "active", "meta": {"ad_id": "u1-new"}}])
+    m.status = {"u1-ad0": None}
+    m.leads = {"u1-new": 1}
+    out = await ct.track_test(mock_db, mock_mongo_client, await get_test(mock_db, "u1", t["id"]), today=TODAY)
+    assert [e for e in out["changed"] if e["kind"].startswith("account")] == [
+        {"kind": "account_fail", "ad_account_id": "act_0"}]
+
+
+async def test_verdict_at_kept_on_revert(mock_db, mock_mongo_client, monkeypatch):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db)
+    m.leads = {"u1-ad0": 10, "u1-ad1": 10, "u1-ad2": 2}
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    first = (await get_test(mock_db, "u1", t["id"]))["verdict_at"]
+    m.status = {"u1-ad0": None, "u1-ad1": None}
+    await ct.track_test(mock_db, mock_mongo_client, await get_test(mock_db, "u1", t["id"]), today=TODAY)
+    got = await get_test(mock_db, "u1", t["id"])
+    assert got["status"] == "testing" and got["verdict"] is None and got["verdict_at"] == first
