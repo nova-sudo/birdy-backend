@@ -307,11 +307,16 @@ async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Findi
     if claimed is None:
         return None
     targets = list(finding.action.targets)
-    ad_ids = [t["object_id"] for t in targets]
-    await posting.pause_ads(db, mongo_client, user_id, test["id"], None, ad_ids=ad_ids)
-    rows = {r["meta"]["ad_id"]: r for r in await _rows_for(db, user_id, test["id"], ad_ids)}
-    done = [t for t in targets if (rows.get(t["object_id"]) or {}).get("meta_status") == "PAUSED"]
+    rows = {r["meta"]["ad_id"]: r for r in await _rows_for(
+        db, user_id, test["id"], [t["object_id"] for t in targets])}
+    allowed, blocked = await _guardrail_split(db, user_id, finding, targets, rows)
+    ad_ids = [t["object_id"] for t in allowed]
+    if ad_ids:
+        await posting.pause_ads(db, mongo_client, user_id, test["id"], None, ad_ids=ad_ids)
+        rows = {r["meta"]["ad_id"]: r for r in await _rows_for(db, user_id, test["id"], ad_ids)}
+    done = [t for t in allowed if (rows.get(t["object_id"]) or {}).get("meta_status") == "PAUSED"]
     rest = [t for t in targets if t not in done]
+    finding.blocked_reason = blocked
 
     ref_id = store.suggestion_key(user_id, finding)
     if not rest:
@@ -340,6 +345,39 @@ async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Findi
         finding.action.targets = rest
         return "partial"
     return "applied"
+
+
+async def _guardrail_split(db, user_id: str, finding: Finding, targets: list[dict],
+                           rows: dict) -> tuple[list[dict], dict | None]:
+    """The same protected-tag and per-client daily pause-cap checks an agent's auto-run
+    pause passes (ai.agents.guardrails.check_guardrails), with the user's media-buying
+    agent's guardrails (defaults when there is no agent). Checked per client group.
+    Returns (allowed targets, first blocked_reason or None)."""
+    from ai.agents.defaults import DEFAULT_GUARDRAILS
+    from ai.agents.guardrails import check_guardrails
+
+    agent = await db["agents"].find_one({"user_id": user_id, "type": "media_buying"}) or {}
+    guard = {
+        # Not an agent rule: no permission or last-live-ad check, just tags and the cap.
+        "permissions": {"ads": True},
+        "guardrails": {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {}),
+                       "protect_last_live_ad": False},
+        "client_caps": agent.get("client_caps") or {},
+        "scope": agent.get("scope") or {},
+    }
+    by_group: dict[str, list[dict]] = {}
+    for t in targets:
+        gid = (rows.get(t["object_id"]) or {}).get("client_group_id") or finding.client_group_id
+        by_group.setdefault(gid, []).append(t)
+    allowed, reason = [], None
+    for gid, group_targets in sorted(by_group.items(), key=lambda kv: str(kv[0])):
+        doc = {"action": {"type": ACTION_PAUSE_ADS, "targets": group_targets}, "client_group_id": gid}
+        g = await check_guardrails(db, guard, doc, now_utc=_utcnow())
+        if g.ok:
+            allowed.extend(group_targets)
+        elif reason is None:
+            reason = {"code": g.reason, "message": g.message}
+    return [t for t in targets if t in allowed], reason
 
 
 async def _rows_for(db, user_id: str, test_id: str, ad_ids: list[str]) -> list[dict]:
@@ -389,9 +427,12 @@ async def sync_creative_suggestions(db, user_id: str, test: dict, ads: list[dict
 
     keep, created_docs, updated_docs = await _persist(db, user_id, findings)
     if partial is not None:
+        flags: dict = {"auto_failed": True}
+        if getattr(partial, "blocked_reason", None):
+            flags["blocked_reason"] = partial.blocked_reason  # a guardrail held some back
         await db[store.SUGGESTIONS].update_one(
             {"_id": store.suggestion_key(user_id, partial), "user_id": user_id},
-            {"$set": {"auto_failed": True}})
+            {"$set": flags})
     await close_test_items(db, user_id, test["id"], keep)
     await _notify(db, user_id, created_docs, updated_docs)
     return len(findings)

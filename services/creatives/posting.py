@@ -532,7 +532,7 @@ async def _activate(db, mongo_client, user_id: str, test: dict, ads: list[dict],
     return {"activated": activated, "errors": errors}
 
 
-async def _ensure_verdict_alert(db, user_id: str, test: dict) -> None:
+async def ensure_verdict_alert(db, user_id: str, test: dict) -> None:
     """Create the "notify when a verdict lands" alert once (stored as on_verdict.alert_id)."""
     on_verdict = test.get("on_verdict") or {}
     if not on_verdict.get("notify_channels"):
@@ -562,7 +562,7 @@ async def go_live(db, mongo_client, user_id: str, test_id: str, *, partial_ok: b
     if waiting and not partial_ok:
         raise PostingError("Some ads are not created yet", 409)
     res = await _activate(db, mongo_client, user_id, test, created, now)
-    await _ensure_verdict_alert(db, user_id, test)
+    await ensure_verdict_alert(db, user_id, test)
     return {"test_id": test_id, **res}
 
 

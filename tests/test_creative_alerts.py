@@ -135,7 +135,7 @@ async def test_go_live_creates_alert_once(mock_db, mock_mongo_client, monkeypatc
     fresh = await get_test(mock_db, U, t["id"])
     aid = fresh["on_verdict"]["alert_id"]
     assert await mock_db["alerts"].count_documents({"id": aid}) == 1
-    await posting._ensure_verdict_alert(mock_db, U, fresh)  # idempotent
+    await posting.ensure_verdict_alert(mock_db, U, fresh)  # idempotent
     assert await mock_db["alerts"].count_documents({"scope": "creative_tests"}) == 1
 
 

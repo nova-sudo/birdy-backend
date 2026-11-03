@@ -348,10 +348,12 @@ async def adopt_creative(
         except ValueError as e:
             raise HTTPException(409, str(e))
         if test.get("status") == store.DRAFT:
-            await store.update_test(
+            fresh = await store.update_test(
                 db, current_user, test_id,
                 {"status": store.TESTING, "started_at": datetime.now(timezone.utc)},
             )
+            # Adopting is how this test went live: the same verdict alert as go-live.
+            await posting.ensure_verdict_alert(db, current_user, fresh or test)
         return _json(ad)
 
 

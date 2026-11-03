@@ -522,8 +522,202 @@ async def test_creative_cpl_alert_uses_converted_values(mock_db, mock_mongo_clie
 
 async def test_prefill_converts_client_cpl_to_user_currency(mock_db, jpy):
     from services.creatives.targets import prefill_targets
+    await mock_db["users"].insert_one({"user_id": U, "default_currency": "GBP"})
     await mock_db["client_groups"].insert_one({"id": "gj", "user_id": U, "targets": {"cpl": 4000},
                                                "ad_account_currency": "JPY"})
     out = await prefill_targets(mock_db, U, ["gj"])
     assert out["metrics"]["cpl"]["value"] == pytest.approx(20)
     assert out["per_account"]["gj"]["cpl"] == 4000  # per-account stays in the account's currency
+
+
+# ── M1: Slack chat never gets the creative write tools ──────────────────────
+
+class _Scripted:
+    def __init__(self, responses):
+        self.responses, self.seen, self.tools, self.model = list(responses), [], [], "stub"
+
+    async def chat_completion(self, messages, tools=None, tool_choice="auto", temperature=0.3,
+                              max_tokens=2048):
+        self.seen.append(messages)
+        self.tools.append([s["function"]["name"] for s in tools or []])
+        return self.responses.pop(0)
+
+
+def _registry():
+    from ai.tools import creative_tools
+    from ai.tools.registry import ToolRegistry
+    reg = ToolRegistry()
+    creative_tools.register_creative_tools(reg)
+    return reg
+
+
+async def test_slack_chat_has_no_creative_write_tools_or_guide(mock_db):
+    from ai import conversation_log
+    from ai.orchestrator import run_chat
+    from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
+    from ai.providers.base import ProviderResponse
+    from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_WRITE_TOOLS
+
+    provider = _Scripted([ProviderResponse(content="hi")])
+    await run_chat(provider=provider, tool_registry=_registry(), db=mock_db, user_id=U,
+                   message="hello", page=None, source=conversation_log.SOURCE_SLACK)
+    assert CREATIVE_TESTS_GUIDE not in provider.seen[0][0]["content"]
+    assert not set(CREATIVE_WRITE_TOOLS) & set(provider.tools[0])
+    assert set(CREATIVE_READ_TOOLS) <= set(provider.tools[0])
+
+    web = _Scripted([ProviderResponse(content="hi")])
+    await run_chat(provider=web, tool_registry=_registry(), db=mock_db, user_id=U,
+                   message="hello", page=None)
+    assert set(CREATIVE_WRITE_TOOLS) <= set(web.tools[0])
+
+
+async def test_slack_chat_refuses_a_forced_write_tool_call(mock_db):
+    import json
+
+    from ai import conversation_log
+    from ai.orchestrator import run_chat
+    from ai.providers.base import ProviderResponse, ToolCall
+    from ai.tools.registry import ToolRegistry
+
+    called = []
+
+    async def stub(db, user_id, mongo_client=None, **kw):
+        called.append(kw)
+        return {"ok": True}
+
+    reg = ToolRegistry()
+    reg.register(name="post_creative_test", description="s",
+                 parameters={"type": "object", "properties": {}}, executor=stub)
+    provider = _Scripted([
+        ProviderResponse(content=None, finish_reason="tool_calls", tool_calls=[ToolCall(
+            id="1", name="post_creative_test", arguments=json.dumps({"confirmed": True}))]),
+        ProviderResponse(content="done")])
+    await run_chat(provider=provider, tool_registry=reg, db=mock_db, user_id=U,
+                   message="post it", page=None, source=conversation_log.SOURCE_SLACK)
+    assert called == []
+
+
+# ── M2: auto-pause honours the agent guardrails ─────────────────────────────
+
+async def _loser(db, name="Hook", n=2):
+    t = await create_test(db, U, name=name, origin="new", creative={"format": "image"},
+                          targets={}, on_verdict={"auto_pause_losers": True})
+    await update_test(db, U, t["id"], {"status": "loser", "verdict": "loser",
+                                       "summary": {"currency": "GBP", "accounts_total": n}})
+    for i in range(n):
+        await db["client_groups"].insert_one({"id": f"g{i}", "user_id": U, "name": f"Client {i}",
+                                              "meta_ad_account_id": f"act_{i}"})
+    await add_test_ads(db, U, t["id"], [
+        {"ad_account_id": f"act_{i}", "client_group_id": f"g{i}", "post_state": "active",
+         "meta_status": "ACTIVE", "meta": {"ad_id": f"ad{i}"}, "score": {"state": "fail"}}
+        for i in range(n)])
+    return await get_test(db, U, t["id"])
+
+
+async def _sync(db, mc, t):
+    t = await get_test(db, U, t["id"])
+    return await cf.sync_creative_suggestions(db, U, t, await list_test_ads(db, t["id"], user_id=U),
+                                              mongo_client=mc)
+
+
+async def test_auto_pause_blocked_by_protected_tag(mock_db, mock_mongo_client, monkeypatch):
+    from ai.suggestions import store as sstore
+    st = Status(monkeypatch)
+    t = await _loser(mock_db, name="Evergreen hook")  # default protected tag: Evergreen
+    await _sync(mock_db, mock_mongo_client, t)
+    assert st.calls == []
+    [doc] = await mock_db[sstore.SUGGESTIONS].find({"rule_id": "creative_loser"}).to_list(None)
+    assert doc["status"] == "open" and doc["blocked_reason"]["code"] == "protected_tag"
+    assert len(doc["action"]["targets"]) == 2
+
+
+async def test_auto_pause_respects_per_client_pause_cap(mock_db, mock_mongo_client, monkeypatch):
+    from ai.suggestions import store as sstore
+    st = Status(monkeypatch)
+    await mock_db["agents"].insert_one({"_id": "ag1", "user_id": U, "type": "media_buying",
+                                        "guardrails": {"max_pauses_per_client_day": 1}})
+    await mock_db[sstore.ACTIVITY].insert_one({
+        "user_id": U, "client_group_id": "g0", "kind": sstore.KIND_ACTION_APPLIED,
+        "applied_action_type": "pause_ads", "created_at": cf._utcnow() - timedelta(minutes=5)})
+    t = await _loser(mock_db)
+    await _sync(mock_db, mock_mongo_client, t)
+    assert st.calls == [("ad1", "PAUSED")]           # g0 is at its cap, g1 is not
+    [doc] = await mock_db[sstore.SUGGESTIONS].find({"rule_id": "creative_loser"}).to_list(None)
+    assert doc["status"] == "open" and doc["blocked_reason"]["code"] == "pause_cap"
+    assert [x["object_id"] for x in doc["action"]["targets"]] == ["ad0"]
+
+
+# ── M3: blob cleanup keeps media another live test still uses ───────────────
+
+async def test_cleanup_skips_urls_still_referenced(mock_db, monkeypatch):
+    from datetime import timezone
+
+    from services.creatives import upload_grant as ug
+
+    now = datetime(2026, 11, 3, 12, tzinfo=timezone.utc)
+    shared = "https://x.public.blob.vercel-storage.com/shared.mp4"
+    recent = "https://x.public.blob.vercel-storage.com/recent.png"
+    own = "https://x.public.blob.vercel-storage.com/own.png"
+    private = "https://x.blob.vercel-storage.com/private.png"  # not a public blob URL
+    calls = []
+
+    async def fake_delete(urls):
+        calls.append(sorted(urls))
+
+    monkeypatch.setattr(ug, "_delete_blobs", fake_delete)
+
+    async def seed(tid, status, archived_at, media):
+        await mock_db[TESTS].insert_one({"id": tid, "user_id": U, "status": status,
+                                         "archived_at": archived_at, "creative": {"media": media}})
+
+    await seed("old", "archived", now - timedelta(days=40),
+               {"blob_url": shared, "thumbnail_url": own})
+    await seed("old2", "archived", now - timedelta(days=40), {"blob_url": recent, "thumbnail_url": private})
+    await seed("scaled", "testing", None, {"blob_url": shared})           # still live
+    await seed("fresh", "archived", now - timedelta(days=3), {"blob_url": recent})  # archived < 30d
+    assert await ug.cleanup_archived_media(mock_db, now) == 2
+    assert calls == [[own]]
+
+
+# ── M11: adopting into a draft creates the verdict alert ────────────────────
+
+async def test_adopt_into_draft_creates_verdict_alert(mock_db, mock_mongo_client, monkeypatch):
+    import contextlib
+
+    from fastapi.testclient import TestClient
+
+    import routers.creatives as r
+    from dependencies import get_current_user
+    from main import app
+
+    t = await create_test(mock_db, U, name="Hook", origin="new", creative={"format": "image"},
+                          targets={}, on_verdict={"notify_channels": ["in_app"]})
+    await mock_db["client_groups"].insert_one({
+        "id": "g1", "user_id": U, "name": "C", "meta_ad_account_id": "act_1",
+        "facebook_cache": {"entities": {"ads": [
+            {"id": "ad1", "name": "CT-0001 | hook", "adset_id": "as1", "campaign_id": "c1"}]}}})
+
+    @contextlib.asynccontextmanager
+    async def client_cm():
+        yield mock_mongo_client
+
+    monkeypatch.setattr(r, "get_mongo_client", client_cm)
+    app.dependency_overrides[get_current_user] = lambda: U
+    try:
+        res = TestClient(app).post(f"/api/creatives/{t['id']}/adopt", json={"ad_id": "ad1"})
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert res.status_code == 200, res.text
+    after = await get_test(mock_db, U, t["id"])
+    assert after["status"] == "testing"
+    alert = await mock_db["alerts"].find_one({"id": after["on_verdict"]["alert_id"]})
+    assert alert["creative_test_ids"] == [t["id"]] and alert["condition"]["metric"] == "creative_verdict"
+
+
+# ── M14: env examples name the creatives settings ───────────────────────────
+
+def test_env_example_lists_creative_settings():
+    from pathlib import Path
+    text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
+    for key in ("FRONTEND_URL", "CREATIVE_UPLOAD_SECRET", "BLOB_READ_WRITE_TOKEN"):
+        assert f"{key}=" in text

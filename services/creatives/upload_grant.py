@@ -28,7 +28,6 @@ RETENTION = timedelta(days=30)
 BLOB_DELETE_URL = "https://blob.vercel-storage.com/delete"
 DELETE_BATCH = 100
 BLOB_API_VERSION = "13"
-BLOB_HOST_SUFFIX = ".blob.vercel-storage.com"
 PUBLIC_BLOB_HOST_SUFFIX = ".public.blob.vercel-storage.com"
 
 
@@ -100,14 +99,6 @@ async def _delete_blobs(urls: list[str]) -> None:
             r.raise_for_status()
 
 
-def _is_blob_url(url) -> bool:
-    try:
-        host = urlparse(url).hostname or ""
-    except ValueError:
-        return False
-    return host.endswith(BLOB_HOST_SUFFIX)
-
-
 def is_public_blob_url(url) -> bool:
     """https URL whose parsed hostname ends with the public Blob suffix (never a substring match)."""
     try:
@@ -126,8 +117,30 @@ def media_limit(mime) -> int | None:
     return None
 
 
+_MEDIA_URL_FIELDS = ("creative.media.blob_url", "creative.media.thumbnail_url",
+                     "creative.blob_url", "creative.thumbnail_url")
+
+
 def _blob_urls(media: dict) -> list[str]:
-    return [u for u in (media.get("blob_url"), media.get("thumbnail_url")) if u and _is_blob_url(u)]
+    return [u for u in (media.get("blob_url"), media.get("thumbnail_url")) if u and is_public_blob_url(u)]
+
+
+async def _still_referenced(db, urls: set[str], cutoff: datetime) -> set[str]:
+    """URLs a test still uses: one not archived (a scaled or duplicated test shares its
+    source's upload), or one archived less than the retention period ago."""
+    if not urls:
+        return set()
+    keep_tests = {"$or": [{"status": {"$ne": ARCHIVED}}, {"archived_at": {"$gt": cutoff}}]}
+    uses = {"$or": [{f: {"$in": list(urls)}} for f in _MEDIA_URL_FIELDS]}
+    found: set[str] = set()
+    async for t in db[TESTS].find({"$and": [keep_tests, uses]}, {"creative": 1}):
+        creative = t.get("creative") or {}
+        media = creative.get("media") or {}
+        for u in (media.get("blob_url"), media.get("thumbnail_url"),
+                  creative.get("blob_url"), creative.get("thumbnail_url")):
+            if u in urls:
+                found.add(u)
+    return found
 
 
 async def cleanup_archived_media(db, now_utc: datetime) -> int:
@@ -144,12 +157,15 @@ async def cleanup_archived_media(db, now_utc: datetime) -> int:
         "creative.media": {"$exists": True, "$ne": None},
     }).to_list(None)
 
+    candidates = {u for t in tests for u in _blob_urls((t.get("creative") or {}).get("media") or {})}
+    in_use = await _still_referenced(db, candidates, cutoff)
+
     chunks, current, count = [], [], 0
     for test in tests:
         media = (test.get("creative") or {}).get("media") or {}
         if media.get("deleted_at"):
             continue
-        urls = _blob_urls(media)
+        urls = [u for u in _blob_urls(media) if u not in in_use]
         if current and count + len(urls) > DELETE_BATCH:
             chunks.append(current)
             current, count = [], 0
