@@ -65,7 +65,7 @@ async def test_add_test_ads_defaults(mock_db):
     assert rows[0]["post_state"] == "pending"
     assert rows[0]["score"] == {"state": "scoring"}
     assert rows[0]["test_id"] == t["id"] and rows[0]["user_id"] == "u1"
-    assert len(await list_test_ads(mock_db, t["id"])) == 1
+    assert len(await list_test_ads(mock_db, t["id"], user_id="u1")) == 1
 
 
 async def test_create_indexes_is_idempotent(mock_mongo_client):

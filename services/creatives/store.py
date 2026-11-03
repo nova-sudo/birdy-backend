@@ -154,8 +154,9 @@ async def add_test_ads(db, user_id: str, test_id: str, rows: list[dict]) -> list
     return [_clean(d) for d in docs]
 
 
-async def list_test_ads(db, test_id: str) -> list[dict]:
-    return [_clean(d) async for d in db[TEST_ADS].find({"test_id": test_id}).sort("created_at", ASCENDING)]
+async def list_test_ads(db, test_id: str, *, user_id: str) -> list[dict]:
+    query = {"test_id": test_id, "user_id": user_id}
+    return [_clean(d) async for d in db[TEST_ADS].find(query).sort("created_at", ASCENDING)]
 
 
 async def create_creative_indexes(mongo_client) -> None:

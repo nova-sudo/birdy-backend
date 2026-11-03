@@ -17,12 +17,12 @@ from integrations.facebook_utils.meta_creative_reader import (
 )
 from services.creatives.store import (
     AD_DAYS,
-    ARCHIVED,
     COUNTERS,
     FINAL_VERDICTS,
     TEST_ADS,
     TESTS,
     TESTING,
+    list_test_ads,
     update_test,
 )
 from services.creatives.reconcile import reconcile_all
@@ -88,10 +88,7 @@ def _baseline(account_rows: list[dict], ad_totals: dict) -> dict | None:
 
 async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     user_id = test["user_id"]
-    ads = [a async for a in db[TEST_ADS].find({"test_id": test["id"], "user_id": user_id})]
-    for a in ads:
-        if a.get("_id") != a.get("id"):
-            a.pop("_id", None)
+    ads = await list_test_ads(db, test["id"], user_id=user_id)
     live = [a for a in ads if a.get("post_state") == "active" and (a.get("meta") or {}).get("ad_id")]
     prev_by_ad = {a["id"]: ((a.get("score") or {}).get("state"), a.get("ad_account_id"))
                   for a in ads if a.get("post_state") == "active"}

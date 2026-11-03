@@ -50,7 +50,7 @@ async def test_adopt_inserts_active_adopted_row(mock_db):
     await group(mock_db, "g1", "act_1", [ad("a1", f"{t['code']} | hook")])
     row = await reconcile.adopt(mock_db, "u1", t["id"], "a1")
     assert row["post_state"] == "active" and row["origin"] == "adopted"
-    assert (await list_test_ads(mock_db, t["id"]))[0]["meta"]["ad_id"] == "a1"
+    assert (await list_test_ads(mock_db, t["id"], user_id="u1"))[0]["meta"]["ad_id"] == "a1"
     assert await reconcile.find_adoptable(mock_db, "u1") == []
 
 

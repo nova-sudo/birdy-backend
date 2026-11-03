@@ -81,7 +81,7 @@ async def test_track_scores_and_sets_verdict(mock_db, mock_mongo_client, monkeyp
     assert any(e["kind"] == "verdict" for e in out["changed"])
     assert t2["verdict"] == "winner" and t2["status"] == "winner" and t2["verdict_at"]
     assert t2["summary"]["accounts_pass"] == 2 and t2["summary"]["updated_at"]
-    states = sorted(a["score"]["state"] for a in await list_test_ads(mock_db, t["id"]))
+    states = sorted(a["score"]["state"] for a in await list_test_ads(mock_db, t["id"], user_id="u1"))
     assert states == ["fail", "pass", "pass"]
 
 
@@ -101,7 +101,7 @@ async def test_removed_ad_is_excluded(mock_db, mock_mongo_client, monkeypatch): 
     m.leads = {"u1-ad0": 10, "u1-ad1": 10}
     m.status = {"u1-ad2": None}
     out = await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
-    ads = {a["meta"]["ad_id"]: a for a in await list_test_ads(mock_db, t["id"])}
+    ads = {a["meta"]["ad_id"]: a for a in await list_test_ads(mock_db, t["id"], user_id="u1")}
     assert ads["u1-ad2"]["post_state"] == "removed" and ads["u1-ad2"]["score"]["state"] == "removed"
     assert out["verdict"] == "winner"
     assert (await get_test(mock_db, "u1", t["id"]))["summary"]["accounts_total"] == 2
@@ -144,7 +144,7 @@ async def test_group_cpl_applies_per_account(mock_db, mock_mongo_client, monkeyp
     await mock_db["client_groups"].update_one({"id": "g0"}, {"$set": {"targets": {"cpl": 10}}})
     m.leads = {"u1-ad0": 10, "u1-ad1": 10}  # cpl 20: fails g0 (10), passes g1 (35)
     await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
-    ads = {a["meta"]["ad_id"]: a["score"]["state"] for a in await list_test_ads(mock_db, t["id"])}
+    ads = {a["meta"]["ad_id"]: a["score"]["state"] for a in await list_test_ads(mock_db, t["id"], user_id="u1")}
     assert ads == {"u1-ad0": "fail", "u1-ad1": "pass"}
 
 
@@ -156,7 +156,7 @@ async def test_baseline_excludes_own_days(mock_db, mock_mongo_client, monkeypatc
     m.account_rows = [{"date_start": "2026-10-30", "spend": "600", "impressions": "30000",
                        "inline_link_clicks": "600", "actions": [{"action_type": "lead", "value": "20"}]}]
     await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
-    ad = (await list_test_ads(mock_db, t["id"]))[0]
+    ad = (await list_test_ads(mock_db, t["id"], user_id="u1"))[0]
     assert ad["score"]["state"] == "pass" and round(ad["score"]["baseline_cpl"]) == 40
 
 
