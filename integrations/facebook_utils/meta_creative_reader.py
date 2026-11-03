@@ -124,13 +124,16 @@ async def fetch_ad_status(ad_id: str, token: str) -> Optional[str]:
 # --- wizard reads ----------------------------------------------------------
 
 ADSET_FIELDS = ("id,name,status,effective_status,campaign{id,name,objective},"
-                "optimization_goal,promoted_object")
+                "optimization_goal,promoted_object,destination_type")
 
 _ACCEPTED_OBJECTIVES = {
     "lead_form": ("OUTCOME_LEADS",),
     "website": ("OUTCOME_LEADS", "OUTCOME_TRAFFIC", "OUTCOME_SALES", "OUTCOME_ENGAGEMENT"),
     "whatsapp": ("OUTCOME_ENGAGEMENT", "OUTCOME_SALES"),
 }
+
+
+_DESTINATION_TYPE = {"lead_form": "ON_AD", "whatsapp": "WHATSAPP"}
 
 
 async def _list(url: str, params: dict) -> List[Dict]:
@@ -157,8 +160,22 @@ async def list_promote_pages(ad_account_id: str, token: str) -> List[Dict]:
 
 
 async def list_lead_forms(page_id: str, token: str) -> List[Dict]:
-    return await _list(f"{GRAPH}/{page_id}/leadgen_forms",
-                       {"access_token": token, "fields": "id,name,status", "limit": PAGE_LIMIT})
+    """leadgen_forms needs a Page access token: fetch it with the user token first."""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            page = await _get(client, f"{GRAPH}/{page_id}",
+                              {"access_token": token, "fields": "access_token"})
+        page_token = page.get("access_token")
+        if not page_token:
+            raise MetaReadError("Meta gave no Page access token for this Page")
+        return await _list(f"{GRAPH}/{page_id}/leadgen_forms",
+                           {"access_token": page_token, "fields": "id,name,status",
+                            "limit": PAGE_LIMIT})
+    except MetaReadError as e:
+        if e.code == 190:
+            # A Page-token problem is not a dead user connection: do not surface 190.
+            raise MetaReadError(f"Could not read this Page's lead forms: {e}") from e
+        raise
 
 
 def adset_compatible(adset: dict, destination: str):
@@ -168,6 +185,11 @@ def adset_compatible(adset: dict, destination: str):
         return False, f"Unknown destination '{destination}'"
     objective = (adset.get("campaign") or {}).get("objective")
     if objective in accepted:
+        needed = _DESTINATION_TYPE.get(destination)
+        dtype = adset.get("destination_type")
+        if needed and dtype != needed:
+            return False, (f"{destination.replace('_', ' ')} ads need an ad set with destination "
+                           f"{needed} (this one is {dtype or 'unknown'})")
         return True, None
     shown = " or ".join(accepted)
     return False, f"{destination.replace('_', ' ')} ads need a campaign with objective {shown} (this one is {objective or 'unknown'})"

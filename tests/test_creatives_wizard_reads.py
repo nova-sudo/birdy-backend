@@ -59,8 +59,18 @@ def test_foreign_account_is_404(api, mock_db):
     ("OUTCOME_LEADS", "whatsapp", False),
 ])
 def test_adset_compatible(objective, dest, ok):
-    good, reason = reader.adset_compatible({"campaign": {"objective": objective}}, dest)
+    dt = {"lead_form": "ON_AD", "whatsapp": "WHATSAPP"}.get(dest)
+    good, reason = reader.adset_compatible(
+        {"campaign": {"objective": objective}, "destination_type": dt}, dest)
     assert good is ok and (reason is None) == ok
+
+
+def test_adset_destination_type_checked():
+    camp = {"objective": "OUTCOME_LEADS"}
+    assert reader.adset_compatible({"campaign": camp, "destination_type": "WEBSITE"}, "lead_form")[0] is False
+    assert reader.adset_compatible({"campaign": {"objective": "OUTCOME_SALES"}, "destination_type": "WEBSITE"},
+                                   "whatsapp")[0] is False
+    assert reader.adset_compatible({"campaign": camp, "destination_type": "WEBSITE"}, "website")[0] is True
 
 
 def test_adsets_route_flags_compatibility_and_owner(api, mock_db, monkeypatch):
@@ -70,7 +80,7 @@ def test_adsets_route_flags_compatibility_and_owner(api, mock_db, monkeypatch):
 
     async def fake_adsets(act, token):
         assert (act, token) == ("act_1", "tok")
-        return [{"id": "as1", "name": "A", "campaign": {"id": "c2", "objective": "OUTCOME_LEADS"}},
+        return [{"id": "as1", "name": "A", "destination_type": "ON_AD", "campaign": {"id": "c2", "objective": "OUTCOME_LEADS"}},
                 {"id": "as2", "name": "B", "campaign": {"id": "c1", "objective": "OUTCOME_TRAFFIC"}}]
 
     monkeypatch.setattr(creatives_router, "list_adsets", fake_adsets)
@@ -108,6 +118,25 @@ def test_lead_forms_requires_page_of_users_account(api, mock_db, monkeypatch):
     assert api.get("/api/creatives/pages/p_other/lead-forms").status_code == 404
 
 
+def test_lead_forms_survives_one_failing_account(api, mock_db, monkeypatch):
+    import asyncio
+    asyncio.run(grp(mock_db, "g1", "Acme", "act_1"))
+    asyncio.run(grp(mock_db, "g2", "Bolt", "act_2"))
+
+    async def fake_pages(act, token):
+        if act == "act_1":
+            raise reader.MetaReadError("boom", 1)
+        return [{"id": "p1", "name": "Page"}]
+
+    async def fake_forms(page_id, token):
+        return [{"id": "f1"}]
+
+    monkeypatch.setattr(creatives_router, "list_promote_pages", fake_pages)
+    monkeypatch.setattr(creatives_router, "list_lead_forms", fake_forms)
+    assert api.get("/api/creatives/pages/p1/lead-forms").status_code == 200
+    assert api.get("/api/creatives/pages/zz/lead-forms").status_code == 404
+
+
 def _ad(i, name, spend, **kw):
     return {"id": i, "name": name, "status": "ACTIVE", "creative_thumbnail": f"t{i}",
             "creative_image": f"img{i}", "creative_video_id": f"v{i}",
@@ -133,5 +162,5 @@ def test_search_ranks_exact_code_first(api, mock_db):
     assert top["title"] == "T" and top["body"] == "B"
     assert top["metrics"] == {"spend": 10.0, "leads": 2.0, "cpl": 5.0}
     assert rows[2]["metrics"]["cpl"] == 100.0
-    assert api.get("/api/creatives/ads/search?q=ct-0042&ad_account_id=act_9").json() == []
+    assert api.get("/api/creatives/ads/search?q=ct-0042&ad_account_id=act_9").status_code == 404
     assert len(api.get("/api/creatives/ads/search?q=ct&limit=1").json()) == 1

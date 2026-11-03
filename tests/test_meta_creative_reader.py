@@ -13,6 +13,7 @@ from integrations.facebook_utils.meta_creative_reader import (
     fetch_account_daily,
     fetch_ad_status,
     fetch_tracked_ad_days,
+    list_lead_forms,
 )
 
 D1, D2 = date(2026, 10, 1), date(2026, 10, 30)
@@ -111,3 +112,24 @@ async def test_account_daily_is_account_level(patch_client):
     q = parse_qs(urlparse(seen[0]).query)
     assert q["level"] == ["account"] and "filtering" not in q
     assert rows[0]["spend"] == "9"
+
+
+@pytest.mark.asyncio
+async def test_lead_forms_use_page_token(patch_client):
+    seen = []
+    patch_client([{"body": {"access_token": "PAGETOK", "id": "p1"}},
+                  {"body": {"data": [{"id": "f1", "name": "F", "status": "ACTIVE"}]}}], seen)
+    forms = await list_lead_forms("p1", "USERTOK")
+    assert forms[0]["id"] == "f1"
+    q0, q1 = (parse_qs(urlparse(u).query) for u in seen)
+    assert urlparse(seen[0]).path == "/v25.0/p1" and q0["access_token"] == ["USERTOK"]
+    assert q0["fields"] == ["access_token"]
+    assert urlparse(seen[1]).path == "/v25.0/p1/leadgen_forms" and q1["access_token"] == ["PAGETOK"]
+
+
+@pytest.mark.asyncio
+async def test_lead_forms_190_is_not_reported_as_190(patch_client):
+    patch_client([{"status": 400, "body": {"error": {"message": "bad", "code": 190}}}], [])
+    with pytest.raises(MetaReadError) as ei:
+        await list_lead_forms("p1", "USERTOK")
+    assert ei.value.code is None

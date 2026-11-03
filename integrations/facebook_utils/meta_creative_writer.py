@@ -11,6 +11,7 @@ Failures raise MetaWriteError tagged with the wizard `step` that failed.
 
 import base64
 import json
+from urllib.parse import urlparse
 from typing import Optional, Union
 
 import httpx
@@ -62,17 +63,48 @@ async def _request(method: str, url: str, step: str, *, params=None, data=None, 
     return resp.json()
 
 
-async def upload_image(act: str, token: str, *, image_url: str) -> str:
-    """Download the image and post it base64-encoded; returns the image hash."""
+BLOB_SUFFIX = ".public.blob.vercel-storage.com"
+MAX_IMAGE_BYTES = 30 * 1024 * 1024
+IMAGE_TYPES = ("image/jpeg", "image/png")
+
+
+def _check_blob_url(url: str) -> None:
+    u = urlparse(url or "")
+    if u.scheme != "https" or not (u.hostname or "").endswith(BLOB_SUFFIX):
+        raise MetaWriteError("Media must be an https Birdy upload URL", step="media")
+
+
+async def _download_image(url: str) -> bytes:
+    _check_blob_url(url)
     try:
-        async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
-            dl = await client.get(image_url)
-            dl.raise_for_status()
+        async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
+            async with client.stream("GET", url) as dl:
+                if dl.status_code != 200:
+                    raise MetaWriteError(f"Could not download image (HTTP {dl.status_code})",
+                                         step="media")
+                ctype = dl.headers.get("content-type", "").split(";")[0].strip().lower()
+                if ctype not in IMAGE_TYPES:
+                    raise MetaWriteError("Image must be image/jpeg or image/png", step="media")
+                buf = bytearray()
+                async for chunk in dl.aiter_bytes():
+                    buf.extend(chunk)
+                    if len(buf) > MAX_IMAGE_BYTES:
+                        raise MetaWriteError("Image is larger than 30 MB", step="media")
+                return bytes(buf)
     except httpx.HTTPError as e:
-        raise MetaWriteError(f"Could not download image: {e}", step="upload_image") from e
+        raise MetaWriteError(f"Could not download image: {e}", step="media") from e
+
+
+async def upload_image(act: str, token: str, *, image_url: str) -> str:
+    """Download the image (Birdy blob host only) and post it base64-encoded; returns the hash.
+
+    Revive creatives that already hold a Meta image_hash skip this call entirely and pass the
+    hash as media_ref to create_adcreative.
+    """
+    content = await _download_image(image_url)
     data = await _request("POST", f"{GRAPH}/{act}/adimages", "upload_image",
                           data={"access_token": token,
-                                "bytes": base64.b64encode(dl.content).decode()})
+                                "bytes": base64.b64encode(content).decode()})
     images = data.get("images") or {}
     first = next(iter(images.values()), None) or {}
     if not first.get("hash"):
@@ -81,6 +113,7 @@ async def upload_image(act: str, token: str, *, image_url: str) -> str:
 
 
 async def upload_video(act: str, token: str, *, file_url: str, name: str) -> str:
+    _check_blob_url(file_url)
     data = await _request("POST", f"{GRAPH}/{act}/advideos", "upload_video",
                           data={"access_token": token, "file_url": file_url, "name": name},
                           timeout=300.0)
@@ -98,11 +131,6 @@ async def video_ready(video_id: str, token: str) -> bool:
     return state == "ready"
 
 
-def _whatsapp_link(number: Optional[str]) -> str:
-    digits = "".join(c for c in (number or "") if c.isdigit())
-    return f"https://api.whatsapp.com/send?phone={digits}"
-
-
 async def create_adcreative(
     act: str, token: str, *, name: str, page_id: str, fmt: str,
     media_ref: Union[str, dict], primary_text: str, headline: str, description: str,
@@ -112,12 +140,16 @@ async def create_adcreative(
 ) -> str:
     """media_ref: image hash (image), or video id / {"video_id", "image_url"} (video)."""
     if destination == "lead_form":
-        value = {"lead_gen_form_id": lead_form_id}
-        link = website_url or "https://fb.me/"
+        link = "http://fb.me/"
+        value = {"lead_gen_form_id": lead_form_id, "link": link}
     elif destination == "whatsapp":
-        link = _whatsapp_link(whatsapp_number)
-        value = {"app_destination": "WHATSAPP", "link": link}
+        # whatsapp_number is informational only; Meta resolves the number from the Page/ad set.
+        link = "https://api.whatsapp.com/send"
+        value = {"app_destination": "WHATSAPP"}
+        cta_type = "WHATSAPP_MESSAGE"
     else:
+        if not website_url:
+            raise MetaWriteError("A website URL is required", step="creative")
         link = website_url
         value = {"link": link}
     cta = {"type": cta_type, "value": value}
@@ -128,10 +160,13 @@ async def create_adcreative(
                                "call_to_action": cta}}
     else:
         ref = media_ref if isinstance(media_ref, dict) else {"video_id": media_ref}
+        if not (ref.get("image_url") or ref.get("image_hash")):
+            raise MetaWriteError("A video ad needs a thumbnail image", step="creative")
         video = {"video_id": ref["video_id"], "message": primary_text, "title": headline,
                  "link_description": description, "call_to_action": cta}
-        if ref.get("image_url"):
-            video["image_url"] = ref["image_url"]
+        for k in ("image_url", "image_hash"):
+            if ref.get(k):
+                video[k] = ref[k]
         story = {"video_data": video}
     story["page_id"] = page_id
 

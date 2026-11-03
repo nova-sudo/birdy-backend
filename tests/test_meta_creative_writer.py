@@ -11,6 +11,8 @@ from integrations.facebook_utils import meta_creative_writer as w
 
 
 REAL = httpx.AsyncClient
+URL = "https://abc.public.blob.vercel-storage.com/x.png"
+VURL = "https://abc.public.blob.vercel-storage.com/v.mp4"
 
 
 @pytest.fixture
@@ -25,7 +27,8 @@ def serve(monkeypatch):
             r = responses[min(calls["n"], len(responses) - 1)]
             calls["n"] += 1
             if "content" in r:
-                return httpx.Response(r.get("status", 200), content=r["content"])
+                return httpx.Response(r.get("status", 200), content=r["content"],
+                                      headers=r.get("headers"))
             return httpx.Response(r.get("status", 200), json=r["json"])
 
         real = REAL
@@ -38,8 +41,8 @@ def serve(monkeypatch):
 
 async def test_upload_image_posts_base64_and_returns_hash(serve):
     seen = []
-    serve([{"content": b"PNGDATA"}, {"json": {"images": {"x.png": {"hash": "H1"}}}}], seen)
-    assert await w.upload_image("act_1", "tok", image_url="https://cdn/x.png") == "H1"
+    serve([{"content": b"PNGDATA", "headers": {"content-type": "image/png"}}, {"json": {"images": {"x.png": {"hash": "H1"}}}}], seen)
+    assert await w.upload_image("act_1", "tok", image_url=URL) == "H1"
     assert seen[1]["url"].endswith("/v25.0/act_1/adimages")
     assert base64.b64decode(seen[1]["body"]["bytes"]) == b"PNGDATA"
 
@@ -47,8 +50,8 @@ async def test_upload_image_posts_base64_and_returns_hash(serve):
 async def test_upload_video_and_ready(serve):
     seen = []
     serve([{"json": {"id": "V1"}}], seen)
-    assert await w.upload_video("act_1", "tok", file_url="https://b/v.mp4", name="CT-0001 | x") == "V1"
-    assert seen[0]["url"].endswith("/act_1/advideos") and seen[0]["body"]["file_url"] == "https://b/v.mp4"
+    assert await w.upload_video("act_1", "tok", file_url=VURL, name="CT-0001 | x") == "V1"
+    assert seen[0]["url"].endswith("/act_1/advideos") and seen[0]["body"]["file_url"] == VURL
     serve([{"json": {"status": {"video_status": "processing"}}}], seen)
     assert await w.video_ready("V1", "tok") is False
     serve([{"json": {"status": {"video_status": "ready"}}}], seen)
@@ -75,7 +78,84 @@ async def test_image_lead_form_creative(serve):
                                   lead_form_id="F1")
     ld = spec["link_data"]
     assert spec["page_id"] == "P1" and ld["image_hash"] == "HASH"
-    assert ld["call_to_action"] == {"type": "SIGN_UP", "value": {"lead_gen_form_id": "F1"}}
+    assert ld["call_to_action"] == {"type": "SIGN_UP", "value": {
+        "lead_gen_form_id": "F1", "link": "http://fb.me/"}}
+
+
+async def test_video_lead_form_creative(serve):
+    spec, _ = await creative_spec(serve, fmt="video", destination="lead_form", lead_form_id="F1",
+                                  media_ref={"video_id": "V1", "image_hash": "TH"})
+    vd = spec["video_data"]
+    assert vd["image_hash"] == "TH"
+    assert vd["call_to_action"]["value"] == {"lead_gen_form_id": "F1", "link": "http://fb.me/"}
+
+
+async def test_revive_reuses_existing_media_without_download(serve):
+    seen = []
+    serve([{"json": {"id": "CR1"}}], seen)
+    await w.create_adcreative("act_1", "tok", **COMMON, fmt="image", media_ref="EXISTINGHASH",
+                              destination="website", website_url="https://x.com")
+    assert len(seen) == 1 and seen[0]["url"].endswith("/adcreatives")
+    assert json.loads(seen[0]["body"]["object_story_spec"])["link_data"]["image_hash"] == "EXISTINGHASH"
+
+
+async def test_video_without_thumbnail_rejected_before_meta(serve):
+    seen = []
+    serve([{"json": {"id": "x"}}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.create_adcreative("act_1", "tok", **COMMON, fmt="video", media_ref="V1",
+                                  destination="website", website_url="https://x.com")
+    assert ei.value.step == "creative" and seen == []
+
+
+async def test_website_without_url_rejected_before_meta(serve):
+    seen = []
+    serve([{"json": {"id": "x"}}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.create_adcreative("act_1", "tok", **COMMON, fmt="image", media_ref="H",
+                                  destination="website")
+    assert ei.value.step == "creative" and seen == []
+
+
+@pytest.mark.parametrize("url", [
+    "http://abc.public.blob.vercel-storage.com/x.png",
+    "https://evil.com/x.png",
+    "https://public.blob.vercel-storage.com.evil.com/x.png",
+    "https://169.254.169.254/x.png",
+])
+async def test_bad_media_host_rejected(serve, url):
+    seen = []
+    serve([{"content": b"x"}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.upload_image("act_1", "tok", image_url=url)
+    assert ei.value.step == "media" and seen == []
+    with pytest.raises(w.MetaWriteError):
+        await w.upload_video("act_1", "tok", file_url=url, name="n")
+
+
+async def test_redirect_not_followed(serve):
+    seen = []
+    serve([{"status": 302, "content": b"", "headers": {"location": "http://169.254.169.254/"}}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.upload_image("act_1", "tok", image_url=URL)
+    assert ei.value.step == "media" and len(seen) == 1
+
+
+async def test_oversize_image_aborted(serve, monkeypatch):
+    monkeypatch.setattr(w, "MAX_IMAGE_BYTES", 10)
+    seen = []
+    serve([{"content": b"x" * 100, "headers": {"content-type": "image/jpeg"}}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.upload_image("act_1", "tok", image_url=URL)
+    assert ei.value.step == "media" and len(seen) == 1
+
+
+async def test_wrong_content_type_rejected(serve):
+    seen = []
+    serve([{"content": b"GIF", "headers": {"content-type": "image/gif"}}], seen)
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.upload_image("act_1", "tok", image_url=URL)
+    assert ei.value.step == "media" and len(seen) == 1
 
 
 async def test_video_website_creative_with_utm(serve):
@@ -91,8 +171,9 @@ async def test_video_website_creative_with_utm(serve):
 async def test_whatsapp_creative(serve):
     spec, _ = await creative_spec(serve, fmt="image", media_ref="H", destination="whatsapp",
                                   whatsapp_number="+44 7700 900123")
-    cta = spec["link_data"]["call_to_action"]["value"]
-    assert cta["app_destination"] == "WHATSAPP" and cta["link"].endswith("phone=447700900123")
+    ld = spec["link_data"]
+    assert ld["call_to_action"] == {"type": "WHATSAPP_MESSAGE", "value": {"app_destination": "WHATSAPP"}}
+    assert ld["link"] == "https://api.whatsapp.com/send"
 
 
 async def test_create_ad_is_always_paused(serve):

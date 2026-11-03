@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import re
+
 from integrations.facebook_utils.meta_creative_writer import MetaWriteError
 
+_FORM_RE = re.compile(r"\b(lead ?gen(?:_gen)? form|lead form|instant form)\b")
+_PAGE_RE = re.compile(r"\bpage\b")
 _ADSET_STATES = ("paused", "archived", "deleted", "inactive")
 
 
@@ -23,7 +27,7 @@ def explain(err: MetaWriteError) -> dict:
                 "fix": "retry_later"}
     if err.code == 368 or err.subcode == 1885183:
         return {"message": message, "fix": None}
-    if err.code == 100 and ("form" in text or "page" in text) and "ad set" not in text:
+    if err.code == 100 and _FORM_RE.search(text) and _PAGE_RE.search(text):
         return {"message": "This lead form does not belong to the selected Page. "
                            "Use a website link instead, or pick the form's own Page.",
                 "fix": "use_website_url"}

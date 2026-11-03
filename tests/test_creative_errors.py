@@ -17,6 +17,10 @@ def E(code=None, subcode=None, user_msg=None, msg="boom"):
     (E(4), "retry_later"), (E(17), "retry_later"), (E(613), "retry_later"),
     (E(190), "reconnect_meta"),
     (E(100, user_msg="Something else"), None),
+    (E(100, user_msg="Image format not supported"), None),
+    (E(100, user_msg="Invalid page_id"), None),
+    (E(100, user_msg="Invalid parameter: lead form not found on this page"), "use_website_url"),
+    (E(100, user_msg="Your video must be a thumbnail form for a page"), None),
 ])
 def test_fix_mapping(err, fix):
     assert explain(err)["fix"] == fix

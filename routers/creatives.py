@@ -196,13 +196,20 @@ async def page_lead_forms(page_id: str, current_user: str = Depends(get_current_
             {"_id": 0, "meta_ad_account_id": 1},
         ).to_list(length=None)
         token = await _meta_token(mongo_client, current_user)
-    try:
-        for act in sorted({g["meta_ad_account_id"] for g in groups}):
+    owned = False
+    for act in sorted({g["meta_ad_account_id"] for g in groups}):
+        try:
             if any(p.get("id") == page_id for p in await list_promote_pages(act, token)):
-                return await list_lead_forms(page_id, token)
+                owned = True
+                break
+        except MetaReadError as e:  # one broken account must not hide the others
+            continue
+    if not owned:
+        raise HTTPException(404, "Page not found")
+    try:
+        return await list_lead_forms(page_id, token)
     except MetaReadError as e:
         raise _meta_error(e)
-    raise HTTPException(404, "Page not found")
 
 
 def _num(v) -> float:
@@ -236,6 +243,8 @@ async def search_ads(
         query["meta_ad_account_id"] = ad_account_id
     async with get_mongo_client() as mongo_client:
         groups = await mongo_client[DB_NAME]["client_groups"].find(query, {"_id": 0}).to_list(length=None)
+    if ad_account_id and not groups:
+        raise HTTPException(404, "Ad account not found")
     needle = q.strip().lower()
     seen: set[str] = set()
     hits = []
