@@ -10,11 +10,12 @@ import logging
 from datetime import datetime, timezone
 
 from core.constants import OPERATOR_LABELS
-from services.creatives.store import ARCHIVED, FINAL_VERDICTS, TEST_ADS, TESTING, TESTS
+from services.creatives.store import ARCHIVED, FINAL_VERDICTS, POSTING, TEST_ADS, TESTING, TESTS
 
 logger = logging.getLogger(__name__)
 
 LIVE_TEST_STATUSES = (TESTING, *FINAL_VERDICTS)
+SCORE_LABELS = {"cpl": "CPL", "ctr": "CTR", "hook_rate": "Hook rate"}
 SCORE_METRICS = {"creative_cpl": "cpl", "creative_ctr": "ctr", "creative_hook_rate": "hook_rate"}
 NOT_AVAILABLE = "Not available for creative tests"
 OPS = {
@@ -46,14 +47,15 @@ def _progress(op: str, value: float, threshold: float, triggered: bool) -> float
     return 0.0
 
 
-async def _tests(db, alert: dict) -> list[dict]:
+async def _tests(db, alert: dict, *, include_posting: bool = False) -> list[dict]:
     query: dict = {"user_id": alert.get("user_id")}
     ids = alert.get("creative_test_ids") or []
     if ids:
         query["id"] = {"$in": ids}
         query["status"] = {"$ne": ARCHIVED}
     else:
-        query["status"] = {"$in": list(LIVE_TEST_STATUSES)}
+        statuses = (POSTING, *LIVE_TEST_STATUSES) if include_posting else LIVE_TEST_STATUSES
+        query["status"] = {"$in": list(statuses)}
     return await db[TESTS].find(query).to_list(None)
 
 
@@ -96,7 +98,7 @@ async def evaluate_creative_alert(alert: dict, db) -> dict:
     threshold = float(condition.get("value", 0))
     per_account = alert.get("tracking_mode") == "per_client"
     try:
-        tests = await _tests(db, alert)
+        tests = await _tests(db, alert, include_posting=metric == "creative_post_failed")
 
         if metric == "creative_verdict":
             fired = _verdict_fired(alert, tests)
@@ -110,7 +112,7 @@ async def evaluate_creative_alert(alert: dict, db) -> dict:
 
         ads = await _ads(db, alert, tests)
         if metric == "creative_post_failed":
-            op, thr = "gt", 0.0
+            op, thr, threshold = "gt", 0.0, 0.0  # always "any failed post", whatever the saved condition
             label = "Creative ads failed to post"
             by_acct: dict = {}
             for a in ads:
@@ -121,7 +123,7 @@ async def evaluate_creative_alert(alert: dict, db) -> dict:
                 return _result(False, 0.0, 0.0, threshold, NOT_AVAILABLE)
             op, thr = operator, threshold
             key = SCORE_METRICS[metric]
-            label = f"{key.replace('_', ' ').upper() if key != 'hook_rate' else 'Hook rate'}"
+            label = SCORE_LABELS[key]
             values = {}
             for a in ads:
                 if a.get("post_state") != "active":
@@ -147,7 +149,8 @@ async def evaluate_creative_alert(alert: dict, db) -> dict:
             hit = OPS[op](v, thr)
             rows.append({"triggered": hit, "current_value": v, "progress_pct": round(_progress(op, v, thr, hit), 1),
                          "threshold": threshold, "group_id": acct, "group_name": names.get(acct) or acct,
-                         "message": f"{label} is {v:g}, watching for {OPERATOR_LABELS.get(op, op)} {threshold:g}"})
+                         "message": (f"{int(v)} failed post(s)" if metric == "creative_post_failed" else
+                                    f"{label} is {v:g}, watching for {OPERATOR_LABELS.get(op, op)} {threshold:g}")})
         hits = [r for r in rows if r["triggered"]]
         worst = max(rows, key=lambda r: r["progress_pct"])
         if per_account:

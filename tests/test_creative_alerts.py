@@ -99,7 +99,7 @@ async def test_post_failed(mock_db):
     res = await evaluate_creative_alert(alert("creative_post_failed", tracking_mode="per_client"), mock_db)
     assert res["triggered"] and res["current_value"] == 1
     assert [r["group_id"] for r in res["per_client_results"] if r["triggered"]] == ["act_1"]
-    ok = await seed(mock_db, uid="u3")
+    await seed(mock_db, uid="u3")
     assert not (await evaluate_creative_alert({**alert("creative_post_failed"), "user_id": "u3"}, mock_db))["triggered"]
 
 
@@ -163,3 +163,26 @@ async def test_archive_removes_auto_alert(mock_db, mock_mongo_client, monkeypatc
     await creatives.archive_creative(t["id"], current_user=U)
     assert await mock_db["alerts"].find_one({"id": aid}) is None
     assert await mock_db["alerts"].find_one({"id": "keep"}) is not None
+
+
+async def test_post_failed_includes_posting_tests_and_ignores_condition(mock_db):
+    await seed(mock_db, status="posting", post_states={0: "failed"})
+    res = await evaluate_creative_alert(alert("creative_post_failed", op="lt", value=99,
+                                              tracking_mode="per_client"), mock_db)
+    assert res["triggered"] and res["threshold"] == 0.0
+    row = res["per_client_results"][0]
+    assert row["threshold"] == 0.0 and row["message"] == "1 failed post(s)"
+    total = await evaluate_creative_alert(alert("creative_post_failed", op="lt", value=99), mock_db)
+    assert total["triggered"] and total["threshold"] == 0.0
+
+
+async def test_verdict_mixed_aware_naive(mock_db):
+    from datetime import timezone
+    t = await seed(mock_db, verdict="winner", verdict_at=datetime(2026, 11, 1, tzinfo=timezone.utc))
+    a = alert("creative_verdict", creative_test_ids=[t["id"]], last_triggered_at=datetime(2026, 10, 31))
+    assert (await evaluate_creative_alert(a, mock_db))["triggered"]
+    a["last_triggered_at"] = datetime(2026, 11, 2)
+    assert not (await evaluate_creative_alert(a, mock_db))["triggered"]
+    await update_test(mock_db, U, t["id"], {"verdict_at": datetime(2026, 11, 1)})
+    a["last_triggered_at"] = datetime(2026, 10, 31, tzinfo=timezone.utc)
+    assert (await evaluate_creative_alert(a, mock_db))["triggered"]
