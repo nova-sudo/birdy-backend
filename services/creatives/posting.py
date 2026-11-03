@@ -12,6 +12,7 @@ is created, or immediately per ad when the test is already live (add-accounts).
 from __future__ import annotations
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
@@ -51,6 +52,8 @@ VIDEO_UPLOAD_LEASE = timedelta(seconds=360)
 BACKOFF_BASE = timedelta(seconds=30)
 MAX_ATTEMPTS = 5
 MAX_VIDEO_POLLS = 60  # ~1 h of minute ticks
+MAX_VIDEO_UPLOADS_PER_TICK = 1
+VIDEO_NEEDS_UPLOAD = "Upload the video file to post it to another ad account"
 
 QUEUED, RUNNING, DONE, FAILED = "queued", "running", "done", "failed"
 
@@ -113,6 +116,10 @@ async def enqueue_post(db, user_id: str, test_id: str, *, accounts: list[dict],
         "meta_ad_account_id", {"user_id": user_id, "meta_ad_account_id": {"$in": acts}}))
     if missing := [a for a in acts if a not in owned]:
         raise PostingError(f"Unknown ad account: {', '.join(missing)}")
+    if (test.get("creative") or {}).get("format", "image") != "image":
+        for act in acts:
+            if _media_plan(test, act)[0] == "unavailable":
+                raise PostingError(f"{VIDEO_NEEDS_UPLOAD} ({act})")
 
     # One atomic claim on the test doc: the status check plus `posted_accounts` make a
     # double click (or two overlapping add-accounts calls) a 409 instead of a second ad.
@@ -135,11 +142,24 @@ async def enqueue_post(db, user_id: str, test_id: str, *, accounts: list[dict],
     if await db[TESTS].find_one_and_update(query, update) is None:
         raise PostingError(conflict, 409)
 
-    ads = await add_test_ads(db, user_id, test_id,
-                             [{**r, "meta": {}, "post_state": "pending", "post_error": None}
-                              for r in rows])
-    jobs = [_new_job(user_id, test_id, a["id"], now) for a in ads]
-    await db[POST_JOBS].insert_many([dict(j) for j in jobs])
+    batch = uuid.uuid4().hex
+    try:
+        ads = await add_test_ads(db, user_id, test_id,
+                                 [{**r, "meta": {}, "post_state": "pending", "post_error": None,
+                                   "post_batch": batch} for r in rows])
+        jobs = [{**_new_job(user_id, test_id, a["id"], now), "post_batch": batch} for a in ads]
+        await db[POST_JOBS].insert_many([dict(j) for j in jobs])
+    except Exception:
+        # Undo the claim so the user can press Post again.
+        scope = {"user_id": user_id, "test_id": test_id, "post_batch": batch}
+        await db[POST_JOBS].delete_many(scope)
+        await db[TEST_ADS].delete_many(scope)
+        undo: dict = {"$pull": {"posted_accounts": {"$in": acts}}}
+        if not add_accounts:
+            undo["$set"] = {"status": DRAFT}
+            undo["$unset"] = {"posted_at": ""}
+        await db[TESTS].update_one({"id": test_id, "user_id": user_id}, undo)
+        raise
     return {"test_id": test_id, "queued": len(jobs), "ads": ads}
 
 
@@ -151,22 +171,36 @@ def _media(creative: dict) -> dict:
             **(creative.get("media") or {})}
 
 
-def _reusable_media(test: dict, ad: dict) -> dict | None:
-    """Existing Meta media on a revive creative (no download/upload). Image hashes and
-    video ids are account-scoped, so when the target account differs from the source and
-    a Birdy upload exists, upload that instead."""
+def _norm_act(act) -> str:
+    act = str(act or "").strip()
+    return act[4:] if act.startswith("act_") else act
+
+
+def _media_plan(test: dict, act: str) -> tuple[str, str | None]:
+    """How to get media into `act`: ("reuse", id) existing Meta media (no upload);
+    ("blob", url) Birdy upload; ("meta_cdn", url) re-upload the source ad's image (revive into
+    another account: image hashes / video ids are account-scoped); ("unavailable", None)."""
     creative = test.get("creative") or {}
     media = _media(creative)
-    fmt = creative.get("format", "image")
-    src_act = (test.get("source") or {}).get("ad_account_id")
-    if media.get("blob_url") and src_act and src_act != ad["ad_account_id"]:
-        return None
-    if fmt == "image" and media.get("image_hash"):
-        return {"image_hash": media["image_hash"]}
-    thumb = media.get("thumbnail_url") or media.get("image_url")
-    if fmt != "image" and media.get("video_id") and (thumb or media.get("image_hash")):
-        return {"video_id": media["video_id"]}
-    return None
+    source = test.get("source")
+    src_act = _norm_act(source.get("ad_account_id")) if isinstance(source, dict) else ""
+    same_account = not src_act or src_act == _norm_act(act)
+    if creative.get("format", "image") == "image":
+        if media.get("image_hash") and same_account:
+            return "reuse", media["image_hash"]
+        if media.get("blob_url"):
+            return "blob", media["blob_url"]
+        if media.get("image_url"):
+            return "meta_cdn", media["image_url"]
+        if media.get("image_hash"):
+            return "reuse", media["image_hash"]
+        return "unavailable", None
+    thumb = media.get("thumbnail_url") or media.get("image_url") or media.get("image_hash")
+    if media.get("video_id") and thumb and same_account:
+        return "reuse", media["video_id"]
+    if media.get("blob_url"):
+        return "blob", media["blob_url"]
+    return "unavailable", None
 
 
 def _media_ref(test: dict, ad: dict):
@@ -191,9 +225,33 @@ async def _set_meta(db, ad: dict, key: str, value: str, now: datetime, **extra) 
         {"$set": {f"meta.{key}": value, "updated_at": now, **extra}})
 
 
-async def _run_step(db, job: dict, test: dict, ad: dict, token: str, now: datetime) -> str:
-    """Run the next missing step. Returns the step name, or "wait" (video processing),
-    or "created" once the ad exists. Raises MetaWriteError tagged with the pipeline step."""
+class _Tick:
+    """Clock for one run_post_jobs call: `now()` is the tick's wall time plus the monotonic
+    time elapsed since it started, so a job claimed late in a tick still gets a full lease."""
+
+    def __init__(self, now: datetime, clock, deadline: float | None):
+        self.base = now
+        self.clock = clock
+        self.start = clock()
+        self.deadline = deadline
+        self.video_uploads = 0
+
+    def now(self) -> datetime:
+        return self.base + timedelta(seconds=max(self.clock() - self.start, 0))
+
+    def out_of_time(self) -> bool:
+        return self.deadline is not None and self.clock() >= self.deadline
+
+
+def _job_key(job: dict) -> dict:
+    """Filter for writes by the worker holding this claim; a stale worker matches nothing."""
+    return {"id": job["id"], "user_id": job["user_id"], "lease_id": job["lease_id"]}
+
+
+async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick) -> str:
+    """Run the next missing step. Returns the step name, "wait" (video processing),
+    "deferred" (video upload budget used this tick), or "created" once the ad exists.
+    Raises MetaWriteError tagged with the pipeline step."""
     creative = test.get("creative") or {}
     meta = ad.get("meta") or {}
     act = ad["ad_account_id"]
@@ -201,22 +259,27 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, now: dateti
     name = test["meta_ad_name"]
     step = "media"
     try:
-        if fmt == "image" and not meta.get("image_hash"):
-            reuse = _reusable_media(test, ad)
-            value = reuse["image_hash"] if reuse else await upload_image(
-                act, token, image_url=_media(creative).get("blob_url"))
-            await _set_meta(db, ad, "image_hash", value, now)
-            return step
-        if fmt != "image" and not meta.get("video_id"):
-            reuse = _reusable_media(test, ad)
-            if reuse:
-                value = reuse["video_id"]
+        if not meta.get("image_hash" if fmt == "image" else "video_id"):
+            how, ref = _media_plan(test, act)
+            if how == "unavailable":
+                raise MetaWriteError(VIDEO_NEEDS_UPLOAD if fmt != "image"
+                                     else "This creative has no image to upload")
+            if how == "reuse":
+                value = ref
+            elif fmt == "image":
+                value = await upload_image(act, token, image_url=ref,
+                                           allow_meta_cdn=how == "meta_cdn")
             else:
-                await db[POST_JOBS].update_one(
-                    {"id": job["id"]}, {"$set": {"lease_until": now + VIDEO_UPLOAD_LEASE}})
-                value = await upload_video(act, token, file_url=_media(creative).get("blob_url"),
-                                           name=name)
-            await _set_meta(db, ad, "video_id", value, now)
+                if tick.video_uploads >= MAX_VIDEO_UPLOADS_PER_TICK:
+                    return "deferred"
+                tick.video_uploads += 1
+                res = await db[POST_JOBS].update_one(
+                    _job_key(job), {"$set": {"lease_until": tick.now() + VIDEO_UPLOAD_LEASE}})
+                if res.matched_count == 0:  # lost the claim; another worker owns it now
+                    return "stale"
+                value = await upload_video(act, token, file_url=ref, name=name)
+            await _set_meta(db, ad, "image_hash" if fmt == "image" else "video_id", value,
+                            tick.now())
             return step
 
         step = "creative"
@@ -224,7 +287,7 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, now: dateti
             if fmt != "image" and not meta.get("video_ready"):
                 if not await video_ready(meta["video_id"], token):
                     return "wait"
-                await _set_meta(db, ad, "video_ready", True, now)
+                await _set_meta(db, ad, "video_ready", True, tick.now())
             dest = ad.get("destination") or creative.get("destination") or "website"
             value = await create_adcreative(
                 act, token, name=name, page_id=ad["page_id"], fmt=fmt,
@@ -239,14 +302,15 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, now: dateti
                 lead_form_id=ad.get("lead_form_id"),
                 whatsapp_number=creative.get("whatsapp_number"),
             )
-            await _set_meta(db, ad, "creative_id", value, now)
+            await _set_meta(db, ad, "creative_id", value, tick.now())
             return step
 
         step = "ad"
         if not meta.get("ad_id"):
             value = await create_ad(act, token, name=name, adset_id=ad["adset_id"],
                                     creative_id=meta["creative_id"])
-            await _set_meta(db, ad, "ad_id", value, now, post_state="created", post_error=None)
+            await _set_meta(db, ad, "ad_id", value, tick.now(), post_state="created",
+                            post_error=None)
         return "created"
     except MetaWriteError as e:
         e.step = step
@@ -263,21 +327,26 @@ async def _claim(db, now: datetime, exclude: list[str]) -> dict | None:
     return await db[POST_JOBS].find_one_and_update(
         {"id": {"$nin": exclude}, "state": {"$in": [QUEUED, RUNNING]},
          "$or": [{"lease_until": None}, {"lease_until": {"$lte": now}}]},
-        {"$set": {"state": RUNNING, "lease_until": now + LEASE, "updated_at": now}},
+        {"$set": {"state": RUNNING, "lease_until": now + LEASE, "lease_id": uuid.uuid4().hex,
+                  "updated_at": now}},
         sort=[("created_at", 1)],
         return_document=ReturnDocument.AFTER,
     )
 
 
-async def _finish(db, job: dict, now: datetime, **fields) -> None:
-    await db[POST_JOBS].update_one({"id": job["id"]}, {"$set": {**fields, "updated_at": now}})
+async def _finish(db, job: dict, now: datetime, **fields) -> bool:
+    """Release or close the claimed job; False (no-op) when this worker lost the claim."""
+    res = await db[POST_JOBS].update_one(
+        _job_key(job), {"$set": {**fields, "lease_id": None, "updated_at": now}})
+    return res.matched_count > 0
 
 
 async def _fail(db, job: dict, ad: dict, err: dict, now: datetime) -> None:
+    if not await _finish(db, job, now, state=FAILED, lease_until=None, last_error=err):
+        return
     await db[TEST_ADS].update_one(
         {"id": ad["id"], "user_id": ad["user_id"]},
         {"$set": {"post_state": "failed", "post_error": err, "updated_at": now}})
-    await _finish(db, job, now, state=FAILED, lease_until=None, last_error=err)
 
 
 async def _after_created(db, mongo_client, test: dict, ad: dict, now: datetime) -> dict | None:
@@ -294,19 +363,19 @@ async def _after_created(db, mongo_client, test: dict, ad: dict, now: datetime) 
     return None
 
 
-async def _process(db, mongo_client, job: dict, now: datetime, tokens: dict) -> str:
+async def _process(db, mongo_client, job: dict, tick: _Tick, tokens: dict) -> str:
     uid = job["user_id"]
     ad = await db[TEST_ADS].find_one({"id": job["test_ad_id"], "user_id": uid})
     test = await get_test(db, uid, job["test_id"])
     if ad is None or test is None or test.get("status") == ARCHIVED:
-        await _finish(db, job, now, state=DONE, lease_until=None, note="test or ad gone")
+        await _finish(db, job, tick.now(), state=DONE, lease_until=None, note="test or ad gone")
         return "skipped"
     if ad.get("post_state") not in ("pending", "uploading"):
-        await _finish(db, job, now, state=DONE, lease_until=None)
+        await _finish(db, job, tick.now(), state=DONE, lease_until=None)
         return "skipped"
     if ad.get("post_state") == "pending":
         await db[TEST_ADS].update_one({"id": ad["id"], "user_id": uid},
-                                      {"$set": {"post_state": "uploading", "updated_at": now}})
+                                      {"$set": {"post_state": "uploading", "updated_at": tick.now()}})
 
     if uid not in tokens:
         tokens[uid] = ((await get_facebook_token(uid, mongo_client)) or {}).get("access_token")
@@ -314,8 +383,9 @@ async def _process(db, mongo_client, job: dict, now: datetime, tokens: dict) -> 
     try:
         if not token:
             raise MetaWriteError("Meta is not connected", code=190)
-        result = await _run_step(db, job, test, ad, token, now)
+        result = await _run_step(db, job, test, ad, token, tick)
     except MetaWriteError as e:
+        now = tick.now()
         err = _post_error(e)
         attempts = job.get("attempts", 0) + 1
         if e.retryable and attempts < MAX_ATTEMPTS:
@@ -327,9 +397,15 @@ async def _process(db, mongo_client, job: dict, now: datetime, tokens: dict) -> 
     except Exception as e:  # a bug must not wedge the job under a lease forever
         logger.error(f"[creatives-post] job {job['id']} crashed: {e}", exc_info=True)
         await _fail(db, job, ad, {"code": None, "subcode": None, "message": str(e)[:300],
-                                  "step": None, "fix": None}, now)
+                                  "step": None, "fix": None}, tick.now())
         return "failed"
 
+    now = tick.now()
+    if result == "stale":
+        return "stale"
+    if result == "deferred":
+        await _finish(db, job, now, state=QUEUED, lease_until=None)
+        return "deferred"
     if result == "wait":
         polls = job.get("video_polls", 0) + 1
         if polls >= MAX_VIDEO_POLLS:
@@ -350,20 +426,23 @@ async def _process(db, mongo_client, job: dict, now: datetime, tokens: dict) -> 
     return "advanced"
 
 
-async def run_post_jobs(db, mongo_client, now_utc: datetime, *, limit: int = 5) -> dict:
-    """Claim up to `limit` jobs (each at most once per call) and run one step for each."""
-    now = _naive(now_utc)
+async def run_post_jobs(db, mongo_client, now_utc: datetime, *, limit: int = 5,
+                        deadline: float | None = None, clock=None) -> dict:
+    """Claim up to `limit` jobs (each at most once per call) and run one step for each.
+    Stops claiming once `deadline` (a `clock()` value, default time.monotonic) passes;
+    at most one video upload per call."""
+    tick = _Tick(_naive(now_utc), clock or time.monotonic, deadline)
     counts = {"claimed": 0, "advanced": 0, "created": 0, "waiting": 0, "backoff": 0,
-              "failed": 0, "skipped": 0}
+              "failed": 0, "skipped": 0, "deferred": 0, "stale": 0}
     tokens: dict[str, str | None] = {}
     seen: list[str] = []
-    while counts["claimed"] < limit:
-        job = await _claim(db, now, seen)
+    while counts["claimed"] < limit and not tick.out_of_time():
+        job = await _claim(db, tick.now(), seen)
         if job is None:
             break
         seen.append(job["id"])
         counts["claimed"] += 1
-        counts[await _process(db, mongo_client, job, now, tokens)] += 1
+        counts[await _process(db, mongo_client, job, tick, tokens)] += 1
     return counts
 
 
@@ -377,6 +456,8 @@ async def _activate(db, mongo_client, user_id: str, test: dict, ads: list[dict],
     for ad in ads:
         ad_id = (ad.get("meta") or {}).get("ad_id")
         if ad.get("post_state") != "created" or not ad_id:
+            continue
+        if ad.get("meta_status") == "PAUSED":  # a pause wins over auto go-live
             continue
         try:
             await set_object_status(user_id, ad_id, "ad", "ACTIVE", mongo_client)
@@ -472,8 +553,8 @@ async def retry(db, user_id: str, test_id: str, test_ad_id: str, *, patch: dict 
     if any(k in patch for k in CREATIVE_FIELDS) and meta.get("creative_id"):
         update["$unset"] = {"meta.creative_id": ""}
     await db[TEST_ADS].update_one({"id": test_ad_id, "user_id": user_id}, update)
-    reset = {"state": QUEUED, "attempts": 0, "lease_until": None, "video_polls": 0,
-             "updated_at": now}
+    reset = {"state": QUEUED, "attempts": 0, "lease_until": None, "lease_id": None,
+             "video_polls": 0, "updated_at": now}
     res = await db[POST_JOBS].update_one({"test_ad_id": test_ad_id, "user_id": user_id},
                                          {"$set": reset, "$unset": {"last_error": ""}})
     if res.matched_count == 0:

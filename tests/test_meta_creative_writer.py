@@ -201,3 +201,32 @@ async def test_rate_limit_retryable(serve):
     with pytest.raises(w.MetaWriteError) as ei:
         await w.create_ad("act_1", "tok", name="n", adset_id="a", creative_id="c")
     assert ei.value.retryable
+
+
+CDN = "https://scontent-lhr8-1.xx.fbcdn.net/v/t45/a.jpg"
+
+
+async def test_meta_cdn_image_only_when_allowed(serve):
+    seen = []
+    with pytest.raises(w.MetaWriteError) as ei:
+        await w.upload_image("act_1", "tok", image_url=CDN)
+    assert ei.value.step == "media" and seen == []
+    for bad in ("https://fbcdn.net.evil.com/a.jpg", "http://x.fbcdn.net/a.jpg",
+                "https://evilfbcdn.net/a.jpg"):
+        with pytest.raises(w.MetaWriteError):
+            await w.upload_image("act_1", "tok", image_url=bad, allow_meta_cdn=True)
+    serve([{"content": b"JPG", "headers": {"content-type": "image/jpeg"}},
+           {"json": {"images": {"a.jpg": {"hash": "H2"}}}}], seen)
+    assert await w.upload_image("act_1", "tok", image_url=CDN, allow_meta_cdn=True) == "H2"
+    assert seen[0]["url"] == CDN
+
+
+async def test_meta_cdn_keeps_size_and_redirect_guards(serve, monkeypatch):
+    seen = []
+    serve([{"status": 302, "content": b"", "headers": {"location": "http://169.254.169.254/"}}], seen)
+    with pytest.raises(w.MetaWriteError):
+        await w.upload_image("act_1", "tok", image_url=CDN, allow_meta_cdn=True)
+    monkeypatch.setattr(w, "MAX_IMAGE_BYTES", 10)
+    serve([{"content": b"x" * 100, "headers": {"content-type": "image/jpeg"}}], seen)
+    with pytest.raises(w.MetaWriteError):
+        await w.upload_image("act_1", "tok", image_url=CDN, allow_meta_cdn=True)

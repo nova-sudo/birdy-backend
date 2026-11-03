@@ -40,6 +40,9 @@ from services.daily_refresh_slot import DEFAULT_TIMEZONE, last_slot_utc
 logger = logging.getLogger(__name__)
 
 TICK_BUDGET_SECONDS = 45
+# Posting gets the first slice of the tick; tracking then runs against its own
+# TICK_BUDGET_SECONDS deadline from the tick start (so always at least ~20 s).
+POST_BUDGET_SECONDS = 25
 MAX_TESTS_PER_TICK = 25
 
 
@@ -276,7 +279,8 @@ async def run_creatives_tick(now_utc: datetime | None = None) -> dict:
         result: dict = {}
         # Posting first: a Post click should not wait behind a long tracking pass.
         try:
-            result["posting"] = await run_post_jobs(db, mongo_client, now_utc)
+            result["posting"] = await run_post_jobs(
+                db, mongo_client, now_utc, deadline=time.monotonic() + POST_BUDGET_SECONDS)
         except Exception as e:
             logger.error(f"[creatives-post] tick failed: {e}", exc_info=True)
             result["posting"] = {"error": str(e)[:300]}

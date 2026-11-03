@@ -39,8 +39,9 @@ class Meta:
         self.ready = True
         self.status_err = {}   # ad_id -> exception
 
-        async def upload_image(act, token, *, image_url):
-            return await self._hit("upload_image", act, f"hash_{act}", image_url=image_url)
+        async def upload_image(act, token, *, image_url, allow_meta_cdn=False):
+            return await self._hit("upload_image", act, f"hash_{act}", image_url=image_url,
+                                   allow_meta_cdn=allow_meta_cdn)
 
         async def upload_video(act, token, *, file_url, name):
             return await self._hit("upload_video", act, f"vid_{act}", file_url=file_url)
@@ -73,9 +74,13 @@ class Meta:
                          ("get_facebook_token", token)):
             monkeypatch.setattr(posting, name, fn)
 
+    hook = None  # async (fn, act) -> None, run inside every writer call
+
     async def _hit(self, fn, act, result, **kw):
         self.calls[fn].append((act, kw))
         await asyncio.sleep(0)
+        if self.hook:
+            await self.hook(fn, act)
         e = self.err.pop((fn, act), None)
         if e:
             raise e
@@ -400,3 +405,165 @@ async def test_tick_runs_post_jobs_first(mock_db, mock_mongo_client, monkeypatch
     monkeypatch.setattr(ct, "track_due_tests", fake_track)
     res = await ct.run_creatives_tick(datetime(2026, 11, 3, 9))
     assert order[:2] == ["post", "track"] and res["posting"] == {"claimed": 0}
+
+
+class Clock:
+    def __init__(self):
+        self.t = 1000.0
+
+    def __call__(self):
+        return self.t
+
+
+async def test_late_claim_gets_full_lease_and_stale_worker_is_noop(mock_db, mock_mongo_client, meta):
+    t = await posted(mock_db, n=2)
+    clock = Clock()
+    seen = {}
+
+    async def hook(fn, act):
+        if act == "act_0":
+            clock.t += 120  # the first job's step takes two minutes
+        elif act == "act_1" and "inner" not in seen:
+            job = await mock_db[POST_JOBS].find_one({"test_id": t["id"], "lease_id": {"$ne": None}})
+            seen["job"] = job
+            assert job["lease_until"] == NOW + timedelta(seconds=120 + 90)
+            meta.hook = None
+            # an overlapping tick at real time (NOW + 150s) while act_1 is mid-step
+            seen["inner"] = await posting.run_post_jobs(mock_db, mock_mongo_client,
+                                                        NOW + timedelta(seconds=150))
+
+    meta.hook = hook
+    await posting.run_post_jobs(mock_db, mock_mongo_client, NOW, clock=clock)
+    assert [a for a, _ in meta.calls["upload_image"]].count("act_1") == 1
+    assert seen["inner"]["claimed"] == 1  # only the released act_0 job
+    # a worker whose claim was taken over cannot overwrite the job
+    stale = {**seen["job"], "lease_id": "someone-else"}
+    assert await posting._finish(mock_db, stale, NOW, state="failed") is False
+    job = await mock_db[POST_JOBS].find_one({"id": stale["id"]})
+    assert job["state"] == "queued"
+
+
+async def test_posting_deadline_stops_claiming(mock_db, mock_mongo_client, meta):
+    await posted(mock_db, n=4)
+    clock = Clock()
+
+    async def hook(fn, act):
+        clock.t += 10
+
+    meta.hook = hook
+    res = await posting.run_post_jobs(mock_db, mock_mongo_client, NOW, clock=clock,
+                                      deadline=clock.t + 25)
+    assert res["claimed"] == 3  # claimed at +0, +10, +20; +30 is past the slice
+    res = await posting.run_post_jobs(mock_db, mock_mongo_client, NOW + timedelta(minutes=1),
+                                      clock=clock, deadline=clock.t - 1)
+    assert res["claimed"] == 0
+
+
+async def test_one_video_upload_per_tick(mock_db, mock_mongo_client, meta):
+    creative = {**IMAGE, "format": "video",
+                "media": {"blob_url": BLOB.replace("img.png", "v.mp4"), "thumbnail_url": BLOB}}
+    t = await posted(mock_db, creative, n=2)
+    res = await tick(mock_db, mock_mongo_client, 0)
+    assert len(meta.calls["upload_video"]) == 1 and res["deferred"] == 1
+    jobs = await mock_db[POST_JOBS].find({"test_id": t["id"]}).to_list(None)
+    assert all(j["state"] == "queued" and j["lease_until"] is None for j in jobs)
+    await tick(mock_db, mock_mongo_client, 1)
+    assert len(meta.calls["upload_video"]) == 2
+
+
+async def test_tick_gives_posting_a_deadline(mock_db, mock_mongo_client, monkeypatch):
+    import time as _time
+    from jobs import creative_tracking as ct
+
+    got = {}
+
+    async def fake_post(db, mc, now_utc, **kw):
+        got.update(kw)
+        return {"claimed": 0}
+
+    async def fake_track(db, mc, now_utc, *, deadline=None):
+        got["track_deadline"] = deadline
+        return {"tracked": 0}
+
+    monkeypatch.setattr(ct, "run_post_jobs", fake_post)
+    monkeypatch.setattr(ct, "track_due_tests", fake_track)
+    before = _time.monotonic()
+    await ct.run_creatives_tick(datetime(2026, 11, 3, 9))
+    assert before + 24 <= got["deadline"] <= _time.monotonic() + 25
+    assert got["track_deadline"] >= got["deadline"] + 19
+
+
+REVIVE_IMG = {**IMAGE, "media": {"image_hash": "src_hash",
+                                 "image_url": "https://scontent-lhr8-1.xx.fbcdn.net/v/t45/a.jpg"}}
+
+
+async def test_cross_account_image_revive_reuploads_from_meta_cdn(mock_db, mock_mongo_client, meta):
+    t = await make(mock_db, REVIVE_IMG, n=2)
+    await mock_db[TESTS].update_one({"id": t["id"]}, {"$set": {"source": {"ad_account_id": "0"}}})
+    await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(2), now=NOW)
+    await tick(mock_db, mock_mongo_client)
+    ups = {a: kw for a, kw in meta.calls["upload_image"]}
+    assert "act_0" not in ups  # "0" == "act_0": same account reuses the hash
+    assert ups["act_1"] == {"image_url": REVIVE_IMG["media"]["image_url"], "allow_meta_cdn": True}
+    ads = {a["ad_account_id"]: a for a in await list_test_ads(mock_db, t["id"], user_id=U)}
+    assert ads["act_0"]["meta"]["image_hash"] == "src_hash"
+
+
+async def test_odd_source_is_tolerated(mock_db, mock_mongo_client, meta):
+    t = await make(mock_db, REVIVE_IMG, n=1)
+    await mock_db[TESTS].update_one({"id": t["id"]}, {"$set": {"source": "weird"}})
+    await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(1), now=NOW)
+    await tick(mock_db, mock_mongo_client)
+    assert meta.calls["upload_image"] == []
+
+
+async def test_cross_account_video_revive_without_blob_rejected(mock_db, mock_mongo_client, meta):
+    creative = {**IMAGE, "format": "video", "media": {"video_id": "v_src", "image_hash": "th"}}
+    t = await make(mock_db, creative, n=2)
+    await mock_db[TESTS].update_one({"id": t["id"]},
+                                    {"$set": {"source": {"ad_account_id": "act_0"}}})
+    with pytest.raises(posting.PostingError) as e:
+        await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(2), now=NOW)
+    assert e.value.status_code == 400 and "Upload the video file" in e.value.message
+    assert (await get_test(mock_db, U, t["id"]))["status"] == "draft"
+    await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(1), now=NOW)  # same account ok
+
+
+async def test_pause_wins_over_go_live(mock_db, mock_mongo_client, meta):
+    t = await posted(mock_db, n=2)
+    meta.err[("create_adcreative", "act_1")] = MetaWriteError("x", code=100, step="create_creative")
+    for m in range(3):
+        await tick(mock_db, mock_mongo_client, m)
+    await posting.pause_ads(mock_db, mock_mongo_client, U, t["id"], ["act_0"], now=NOW)
+    res = await posting.go_live(mock_db, mock_mongo_client, U, t["id"], partial_ok=True, now=NOW)
+    assert res["activated"] == 0 and ("ad_act_0", "ACTIVE") not in meta.calls["status"]
+
+
+async def test_enqueue_rolls_back_on_insert_failure(mock_db, mock_mongo_client, meta, monkeypatch):
+    t = await make(mock_db, n=2)
+    real = posting.add_test_ads
+
+    async def boom(*a, **kw):
+        await real(*a, **kw)
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr(posting, "add_test_ads", boom)
+    with pytest.raises(RuntimeError):
+        await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(2), now=NOW)
+    got = await get_test(mock_db, U, t["id"])
+    assert got["status"] == "draft" and got.get("posted_accounts") == []
+    assert await mock_db[TEST_ADS].count_documents({}) == 0
+    monkeypatch.setattr(posting, "add_test_ads", real)
+    res = await posting.enqueue_post(mock_db, U, t["id"], accounts=accounts(2), now=NOW)
+    assert res["queued"] == 2
+
+
+async def test_post_jobs_writes_are_owner_scoped(mock_db, mock_mongo_client, meta):
+    t = await posted(mock_db, n=1)
+    # a job doc for the same id but another user must not be touched by the worker
+    job = await mock_db[POST_JOBS].find_one({"test_id": t["id"]})
+    await mock_db[POST_JOBS].insert_one({**{k: v for k, v in job.items() if k != "_id"},
+                                         "user_id": "other", "state": "done"})
+    await tick(mock_db, mock_mongo_client)
+    other = await mock_db[POST_JOBS].find_one({"id": job["id"], "user_id": "other"})
+    assert other["state"] == "done" and other.get("lease_id") is None

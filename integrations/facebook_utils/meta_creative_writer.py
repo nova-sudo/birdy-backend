@@ -68,14 +68,19 @@ MAX_IMAGE_BYTES = 30 * 1024 * 1024
 IMAGE_TYPES = ("image/jpeg", "image/png")
 
 
-def _check_blob_url(url: str) -> None:
+META_CDN_SUFFIX = ".fbcdn.net"
+
+
+def _check_blob_url(url: str, *, allow_meta_cdn: bool = False) -> None:
     u = urlparse(url or "")
-    if u.scheme != "https" or not (u.hostname or "").endswith(BLOB_SUFFIX):
+    host = (u.hostname or "").lower()
+    ok = host.endswith(BLOB_SUFFIX) or (allow_meta_cdn and host.endswith(META_CDN_SUFFIX))
+    if u.scheme != "https" or not ok:
         raise MetaWriteError("Media must be an https Birdy upload URL", step="media")
 
 
-async def _download_image(url: str) -> bytes:
-    _check_blob_url(url)
+async def _download_image(url: str, *, allow_meta_cdn: bool = False) -> bytes:
+    _check_blob_url(url, allow_meta_cdn=allow_meta_cdn)
     try:
         async with httpx.AsyncClient(timeout=60.0, follow_redirects=False) as client:
             async with client.stream("GET", url) as dl:
@@ -95,13 +100,15 @@ async def _download_image(url: str) -> bytes:
         raise MetaWriteError(f"Could not download image: {e}", step="media") from e
 
 
-async def upload_image(act: str, token: str, *, image_url: str) -> str:
+async def upload_image(act: str, token: str, *, image_url: str, allow_meta_cdn: bool = False) -> str:
     """Download the image (Birdy blob host only) and post it base64-encoded; returns the hash.
 
     Revive creatives that already hold a Meta image_hash skip this call entirely and pass the
-    hash as media_ref to create_adcreative.
+    hash as media_ref to create_adcreative. A revive into a different ad account (hashes are
+    account-scoped) passes allow_meta_cdn=True to re-upload the source ad's *.fbcdn.net image
+    under the same guards (https, no redirects, jpeg/png, 30 MB streaming cap).
     """
-    content = await _download_image(image_url)
+    content = await _download_image(image_url, allow_meta_cdn=allow_meta_cdn)
     data = await _request("POST", f"{GRAPH}/{act}/adimages", "upload_image",
                           data={"access_token": token,
                                 "bytes": base64.b64encode(content).decode()})
