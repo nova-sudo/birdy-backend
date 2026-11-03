@@ -68,9 +68,9 @@ async def patch_settings(agent_id: str, body: SettingsPatch,
                 {"id": {"$in": added}, "user_id": current_user})}
             for gid in added:
                 cpl = client_targets.clean((groups.get(gid) or {}).get("targets")).get("cpl")
-                entry = merged["clients"].setdefault(gid, {})
+                entry = merged["clients"].get(gid) or {}
                 if cpl is not None and (entry.get("zones") or {}).get("green_under") is None:
-                    entry["zones"] = {**(entry.get("zones") or {}), "green_under": cpl}
+                    merged["clients"][gid] = {**entry, "zones": {**(entry.get("zones") or {}), "green_under": cpl}}
 
         updated = await agent_store.update_agent(db, current_user, agent_id, update)
         return agents_router._agent_to_api(updated)

@@ -25,7 +25,8 @@ DEFAULT_SETTINGS: dict = {
     "treatments": [],
     "clients": {},
     "creative": {"max_ads_live": 4, "winner_days": 14, "winner_min_leads": 8,
-                 "revive_after_days": 60, "major_downtrend_pct": 30, "auto_max_adds": 2},
+                 "revive_after_days": 60, "major_downtrend_pct": 30, "auto_max_adds": 2,
+                 "data_window_days": 7},
     "scoring": {"min_days": 7, "win_min_leads": 5, "lose_cpl_multiple": 1.3,
                 "lose_spend_multiple": 6, "lose_max_leads": 1, "rule_after": 3},
     "alerts": {"prepaid_days": 4, "spend_drop_ratio": 0.5},
@@ -54,12 +55,21 @@ def _zones_from(z) -> Zones | None:
     return None
 
 
+def _override(settings: dict, gid: str) -> dict | None:
+    """The client's zones override when any limit is set on it, else None."""
+    z = (((settings.get("clients") or {}).get(gid)) or {}).get("zones")
+    if isinstance(z, dict) and any(z.get(k) is not None for k in ("green_under", "red_over")):
+        return z
+    return None
+
+
 def resolve_zones(settings: dict, gid: str, currency: str | None) -> Zones | None:
-    """The client's own zones win. The agency default applies only when the client's account
-    currency matches the default's currency. Otherwise None: the setup must ask for an override."""
-    own = _zones_from((((settings.get("clients") or {}).get(gid)) or {}).get("zones"))
-    if own is not None:
-        return own
+    """The client's own zones win, and need both limits: a partial override is None, never the
+    agency default. With no override the default applies only when the client's account
+    currency matches the default's currency. Otherwise None: setup must ask for an override."""
+    override = _override(settings, gid)
+    if override is not None:
+        return _zones_from(override)
     default = settings.get("zones") or {}
     if default.get("currency") and currency and default["currency"] == currency:
         return _zones_from(default)
@@ -67,6 +77,8 @@ def resolve_zones(settings: dict, gid: str, currency: str | None) -> Zones | Non
 
 
 def resolve_mode(settings: dict, gid: str, kind: str) -> str:
+    if kind not in MODE_KINDS:
+        raise ValueError(f"no mode for change type {kind!r}; alerts are always Flag")
     client = (((settings.get("clients") or {}).get(gid)) or {}).get("modes") or {}
     mode = client.get(kind) or (settings.get("modes") or {}).get(kind) or "ask"
     if kind == "add" and mode == "auto" and not add_writes_enabled():
@@ -88,9 +100,13 @@ def settings_errors(settings: dict, groups: list[dict]) -> list[dict]:
         errors.append({"field": "zones", "message": "Red must be at least the green limit"})
     for g in groups:
         gid, name = g.get("id"), g.get("name") or g.get("id")
-        own = ((settings.get("clients") or {}).get(gid) or {}).get("zones")
+        own = _override(settings, gid)
         z = _zones_from(own)
-        if z is not None and z.red_over < z.green_under:
+        if own is not None and z is None:
+            missing = "red" if own.get("green_under") is not None else "green"
+            errors.append({"field": "zones", "client_group_id": gid,
+                           "message": f"{name} has only one zone limit set; it needs a {missing} limit too"})
+        elif z is not None and z.red_over < z.green_under:
             errors.append({"field": "zones", "client_group_id": gid,
                            "message": f"{name}: red must be at least the green limit"})
         elif resolve_zones(settings, gid, g.get("ad_account_currency")) is None:
@@ -136,13 +152,18 @@ def _modes_shape(m, field: str, gid: str | None = None) -> list[dict]:
     return out
 
 
-def _numbers_shape(block, field: str, defaults: dict, *, positive_int=()) -> list[dict]:
+def _numbers_shape(block, field: str, defaults: dict, *, positive_int=(), at_least_one=(),
+                   fraction=()) -> list[dict]:
     if not isinstance(block, dict):
         return [_err(field, "must be an object")]
     out = []
     for k, v in block.items():
         if k not in defaults:
             out.append(_err(f"{field}.{k}", "unknown field"))
+        elif k in fraction and not (_num(v) and 0 < v <= 1):
+            out.append(_err(f"{field}.{k}", "must be above 0 and at most 1"))
+        elif k in at_least_one and not (_num(v) and v >= 1 and int(v) == v):
+            out.append(_err(f"{field}.{k}", "must be a whole number, 1 or more"))
         elif not _num(v) or v < 0 or (k in positive_int and int(v) != v):
             out.append(_err(f"{field}.{k}", "must be a whole number, 0 or more" if k in positive_int
                             else "must be a number, 0 or more"))
@@ -190,12 +211,13 @@ def shape_errors(patch: dict) -> list[dict]:
             out += _modes_shape(val, "modes")
         elif key == "creative":
             out += _numbers_shape(val, key, DEFAULT_SETTINGS[key], positive_int=(
-                "max_ads_live", "winner_days", "winner_min_leads", "revive_after_days", "auto_max_adds"))
+                "max_ads_live", "winner_days", "winner_min_leads", "revive_after_days", "auto_max_adds",
+                "data_window_days"), at_least_one=("max_ads_live", "winner_days", "data_window_days"))
         elif key == "scoring":
             out += _numbers_shape(val, key, DEFAULT_SETTINGS[key], positive_int=(
-                "min_days", "win_min_leads", "lose_max_leads", "rule_after"))
+                "min_days", "win_min_leads", "lose_max_leads", "rule_after"), at_least_one=("min_days",))
         elif key == "alerts":
-            out += _numbers_shape(val, key, DEFAULT_SETTINGS[key])
+            out += _numbers_shape(val, key, DEFAULT_SETTINGS[key], fraction=("spend_drop_ratio",))
         elif key == "batches":
             ok = isinstance(val, list) and all(
                 isinstance(b, dict) and isinstance(b.get("id"), str) and isinstance(b.get("name"), str)
@@ -251,4 +273,11 @@ def merge_settings(current: dict, patch: dict) -> dict:
         else:
             clients[gid] = merge(clients.get(gid) or {}, c)
     merged["clients"] = clients
+    new_zones = (patch.get("zones") or {})
+    old_zones = current.get("zones") or {}
+    if "currency" in new_zones and new_zones["currency"] != old_zones.get("currency") \
+            and not all(new_zones.get(k) is not None for k in ("green_under", "red_over")):
+        # A new currency never inherits the old currency's amounts.
+        merged["zones"] = {**merged["zones"], "green_under": new_zones.get("green_under"),
+                           "red_over": new_zones.get("red_over")}
     return merged

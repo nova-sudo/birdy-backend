@@ -70,7 +70,8 @@ def test_spec_defaults():
     assert d["batches"] == [{"id": "a", "name": "Batch A", "weekdays": [0, 3]},
                             {"id": "b", "name": "Batch B", "weekdays": [1, 4]}]
     assert d["creative"] == {"max_ads_live": 4, "winner_days": 14, "winner_min_leads": 8,
-                             "revive_after_days": 60, "major_downtrend_pct": 30, "auto_max_adds": 2}
+                             "revive_after_days": 60, "major_downtrend_pct": 30, "auto_max_adds": 2,
+                             "data_window_days": 7}
     assert (d["alerts"], d["scoring"]["rule_after"]) == ({"prepaid_days": 4, "spend_drop_ratio": 0.5}, 3)
     assert d["modes"] == {"remove": "ask", "add": "ask", "revive": "ask"}
 
@@ -144,7 +145,7 @@ async def test_patch_client_list_updates_scope_and_prefills_green(api, mock_db):
     assert r.status_code == 200
     assert r.json()["scope"]["client_group_ids"] == ["g1", "g2"]
     clients = r.json()["settings"]["clients"]
-    assert clients["g1"]["zones"] == {"green_under": 2.5} and "zones" not in clients["g2"]
+    assert clients["g1"]["zones"] == {"green_under": 2.5} and "g2" not in clients
     assert "prepaid" not in clients["g1"]
     # A green limit the agency already chose is not overwritten on re-add.
     api.patch(f"/api/agents/{aid}/settings", json={
@@ -181,3 +182,90 @@ async def test_activate_reports_zone_errors(api, mock_db):
         "settings": {"zones": GBP_ZONES}, "client_group_ids": ["g1"]})
     r = api.post(f"/api/agents/{aid}/activate")
     assert r.status_code == 400 and r.json()["errors"][0]["client_group_id"] == "g1"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("zones", [
+    {"green_under": 6}, {"red_over": 9}, {"green_under": 6, "red_over": None},
+    {"green_under": None, "red_over": 9}])
+def test_partial_override_never_falls_back_to_default(zones):
+    s = {**DEFAULT_SETTINGS, "zones": GBP_ZONES, "clients": {"g": {"zones": zones}}}
+    assert resolve_zones(s, "g", "GBP") is None
+    errs = settings_errors(s, [{"id": "g", "name": "Glow", "ad_account_currency": "GBP"}])
+    assert len(errs) == 1 and errs[0]["client_group_id"] == "g" and "Glow" in errs[0]["message"]
+    missing = "red" if "green_under" in zones and zones["green_under"] is not None else "green"
+    assert missing in errs[0]["message"]
+
+
+def test_all_null_override_is_no_override():
+    s = {**DEFAULT_SETTINGS, "zones": GBP_ZONES,
+         "clients": {"g": {"zones": {"green_under": None, "red_over": None}}}}
+    assert resolve_zones(s, "g", "GBP") == Zones(8, 10)
+
+
+def test_resolve_mode_rejects_unknown_kind():
+    with pytest.raises(ValueError):
+        resolve_mode(DEFAULT_SETTINGS, "g", "alert")
+
+
+def test_data_window_default():
+    assert DEFAULT_SETTINGS["creative"]["data_window_days"] == 7
+
+
+def test_spec_scoring_and_weekly_defaults():
+    assert DEFAULT_SETTINGS["scoring"] == {
+        "min_days": 7, "win_min_leads": 5, "lose_cpl_multiple": 1.3,
+        "lose_spend_multiple": 6, "lose_max_leads": 1, "rule_after": 3}
+    assert DEFAULT_SETTINGS["weekly"] == {"enabled": False, "weekday": 0, "auto_post": False}
+
+
+@pytest.mark.parametrize("settings", [
+    {"creative": {"data_window_days": 0}}, {"creative": {"data_window_days": 1.5}},
+    {"creative": {"max_ads_live": 0}}, {"creative": {"winner_days": 0}},
+    {"scoring": {"min_days": 0}}, {"alerts": {"spend_drop_ratio": 0}},
+    {"alerts": {"spend_drop_ratio": 1.5}}])
+async def test_out_of_range_numbers_are_rejected(api, mock_db, settings):
+    aid = await _stock(mock_db)
+    assert api.patch(f"/api/agents/{aid}/settings", json={"settings": settings}).status_code == 400
+
+
+async def test_in_range_numbers_are_accepted(api, mock_db):
+    aid = await _stock(mock_db)
+    r = api.patch(f"/api/agents/{aid}/settings", json={"settings": {
+        "creative": {"data_window_days": 1}, "alerts": {"spend_drop_ratio": 1}}})
+    assert r.status_code == 200
+
+
+async def test_currency_change_nulls_old_amounts(api, mock_db):
+    aid = await _stock(mock_db)
+    api.patch(f"/api/agents/{aid}/settings", json={"settings": {"zones": GBP_ZONES}})
+    r = api.patch(f"/api/agents/{aid}/settings", json={"settings": {"zones": {"currency": "USD"}}})
+    assert r.json()["settings"]["zones"] == {"currency": "USD", "green_under": None, "red_over": None}
+    r = api.patch(f"/api/agents/{aid}/settings", json={"settings": {
+        "zones": {"currency": "EUR", "green_under": 3, "red_over": 4}}})
+    assert r.json()["settings"]["zones"] == {"currency": "EUR", "green_under": 3, "red_over": 4}
+    r = api.patch(f"/api/agents/{aid}/settings", json={"settings": {"zones": {"red_over": 5}}})
+    assert r.json()["settings"]["zones"]["green_under"] == 3  # same currency keeps amounts
+
+
+async def test_no_client_entry_without_something_to_prefill(api, mock_db):
+    aid = await _stock(mock_db)
+    await _group(mock_db, "g2")
+    r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g2"]})
+    assert r.json()["settings"]["clients"] == {}
+    assert resolve_zones(r.json()["settings"], "g2", "GBP") is None
+    assert resolve_mode(r.json()["settings"], "g2", "add") == "ask"
+
+
+async def test_flag_only_is_preserved_across_client_list_patch(api, mock_db):
+    aid = await _stock(mock_db)
+    for g in ("g1", "g2", "g3"):
+        await _group(mock_db, g)
+    api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g1", "g2"], "only_flag": ["g2"]})
+    r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g1", "g2", "g3"]})
+    assert r.json()["scope"]["flag_only_client_group_ids"] == ["g2"]
+    r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g1", "g3"]})
+    assert r.json()["scope"]["flag_only_client_group_ids"] == []
