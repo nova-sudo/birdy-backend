@@ -223,7 +223,8 @@ async def sync_open_rule_mode(db, rule_id: str, mode: str) -> None:
 # ---------------------------------------------------------------------------
 
 async def add_memory(db, agent_id: str, *, text: str, kind: str, source: str,
-                     source_ref=None, filter=None) -> dict:
+                     source_ref=None, filter=None, author=None,
+                     client_group_id=None) -> dict:
     doc = {
         "_id": _new_id(),
         "agent_id": agent_id,
@@ -235,6 +236,10 @@ async def add_memory(db, agent_id: str, *, text: str, kind: str, source: str,
         "active": True,
         "created_at": _now(),
     }
+    if author is not None:
+        doc["author"] = author
+    if client_group_id is not None:
+        doc["client_group_id"] = client_group_id
     await db[MEMORY].insert_one(doc)
     return doc
 

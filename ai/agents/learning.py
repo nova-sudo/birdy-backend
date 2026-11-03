@@ -348,7 +348,7 @@ async def _context(db, agent: dict, note: str, doc: dict) -> tuple[str, set[str]
     return json.dumps(ctx, default=str), set(gids)
 
 
-async def _meter(db, user_id: str, provider, resp) -> None:
+async def _meter(db, user_id: str, provider, resp, feature: str = "agent_note_memory") -> None:
     """Bill the call like the other server-side LLM calls. Never raises."""
     try:
         from credits import record_usage
@@ -357,12 +357,13 @@ async def _meter(db, user_id: str, provider, resp) -> None:
             db, user_id, model=getattr(provider, "model", None),
             prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
             completion_tokens=getattr(usage, "output_tokens", 0) or 0,
-            source="agents", feature="agent_note_memory")
+            source="agents", feature=feature)
     except Exception as e:
         logger.warning("learning: metering the note call failed for %s: %s", user_id, e)
 
 
-async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
+async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str = "denial",
+                           author: str | None = None, client_group_id: str | None = None) -> dict:
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
     error, or output that can't be used, stores the note as a fact. Never raises."""
@@ -388,11 +389,12 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
                        agent.get("_id"), e)
         text, kind, flt = note, "fact", None
     try:
-        return await add_memory(db, agent["_id"], text=text, kind=kind, source="denial",
-                                source_ref=(doc or {}).get("_id"), filter=flt)
+        return await add_memory(db, agent["_id"], text=text, kind=kind, source=source,
+                                source_ref=(doc or {}).get("_id"), filter=flt,
+                                author=author, client_group_id=client_group_id)
     except Exception as e:
         logger.error("learning: could not store memory for agent %s: %s", agent.get("_id"), e)
-        return {"text": text, "kind": kind, "filter": flt, "source": "denial",
+        return {"text": text, "kind": kind, "filter": flt, "source": source,
                 "source_ref": (doc or {}).get("_id"), "active": False}
 
 
