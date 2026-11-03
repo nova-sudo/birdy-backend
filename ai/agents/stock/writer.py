@@ -8,16 +8,18 @@ returns reaches a card without `validate_draft`.
 Money rule: a money figure in the text is a number next to a currency (symbol, ISO code or
 word). It must come from the facts or the candidates, in a currency that fact was given in.
 Decision on rounding: a figure written with fewer decimals than the fact is accepted when it is
-that fact rounded half-up to the written precision (4.115 may be written 4.12, 4.1 or 4), with
+that fact rounded half-up or truncated to the written precision (4.115 may be written 4.12, 4.11,
+4.1 or 4), with
 "k" and "m" suffixes scaled the same way. Any figure that is not a rounding of a supplied one,
-including sums and differences, is rejected. Percentages and lead counts carry no currency, so
-they are never money. "1,234.50", "1.234,50" and "4,12" are all read.
+including sums and differences, is rejected. A bare number is also money when it sits within 30
+characters of cpl, cost, spend, spent, budget, limit or target (either order) and is not a
+percentage or a count of leads, ads, days and the like; it must match a fact in any currency. "1,234.50", "1.234,50" and "4,12" are all read.
 """
 
 import asyncio
 import logging
 import re
-from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal, InvalidOperation
 
 from ai.prompts import stock_agent as prompt
 
@@ -37,20 +39,32 @@ _WORDS = {"pound": {"GBP"}, "pounds": {"GBP"}, "quid": {"GBP"}, "euro": {"EUR"},
 _CODES = ("GBP USD EUR CAD AUD NZD AED SAR QAR KWD BHD OMR EGP INR JPY CNY CHF SEK NOK DKK PLN CZK "
           "HUF TRY ZAR MXN BRL SGD HKD ILS THB MYR IDR PHP KRW NGN RUB").split()
 _SYM = "[" + "".join(_SYMBOLS) + "]"
-_NUM = r"\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?"
+_SP = "[ \u00a0\u202f]"
+_NUM = (rf"\d{{1,3}}(?:[.,]\d{{3}})+(?:[.,]\d+)?|\d{{1,3}}(?:{_SP}\d{{3}})+(?:[.,]\d+)?|\d+(?:[.,]\d+)?")
+_SCALE = r"(?:[kK]|[mM]|bn|million|billion|thousand|grand)(?![A-Za-z])"
+_SCALES = {"k": 1000, "thousand": 1000, "grand": 1000, "m": 10**6, "million": 10**6,
+           "bn": 10**9, "billion": 10**9}
 _MONEY_KEYS = ("spend", "cpl", "prev_spend", "prev_cpl", "green_under", "red_over")
+# A bare number is money when it sits within this many characters of a money word.
+_MONEY_WORDS = re.compile(r"\b(?:cpl|cost|costs|spend|spent|budget|budgets|limit|limits|target)\b", re.I)
+_NEAR = 30
+_BARE_NOT_MONEY = re.compile(
+    r"\s?(?:%|percent\b|(?:leads?|ads?|days?|weeks?|clicks|creatives?|clients?|times|x)\b)", re.I)
 
 
 def _money_re(codes) -> re.Pattern:
     code = "|".join(sorted(set(codes), key=len, reverse=True))
     word = "|".join(_WORDS)
     return re.compile(
-        rf"(?:(?<![A-Za-z])(?P<pc>{code})\s?|(?P<ps>{_SYM})\s?)(?P<pn>{_NUM})(?P<pk>[kKmM](?![A-Za-z]))?"
-        rf"|(?P<sn>{_NUM})(?P<sk>[kKmM])?\s?(?:(?P<sc>{code})(?![A-Za-z])|(?P<ss>{_SYM})|(?P<sw>{word})(?![A-Za-z]))")
+        rf"(?:(?<![A-Za-z])(?P<pc>{code})\s?|(?P<ps>{_SYM})\s?)(?P<pn>{_NUM})(?:\s?(?P<pk>{_SCALE}))?"
+        rf"|(?P<sn>{_NUM})(?:\s?(?P<sk>{_SCALE}))?\s?"
+        rf"(?:(?P<sc>{code})(?![A-Za-z])|(?P<ss>{_SYM})|(?P<sw>{word})(?![A-Za-z]))")
 
 
 def _parse_amount(raw: str) -> tuple[Decimal, int]:
-    """Value and number of decimals written, reading '.' or ',' as decimal or thousands."""
+    """Value and number of decimals written, reading '.' or ',' as decimal or thousands, and a
+    space or nbsp before exactly three digits as thousands."""
+    raw = re.sub(_SP, "", raw)
     has_c, has_d = "," in raw, "." in raw
     if has_c and has_d:
         dec = "," if raw.rfind(",") > raw.rfind(".") else "."
@@ -68,22 +82,40 @@ def _parse_amount(raw: str) -> tuple[Decimal, int]:
 
 
 def _money_figures(text: str, codes) -> list[tuple[str, Decimal, int, int, set]]:
-    """[(as written, value, decimals, scale, possible currency codes)]"""
-    out = []
+    """[(as written, value, decimals, scale, possible currency codes)]. Currency codes are
+    empty for a bare number, which then matches any currency's facts."""
+    out, spans = [], []
     for m in _money_re(codes).finditer(text):
         raw = m.group("pn") or m.group("sn")
         try:
             value, dec = _parse_amount(raw)
         except InvalidOperation:
             continue
-        suffix = (m.group("pk") or m.group("sk") or "").lower()
-        scale = {"k": 1000, "m": 1000000}.get(suffix, 1)
-        cur = m.group("pc") or m.group("sc")
+        scale = _SCALES.get((m.group("pk") or m.group("sk") or "").lower(), 1)
+        cur = (m.group("pc") or m.group("sc") or "").upper()
         if cur:
             cs = {cur}
         else:
             cs = _SYMBOLS.get(m.group("ps") or m.group("ss") or "") or _WORDS.get((m.group("sw") or "").lower(), set())
         out.append((m.group(0).strip(), value, dec, scale, cs))
+        spans.append(m.span())
+    words = [m.span() for m in _MONEY_WORDS.finditer(text)]
+    bare = re.compile(rf"(?<![\w:.,]){_NUM}(?:\s?{_SCALE})?(?![\w:])")
+    for m in bare.finditer(text):
+        if any(a < m.end() and m.start() < b for a, b in spans):
+            continue
+        if _BARE_NOT_MONEY.match(text, m.end()):
+            continue
+        if not any(m.start() - e <= _NEAR and m.start() >= e or s - m.end() <= _NEAR and s >= m.end()
+                   for s, e in words):
+            continue
+        sm = re.search(_SCALE + "$", m.group(0))
+        num = m.group(0)[:sm.start()].strip() if sm else m.group(0)
+        try:
+            value, dec = _parse_amount(re.match(_NUM, num).group(0))
+        except (InvalidOperation, AttributeError):
+            continue
+        out.append((m.group(0).strip(), value, dec, _SCALES.get(sm.group(0).lower(), 1) if sm else 1, set()))
     return out
 
 
@@ -115,7 +147,7 @@ def _supplied_money(facts: dict, candidates: dict) -> list[tuple[str | None, Dec
 def _rounds_to(fact: Decimal, value: Decimal, dec: int, scale: int) -> bool:
     q = Decimal(1).scaleb(-dec)
     try:
-        return (fact / scale).quantize(q, rounding=ROUND_HALF_UP) == value
+        return any((fact / scale).quantize(q, rounding=r) == value for r in (ROUND_HALF_UP, ROUND_DOWN))
     except InvalidOperation:
         return False
 
@@ -144,13 +176,25 @@ def _id_list(raw, key: str, allowed: set[str], errs: list[str]) -> list[str]:
     return out
 
 
+_SLACK_MARKUP = re.compile(r"<[^<>]*>")
+
+
+def _plain(text: str) -> str:
+    """Remove Slack markup (<!channel>, <https://x|y>, <@U1>) from model text."""
+    while True:
+        out = _SLACK_MARKUP.sub("", text)
+        if out == text:
+            return out.strip()
+        text = out
+
+
 def _clean_flags(raw, chosen: set[str]) -> list[dict]:
     out = []
     for f in raw if isinstance(raw, list) else []:
         if isinstance(f, dict) and f.get("id") in chosen:
             kind = str(f.get("kind") or "").lower()
             out.append({"id": f["id"], "kind": kind if kind in FLAG_KINDS else "other",
-                        "note": str(f.get("note") or "")[:200]})
+                        "note": _plain(str(f.get("note") or ""))[:200]})
     return out
 
 
@@ -174,7 +218,7 @@ def validate_draft(raw: dict, facts: dict, candidates: dict, max_live: int) -> t
         if not isinstance(v, str):
             errs.append(f"{f} must be text")
             v = ""
-        text[f] = v.strip()[:TEXT_MAX]
+        text[f] = _plain(v)[:TEXT_MAX]
     pool = _supplied_money(facts, candidates)
     codes = set(_CODES) | {c for c, _ in pool if isinstance(c, str)}
     for f, v in text.items():
@@ -182,25 +226,37 @@ def validate_draft(raw: dict, facts: dict, candidates: dict, max_live: int) -> t
     if errs:
         return None, errs
     flags = _clean_flags(raw.get("flags"), set(add) | set(remove) | set(revive))
+    for fl in flags:
+        errs += [f"flags note: {e}" for e in _money_errors(fl["note"], codes, pool)]
+    if errs:
+        return None, errs
     return {"add": add, "remove": remove, "revive": revive, **text, "flags": flags}, []
 
 
 def _fmt_money(v, currency) -> str:
-    if v is None:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v or v in (float("inf"), float("-inf")):
         return "no data"
-    sym = next((s for s, cs in _SYMBOLS.items() if cs == {currency}), None)
-    return f"{sym}{v:.2f}" if sym else f"{v:.2f} {currency}".strip()
+    cur = currency if isinstance(currency, str) and currency.strip() else None
+    sym = next((s for s, cs in _SYMBOLS.items() if cs == {cur}), None) if cur else None
+    if sym:
+        return f"{sym}{v:.2f}"
+    return f"{v:.2f} {cur}" if cur else f"{v:.2f}"
 
 
 def _failed(facts: dict) -> dict:
-    cur = facts.get("currency")
-    sentence = (f"CPL moved from {_fmt_money(facts.get('prev_cpl'), cur)} to {_fmt_money(facts.get('cpl'), cur)}. "
-                "Birdy couldn't write this one, so please review the changes yourself.")
+    """The plain code-written card. Never raises, whatever the facts hold."""
+    try:
+        cur = facts.get("currency")
+        sentence = (f"CPL moved from {_fmt_money(facts.get('prev_cpl'), cur)} to {_fmt_money(facts.get('cpl'), cur)}. "
+                    "Birdy couldn't write this one, so please review the changes yourself.")
+    except Exception:
+        sentence = "Birdy couldn't write this one, so please review the changes yourself."
     return {"add": [], "remove": [], "revive": [], "additional_changes": "", "thought_process": sentence,
             "next_steps": "", "flags": [], "failed": True}
 
 
-async def write_card(db, agent: dict, facts: dict, candidates: dict, lessons: list) -> dict:
+async def write_card(db, agent: dict, facts: dict, candidates: dict, lessons: list, *,
+                     last_card: dict | None = None, open_questions: list | None = None) -> dict:
     """One AI call, one retry that quotes what was wrong. Never raises: any failure (no
     credits, provider error, timeout, unusable or invalid reply twice) gives the plain
     code-written sentence with no changes and failed=True, so nothing runs on Auto."""
@@ -220,7 +276,8 @@ async def write_card(db, agent: dict, facts: dict, candidates: dict, lessons: li
             resp = await asyncio.wait_for(provider.chat_completion(
                 messages=[{"role": "system", "content": prompt.SYSTEM},
                           {"role": "user", "content": prompt.build_user_message(
-                              facts, candidates, lessons, max_live, problems)}],
+                              facts, candidates, lessons, max_live, problems,
+                              last_card=last_card, open_questions=open_questions)}],
                 temperature=0, max_tokens=MAX_TOKENS), timeout=LLM_TIMEOUT_S)
             await _meter(db, user_id, provider, resp, feature="stock_agent_card")
             parsed = _parse_json(getattr(resp, "content", None))
