@@ -190,3 +190,17 @@ async def test_retryable_error_skips_one_test(mock_db, mock_mongo_client, monkey
     assert res["tracked"] == 1 and res["skipped"] == 1
     assert (await get_test(mock_db, "a", t1["id"])).get("tracked_at") is None
     assert (await get_test(mock_db, "b", t2["id"]))["tracked_at"]
+
+
+async def test_tick_reconciles_once_per_utc_day(mock_db, mock_mongo_client, monkeypatch):
+    calls = []
+
+    async def fake_reconcile(db):
+        calls.append(1)
+        return {"adoptable": 0}
+
+    monkeypatch.setattr(ct, "reconcile_all", fake_reconcile)
+    first = await ct.run_creatives_tick(datetime(2026, 11, 3, 9))
+    second = await ct.run_creatives_tick(datetime(2026, 11, 3, 18))
+    third = await ct.run_creatives_tick(datetime(2026, 11, 4, 0, 5))
+    assert len(calls) == 2 and "reconcile" in first and "reconcile" not in second and "reconcile" in third

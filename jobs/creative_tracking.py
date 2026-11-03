@@ -18,6 +18,7 @@ from integrations.facebook_utils.meta_creative_reader import (
 from services.creatives.store import (
     AD_DAYS,
     ARCHIVED,
+    COUNTERS,
     FINAL_VERDICTS,
     TEST_ADS,
     TESTS,
@@ -25,6 +26,7 @@ from services.creatives.store import (
     list_test_ads,
     update_test,
 )
+from services.creatives.reconcile import reconcile_all
 from services.creatives.targets import owning_group, resolve_account_targets
 from services.creatives.verdict import (
     aggregate_days,
@@ -232,4 +234,19 @@ async def run_creatives_tick(now_utc: datetime | None = None) -> dict:
     deadline = time.monotonic() + TICK_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        return {"tracking": await track_due_tests(db, mongo_client, now_utc, deadline=deadline)}
+        result = {"tracking": await track_due_tests(db, mongo_client, now_utc, deadline=deadline)}
+        day = _naive_utc(now_utc).date().isoformat()
+        # Claim the once-per-UTC-day reconcile; only the first tick of the day wins.
+        claimed = await db[COUNTERS].find_one_and_update(
+            {"_id": "__daily__", "reconciled_on": {"$ne": day}},
+            {"$set": {"reconciled_on": day}},
+        )
+        if claimed is None and await db[COUNTERS].find_one({"_id": "__daily__"}) is None:
+            try:
+                await db[COUNTERS].insert_one({"_id": "__daily__", "reconciled_on": day})
+                claimed = True
+            except Exception:  # lost the insert race: another tick has it
+                claimed = None
+        if claimed is not None:
+            result["reconcile"] = await reconcile_all(db)
+        return result
