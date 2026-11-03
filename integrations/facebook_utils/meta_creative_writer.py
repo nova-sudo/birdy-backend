@@ -138,6 +138,21 @@ async def video_ready(video_id: str, token: str) -> bool:
     return state == "ready"
 
 
+async def video_thumbnail(video_id: str, token: str) -> Optional[str]:
+    """A thumbnail URL Meta generated for an uploaded video: the preferred one, else the
+    first, else the video's `picture`. None when Meta has none yet."""
+    data = await _request("GET", f"{GRAPH}/{video_id}/thumbnails", "video_thumbnail",
+                          params={"access_token": token, "fields": "uri,is_preferred"},
+                          timeout=30.0)
+    thumbs = [t for t in data.get("data") or [] if isinstance(t, dict) and t.get("uri")]
+    pick = next((t for t in thumbs if t.get("is_preferred")), thumbs[0] if thumbs else None)
+    if pick:
+        return pick["uri"]
+    data = await _request("GET", f"{GRAPH}/{video_id}", "video_thumbnail",
+                          params={"access_token": token, "fields": "picture"}, timeout=30.0)
+    return data.get("picture") or None
+
+
 async def create_adcreative(
     act: str, token: str, *, name: str, page_id: str, fmt: str,
     media_ref: Union[str, dict], primary_text: str, headline: str, description: str,

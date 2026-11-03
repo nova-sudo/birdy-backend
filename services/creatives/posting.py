@@ -26,6 +26,7 @@ from integrations.facebook_utils.meta_creative_writer import (
     upload_image,
     upload_video,
     video_ready,
+    video_thumbnail,
 )
 from services.creatives.errors import explain
 from services.creatives.store import (
@@ -197,12 +198,16 @@ def media_plan(test: dict, act: str) -> tuple[str, str | None]:
         if media.get("image_hash"):
             return "reuse", media["image_hash"]
         return "unavailable", None
-    thumb = media.get("thumbnail_url") or media.get("image_url") or media.get("image_hash")
-    if media.get("video_id") and thumb and same_account:
+    # No thumbnail is fine: the creative step reads Meta's own (video_thumbnail).
+    if media.get("video_id") and same_account:
         return "reuse", media["video_id"]
     if media.get("blob_url"):
         return "blob", media["blob_url"]
     return "unavailable", None
+
+
+def _own_thumb(media: dict) -> str | None:
+    return media.get("thumbnail_url") or media.get("image_url")
 
 
 def _media_ref(test: dict, ad: dict):
@@ -212,7 +217,7 @@ def _media_ref(test: dict, ad: dict):
         return meta["image_hash"]
     media = _media(creative)
     ref = {"video_id": meta["video_id"]}
-    thumb = media.get("thumbnail_url") or media.get("image_url")
+    thumb = _own_thumb(media) or meta.get("thumbnail_url")
     if thumb:
         ref["image_url"] = thumb
     elif media.get("image_hash"):
@@ -290,6 +295,15 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick
                 if not await video_ready(meta["video_id"], token):
                     return "wait"
                 await _set_meta(db, ad, "video_ready", True, tick.now())
+            media = _media(creative)
+            if (fmt != "image" and not _own_thumb(media) and not media.get("image_hash")
+                    and not meta.get("thumbnail_url")):
+                # Wizard and chat uploads carry no thumbnail; Meta makes some once the
+                # video is processed. None yet: wait like an unprocessed video.
+                thumb = await video_thumbnail(meta["video_id"], token)
+                if not thumb:
+                    return "wait"
+                await _set_meta(db, ad, "thumbnail_url", thumb, tick.now())
             dest = ad.get("destination") or creative.get("destination") or "website"
             value = await create_adcreative(
                 act, token, name=name, page_id=ad["page_id"], fmt=fmt,
@@ -326,14 +340,27 @@ def _post_error(e: MetaWriteError) -> dict:
 
 
 async def _claim(db, now: datetime, exclude: list[str]) -> dict | None:
-    return await db[POST_JOBS].find_one_and_update(
+    """Claim the next due job. A RUNNING job whose lease ran out lost its worker mid-step
+    (crash, or a video upload outliving its lease): that reclaim counts as an attempt, so
+    a step that keeps dying is failed after MAX_ATTEMPTS instead of re-running forever."""
+    lease_id = uuid.uuid4().hex
+    before = await db[POST_JOBS].find_one_and_update(
         {"id": {"$nin": exclude}, "state": {"$in": [QUEUED, RUNNING]},
          "$or": [{"lease_until": None}, {"lease_until": {"$lte": now}}]},
-        {"$set": {"state": RUNNING, "lease_until": now + LEASE, "lease_id": uuid.uuid4().hex,
+        {"$set": {"state": RUNNING, "lease_until": now + LEASE, "lease_id": lease_id,
                   "updated_at": now}},
         sort=[("created_at", 1)],
-        return_document=ReturnDocument.AFTER,
+        return_document=ReturnDocument.BEFORE,
     )
+    if before is None:
+        return None
+    job = {**before, "state": RUNNING, "lease_until": now + LEASE, "lease_id": lease_id,
+           "updated_at": now}
+    if before.get("state") == RUNNING:
+        job["attempts"] = job.get("attempts", 0) + 1
+        job["reclaimed"] = True
+        await db[POST_JOBS].update_one(_job_key(job), {"$set": {"attempts": job["attempts"]}})
+    return job
 
 
 async def _finish(db, job: dict, now: datetime, **fields) -> bool:
@@ -394,6 +421,12 @@ async def _process(db, mongo_client, job: dict, tick: _Tick, tokens: dict) -> st
     if ad.get("post_state") == "pending":
         await db[TEST_ADS].update_one({"id": ad["id"], "user_id": uid},
                                       {"$set": {"post_state": "uploading", "updated_at": tick.now()}})
+
+    if job.get("reclaimed") and job.get("attempts", 0) >= MAX_ATTEMPTS:
+        await _fail(db, job, ad, {"code": None, "subcode": None, "step": None, "fix": "retry_later",
+                                  "message": "Posting stalled: Meta did not answer in time. Retry later."},
+                    tick.now())
+        return "failed"
 
     if uid not in tokens:
         tokens[uid] = ((await get_facebook_token(uid, mongo_client)) or {}).get("access_token")

@@ -279,3 +279,157 @@ async def test_post_jobs_index_on_test_ad_id(mock_mongo_client):
     await store.create_creative_indexes(mock_mongo_client)
     info = await mock_mongo_client[DB_NAME][store.POST_JOBS].index_information()
     assert info["test_ad_id"]["key"] == [("test_ad_id", 1)]
+
+
+# ── I2: a video with no thumbnail takes Meta's own ──────────────────────────
+
+BLOB_VIDEO = "https://abc.public.blob.vercel-storage.com/clip.mp4"
+# What the wizard's MediaDrop stores for a video (lib/creative-upload.js): no thumbnail_url.
+FE_VIDEO_MEDIA = {"blob_url": BLOB_VIDEO, "mime": "video/mp4", "bytes": 4_200_000,
+                  "width": 1080, "height": 1920, "duration_s": 14.2}
+VIDEO = {"format": "video", "media": FE_VIDEO_MEDIA, "primary_text": "Hi", "headline": "H",
+         "description": "D", "cta_type": "LEARN_MORE", "destination": "website",
+         "website_url": "https://example.com"}
+THUMB_A = "https://scontent-lhr8-1.xx.fbcdn.net/v/t15.5256-10/a_n.jpg?_nc_cat=1&oh=x&oe=y"
+THUMB_B = "https://scontent-lhr8-1.xx.fbcdn.net/v/t15.5256-10/b_n.jpg?_nc_cat=1&oh=x&oe=y"
+
+
+def graph(monkeypatch, thumbnails, picture=None):
+    """Recorded Graph v25.0 responses for the video posting path, routed by path."""
+    from urllib.parse import parse_qs, urlparse
+
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        url = urlparse(str(request.url))
+        q = {k: v[0] for k, v in parse_qs(url.query).items()}
+        body = {k: v[0] for k, v in parse_qs(request.content.decode()).items()} if request.content else {}
+        seen.append((request.method, url.path, q, body))
+        path = url.path.removeprefix("/v25.0")
+        if path == "/act_0/advideos":
+            return httpx.Response(200, json={"id": "1209384756"})
+        if path == "/1209384756" and q.get("fields") == "status":
+            return httpx.Response(200, json={"status": {"video_status": "ready",
+                                                        "processing_progress": 100},
+                                             "id": "1209384756"})
+        if path == "/1209384756/thumbnails":
+            return httpx.Response(200, json={"data": thumbnails, "paging": {
+                "cursors": {"before": "QVFI", "after": "QVFJ"}}})
+        if path == "/1209384756" and q.get("fields") == "picture":
+            return httpx.Response(200, json={"picture": picture, "id": "1209384756"})
+        if path == "/act_0/adcreatives":
+            return httpx.Response(200, json={"id": "120210000000001"})
+        if path == "/act_0/ads":
+            return httpx.Response(200, json={"id": "120210000000002"})
+        return httpx.Response(400, json={"error": {"message": f"unexpected {path}", "code": 100}})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr("integrations.facebook_utils.meta_creative_writer.httpx.AsyncClient",
+                        lambda *a, **kw: real(transport=httpx.MockTransport(handler),
+                                              **{k: v for k, v in kw.items() if k != "timeout"}))
+
+    async def token(uid, client):
+        return {"access_token": "tok"}
+
+    monkeypatch.setattr(posting, "get_facebook_token", token)
+    Status(monkeypatch)
+    return seen
+
+
+async def _post_video(db, mc, creative=VIDEO):
+    await db["client_groups"].insert_one({"id": "g0", "user_id": U, "name": "C",
+                                          "meta_ad_account_id": "act_0"})
+    t = await create_test(db, U, name="Clip", origin="new", creative=creative, targets={})
+    await posting.enqueue_post(db, U, t["id"], accounts=[
+        {"ad_account_id": "act_0", "client_group_id": "g0", "adset_id": "as0", "page_id": "p0"}],
+        now=datetime(2026, 11, 3, 12))
+    for m in range(4):
+        await posting.run_post_jobs(db, mc, datetime(2026, 11, 3, 12, m), clock=lambda: 0.0)
+    return t
+
+
+def _spec(seen):
+    import json as _json
+    [body] = [b for meth, path, _, b in seen if path.endswith("/adcreatives")]
+    return _json.loads(body["object_story_spec"])
+
+
+async def test_video_without_thumbnail_uses_preferred_meta_thumbnail(mock_db, mock_mongo_client, monkeypatch):
+    seen = graph(monkeypatch, [
+        {"id": "10161", "uri": THUMB_A, "is_preferred": False},
+        {"id": "10162", "uri": THUMB_B, "is_preferred": True}])
+    t = await _post_video(mock_db, mock_mongo_client)
+    video = _spec(seen)["video_data"]
+    assert video["video_id"] == "1209384756" and video["image_url"] == THUMB_B
+    [ad] = await list_test_ads(mock_db, t["id"], user_id=U)
+    assert ad["post_state"] == "active" and ad["meta"]["thumbnail_url"] == THUMB_B
+    q = next(q for _, path, q, _ in seen if path.endswith("/thumbnails"))
+    assert q["fields"] == "uri,is_preferred"
+
+
+async def test_video_thumbnail_falls_back_to_first_then_picture(mock_db, mock_mongo_client, monkeypatch):
+    seen = graph(monkeypatch, [{"id": "1", "uri": THUMB_A, "is_preferred": False},
+                               {"id": "2", "uri": THUMB_B, "is_preferred": False}])
+    await _post_video(mock_db, mock_mongo_client)
+    assert _spec(seen)["video_data"]["image_url"] == THUMB_A
+
+
+async def test_video_thumbnail_picture_fallback(mock_db, mock_mongo_client, monkeypatch):
+    seen = graph(monkeypatch, [], picture=THUMB_B)
+    await _post_video(mock_db, mock_mongo_client)
+    assert _spec(seen)["video_data"]["image_url"] == THUMB_B
+
+
+async def test_uploaded_thumbnail_wins_over_meta(mock_db, mock_mongo_client, monkeypatch):
+    own = "https://abc.public.blob.vercel-storage.com/cover.png"
+    seen = graph(monkeypatch, [{"id": "1", "uri": THUMB_A, "is_preferred": True}])
+    await _post_video(mock_db, mock_mongo_client,
+                      {**VIDEO, "media": {**FE_VIDEO_MEDIA, "thumbnail_url": own}})
+    assert _spec(seen)["video_data"]["image_url"] == own
+    assert not any(path.endswith("/thumbnails") for _, path, _, _ in seen)
+
+
+async def test_same_account_revive_video_without_thumbnail_can_post():
+    test = {"creative": {"format": "video", "media": {"video_id": "v1"}},
+            "source": {"ad_account_id": "act_0"}}
+    assert posting.media_plan(test, "act_0") == ("reuse", "v1")
+
+
+# ── M6: a lease-expiry reclaim counts as an attempt ─────────────────────────
+
+async def test_lease_reclaim_counts_attempts_and_gives_up(mock_db, mock_mongo_client, monkeypatch):
+    uploads = []
+
+    async def upload_video(act, token, *, file_url, name):
+        uploads.append(act)
+        raise _Killed()  # the worker dies mid-upload; the job stays RUNNING under its lease
+
+    async def token(uid, client):
+        return {"access_token": "tok"}
+
+    monkeypatch.setattr(posting, "upload_video", upload_video)
+    monkeypatch.setattr(posting, "get_facebook_token", token)
+    await mock_db["client_groups"].insert_one({"id": "g0", "user_id": U, "name": "C",
+                                               "meta_ad_account_id": "act_0"})
+    t = await create_test(mock_db, U, name="Clip", origin="new", creative=VIDEO, targets={})
+    await posting.enqueue_post(mock_db, U, t["id"], accounts=[
+        {"ad_account_id": "act_0", "client_group_id": "g0", "adset_id": "as0", "page_id": "p0"}],
+        now=datetime(2026, 11, 3, 12))
+    now = datetime(2026, 11, 3, 12)
+    for _ in range(posting.MAX_ATTEMPTS + 3):
+        try:
+            await posting.run_post_jobs(mock_db, mock_mongo_client, now, clock=lambda: 0.0)
+        except _Killed:
+            pass
+        now += posting.VIDEO_UPLOAD_LEASE + timedelta(seconds=1)
+    job = await mock_db[store.POST_JOBS].find_one({})
+    assert job["state"] == "failed"
+    assert len(uploads) == posting.MAX_ATTEMPTS
+    [ad] = await list_test_ads(mock_db, t["id"], user_id=U)
+    assert ad["post_state"] == "failed" and "stalled" in ad["post_error"]["message"]
+
+
+class _Killed(BaseException):
+    """Stands in for the process dying: not an Exception, so nothing in posting catches it."""
