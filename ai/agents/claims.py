@@ -7,7 +7,7 @@ naming the agent allowed to change that client's ads. A unique index on
 
 An agent that watches a client it does not hold can still report on it, but every change it
 proposes is a Flag (see runner.run_agent and guardrails.check_guardrails).
-A client nobody holds is not blocked: draft agents and legacy rows hold nothing.
+Only the holder acts: a watcher with no claim (or a draft) never writes.
 """
 
 import logging
@@ -101,8 +101,11 @@ async def migrate_claims(db) -> None:
     watcher (its changes are flagged). Safe to run on every start: never overwrites a claim."""
     agents = await db["agents"].find({"status": "active"}).sort("created_at", 1).to_list(length=None)
     for a in agents:
-        gids = (a.get("scope") or {}).get("client_group_ids") or []
-        for gid in dict.fromkeys(gids):
+        scope = a.get("scope") or {}
+        skip = set(scope.get("flag_only_client_group_ids") or [])  # chosen "only flag": never claim
+        for gid in dict.fromkeys(scope.get("client_group_ids") or []):
+            if gid in skip:
+                continue
             conflicts = await claim_clients(db, a["user_id"], a["_id"], [gid])
             if conflicts:
                 logger.info("claims migration: %s keeps %s, %s only watches it",

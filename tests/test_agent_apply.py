@@ -64,6 +64,8 @@ async def _seed_agent(db, **over):
     }
     agent.update(over)
     await db["agents"].insert_one(agent)
+    from ai.agents import claims
+    await claims.claim_clients(db, agent["user_id"], agent["_id"], agent["scope"]["client_group_ids"])
     return agent
 
 

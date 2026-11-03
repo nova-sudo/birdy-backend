@@ -217,9 +217,9 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
     updated_docs: list[dict] = []
     for gid, ctx, findings in evaluated:
         try:
-            # Another agent acts on this client: this one may report, but every item is a Flag.
-            held_by = await claims.holder(db, user_id, gid)
-            not_acting = bool(held_by) and held_by != agent_id
+            # Only the agent holding a client may change it. Any other watcher (another agent
+            # holds it, or the user chose "only flag") reports, and every item is a Flag.
+            not_acting = await claims.holder(db, user_id, gid) != agent_id
             to_apply: list[str] = []
             for f in findings:
                 f.evidence.window = AGENT_WINDOW

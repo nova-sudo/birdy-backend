@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from ai.agents import memory_filters, runner
+from ai.agents import claims, memory_filters, runner
 from ai.agents.meta_state import MetaTokenError
 from ai.agents.store import add_memory, create_agent, list_rules, update_agent, update_rule
 from ai.suggestions import actions
@@ -71,6 +71,7 @@ async def _agent(db, gids):
         "status": "active",
         "scope": {"client_group_ids": list(gids), "schedule": {"time": "07:00", "tz": "Europe/London"}},
     })
+    await claims.claim_clients(db, USER, agent["_id"], list(gids))  # only the holder may change a client
     return agent
 
 

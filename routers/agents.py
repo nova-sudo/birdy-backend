@@ -198,11 +198,16 @@ class ActivateBody(BaseModel):
     only_flag: Optional[list[str]] = None
 
 
+FLAG_ONLY_KEY = "flag_only_client_group_ids"  # scope key: watched, never claimed or acted on
+
+
 async def _claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move: bool,
                        only_flag) -> JSONResponse | None:
     """Claim the clients an active agent acts on. Clients in `only_flag` stay in its scope with
-    no claim. Returns a 409 response naming the holders when another agent has any of them."""
+    no claim (and any claim this agent holds on them is released). Returns a 409 response
+    naming the holders when another agent has any of the rest."""
     skip = set(only_flag or [])
+    await claims.release_clients(db, user_id, agent_id, skip)
     conflicts = await claims.claim_clients(db, user_id, agent_id, [g for g in ids if g not in skip], move=move)
     if conflicts:
         return JSONResponse(status_code=409, content={
@@ -233,15 +238,18 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
             if "schedule" in body.scope:
                 merged_scope["schedule"] = {**(current.get("schedule") or {}),
                                             **_validate_schedule(body.scope["schedule"])}
+            eff_ids = ids if ids is not None else list(current.get("client_group_ids") or [])
+            flag_only = [g for g in (body.only_flag if body.only_flag is not None
+                                     else current.get(FLAG_ONLY_KEY) or []) if g in eff_ids]
+            merged_scope[FLAG_ONLY_KEY] = flag_only
             patch["scope"] = merged_scope
-            if ids is not None and agent.get("status") == "active":
-                resp = await _claim_scope(db, current_user, agent_id, ids,
-                                          move=body.move_claims, only_flag=body.only_flag)
+            if agent.get("status") == "active":
+                resp = await _claim_scope(db, current_user, agent_id, eff_ids,
+                                          move=body.move_claims, only_flag=flag_only)
                 if resp is not None:
                     return resp
                 await claims.release_clients(
-                    db, current_user, agent_id,
-                    set((current.get("client_group_ids") or [])) - set(ids))
+                    db, current_user, agent_id, set(current.get("client_group_ids") or []) - set(eff_ids))
 
         if body.permissions is not None:
             unknown = set(body.permissions) - set(DEFAULT_PERMISSIONS)
@@ -680,11 +688,16 @@ async def activate(agent_id: str, body: Optional[ActivateBody] = None,
         if not conf["ready"]:
             return JSONResponse(status_code=409, content={
                 "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
-        resp = await _claim_scope(db, current_user, agent_id,
-                                  list((agent.get("scope") or {}).get("client_group_ids") or []),
-                                  move=body.move_claims, only_flag=body.only_flag)
+        scope = agent.get("scope") or {}
+        ids = list(scope.get("client_group_ids") or [])
+        flag_only = [g for g in (body.only_flag if body.only_flag is not None
+                                 else scope.get(FLAG_ONLY_KEY) or []) if g in ids]
+        resp = await _claim_scope(db, current_user, agent_id, ids,
+                                  move=body.move_claims, only_flag=flag_only)
         if resp is not None:
             return resp
+        await db[agent_store.AGENTS].update_one(
+            {"_id": agent_id, "user_id": current_user}, {"$set": {f"scope.{FLAG_ONLY_KEY}": flag_only}})
         for rule in await agent_store.list_rules(db, agent_id):
             mode = ("ask" if rule["kind"] in agent_confidence.ASK_KINDS
                     else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)

@@ -102,6 +102,8 @@ async def seed_agent(db, user=U, gids=("g1",)):
         "status": "active",
         "scope": {"client_group_ids": list(gids), "schedule": {"time": "07:00", "tz": "Europe/London"}},
     })
+    from ai.agents import claims
+    await claims.claim_clients(db, user, agent["_id"], list(gids))
     rules = {r["kind"]: r for r in await db[RULES].find({"agent_id": agent["_id"]}).to_list(length=None)}
     return agent, rules
 
@@ -728,6 +730,8 @@ async def test_silent_auto_run_is_not_posted_to_slack(mock_db, mock_mongo_client
     agent = await update_agent(mock_db, "u1", agent["_id"], {
         "status": "active",
         "scope": {"client_group_ids": ["cg1"], "schedule": {"time": "07:00", "tz": "Europe/London"}}})
+    from ai.agents import claims
+    await claims.claim_clients(mock_db, "u1", agent["_id"], ["cg1"])
     rule = await mock_db[RULES].find_one({"agent_id": agent["_id"], "kind": "pause_over_target"})
     await mock_db[RULES].update_one({"_id": rule["_id"]}, {"$set": {"stats.streak": 10}})
     await learning.graduate(mock_db, agent, rule["_id"], choice, now=NOW)

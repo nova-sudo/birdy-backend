@@ -93,8 +93,9 @@ async def test_guardrails_block_non_acting_agent(mock_db):
     r = await check_guardrails(mock_db, b, _doc(), now_utc=datetime(2026, 10, 20))
     assert not r.ok and r.reason == "not_acting_agent"
     assert (await check_guardrails(mock_db, a, _doc(), now_utc=datetime(2026, 10, 20))).ok
-    # an unclaimed client does not block
-    assert (await check_guardrails(mock_db, b, _doc("g9"), now_utc=datetime(2026, 10, 20))).ok
+    # a client nobody holds is blocked too: only the holder writes
+    r = await check_guardrails(mock_db, b, _doc("g9"), now_utc=datetime(2026, 10, 20))
+    assert not r.ok and r.reason == "not_acting_agent"
 
 
 async def test_migration_claims_active_agents_first_created_wins_idempotent(mock_db, mock_mongo_client):
@@ -184,18 +185,58 @@ async def test_activate_claims_or_409(api, mock_db, monkeypatch):
     assert await claims.holder(mock_db, U, "g1") == b["_id"]
 
 
-async def test_activate_scope_that_stays_watching_without_claim(api, mock_db, monkeypatch):
-    """'Only flag': the user drops the client from claims by moving nothing; scope keeps it only via
-    the other agent. Covered by patch 409 leaving scope unchanged; here activation of an unclaimed scope claims it."""
+async def test_activate_claims_unclaimed_scope(api, mock_db, monkeypatch):
     await _groups(mock_db, "g1")
     b = await _agent(mock_db, "Beta", status="draft")
+    _ready(monkeypatch)
+    assert api.post(f"/api/agents/{b['_id']}/activate").status_code == 200
+    assert await claims.holder(mock_db, U, "g1") == b["_id"]
 
+
+def _ready(monkeypatch):
     async def ready(db, agent):
         return {"ready": True, "missing": [], "score": 90}
 
     monkeypatch.setattr(agents_router, "_confidence", ready)
-    assert api.post(f"/api/agents/{b['_id']}/activate").status_code == 200
-    assert await claims.holder(mock_db, U, "g1") == b["_id"]
+
+
+async def test_activate_only_flag_leaves_no_claim_and_persists(api, mock_db, monkeypatch):
+    await _groups(mock_db, "g1", "g2")
+    a = await _agent(mock_db, "Alpha", gids=("g1",))
+    await claims.claim_clients(mock_db, U, a["_id"], ["g1"])
+    b = await _agent(mock_db, "Beta", status="draft", gids=("g1", "g2"))
+    _ready(monkeypatch)
+    r = api.post(f"/api/agents/{b['_id']}/activate", json={"only_flag": ["g1"]})
+    assert r.status_code == 200, r.text
+    assert await claims.holder(mock_db, U, "g1") == a["_id"]   # untouched
+    assert await claims.holder(mock_db, U, "g2") == b["_id"]
+    doc = await mock_db.agents.find_one({"_id": b["_id"]})
+    assert doc["scope"]["flag_only_client_group_ids"] == ["g1"]
+    assert doc["scope"]["client_group_ids"] == ["g1", "g2"]
+
+
+async def test_patch_only_flag_leaves_no_claim_and_releases_own(api, mock_db):
+    await _groups(mock_db, "g1", "g2")
+    b = await _agent(mock_db, "Beta", gids=("g1", "g2"))
+    await claims.claim_clients(mock_db, U, b["_id"], ["g1", "g2"])
+    r = api.patch(f"/api/agents/{b['_id']}",
+                  json={"scope": {"client_group_ids": ["g1", "g2"]}, "only_flag": ["g1"]})
+    assert r.status_code == 200, r.text
+    assert await claims.holder(mock_db, U, "g1") is None       # moved into flag-only: released
+    assert await claims.holder(mock_db, U, "g2") == b["_id"]
+    # a later patch without only_flag keeps the choice
+    api.patch(f"/api/agents/{b['_id']}", json={"scope": {"client_group_ids": ["g1", "g2"]}})
+    assert await claims.holder(mock_db, U, "g1") is None
+
+
+async def test_migration_keeps_flag_only_clients_unclaimed(mock_db):
+    a = await _agent(mock_db, gids=("g1", "g2"))
+    await mock_db.agents.update_one(
+        {"_id": a["_id"]}, {"$set": {"scope.flag_only_client_group_ids": ["g1"]}})
+    for _ in range(2):
+        await claims.migrate_claims(mock_db)
+    assert await claims.holder(mock_db, U, "g1") is None
+    assert await claims.holder(mock_db, U, "g2") == a["_id"]
 
 
 async def test_runner_forces_flag_for_client_held_by_another_agent(mock_db, mock_mongo_client, monkeypatch):
@@ -213,7 +254,7 @@ async def test_runner_forces_flag_for_client_held_by_another_agent(mock_db, mock
     await tr._seed_client(mock_db, "cg1")
     agent = await tr._agent(mock_db, ["cg1"])
     other = await _agent(mock_db, "Other", gids=())
-    await claims.claim_clients(mock_db, tr.USER, other["_id"], ["cg1"])
+    await claims.claim_clients(mock_db, tr.USER, other["_id"], ["cg1"], move=True)
     res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=tr.AS_OF)
     assert res.created
     docs = await mock_db[sstore.SUGGESTIONS].find({"rule_mode": {"$exists": True}}).to_list(None)
@@ -222,3 +263,27 @@ async def test_runner_forces_flag_for_client_held_by_another_agent(mock_db, mock
 
 async def _async(v):
     return v
+
+
+async def test_runner_forces_flag_for_flag_only_unheld_client(mock_db, mock_mongo_client, monkeypatch):
+    import test_agent_runner as tr
+    from ai.agents import runner
+    from ai.suggestions import store as sstore
+
+    monkeypatch.setattr(runner, "refresh_meta_state", lambda *a, **k: _async({"ads": 0, "adsets": 0}))
+    monkeypatch.setattr(runner, "backfill_paused_at", lambda *a, **k: _async(0))
+
+    async def quiet(db, user_id, docs):
+        return 0
+
+    monkeypatch.setattr("services.slack_suggestion_notifier.post_new_suggestions", quiet)
+    await tr._seed_client(mock_db, "cg1")
+    agent = await tr._agent(mock_db, ["cg1"])
+    await claims.release_clients(mock_db, tr.USER, agent["_id"])  # flag-only: watched, held by nobody
+    rules = await store.list_rules(mock_db, agent["_id"])
+    for r in rules:
+        await store.update_rule(mock_db, agent["_id"], r["_id"], mode="auto")
+    res = await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=tr.AS_OF)
+    assert res.created and res.auto_applied == 0
+    docs = await mock_db[sstore.SUGGESTIONS].find({"rule_mode": {"$exists": True}}).to_list(None)
+    assert docs and {d["rule_mode"] for d in docs} == {"flag"}
