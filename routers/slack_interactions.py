@@ -226,6 +226,14 @@ async def _post_action_error(db, birdy_user_id: str, payload: dict, res: dict) -
         logger.warning(f"suggestion action: error notice failed: {e}")
 
 
+async def _is_scale(db, user_id: str, suggestion_id: str) -> bool:
+    from ai.suggestions import store as sug_store
+    from ai.suggestions.contracts import ACTION_SCALE_CREATIVE
+
+    doc = await sug_store.get_suggestion(db, user_id, suggestion_id)
+    return ((doc or {}).get("action") or {}).get("type") == ACTION_SCALE_CREATIVE
+
+
 async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_client) -> dict:
     """
     Handle the "Do it for me" / "Ignore" / "Undo" buttons on a suggestion message.
@@ -242,7 +250,10 @@ async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_clien
     action_id = action.get("action_id")
     slack_user = (payload.get("user") or {}).get("id")
 
-    if action_id == "suggestion_apply":
+    if action_id == "suggestion_apply" and await _is_scale(db, birdy_user_id, suggestion_id):
+        # Scaling is never applied from Slack (its card links to the wizard).
+        res = {"ok": False, "outcome": "failed", "detail": "open the wizard in Birdy to scale this test"}
+    elif action_id == "suggestion_apply":
         res = await actions.apply_suggestion(
             db, mongo_client, birdy_user_id, suggestion_id, source="slack", by=slack_user)
     elif action_id == "suggestion_undo":

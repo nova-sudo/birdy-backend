@@ -176,3 +176,22 @@ def test_upload_grant_endpoint(api, monkeypatch):
     assert r.status_code == 200 and "." in r.json()["grant"]
     bad = api.post("/api/creatives/upload-grant", json={"mime": "image/gif", "bytes": 1000})
     assert bad.status_code == 400
+
+
+def test_archive_closes_open_creative_suggestions(api, mock_db):
+    import asyncio
+    from ai.suggestions import store as sug_store
+
+    t = make(api)
+    for sid, owner, test_id, rule in (("s1", U, t["id"], "creative_loser"),
+                                      ("s2", U, t["id"], "creative_adopt"),
+                                      ("s3", U, "other", "creative_loser"),
+                                      ("s4", "u2", t["id"], "creative_loser")):
+        asyncio.run(mock_db[sug_store.SUGGESTIONS].insert_one({
+            "_id": sid, "id": sid, "user_id": owner, "agent": "creative_test_judge",
+            "origin_window": "weekly", "status": "open", "rule_id": rule,
+            "evidence": {"creative_test_id": test_id}}))
+    assert api.post(f"/api/creatives/{t['id']}/archive").status_code == 200
+    status = {d["_id"]: d["status"] for d in asyncio.run(
+        mock_db[sug_store.SUGGESTIONS].find({}).to_list(None))}
+    assert status == {"s1": "resolved", "s2": "resolved", "s3": "open", "s4": "open"}

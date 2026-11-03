@@ -190,7 +190,7 @@ def findings_for_test(test: dict, ads: list[dict], groups_by_id: dict) -> list[F
             continue
         err = ad.get("post_error") or {}
         gid = ad.get("client_group_id")
-        out.append(_finding(
+        f = _finding(
             test, rule_id=RULE_POST_FAILED, severity=SEVERITY_HIGH,
             title=f"{code} could not be posted to {_client_name(groups_by_id, gid)}",
             description=err.get("message") or "Meta rejected the ad.",
@@ -200,8 +200,23 @@ def findings_for_test(test: dict, ads: list[dict], groups_by_id: dict) -> list[F
             action=Action(ACTION_RETRY_CREATIVE_POST, params={
                 "test_id": test["id"], "test_ad_id": ad["id"], "patch": _retry_patch(test, ad)}),
             icon="alert-octagon", ad_account_id=ad.get("ad_account_id"),
-            raw={"test_ad_id": ad["id"], "post_error": err}))
+            raw={"test_ad_id": ad["id"], "post_error": err})
+        # Each failure is its own card: a re-failure after an applied retry is new.
+        if at := _failure_stamp(err.get("at")):
+            f.dedup_key += f":{at}"
+        out.append(f)
     return out
+
+
+def _failure_stamp(at) -> str:
+    if isinstance(at, datetime):
+        return at.strftime("%Y%m%dT%H%M%S")
+    return str(at) if at else ""
+
+
+def scale_path(test_id: str) -> str:
+    """Wizard step 2 prefilled from a winning test (dashboard redirect, Slack link)."""
+    return f"/campaigns/creatives/new?scale={test_id}"
 
 
 def adopt_findings(tests_by_id: dict, items: list[dict], groups_by_id: dict) -> list[Finding]:
@@ -272,9 +287,16 @@ async def _open_ids(db, user_id: str, query: dict) -> set:
     return {r["_id"] for r in rows}
 
 
-async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Finding) -> bool:
-    """Pause the loser's failing ads once (test.auto_paused_at guards re-runs) and
-    store the finding as applied by Birdy. False when nothing was paused."""
+async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Finding) -> str | None:
+    """Pause the loser's failing ads once (test.auto_paused_at guards re-runs).
+
+    Pauses by ad (never a whole account: a passing ad may share it). Returns
+      "applied" — every target paused: the finding is stored applied by Birdy;
+      "partial" — some or none paused: the caller keeps an open card for the
+                  rest (`finding.action.targets` is narrowed to them) and flags
+                  it auto_failed;
+      None      — already auto-paused once, nothing done.
+    """
     from services.creatives import posting
     from services.creatives.store import TESTS
 
@@ -282,36 +304,64 @@ async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Findi
         {"id": test["id"], "user_id": user_id, "auto_paused_at": None},
         {"$set": {"auto_paused_at": _utcnow()}})
     if claimed is None:
-        return False
-    ad_ids = [t["object_id"] for t in finding.action.targets]
-    accounts = sorted({a.get("ad_account_id") for a in await _rows_for(db, user_id, test["id"], ad_ids)})
-    await posting.pause_ads(db, mongo_client, user_id, test["id"], accounts)
-    paused = {r["meta"]["ad_id"] for r in await _rows_for(db, user_id, test["id"], ad_ids)
-              if r.get("meta_status") == "PAUSED"}
-    done = [t for t in finding.action.targets if t["object_id"] in paused]
-    if not done:
-        return False
-    doc, _, _ = await store.upsert_finding(db, user_id, finding)
-    if doc is None:
-        return True
-    marked = await store.mark_applied(
-        db, user_id, doc["_id"], applied_targets=done, applied_action_type=ACTION_PAUSE_ADS,
-        decided_by={"actor": store.ACTOR_BIRDY, "source": "creative_tracking", "by": None,
-                    "at": _utcnow()})
-    if marked is not None:
+        return None
+    targets = list(finding.action.targets)
+    ad_ids = [t["object_id"] for t in targets]
+    await posting.pause_ads(db, mongo_client, user_id, test["id"], None, ad_ids=ad_ids)
+    rows = {r["meta"]["ad_id"]: r for r in await _rows_for(db, user_id, test["id"], ad_ids)}
+    done = [t for t in targets if (rows.get(t["object_id"]) or {}).get("meta_status") == "PAUSED"]
+    rest = [t for t in targets if t not in done]
+
+    ref_id = store.suggestion_key(user_id, finding)
+    if not rest:
+        doc, _, _ = await store.upsert_finding(db, user_id, finding)
+        if doc is None:
+            return "applied"
+        ref_id = doc["_id"]
+        await store.mark_applied(
+            db, user_id, ref_id, applied_targets=done, applied_action_type=ACTION_PAUSE_ADS,
+            decided_by={"actor": store.ACTOR_BIRDY, "source": "creative_tracking", "by": None,
+                        "at": _utcnow()})
+    # One activity row per client group, so each group's daily pause cap counts it.
+    by_group: dict[str, int] = {}
+    for t in done:
+        gid = (rows.get(t["object_id"]) or {}).get("client_group_id") or finding.client_group_id
+        by_group[gid] = by_group.get(gid, 0) + 1
+    groups_by_id = await _groups(db, user_id)
+    for gid, n in sorted(by_group.items()):
         await store.log_activity(
             db, user_id, actor=store.ACTOR_BIRDY, kind=store.KIND_ACTION_APPLIED,
-            title=finding.title, client_name=finding.client_name,
-            client_group_id=finding.client_group_id, ref_id=doc["_id"],
+            title=f"{finding.title} ({n} ad{'s' if n != 1 else ''})",
+            client_name=_client_name(groups_by_id, gid), client_group_id=gid, ref_id=ref_id,
             window=finding.evidence.window, label="Auto-run by Birdy", rule_id=finding.rule_id,
             applied_action_type=ACTION_PAUSE_ADS)
-    return True
+    if rest:
+        finding.action.targets = rest
+        return "partial"
+    return "applied"
 
 
 async def _rows_for(db, user_id: str, test_id: str, ad_ids: list[str]) -> list[dict]:
     from services.creatives.store import TEST_ADS
     return await db[TEST_ADS].find(
         {"user_id": user_id, "test_id": test_id, "meta.ad_id": {"$in": ad_ids}}).to_list(None)
+
+
+async def close_test_items(db, user_id: str, test_id: str, keep: set | None = None, *,
+                           include_adopt: bool = False) -> int:
+    """Resolve this test's open items not in `keep` (adopt items belong to reconcile,
+    except on archive: `include_adopt`).
+    A direct, test-scoped update: a concurrent sync of another test can't close
+    items it never read, and a live apply claim is never resolved."""
+    now = _utcnow()
+    res = await db[store.SUGGESTIONS].update_many(
+        {"user_id": user_id, "agent": AGENT, "origin_window": WINDOW_WEEKLY,
+         "status": store.STATUS_OPEN, "evidence.creative_test_id": test_id,
+         "_id": {"$nin": list(keep or ())}, **store.unclaimed_filter(now),
+         **({} if include_adopt else {"rule_id": {"$ne": RULE_ADOPT}})},
+        {"$set": {"status": store.STATUS_RESOLVED, "resolved_at": now, "updated_at": now}},
+    )
+    return res.modified_count
 
 
 async def sync_creative_suggestions(db, user_id: str, test: dict, ads: list[dict], *,
@@ -321,23 +371,27 @@ async def sync_creative_suggestions(db, user_id: str, test: dict, ads: list[dict
     groups_by_id = await _groups(db, user_id)
     findings = findings_for_test(test, ads, groups_by_id)
 
+    partial = None
     on_verdict = test.get("on_verdict") or {}
     if mongo_client is not None and on_verdict.get("auto_pause_losers") and test.get("verdict") == "loser":
         loser = next((f for f in findings if f.rule_id == RULE_LOSER), None)
         if loser is not None:
             try:
-                if await _auto_pause(db, mongo_client, user_id, test, loser):
+                outcome = await _auto_pause(db, mongo_client, user_id, test, loser)
+                if outcome == "applied":
                     findings.remove(loser)
+                elif outcome == "partial":
+                    partial = loser
             except Exception as e:
                 logger.error("creative suggestions: auto-pause failed for %s: %s",
                              test["id"], e, exc_info=True)
 
     keep, created_docs, updated_docs = await _persist(db, user_id, findings)
-    # close_stale_open is per (user, agent, window): keep every open item that is
-    # not this test's, plus all adopt items (the reconcile pass owns those).
-    keep |= await _open_ids(db, user_id, {"$or": [
-        {"evidence.creative_test_id": {"$ne": test["id"]}}, {"rule_id": RULE_ADOPT}]})
-    await store.close_stale_open(db, user_id, AGENT, WINDOW_WEEKLY, keep)
+    if partial is not None:
+        await db[store.SUGGESTIONS].update_one(
+            {"_id": store.suggestion_key(user_id, partial), "user_id": user_id},
+            {"$set": {"auto_failed": True}})
+    await close_test_items(db, user_id, test["id"], keep)
     await _notify(db, user_id, created_docs, updated_docs)
     return len(findings)
 

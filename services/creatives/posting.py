@@ -342,6 +342,7 @@ async def _finish(db, job: dict, now: datetime, **fields) -> bool:
 
 
 async def _fail(db, job: dict, ad: dict, err: dict, now: datetime) -> None:
+    err = {**err, "at": err.get("at") or now}  # identifies this failure (its suggestion key)
     if not await _finish(db, job, now, state=FAILED, lease_until=None, last_error=err):
         return
     await db[TEST_ADS].update_one(
@@ -514,9 +515,10 @@ async def go_live(db, mongo_client, user_id: str, test_id: str, *, partial_ok: b
 
 
 async def pause_ads(db, mongo_client, user_id: str, test_id: str,
-                    ad_account_ids: list[str] | None, *, now: datetime | None = None) -> dict:
-    """Pause the test's live ads (optionally only some accounts). Tracking continues:
-    post_state stays "active", meta_status records PAUSED."""
+                    ad_account_ids: list[str] | None, *, ad_ids: list[str] | None = None,
+                    now: datetime | None = None) -> dict:
+    """Pause the test's live ads (optionally only some accounts, and/or only some Meta
+    ad ids). Tracking continues: post_state stays "active", meta_status records PAUSED."""
     now = _naive(now)
     await _owned_test(db, user_id, test_id)
     ads = await list_test_ads(db, test_id, user_id=user_id)
@@ -526,6 +528,8 @@ async def pause_ads(db, mongo_client, user_id: str, test_id: str,
         if not ad_id or ad.get("post_state") not in ("created", "active"):
             continue
         if ad_account_ids is not None and ad.get("ad_account_id") not in ad_account_ids:
+            continue
+        if ad_ids is not None and ad_id not in ad_ids:
             continue
         if ad.get("meta_status") == "PAUSED":
             continue

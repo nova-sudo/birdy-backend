@@ -13,14 +13,49 @@ including in tests (which have neither).
 """
 
 import logging
+import os
 
 from ai.suggestions import store
+from ai.suggestions.contracts import (
+    ACTION_ADOPT_CREATIVE_AD,
+    ACTION_RETRY_CREATIVE_POST,
+    ACTION_SCALE_CREATIVE,
+)
 from services.slack_bot_service import get_notify_target, get_decrypted_bot_token_for_user
 
 logger = logging.getLogger(__name__)
 
 _SEV_EMOJI = {"HIGH": "🔴", "MEDIUM": "🟠", "OPPORTUNITY": "🟢"}
 _MAX_SECTION_CHARS = 2900  # Slack section text cap (see slack_block_formatter)
+
+# Creative test actions (ai/suggestions/creative_findings.py): their own confirm
+# copy and applied wording; none of them can be undone.
+_CREATIVE_CONFIRM = {
+    ACTION_RETRY_CREATIVE_POST: "Birdy will retry posting the ad for *{client}*.",
+    ACTION_ADOPT_CREATIVE_AD: "Birdy will link this ad to its creative test for *{client}*.",
+}
+_CREATIVE_APPLIED = {
+    ACTION_SCALE_CREATIVE: "Opened the wizard",
+    ACTION_RETRY_CREATIVE_POST: "Retried the post",
+    ACTION_ADOPT_CREATIVE_AD: "Adopted the ad",
+}
+_FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")
+
+
+def _scale_button(doc: dict) -> dict:
+    """Scaling is never applied from Slack: the button opens the wizard, where
+    posting takes a second click."""
+    from ai.suggestions.creative_findings import scale_path
+
+    test_id = ((doc.get("action") or {}).get("params") or {}).get("test_id")
+    return {
+        "type": "button",
+        "action_id": "suggestion_open_wizard",
+        "style": "primary",
+        "text": {"type": "plain_text", "text": "Open the wizard"},
+        "url": f"{_FRONTEND_URL}{scale_path(test_id)}",
+        "value": doc["id"],
+    }
 
 
 def build_suggestion_blocks(doc: dict) -> tuple[list[dict], str]:
@@ -42,8 +77,12 @@ def build_suggestion_blocks(doc: dict) -> tuple[list[dict], str]:
 
     elements = []
     action = doc.get("action")
-    if action and doc.get("rule_mode") != "flag":  # flag-mode items never write
-        verb = "pause" if action.get("type") == "pause_ads" else "update"
+    atype = (action or {}).get("type")
+    if atype == ACTION_SCALE_CREATIVE:
+        elements.append(_scale_button(doc))
+    elif action and doc.get("rule_mode") != "flag":  # flag-mode items never write
+        verb = "pause" if atype == "pause_ads" else "update"
+        confirm = _CREATIVE_CONFIRM.get(atype, "Birdy will {verb} the ad(s) for *{client}*.")
         elements.append({
             "type": "button",
             "action_id": "suggestion_apply",
@@ -53,7 +92,7 @@ def build_suggestion_blocks(doc: dict) -> tuple[list[dict], str]:
             # Native confirm dialog — a pause is real money.
             "confirm": {
                 "title": {"type": "plain_text", "text": "Do it for me?"},
-                "text": {"type": "mrkdwn", "text": f"Birdy will {verb} the ad(s) for *{client}*."},
+                "text": {"type": "mrkdwn", "text": confirm.format(verb=verb, client=client)},
                 "confirm": {"type": "plain_text", "text": "Do it"},
                 "deny": {"type": "plain_text", "text": "Cancel"},
             },
@@ -93,6 +132,11 @@ def build_state_blocks(doc: dict, by: str | None = None) -> tuple[list[dict], st
         return build_suggestion_blocks(doc)
 
     if status == store.STATUS_APPLIED:
+        atype = doc.get("applied_action_type") or (doc.get("action") or {}).get("type")
+        if atype in _CREATIVE_APPLIED:  # nothing to undo: no Undo button
+            verb = _CREATIVE_APPLIED[atype]
+            text = f"*{title}*\n:white_check_mark: {verb}{who} · {client}"
+            return [{"type": "section", "text": {"type": "mrkdwn", "text": text}}], f"{verb} — {client}"
         n = len(doc.get("applied_targets") or [])
         verb = "Re-enabled" if doc.get("applied_action_type") == "enable_ads" else "Paused"
         text = f"*{title}*\n:white_check_mark: {verb} {n} ad{'s' if n != 1 else ''}{who} · {client}"

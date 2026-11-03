@@ -63,8 +63,8 @@ NOTHING_TO_UNDO = "Nothing to undo"
 
 async def _execute_creative(mongo_client, user_id: str, atype: str, params: dict) -> dict:
     if atype == ACTION_SCALE_CREATIVE:
-        return {"succeeded": [], "failed": [],
-                "redirect": f"/campaigns/creatives/new?scale={params.get('test_id')}"}
+        from ai.suggestions.creative_findings import scale_path
+        return {"succeeded": [], "failed": [], "redirect": scale_path(params.get("test_id"))}
     from core.database import DB_NAME
     from services.creatives import posting, reconcile
 

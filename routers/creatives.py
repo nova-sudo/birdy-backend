@@ -5,6 +5,7 @@ Creative tests API (Phase 1). Every route is owner-scoped: another user's test
 is a 404, never a 403. Archiving never touches Meta ads.
 """
 
+import logging
 from datetime import date, datetime, timezone
 from typing import Literal, Optional
 
@@ -26,6 +27,8 @@ from services.facebook_cache_shape import read_preset
 from services.creatives import posting, reconcile, store, upload_grant
 from services.creatives.naming import meta_ad_name, slugify
 from services.creatives.targets import owning_group, prefill_targets
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/creatives", tags=["creatives"])
 
@@ -378,6 +381,11 @@ async def archive_creative(test_id: str, current_user: str = Depends(get_current
             db, current_user, test_id,
             {"status": store.ARCHIVED, "archived_at": datetime.now(timezone.utc)},
         )
+        try:  # an archived test's open cards no longer apply
+            from ai.suggestions.creative_findings import close_test_items
+            await close_test_items(db, current_user, test_id, include_adopt=True)
+        except Exception as e:
+            logger.error(f"[creatives] closing suggestions for {test_id} failed: {e}", exc_info=True)
         return _json(updated)
 
 

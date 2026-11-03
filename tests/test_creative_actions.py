@@ -127,3 +127,84 @@ async def test_creative_pause_mirrors_meta_status_and_undo(mock_db, mock_mongo_c
     assert undo["outcome"] == "undone"
     assert (await mock_db[TEST_ADS].find_one({"id": "ta1"}))["meta_status"] == "ACTIVE"
     assert (await mock_db[TEST_ADS].find_one({"id": "ta2"}))["meta_status"] == "ACTIVE"
+
+
+# ── Slack rendering ─────────────────────────────────────────────────────────
+
+from services.slack_suggestion_notifier import build_state_blocks, build_suggestion_blocks
+
+
+def _doc(action, **over):
+    return {"id": "s1", "title": "T", "client_name": "Client 1", "status": "open",
+            "action": action, **over}
+
+
+def _buttons(blocks):
+    return blocks[1]["elements"]
+
+
+def test_slack_scale_is_a_link_to_the_wizard_never_apply():
+    blocks, _ = build_suggestion_blocks(_doc({"type": ACTION_SCALE_CREATIVE, "params": {"test_id": "t1"}}))
+    [link, ignore] = _buttons(blocks)
+    assert link["url"].endswith("/campaigns/creatives/new?scale=t1")
+    assert link["action_id"] != "suggestion_apply" and "confirm" not in link
+    assert ignore["action_id"] == "suggestion_ignore"
+
+
+def test_slack_creative_confirm_copy():
+    retry, _ = build_suggestion_blocks(_doc({"type": ACTION_RETRY_CREATIVE_POST, "params": {}}))
+    adopt, _ = build_suggestion_blocks(_doc({"type": ACTION_ADOPT_CREATIVE_AD, "params": {}}))
+    assert _buttons(retry)[0]["confirm"]["text"]["text"] == "Birdy will retry posting the ad for *Client 1*."
+    assert "link this ad to its creative test" in _buttons(adopt)[0]["confirm"]["text"]["text"]
+
+
+def test_slack_creative_applied_has_verb_and_no_undo():
+    for atype, verb in ((ACTION_RETRY_CREATIVE_POST, "Retried the post"),
+                        (ACTION_ADOPT_CREATIVE_AD, "Adopted the ad"),
+                        (ACTION_SCALE_CREATIVE, "Opened the wizard")):
+        blocks, fallback = build_state_blocks(_doc({"type": atype}, status="applied",
+                                                   applied_action_type=atype))
+        assert verb in blocks[0]["text"]["text"] and fallback.startswith(verb)
+        assert not any(b["type"] == "actions" for b in blocks)
+
+
+def test_slack_pause_cards_unchanged():
+    blocks, fallback = build_suggestion_blocks(_doc({"type": "pause_ads", "targets": [{"object_id": "a"}]}))
+    apply = _buttons(blocks)[0]
+    assert apply["action_id"] == "suggestion_apply" and "url" not in apply
+    assert apply["confirm"]["text"]["text"] == "Birdy will pause the ad(s) for *Client 1*."
+    assert fallback == "Birdy suggestion: T — Client 1"
+    blocks, fallback = build_state_blocks(_doc({"type": "pause_ads"}, status="applied",
+                                               applied_action_type="pause_ads",
+                                               applied_targets=[{"object_id": "a"}]))
+    assert ":white_check_mark: Paused 1 ad · Client 1" in blocks[0]["text"]["text"]
+    assert blocks[1]["elements"][0]["action_id"] == "suggestion_undo"
+    assert fallback == "Paused 1 ad(s) — Client 1"
+    blocks, _ = build_suggestion_blocks(_doc({"type": "enable_ads", "targets": []}))
+    assert _buttons(blocks)[0]["confirm"]["text"]["text"] == "Birdy will update the ad(s) for *Client 1*."
+
+
+async def test_slack_apply_on_scale_is_refused(mock_db, mock_mongo_client, monkeypatch):
+    import routers.slack_interactions as si
+
+    called, errors = [], []
+
+    async def team(db, team_id):
+        return U
+
+    async def apply(*a, **k):
+        called.append(1)
+        return {"ok": True}
+
+    async def post_error(db, uid, payload, res):
+        errors.append(res)
+
+    monkeypatch.setattr(si, "get_user_id_by_team_id", team)
+    monkeypatch.setattr(si.actions, "apply_suggestion", apply)
+    monkeypatch.setattr(si, "_post_action_error", post_error)
+    sid = await seed(mock_db, {"type": ACTION_SCALE_CREATIVE, "targets": [], "params": {"test_id": "t1"}})
+    await si._handle_suggestion_action({"team": {"id": "T1"}, "user": {"id": "S"}},
+                                       {"action_id": "suggestion_apply", "value": sid},
+                                       mock_db, mock_mongo_client)
+    assert called == [] and errors and errors[0]["outcome"] == "failed"
+    assert (await store.get_suggestion(mock_db, U, sid))["status"] == "open"

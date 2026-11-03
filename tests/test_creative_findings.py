@@ -1,6 +1,6 @@
 """Creative test findings -> suggestions (Task 21)."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 
 import pytest
 
@@ -189,11 +189,13 @@ async def test_auto_pause_on_loser_pauses_failing_and_stores_applied(mock_db, mo
     assert sorted(x["object_id"] for x in doc["applied_targets"]) == ["u1-ad0", "u1-ad2"]
     assert doc["decided_by"]["actor"] == "birdy"
     logged = await mock_db[store.ACTIVITY].find({"kind": store.KIND_ACTION_APPLIED}).to_list(None)
-    assert len(logged) == 1 and logged[0]["actor"] == "birdy"
+    # One row per affected client group (g0, g2), for the pause cap.
+    assert sorted(a["client_group_id"] for a in logged) == ["g0", "g2"]
+    assert all(a["actor"] == "birdy" for a in logged)
     # Re-run: no second pause, no second log.
     await sync(mock_db, mock_mongo_client, t)
     assert len(st.calls) == 2
-    assert await mock_db[store.ACTIVITY].count_documents({"kind": store.KIND_ACTION_APPLIED}) == 1
+    assert await mock_db[store.ACTIVITY].count_documents({"kind": store.KIND_ACTION_APPLIED}) == 2
 
 
 async def test_auto_pause_after_user_undo_does_not_repause(mock_db, mock_mongo_client, monkeypatch):
@@ -309,3 +311,103 @@ async def test_track_test_syncs_suggestions(mock_db, mock_mongo_client, monkeypa
     assert out["verdict"] == "loser"
     [doc] = await open_docs(mock_db)
     assert doc["rule_id"] == "creative_loser" and len(doc["action"]["targets"]) == 2
+
+
+# ── fix round 1 ─────────────────────────────────────────────────────────────
+
+async def seed_rows(db, rows, *, verdict="loser", status="loser", on_verdict=None):
+    """rows: (ad_account_id, client_group_id, score_state) per ad."""
+    t = await create_test(db, U, name="Hook", origin="new", creative={"format": "video"},
+                          targets={}, on_verdict=on_verdict or {"auto_pause_losers": True})
+    await update_test(db, U, t["id"], {"status": status, "verdict": verdict, "summary": SUMMARY})
+    for gid in sorted({g for _, g, _ in rows}):
+        await db["client_groups"].insert_one({"id": gid, "user_id": U, "name": gid,
+                                              "meta_ad_account_id": f"act_{gid}"})
+    await add_test_ads(db, U, t["id"], [
+        {"ad_account_id": acct, "client_group_id": gid, "post_state": "active", "meta_status": "ACTIVE",
+         "meta": {"ad_id": f"ad{i}"}, "score": {"state": st}} for i, (acct, gid, st) in enumerate(rows)])
+    return await get_test(db, U, t["id"])
+
+
+async def test_auto_pause_is_per_ad_and_undo_restores_exactly_it(mock_db, mock_mongo_client, monkeypatch):
+    import ai.suggestions.actions as actions_mod
+    from ai.suggestions import actions
+
+    st = Status(monkeypatch)
+    undo_writes = []
+
+    async def set_status(user_id, object_id, object_type, status, client):
+        undo_writes.append((object_id, status))
+
+    async def nothing(*a, **k):
+        return None
+
+    monkeypatch.setattr(actions_mod, "set_object_status", set_status)
+    monkeypatch.setattr(actions_mod, "_sync_slack", nothing)
+    t = await seed_rows(mock_db, [("act_1", "g1", "fail"), ("act_1", "g1", "pass")])
+    await sync(mock_db, mock_mongo_client, t)
+    assert st.calls == [("ad0", "PAUSED")]
+    rows = {a["meta"]["ad_id"]: a for a in await list_test_ads(mock_db, t["id"], user_id=U)}
+    assert rows["ad0"]["meta_status"] == "PAUSED" and rows["ad1"]["meta_status"] == "ACTIVE"
+    doc = await mock_db[store.SUGGESTIONS].find_one({"rule_id": "creative_loser"})
+    assert [x["object_id"] for x in doc["applied_targets"]] == ["ad0"]
+    res = await actions.undo_suggestion(mock_db, mock_mongo_client, U, doc["_id"])
+    assert res["outcome"] == "undone" and undo_writes == [("ad0", "ACTIVE")]
+    rows = {a["meta"]["ad_id"]: a for a in await list_test_ads(mock_db, t["id"], user_id=U)}
+    assert rows["ad0"]["meta_status"] == "ACTIVE"
+
+
+async def test_partial_auto_pause_keeps_open_card_for_the_rest(mock_db, mock_mongo_client, monkeypatch):
+    st = Status(monkeypatch, fail={"ad1"})
+    t = await seed_rows(mock_db, [("act_1", "g1", "fail"), ("act_2", "g2", "fail")])
+    await sync(mock_db, mock_mongo_client, t)
+    assert st.calls == [("ad0", "PAUSED")]
+    [doc] = await open_docs(mock_db)
+    assert doc["rule_id"] == "creative_loser" and doc["auto_failed"] is True
+    assert [x["object_id"] for x in doc["action"]["targets"]] == ["ad1"]
+    logged = await mock_db[store.ACTIVITY].find({"kind": store.KIND_ACTION_APPLIED}).to_list(None)
+    assert [(a["client_group_id"], a["actor"]) for a in logged] == [("g1", "birdy")]
+    await sync(mock_db, mock_mongo_client, t)  # once only
+    assert st.calls == [("ad0", "PAUSED")]
+
+
+async def test_auto_pause_logs_once_per_client_group(mock_db, mock_mongo_client, monkeypatch):
+    Status(monkeypatch)
+    t = await seed_rows(mock_db, [("act_1", "g1", "fail"), ("act_1", "g1", "fail"),
+                                  ("act_2", "g2", "fail"), ("act_3", "g3", "pass")])
+    await sync(mock_db, mock_mongo_client, t)
+    logged = await mock_db[store.ACTIVITY].find({"kind": store.KIND_ACTION_APPLIED}).to_list(None)
+    assert sorted(a["client_group_id"] for a in logged) == ["g1", "g2"]
+    assert all(a["applied_action_type"] == "pause_ads" for a in logged)
+
+
+async def test_refailure_after_applied_retry_is_a_new_card(mock_db, mock_mongo_client):
+    t, ads = await seed(mock_db, ("pass", "scoring"), post_states={1: "uploading"})
+    job = {"id": "j1", "user_id": U, "test_id": t["id"], "test_ad_id": ads[1]["id"],
+           "state": "running", "lease_id": "L"}
+    await mock_db[POST_JOBS].insert_one(dict(job))
+    err = {"code": 100, "subcode": None, "message": "Bad", "step": "ad", "fix": None}
+    await posting._fail(mock_db, job, ads[1], err, NOW)
+    [first] = await open_docs(mock_db)
+    row = await mock_db[TEST_ADS].find_one({"id": ads[1]["id"]})
+    assert row["post_error"]["at"] == NOW
+    await store.mark_applied(mock_db, U, first["_id"], applied_action_type="retry_creative_post")
+    await posting.retry(mock_db, U, t["id"], ads[1]["id"], now=NOW)
+    job2 = await mock_db[POST_JOBS].find_one({"test_ad_id": ads[1]["id"]})
+    await mock_db[POST_JOBS].update_one({"id": job2["id"]}, {"$set": {"lease_id": "L2"}})
+    later = datetime(2026, 11, 3, 13, 0)
+    await posting._fail(mock_db, {**job2, "lease_id": "L2"}, ads[1], err, later)
+    [second] = await open_docs(mock_db)
+    assert second["_id"] != first["_id"] and second["rule_id"] == "creative_post_failed"
+    assert (await store.get_suggestion(mock_db, U, first["_id"]))["status"] == "applied"
+
+
+async def test_close_is_scoped_to_this_test_and_unclaimed(mock_db):
+    for sid, test_id, claim in (("a", "t1", None), ("b", "t1", datetime.now(timezone.utc).replace(tzinfo=None)), ("c", "t2", None)):
+        await mock_db[store.SUGGESTIONS].insert_one({
+            "_id": sid, "id": sid, "user_id": U, "agent": cf.AGENT, "origin_window": "weekly",
+            "status": "open", "rule_id": "creative_loser", "applying_at": claim,
+            "evidence": {"creative_test_id": test_id}})
+    assert await cf.close_test_items(mock_db, U, "t1", set()) == 1
+    status = {d["_id"]: d["status"] for d in await mock_db[store.SUGGESTIONS].find({}).to_list(None)}
+    assert status == {"a": "resolved", "b": "open", "c": "open"}
