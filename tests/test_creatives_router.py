@@ -76,6 +76,18 @@ def test_patch_slug_draft_recomputes_then_409(api, mock_db):
     assert api.patch(f"/api/creatives/{t2['id']}", json={"name": "renamed"}).json()["name"] == "renamed"
 
 
+def test_patch_source_and_origin_draft_only(api, mock_db):
+    import asyncio
+    t = make(api)
+    src = {"ad_id": "a1", "ad_account_id": "act_1", "name": "Ad one"}
+    r = api.patch(f"/api/creatives/{t['id']}", json={"origin": "revive", "source": src})
+    assert r.status_code == 200 and r.json()["origin"] == "revive" and r.json()["source"] == src
+    asyncio.run(mock_db[store.TESTS].update_one({"id": t["id"]}, {"$set": {"status": "testing"}}))
+    assert api.patch(f"/api/creatives/{t['id']}", json={"source": src}).status_code == 409
+    assert api.patch(f"/api/creatives/{t['id']}", json={"origin": "new"}).status_code == 409
+    assert api.patch(f"/api/creatives/{t['id']}", json={"name": "ok"}).status_code == 200
+
+
 def test_archive_hides_from_default_list(api):
     t = make(api)
     r = api.post(f"/api/creatives/{t['id']}/archive")

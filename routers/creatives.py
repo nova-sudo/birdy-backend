@@ -53,6 +53,8 @@ class PatchBody(BaseModel):
     creative: Optional[dict] = None
     targets: Optional[Targets] = None
     on_verdict: Optional[dict] = None
+    source: Optional[dict] = None
+    origin: Optional[Literal["new", "revive"]] = None
 
 
 class UploadGrantBody(BaseModel):
@@ -302,6 +304,7 @@ async def search_ads(
             leads = _num(ad.get("total_leads") or ad.get("results"))
             hits.append((tier, -spend, {
                 "ad_id": ad_id, "name": ad.get("name"), "ad_account_id": g["meta_ad_account_id"],
+                "currency": g.get("ad_account_currency"),
                 "client_name": g.get("name"), "status": ad.get("status"),
                 "thumbnail": ad.get("creative_thumbnail"), "image": ad.get("creative_image"),
                 "video_id": ad.get("creative_video_id"), "title": ad.get("creative_title"),
@@ -351,6 +354,9 @@ async def patch_creative(
         fields = body.model_dump(exclude_unset=True, exclude_none=True)
         if "targets" in fields:
             fields["targets"] = {**(test.get("targets") or {}), **fields["targets"]}
+        for locked in ("source", "origin"):
+            if locked in fields and test.get("status") != store.DRAFT:
+                raise HTTPException(409, f"{locked.capitalize()} can only be changed while the test is a draft")
         if "slug" in fields:
             if test.get("status") != store.DRAFT:
                 raise HTTPException(409, "Slug can only be changed while the test is a draft")

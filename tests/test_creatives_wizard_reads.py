@@ -149,7 +149,7 @@ def test_search_ranks_exact_code_first(api, mock_db):
            _ad("a3", "CT-0042 extra | hook", 0), _ad("a4", "unrelated", 0)]
     metrics = {"a1": {"spend": 900, "results": 9}, "a2": {"spend": 10, "total_leads": 2},
                "a3": {"spend": 500}, "a4": {"spend": 5}}
-    asyncio.run(grp(mock_db, "g1", "Acme", "act_1", facebook_cache={
+    asyncio.run(grp(mock_db, "g1", "Acme", "act_1", ad_account_currency="GBP", facebook_cache={
         "entities": {"ads": ads},
         "presets": {"last_30d": {"ads": metrics}, "last_7d": {"ads": {"a2": {"spend": 1}}}}}))
     asyncio.run(grp(mock_db, "g2", "Foreign", "act_9", user="u2@example.com", facebook_cache={
@@ -160,6 +160,7 @@ def test_search_ranks_exact_code_first(api, mock_db):
     assert top["client_name"] == "Acme" and top["ad_account_id"] == "act_1"
     assert top["thumbnail"] == "ta2" and top["image"] == "imga2" and top["video_id"] == "va2"
     assert top["title"] == "T" and top["body"] == "B"
+    assert top["currency"] == "GBP"
     assert top["metrics"] == {"spend": 10.0, "leads": 2.0, "cpl": 5.0}
     assert rows[2]["metrics"]["cpl"] == 100.0
     assert api.get("/api/creatives/ads/search?q=ct-0042&ad_account_id=act_9").status_code == 404
