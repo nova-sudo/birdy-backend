@@ -259,7 +259,8 @@ async def _resolve_accounts(db, mongo_client, user_id, acts, destination, adset_
     return accounts, needs
 
 
-def _card(test: dict, accounts: list[dict], names: dict, n_accounts: int, warnings: list[str]) -> dict:
+def _card(test: dict, accounts: list[dict], names: dict, n_accounts: int, warnings: list[str],
+          ready: bool = True) -> dict:
     creative = test.get("creative") or {}
     return {
         "test_id": test["id"], "code": test["code"], "name": test.get("name"),
@@ -269,6 +270,7 @@ def _card(test: dict, accounts: list[dict], names: dict, n_accounts: int, warnin
         "targets_text": _targets_text(test.get("targets") or {}),
         "destination_text": _destination_text(creative),
         "warnings": warnings,
+        "n_accounts": n_accounts, "ready": ready,
         "posts_as": f"Paused, then live together once all {n_accounts} accept",
     }
 
@@ -386,10 +388,11 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
             if posting.media_plan(test, a["ad_account_id"])[0] == "unavailable":
                 warnings.append(f"{a['ad_account_id']}: {posting.VIDEO_NEEDS_UPLOAD}.")
     names = {r["ad_account_id"]: r["name"] for r in await reads.ad_accounts(db, user_id)}
-    card = _card(test, accounts, names, len(acts), warnings)
+    ready = not needs and bool(accounts)
+    card = _card(test, accounts, names, len(acts), warnings, ready)
     out = {
         "draft": {"test_id": test["id"], "code": test["code"], "name": test.get("name"),
-                  "status": test.get("status"), "ready": not needs and bool(accounts)},
+                  "status": test.get("status"), "ready": ready},
         "card": card,
         "creative_block": ":::creative " + json.dumps(card) + ":::",
     }

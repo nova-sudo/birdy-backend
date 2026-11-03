@@ -163,6 +163,7 @@ async def test_draft_autopicks_single_adset_and_builds_card(mock_db, meta):
     assert card["code"] == "CT-0001" and card["accounts"] == [{"name": "Acme", "adset_name": "Set 1"}]
     assert card["destination_text"] == "Website: https://a.test" and "25" in card["targets_text"]
     assert card["posts_as"] == "Paused, then live together once all 1 accept"
+    assert card["n_accounts"] == 1 and card["ready"] is True
     assert out["creative_block"].startswith(":::creative {") and out["creative_block"].endswith("}:::")
     test = await store.get_test(mock_db, U, card["test_id"])
     assert test["status"] == "draft" and test["created_via"] == "chat"
@@ -425,6 +426,7 @@ async def test_post_refuses_draft_with_open_needs_and_update_keeps_requested(moc
     out = await t.draft_creative_test(mock_db, U, None, **args)
     assert out["needs"][0]["ad_account_id"] == "act_2"
     assert out["card"]["posts_as"] == "Paused, then live together once all 2 accept"
+    assert out["card"]["n_accounts"] == 2 and out["card"]["ready"] is False
     posted = []
 
     async def spy(*a, **k):
