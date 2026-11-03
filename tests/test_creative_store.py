@@ -71,3 +71,25 @@ async def test_add_test_ads_defaults(mock_db):
 async def test_create_indexes_is_idempotent(mock_mongo_client):
     await create_creative_indexes(mock_mongo_client)
     await create_creative_indexes(mock_mongo_client)
+    from core.database import DB_NAME
+    db = mock_mongo_client[DB_NAME]
+    info = await db["creative_tests"].index_information()
+    assert info["user_code_unique"]["unique"] is True
+    info = await db["creative_test_ads"].index_information()
+    assert info["meta_ad_id_unique"]["unique"] is True
+    info = await db["creative_ad_days"].index_information()
+    assert info["user_ad_date_unique"]["unique"] is True
+
+
+async def test_default_targets_not_shared_between_tests(mock_db):
+    a = await create_test(mock_db, "u1", name="a", origin="new", creative={}, targets={})
+    a["targets"]["metrics"]["cpl"] = {"op": "lte", "value": 1}
+    b = await create_test(mock_db, "u1", name="b", origin="new", creative={}, targets={})
+    assert b["targets"]["metrics"] == {}
+
+
+async def test_non_ascii_name_falls_back_to_untitled(mock_db):
+    t = await create_test(mock_db, "u1", name="اختبار", origin="new", creative={}, targets={})
+    assert t["meta_ad_name"] == "CT-0001 | untitled"
+    t2 = await create_test(mock_db, "u1", name="x", slug="🔥", origin="new", creative={}, targets={})
+    assert t2["slug"] == "untitled"

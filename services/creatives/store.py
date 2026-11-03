@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -75,7 +76,7 @@ async def create_test(
     on_verdict: dict | None = None,
 ) -> dict:
     code = await next_code(db, user_id)
-    final_slug = slugify(slug) if slug else slugify(name)
+    final_slug = (slugify(slug) if slug else slugify(name)) or "untitled"
     now = _now()
     doc = {
         "id": uuid.uuid4().hex,
@@ -87,7 +88,7 @@ async def create_test(
         "origin": origin,
         "source": source,
         "creative": creative,
-        "targets": {**DEFAULT_TARGETS, **(targets or {})},
+        "targets": {**copy.deepcopy(DEFAULT_TARGETS), **(targets or {})},
         "status": DRAFT,
         "created_via": created_via,
         "on_verdict": on_verdict,
