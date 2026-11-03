@@ -130,33 +130,52 @@ def test_verdict(scores: list[dict], win_share: float) -> str:
 test_verdict.__test__ = False  # not a pytest test when imported into test modules
 
 
-async def user_currency(user_id: str, db=None) -> str:
-    """The user's currency (targets and test totals are in it); GBP when unknown.
-    With `db`, read `users.default_currency` from it (the field CurrencyService reads)."""
-    from utils.currency_exchange import CurrencyService
-
-    if db is not None:
-        try:
-            u = await db["users"].find_one({"user_id": user_id}, {"default_currency": 1})
-        except Exception as e:
-            logger.warning(f"creatives: user currency lookup failed for {user_id}: {e}")
-            u = None
-        return (u or {}).get("default_currency") or "GBP"
+async def user_currency(user_id: str, db) -> str | None:
+    """The user's currency (targets and test totals are in it): `users.default_currency`
+    read from the app db. None when it can't be read: callers then leave money
+    unconverted and unscored rather than guess a currency."""
     try:
-        return await CurrencyService.get_user_currency(user_id) or "GBP"
-    except (ValueError, RuntimeError) as e:
+        u = await db["users"].find_one({"user_id": user_id}, {"default_currency": 1})
+    except Exception as e:
         logger.warning(f"creatives: user currency lookup failed for {user_id}: {e}")
-        return "GBP"
+        return None
+    cur = (u or {}).get("default_currency")
+    return str(cur).upper() if cur else None
 
 
-def fx_rate(from_cur: str | None, to_cur: str) -> float | None:
-    """from_cur -> to_cur rate (1.0 when equal or unknown source); None when no rate exists."""
+# Currencies pegged to the US dollar that the converter's ECB data does not carry.
+USD_PEGS = {"AED": 3.6725}
+
+
+def _converter_rate(a: str, b: str) -> float:
     from utils.currency_exchange import CurrencyService
+    return float(CurrencyService.get_rate(a, b))
 
+
+def fx_rate(from_cur: str | None, to_cur: str | None) -> float | None:
+    """from_cur -> to_cur rate (1.0 when equal or no source currency); None when no rate
+    exists or the target currency is unknown. A USD-pegged currency the converter lacks
+    (AED) goes through its fixed peg."""
+    if not to_cur:
+        return None
     if not from_cur or from_cur == to_cur:
         return 1.0
     try:
-        return float(CurrencyService.get_rate(from_cur, to_cur))
+        return _converter_rate(from_cur, to_cur)
+    except Exception as e:
+        first_error = e
+    try:
+        rate = 1.0
+        a, b = from_cur, to_cur
+        if a in USD_PEGS:
+            rate /= USD_PEGS[a]
+            a = "USD"
+        if b in USD_PEGS:
+            rate *= USD_PEGS[b]
+            b = "USD"
+        if (a, b) == (from_cur, to_cur):
+            raise first_error
+        return rate if a == b else rate * _converter_rate(a, b)
     except Exception as e:
         logger.warning(f"creatives: no rate {from_cur}->{to_cur}: {e}")
         return None
@@ -164,9 +183,7 @@ def fx_rate(from_cur: str | None, to_cur: str) -> float | None:
 
 async def rollup(db, user_id: str, ads: list[dict]) -> dict:
     """Test summary across ads, money converted to the user's currency."""
-    from utils.currency_exchange import CurrencyService
-
-    user_cur = await user_currency(user_id)
+    user_cur = await user_currency(user_id, db)
     spend = rated_leads = 0.0
     leads = imps = link_clicks = views = video_imps = 0.0
     rate_missing = mixed = False
@@ -176,14 +193,14 @@ async def rollup(db, user_id: str, ads: list[dict]) -> dict:
         sc = ad.get("score") or {}
         cur = ad.get("currency") or user_cur
         ad_spend = _num(sc.get("spend"))
-        if cur != user_cur:
+        if cur != user_cur or user_cur is None:
             mixed = True
-            try:
-                ad_spend = ad_spend * CurrencyService.get_rate(cur, user_cur)
-            except Exception as e:
-                logger.warning(f"creative rollup: no rate {cur}->{user_cur}: {e}")
+            rate = fx_rate(cur, user_cur)
+            if rate is None:
                 rate_missing = True
                 ad_spend = None
+            else:
+                ad_spend = ad_spend * rate
         leads += _num(sc.get("leads"))
         imps += _num(sc.get("impressions"))
         link_clicks += _num(sc.get("link_clicks"))

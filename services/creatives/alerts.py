@@ -128,6 +128,8 @@ async def evaluate_creative_alert(alert: dict, db) -> dict:
             for a in ads:
                 if a.get("post_state") != "active":
                     continue
+                if (a.get("score") or {}).get("rate_missing"):
+                    continue  # still in the account's currency: not comparable with the threshold
                 v = (a.get("score") or {}).get(key)
                 if v is None:
                     continue

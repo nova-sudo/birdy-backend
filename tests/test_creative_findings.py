@@ -294,14 +294,10 @@ async def test_track_test_syncs_suggestions(mock_db, mock_mongo_client, monkeypa
     from jobs import creative_tracking as ct
     from tests.test_creative_tracking import Meta, make_test
 
-    async def cur(_uid):
-        return "GBP"
-
     async def token(uid, client):
         return {"access_token": "tok"}
 
-    from utils.currency_exchange import CurrencyService
-    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(cur))
+    await mock_db["users"].insert_one({"user_id": U, "default_currency": "GBP"})
     monkeypatch.setattr(ct, "get_facebook_token", token)
     m = Meta(monkeypatch)
     t = await make_test(mock_db)

@@ -32,7 +32,8 @@ async def prefill_targets(db, user_id: str, client_group_ids: list[str]) -> dict
         user_cur = await user_currency(user_id, db) if has_cur else None
         converted = []
         for gid, v in per_account.items():
-            rate = fx_rate((by_id.get(gid) or {}).get("ad_account_currency"), user_cur)
+            grp_cur = (by_id.get(gid) or {}).get("ad_account_currency")
+            rate = fx_rate(grp_cur, user_cur) if grp_cur else 1.0
             try:
                 if rate is not None:
                     converted.append(round(float(v["cpl"]) * rate, 2))

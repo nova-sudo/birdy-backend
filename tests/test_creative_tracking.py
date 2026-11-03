@@ -19,13 +19,10 @@ def day(ad_id, leads, spend=200, d="2026-10-30"):
 
 
 @pytest.fixture(autouse=True)
-def _patches(monkeypatch):
-    from utils.currency_exchange import CurrencyService
-
-    async def cur(_uid):
-        return "GBP"
-
-    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(cur))
+async def _patches(monkeypatch, mock_db):
+    # The user's currency comes from the app db (users.default_currency).
+    await mock_db["users"].insert_one({"user_id": "u1", "default_currency": "GBP"})
+    await mock_db["users"].insert_one({"user_id": "u2", "default_currency": "GBP"})
 
     async def token(uid, client):
         return {"access_token": "tok"}

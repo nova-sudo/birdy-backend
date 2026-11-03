@@ -25,13 +25,9 @@ def day(ad_id, leads, spend=200, d="2026-10-30", views=None):
 
 
 @pytest.fixture(autouse=True)
-def _patches(monkeypatch):
-    from utils.currency_exchange import CurrencyService
-
-    async def cur(_uid):
-        return "GBP"
-
-    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(cur))
+async def _patches(monkeypatch, mock_db):
+    # The user's currency comes from the app db (users.default_currency).
+    await mock_db["users"].insert_one({"user_id": "u1", "default_currency": "GBP"})
 
     async def token(uid, client):
         return {"access_token": "tok"}
@@ -522,7 +518,6 @@ async def test_creative_cpl_alert_uses_converted_values(mock_db, mock_mongo_clie
 
 async def test_prefill_converts_client_cpl_to_user_currency(mock_db, jpy):
     from services.creatives.targets import prefill_targets
-    await mock_db["users"].insert_one({"user_id": U, "default_currency": "GBP"})
     await mock_db["client_groups"].insert_one({"id": "gj", "user_id": U, "targets": {"cpl": 4000},
                                                "ad_account_currency": "JPY"})
     out = await prefill_targets(mock_db, U, ["gj"])
@@ -721,3 +716,79 @@ def test_env_example_lists_creative_settings():
     text = (Path(__file__).resolve().parents[1] / ".env.example").read_text()
     for key in ("FRONTEND_URL", "CREATIVE_UPLOAD_SECRET", "BLOB_READ_WRITE_TOKEN"):
         assert f"{key}=" in text
+
+
+# ── I5 follow-up: user currency from the app db, AED through its USD peg ────
+
+ECB = {("USD", "GBP"): 0.8, ("GBP", "USD"): 1.25}
+
+
+@pytest.fixture
+def ecb(monkeypatch):
+    """A converter that, like the ECB data, has USD and GBP but no AED."""
+    from utils.currency_exchange import CurrencyService
+
+    def rate(a, b):
+        if a == b:
+            return 1.0
+        if (a, b) not in ECB:
+            raise ValueError(f"{a} is not a supported currency")
+        return ECB[(a, b)]
+
+    monkeypatch.setattr(CurrencyService, "get_rate", staticmethod(rate))
+
+
+def test_fx_rate_aed_through_usd_peg(ecb):
+    from services.creatives.verdict import fx_rate
+    assert fx_rate("AED", "GBP") == pytest.approx(0.8 / 3.6725)
+    assert fx_rate("GBP", "AED") == pytest.approx(1.25 * 3.6725)
+    assert fx_rate("AED", "AED") == 1.0
+    assert fx_rate("AED", "USD") == pytest.approx(1 / 3.6725)
+    assert fx_rate("XYZ", "GBP") is None
+    assert fx_rate("GBP", None) is None
+
+
+async def test_aed_user_with_aed_and_usd_accounts(mock_db, mock_mongo_client, monkeypatch, ecb):
+    await mock_db["users"].update_one({"user_id": U}, {"$set": {"default_currency": "AED"}})
+    m = Meta(monkeypatch)
+    # Targets in AED: CPL <= 100 AED, floor 150 AED.
+    t = await make_test(mock_db, n=2, currencies={0: "AED", 1: "USD"},
+                        targets={"mode": "thresholds", "metrics": {"cpl": {"op": "lte", "value": 100}}})
+    m.leads = {"ad0": 10, "ad1": 10}
+    m.spend = {"ad0": 900, "ad1": 300}  # ad0: 90 AED CPL (pass); ad1: $30 = 110.18 AED CPL (fail)
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    got = await rows(mock_db, t)
+    assert got["ad0"]["score"]["state"] == "pass" and got["ad0"]["fx_rate"] == 1.0
+    assert got["ad0"]["currency"] == "AED"
+    assert got["ad1"]["score"]["cpl"] == pytest.approx(30 * 3.6725)
+    assert got["ad1"]["score"]["state"] == "fail" and got["ad1"]["currency"] == "AED"
+    summary = (await get_test(mock_db, U, t["id"]))["summary"]
+    assert summary["currency"] == "AED" and summary["spend"] == pytest.approx(900 + 300 * 3.6725, abs=0.01)
+    assert summary["rate_missing"] is False
+
+
+async def test_no_user_currency_leaves_accounts_unscored(mock_db, mock_mongo_client, monkeypatch, ecb):
+    await mock_db["users"].delete_many({})
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=2)
+    m.leads = {"ad0": 10, "ad1": 10}
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    got = await rows(mock_db, t)
+    assert all(r["score"]["state"] == "scoring" and r["score"]["rate_missing"] for r in got.values())
+    after = await get_test(mock_db, U, t["id"])
+    assert after.get("verdict") is None and after["summary"]["currency"] is None
+
+
+async def test_creative_alerts_skip_unconverted_rows(mock_db, mock_mongo_client, monkeypatch, ecb):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=2, currencies={1: "XYZ"})
+    m.leads = {"ad0": 10, "ad1": 1}
+    m.spend = {"ad0": 100, "ad1": 99999}  # ad1 has no rate: CPL 99999 XYZ, unconverted
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    for metric in ("creative_cpl", "creative_ctr"):
+        alert = {"id": "a1", "user_id": U, "scope": "creative_tests", "creative_test_ids": [t["id"]],
+                 "tracking_mode": "per_client",
+                 "condition": {"metric": metric, "operator": "gt", "value": 50}}
+        res = await alerts.evaluate_creative_alert(alert, mock_db)
+        assert [r["group_id"] for r in res["per_client_results"]] == ["act_0"]
+        assert res["triggered"] is False

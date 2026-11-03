@@ -183,7 +183,7 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     # scored (CPL and CPC derive from the converted spend). Without a rate it is never scored.
     fmt = creative_format(test)
     now = _naive_utc(datetime.now(timezone.utc))
-    user_cur = await user_currency(user_id)
+    user_cur = await user_currency(user_id, db)  # None: nothing is converted, nothing scored
     scored_ads = []
     account_curs: set = set()
     for ad in still_live:
@@ -193,6 +193,7 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
             grp = owning_group(same, ad.get("campaign_id")) if same else {}
         acct_cur = grp.get("ad_account_currency") or user_cur
         account_curs.add(acct_cur)
+        # fx_rate is None without a user currency, so the account stays unscored.
         rate = fx_rate(acct_cur, user_cur)
         raw = aggregate_days([_to_day(r) for r in days_by_ad.get(ad["meta"]["ad_id"], [])])
         group_cpl = (grp.get("targets") or {}).get("cpl")

@@ -105,10 +105,7 @@ def test_aggregate_days_sums_and_days_live():
 async def test_rollup_converts_mixed_currency(mock_db, monkeypatch):  # Review Focus 1
     from utils.currency_exchange import CurrencyService
 
-    async def fake_cur(user_id):
-        return "GBP"
-
-    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(fake_cur))
+    await mock_db["users"].insert_one({"user_id": "u1", "default_currency": "GBP"})
     monkeypatch.setattr(CurrencyService, "get_rate", staticmethod(lambda a, b: 0.75 if (a, b) == ("USD", "GBP") else 1.0))
     ads = [
         {"ad_account_id": "a1", "currency": "GBP", "format": "video",
@@ -128,13 +125,10 @@ async def test_rollup_converts_mixed_currency(mock_db, monkeypatch):  # Review F
 async def test_rollup_rate_missing_excludes_money(mock_db, monkeypatch):
     from utils.currency_exchange import CurrencyService
 
-    async def fake_cur(user_id):
-        return "GBP"
-
     def boom(a, b):
         raise ValueError("no rate")
 
-    monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(fake_cur))
+    await mock_db["users"].insert_one({"user_id": "u1", "default_currency": "GBP"})
     monkeypatch.setattr(CurrencyService, "get_rate", staticmethod(boom))
     ads = [
         {"ad_account_id": "a1", "currency": "GBP", "score": {"state": "pass", "spend": 100, "leads": 4}},
@@ -144,16 +138,12 @@ async def test_rollup_rate_missing_excludes_money(mock_db, monkeypatch):
     assert s["spend"] == 100.0 and s["rate_missing"] is True and s["mixed_currency"] is True
 
 
-async def test_rollup_survives_currency_lookup_errors(mock_db, monkeypatch):
-    from utils.currency_exchange import CurrencyService
-
-    for exc in (ValueError("no user"), RuntimeError("db")):
-        async def boom(user_id, _e=exc):
-            raise _e
-
-        monkeypatch.setattr(CurrencyService, "get_user_currency", staticmethod(boom))
-        s = await rollup(mock_db, "u1", [{"ad_account_id": "a", "score": {"state": "pass", "spend": 10, "leads": 1}}])
-        assert s["currency"] == "GBP" and s["spend"] == 10.0
+async def test_rollup_without_user_currency_never_guesses_one(mock_db):
+    # No users.default_currency: no currency is assumed (never GBP) and no money is summed.
+    s = await rollup(mock_db, "u1", [{"ad_account_id": "a", "currency": "USD",
+                                      "score": {"state": "pass", "spend": 10, "leads": 1}}])
+    assert s["currency"] is None and s["rate_missing"] is True
+    assert s["spend"] == 0 and s["cpl"] is None
 
 
 def test_none_targets_use_defaults_and_zero_is_valid():
