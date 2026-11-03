@@ -553,7 +553,7 @@ async def _conversation_scope(db, user_id: str, session_id: str) -> dict:
         return {"scope": "global", "client_group_id": None, "client_name": None}
 
 
-def _attachment_summary(attachments: list[dict]) -> str:
+def _attachment_summary(attachments: list[dict], first_index: int = 0) -> str:
     """`[Attached: 1 image (1080×1350), 1 video (0:27)]` — what history keeps instead of the image parts."""
     parts = []
     for kind, prefix in (("image", "image/"), ("video", "video/")):
@@ -569,7 +569,8 @@ def _attachment_summary(attachments: list[dict]) -> str:
                 details.append(f"{secs // 60}:{secs % 60:02d}")
         detail = f" ({', '.join(details)})" if details else ""
         parts.append(f"{len(group)} {kind}{'s' if len(group) != 1 else ''}{detail}")
-    return f"[Attached: {', '.join(parts)}]"
+    indexes = ", ".join(str(first_index + i) for i in range(len(attachments)))
+    return f"[Attached: {', '.join(parts)} \u2014 attachment_index {indexes}]"
 
 
 def _vision_parts(message: str, attachments: list[dict]) -> list[dict]:
@@ -609,10 +610,14 @@ async def run_chat(
         if len(attachments) > MAX_CHAT_ATTACHMENTS:
             raise ValueError(f"At most {MAX_CHAT_ATTACHMENTS} attachments per message")
         attachments = [ChatAttachment(**a).model_dump(exclude_none=True) for a in attachments]
-        await db[session_store._COLLECTION].update_one(
+        from pymongo import ReturnDocument
+        updated = await db[session_store._COLLECTION].find_one_and_update(
             {"_id": session_id, "user_id": user_id},
             {"$push": {"session_attachments": {"$each": attachments}}},
+            projection={"session_attachments": 1}, return_document=ReturnDocument.AFTER,
         )
+        # Index of each item = its position in session_attachments after the push (never capped).
+        first_attachment_index = len((updated or {}).get("session_attachments") or []) - len(attachments)
 
     # Defensive clean-up: remove malformed history that causes Mistral 400s
     history[:] = session_store.sanitize_history(history)
@@ -639,7 +644,7 @@ async def run_chat(
         history.append({"role": "system", "content": system_content})
 
     # History keeps text plus a one-line summary; the image parts exist for this turn only.
-    history_message = f"{message}\n{_attachment_summary(attachments)}" if attachments else message
+    history_message = f"{message}\n{_attachment_summary(attachments, first_attachment_index)}" if attachments else message
     history.append({"role": "user", "content": history_message})
     turn_index = len(history) - 1
     turn_parts = (_vision_parts(history_message, attachments)

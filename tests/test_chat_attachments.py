@@ -82,14 +82,14 @@ async def test_history_keeps_summary_not_parts(mock_db):
     assert sent[2]["image_url"]["url"] == VID["thumbnail_url"]
     doc = await mock_db["ai_chat_sessions"].find_one({"_id": out["session_id"]})
     user_msg = next(m for m in doc["messages"] if m["role"] == "user")
-    assert user_msg["content"] == "look\n[Attached: 1 image (1080×1350), 1 video (0:27)]"
+    assert user_msg["content"] == "look\n[Attached: 1 image (1080×1350), 1 video (0:27) \u2014 attachment_index 0, 1]"
     assert doc["session_attachments"] == [IMG, VID]
 
 
 async def test_non_vision_provider_gets_text_only(mock_db):
     p = Scripted([ProviderResponse(content="ok")], vision=False)
     await run_chat(provider=p, tool_registry=reg(), db=mock_db, user_id=U, message="look", attachments=[IMG])
-    assert p.seen[0][-1]["content"] == "look\n[Attached: 1 image (1080×1350)]"
+    assert p.seen[0][-1]["content"] == "look\n[Attached: 1 image (1080×1350) \u2014 attachment_index 0]"
 
 
 async def test_parts_only_for_this_turn(mock_db):
@@ -143,3 +143,15 @@ async def test_draft_reads_attachment_stored_by_run_chat(mock_db, meta):
     tests = await mock_db[store.TESTS].find({"user_id": U}).to_list(10)
     assert out["reply"] == "drafted" and len(tests) == 1
     assert tests[0]["creative"]["media"]["blob_url"] == IMG["blob_url"]
+
+
+async def test_indexes_on_second_turn_continue_session_positions(mock_db):
+    p = Scripted([ProviderResponse(content="a"), ProviderResponse(content="b")], vision=False)
+    first = await run_chat(provider=p, tool_registry=reg(), db=mock_db, user_id=U, message="one",
+                           attachments=[IMG, VID])
+    await run_chat(provider=p, tool_registry=reg(), db=mock_db, user_id=U, message="two",
+                   session_id=first["session_id"], attachments=[IMG, VID, IMG])
+    assert p.seen[1][-1]["content"].endswith("\u2014 attachment_index 2, 3, 4]")
+    doc = await mock_db["ai_chat_sessions"].find_one({"_id": first["session_id"]})
+    assert len(doc["session_attachments"]) == 5
+    assert doc["session_attachments"][2:] == [IMG, VID, IMG]

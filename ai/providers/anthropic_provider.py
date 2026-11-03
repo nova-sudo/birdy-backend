@@ -12,6 +12,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 class AnthropicProvider(BaseLLMProvider):
     supports_vision = True
+
     def __init__(self, api_key: str | None = None, model: str | None = None):
         key = api_key or ANTHROPIC_API_KEY
         if not key:

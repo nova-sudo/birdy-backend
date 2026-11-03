@@ -14,6 +14,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1/chat/completions"
 
 class OpenRouterProvider(BaseLLMProvider):
     supports_vision = True
+
     def __init__(self, model: str | None = None):
         if not OPENROUTER_API_KEY:
             raise ValueError("OPENROUTER_API_KEY environment variable is not set")

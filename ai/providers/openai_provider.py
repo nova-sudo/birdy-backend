@@ -9,7 +9,6 @@ DEFAULT_OPENAI_MODEL = "gpt-4o"
 
 
 class OpenAIProvider(BaseLLMProvider):
-    supports_vision = True
     """Runs on Birdy's own account key, falling back to it when none is passed.
 
     This used to be BYOK-only. Asking each agency for a key meant one wrong
@@ -17,6 +16,8 @@ class OpenAIProvider(BaseLLMProvider):
     a way the user could not diagnose, so the account key is the default and
     an explicitly-passed key is the exception.
     """
+
+    supports_vision = True
 
     def __init__(self, api_key: str | None = None, model: str | None = None):
         from ai.config import OPENAI_API_KEY
