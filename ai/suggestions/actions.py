@@ -30,7 +30,7 @@ mark_applied. The claim comes first so concurrent applies make one Meta write.
 """
 
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 
 from ai.agents.guardrails import (
     FLAG_ONLY,
@@ -43,16 +43,51 @@ from ai.agents.guardrails import (
 from ai.agents.meta_state import record_status_write
 from ai.agents.store import get_agent, list_memory
 from ai.suggestions import store
-from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
+from ai.suggestions.contracts import (
+    ACTION_ADOPT_CREATIVE_AD,
+    ACTION_ENABLE_ADS,
+    ACTION_PAUSE_ADS,
+    ACTION_RETRY_CREATIVE_POST,
+    ACTION_SCALE_CREATIVE,
+)
 from services.meta_status_service import MetaStatusError, get_object_state, set_object_status
 
 logger = logging.getLogger(__name__)
 
+# Creative test actions: no status write to undo (scale only opens the wizard;
+# retry re-queues a post; adopt links an ad). retry/adopt must succeed to apply.
+CREATIVE_ACTIONS = (ACTION_SCALE_CREATIVE, ACTION_RETRY_CREATIVE_POST, ACTION_ADOPT_CREATIVE_AD)
+_MUST_SUCCEED = (ACTION_RETRY_CREATIVE_POST, ACTION_ADOPT_CREATIVE_AD)
+NOTHING_TO_UNDO = "Nothing to undo"
+
+
+async def _execute_creative(mongo_client, user_id: str, atype: str, params: dict) -> dict:
+    if atype == ACTION_SCALE_CREATIVE:
+        return {"succeeded": [], "failed": [],
+                "redirect": f"/campaigns/creatives/new?scale={params.get('test_id')}"}
+    from core.database import DB_NAME
+    from services.creatives import posting, reconcile
+
+    db = mongo_client[DB_NAME]
+    try:
+        if atype == ACTION_RETRY_CREATIVE_POST:
+            await posting.retry(db, user_id, params.get("test_id"), params.get("test_ad_id"),
+                                patch=params.get("patch") or None)
+            return {"succeeded": [params.get("test_ad_id")], "failed": []}
+        await reconcile.adopt(db, user_id, params.get("test_id"), params.get("ad_id"))
+        return {"succeeded": [params.get("ad_id")], "failed": []}
+    except (posting.PostingError, ValueError) as e:
+        oid = params.get("test_ad_id") or params.get("ad_id")
+        return {"succeeded": [], "failed": [{"object_id": oid, "error": getattr(e, "message", None) or str(e)}]}
+
 
 async def execute_action(mongo_client, user_id: str, action: dict) -> dict:
-    """Execute a suggestion's action against Meta. Returns {succeeded, failed}."""
+    """Execute a suggestion's action against Meta. Returns {succeeded, failed}
+    (plus `redirect` for scale_creative)."""
     atype = action.get("type")
     targets = action.get("targets") or []
+    if atype in CREATIVE_ACTIONS:
+        return await _execute_creative(mongo_client, user_id, atype, action.get("params") or {})
     if atype not in (ACTION_PAUSE_ADS, ACTION_ENABLE_ADS):
         return {"succeeded": [], "failed": [{"object_id": None, "error": f"Unsupported action type: {atype}"}]}
 
@@ -148,6 +183,26 @@ async def _record_meta_state(db, user_id: str, doc: dict, targets: list[dict],
         await record_status_write(db, doc["client_group_id"], ad_ids, desired, today=today)
     except Exception as e:
         logger.warning("apply: meta_ad_state write-back failed for %s: %s", doc.get("_id"), e)
+
+
+async def _mirror_creative_status(db, user_id: str, doc: dict, object_ids: list,
+                                  status: str) -> None:
+    """Best-effort: a creative test finding's pause/enable is mirrored on the test's
+    ad rows (meta_status), as posting.pause_ads does, so tracking sees it."""
+    test_id = (doc.get("evidence") or {}).get("creative_test_id")
+    if not test_id or not object_ids:
+        return
+    try:
+        from services.creatives.store import TEST_ADS
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
+        fields = {"meta_status": status, "updated_at": now}
+        if status == "PAUSED":
+            fields["paused_at"] = now
+        await db[TEST_ADS].update_many(
+            {"user_id": user_id, "test_id": test_id, "meta.ad_id": {"$in": [str(o) for o in object_ids]}},
+            {"$set": fields})
+    except Exception as e:
+        logger.warning("apply: creative meta_status mirror failed for %s: %s", doc.get("_id"), e)
 
 
 async def _learn(db, doc: dict, decision: str, **kw) -> dict | None:
@@ -260,6 +315,7 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
     # 3. Re-read, then 4. write only what still needs it.
     succeeded, failed = [], []
     already_in_meta = False
+    redirect = None
     if action and action.get("targets") and atype in (ACTION_PAUSE_ADS, ACTION_ENABLE_ADS):
         pending = await _targets_needing_write(mongo_client, user_id, action)
         if not pending:
@@ -271,6 +327,8 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
                 await _record_meta_state(db, user_id, doc, pending, succeeded,
                                          "PAUSED" if atype == ACTION_PAUSE_ADS else "ACTIVE",
                                          agent=agent)
+                await _mirror_creative_status(db, user_id, doc, succeeded,
+                                              "PAUSED" if atype == ACTION_PAUSE_ADS else "ACTIVE")
             if not succeeded:
                 await store.release_claim(db, user_id, suggestion_id, token)
                 return {"ok": False, "outcome": "failed", "doc": doc,
@@ -279,7 +337,8 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
     elif action:
         res = await execute_action(mongo_client, user_id, action)
         succeeded, failed = res["succeeded"], res["failed"]
-        if action.get("targets") and not succeeded:
+        redirect = res.get("redirect")
+        if (action.get("targets") or atype in _MUST_SUCCEED) and not succeeded:
             await store.release_claim(db, user_id, suggestion_id, token)
             return {"ok": False, "outcome": "failed", "doc": doc,
                     "detail": failed[0]["error"] if failed else "Action failed",
@@ -294,7 +353,7 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
             "name": (targets_by_id.get(str(oid)) or {}).get("name"),
         }
         for oid in succeeded
-    ]
+    ] if atype not in CREATIVE_ACTIONS else []
     decided_by = {"actor": actor, "source": source, "by": by, "at": datetime.utcnow()}
 
     # 5. Atomic open → applied.
@@ -338,8 +397,11 @@ async def _apply_claimed(db, mongo_client, user_id: str, suggestion_id: str, doc
         await _learn(db, doc, "approved")
     await _sync_slack(db, user_id, suggestion_id, by=by)
     outcome = "already_in_meta" if already_in_meta else ("partial" if failed else "applied")
-    return {"ok": True, "outcome": outcome, "doc": marked,
-            "succeeded": succeeded, "failed": failed}
+    out = {"ok": True, "outcome": outcome, "doc": marked,
+           "succeeded": succeeded, "failed": failed}
+    if redirect:
+        out["redirect"] = redirect
+    return out
 
 
 async def dismiss_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
@@ -418,6 +480,8 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
 
     targets = doc.get("applied_targets") or []
     applied_type = doc.get("applied_action_type") or (doc.get("action") or {}).get("type")
+    if applied_type in CREATIVE_ACTIONS:
+        return {"ok": False, "outcome": "not_undoable", "doc": doc, "detail": NOTHING_TO_UNDO}
     inverse = ACTION_ENABLE_ADS if applied_type == ACTION_PAUSE_ADS else ACTION_PAUSE_ADS
 
     succeeded, failed = [], []
@@ -427,6 +491,8 @@ async def undo_suggestion(db, mongo_client, user_id: str, suggestion_id: str, *,
         if succeeded:
             await _record_meta_state(db, user_id, doc, targets, succeeded,
                                      "PAUSED" if inverse == ACTION_PAUSE_ADS else "ACTIVE")
+            await _mirror_creative_status(db, user_id, doc, succeeded,
+                                          "PAUSED" if inverse == ACTION_PAUSE_ADS else "ACTIVE")
         if not succeeded:
             return {"ok": False, "outcome": "failed", "doc": doc,
                     "detail": failed[0]["error"] if failed else "Undo failed",

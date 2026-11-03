@@ -205,7 +205,8 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
         return {"ok": res["ok"], "outcome": res["outcome"],
                 "succeeded": res.get("succeeded", []), "failed": res.get("failed", []),
                 "blocked_reason": res.get("blocked_reason"),
-                "status": res.get("status"), "decided_by": _decided_by(res)}
+                "status": res.get("status"), "decided_by": _decided_by(res),
+                "redirect": res.get("redirect")}
 
 
 def _decided_by(res: dict) -> dict | None:
@@ -281,6 +282,8 @@ async def undo_suggestion(suggestion_id: str, current_user: str = Depends(get_cu
             raise HTTPException(status_code=404, detail="Suggestion not found")
         if res["outcome"] == "failed":
             raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
+        if res["outcome"] == "not_undoable":
+            raise HTTPException(status_code=409, detail=res.get("detail", "Nothing to undo"))
         # "undone" (reversed) and "noop" (nothing was applied to reverse) are
         # both successes — undo is idempotent, so re-undoing settles quietly.
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
