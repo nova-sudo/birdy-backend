@@ -631,6 +631,8 @@ async def test_auto_pause_respects_per_client_pause_cap(mock_db, mock_mongo_clie
     st = Status(monkeypatch)
     await mock_db["agents"].insert_one({"_id": "ag1", "user_id": U, "type": "custom",
                                         "guardrails": {"max_pauses_per_client_day": 1}})
+    from ai.agents import claims
+    await claims.claim_clients(mock_db, U, "ag1", ["g0", "g1"])  # the acting agent's guardrails apply
     await mock_db[sstore.ACTIVITY].insert_one({
         "user_id": U, "client_group_id": "g0", "kind": sstore.KIND_ACTION_APPLIED,
         "applied_action_type": "pause_ads", "created_at": cf._utcnow() - timedelta(minutes=5)})
@@ -640,6 +642,22 @@ async def test_auto_pause_respects_per_client_pause_cap(mock_db, mock_mongo_clie
     [doc] = await mock_db[sstore.SUGGESTIONS].find({"rule_id": "creative_loser"}).to_list(None)
     assert doc["status"] == "open" and doc["blocked_reason"]["code"] == "pause_cap"
     assert [x["object_id"] for x in doc["action"]["targets"]] == ["ad0"]
+
+
+async def test_auto_pause_ignores_guardrails_of_agent_not_acting(mock_db, mock_mongo_client, monkeypatch):
+    from ai.agents import claims
+    from ai.suggestions import store as sstore
+    st = Status(monkeypatch)
+    # A cap-1 agent exists but holds neither client: defaults apply, so both pause.
+    await mock_db["agents"].insert_one({"_id": "ag1", "user_id": U, "type": "custom",
+                                        "guardrails": {"max_pauses_per_client_day": 1}})
+    await mock_db[sstore.ACTIVITY].insert_one({
+        "user_id": U, "client_group_id": "g0", "kind": sstore.KIND_ACTION_APPLIED,
+        "applied_action_type": "pause_ads", "created_at": cf._utcnow() - timedelta(minutes=5)})
+    t = await _loser(mock_db)
+    await _sync(mock_db, mock_mongo_client, t)
+    assert sorted(c[0] for c in st.calls) == ["ad0", "ad1"]
+    assert await claims.holder(mock_db, U, "g0") is None
 
 
 # ── M3: blob cleanup keeps media another live test still uses ───────────────

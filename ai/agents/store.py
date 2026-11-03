@@ -22,6 +22,7 @@ import uuid
 from datetime import datetime
 
 from core.database import DB_NAME
+from ai.agents import claims
 from ai.suggestions.store import SUGGESTIONS
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
@@ -145,6 +146,7 @@ async def delete_draft_agent(db, user_id: str, agent_id: str) -> bool:
         raise AgentActive(agent_id)  # switched on between the read and the delete
     for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS):
         await db[coll].delete_many({"agent_id": agent_id})
+    await claims.release_clients(db, user_id, agent_id)
     return True
 
 
@@ -162,6 +164,8 @@ async def update_agent(db, user_id: str, agent_id: str, patch: dict) -> dict:
         raise ValueError(f"cannot update agent field(s): {sorted(bad)}")
     if patch:
         await db[AGENTS].update_one({"_id": agent_id, "user_id": user_id}, {"$set": patch})
+        if "status" in patch and patch["status"] != "active":
+            await claims.release_clients(db, user_id, agent_id)  # turned off: stops acting
     return await get_agent(db, user_id, agent_id)
 
 
@@ -261,6 +265,8 @@ async def create_agent_indexes(mongo_client):
     await db[AGENTS].create_index(
         [("user_id", 1), ("type", 1)], unique=True, name="user_stock_agent",
         partialFilterExpression={"type": TYPE_STOCK})
+    await claims.ensure_indexes(db)
+    await claims.migrate_claims(db)
     await db[RULES].create_index("agent_id")
     await db[MEMORY].create_index([("agent_id", 1), ("active", 1)])
     await db[PRACTICE].create_index("agent_id")

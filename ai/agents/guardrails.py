@@ -6,6 +6,7 @@ ai/suggestions/actions.apply_suggestion for suggestions that carry an
 agent_id, whether a person approved them or the agent is auto-running.
 
 Checked in order, first failure wins:
+  0. not_acting_agent  the client is held by another agent (see ai/agents/claims.py)
   1. no_permission  the agent may not touch this object type
   2. protected_tag  a target's name (or, for an ad set, any of its ads' names)
                     contains a protected tag
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ai.agents import memory_filters, meta_state
+from ai.agents import claims, memory_filters, meta_state
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS
 from ai.agents.meta_state import AD_STATE
 from ai.suggestions.contracts import ACTION_PAUSE_ADS, Action, Evidence, Finding
@@ -105,6 +106,15 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
     gid = doc.get("client_group_id")
     permissions = {**DEFAULT_PERMISSIONS, **(agent.get("permissions") or {})}
     guardrails = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}
+
+    # 0. Only the client's acting agent may change its ads. Run for every write, so a stale
+    # card or a race can't touch a client that has moved to another agent. An unclaimed
+    # client, or a caller that is not a stored agent (no _id), is not blocked here.
+    if agent.get("_id") and gid:
+        held_by = await claims.holder(db, agent.get("user_id") or doc.get("user_id"), gid)
+        if held_by and held_by != agent["_id"]:
+            return GuardrailResult.blocked(
+                "not_acting_agent", "Another agent now handles this client, so this agent can't change it.")
 
     # 1. Permission for every target's object type.
     for t in targets:

@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai.agents import claims
 from ai.agents import confidence as agent_confidence
 from ai.agents import history as ad_history
 from ai.agents import learning
@@ -187,6 +188,28 @@ class AgentPatch(BaseModel):
     permissions: Optional[dict] = None
     guardrails: Optional[dict] = None
     client_caps: Optional[dict] = None
+    move_claims: bool = False          # take over clients another agent acts on
+    only_flag: Optional[list[str]] = None  # stay watching these clients without claiming them
+
+
+class ActivateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    move_claims: bool = False
+    only_flag: Optional[list[str]] = None
+
+
+async def _claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move: bool,
+                       only_flag) -> JSONResponse | None:
+    """Claim the clients an active agent acts on. Clients in `only_flag` stay in its scope with
+    no claim. Returns a 409 response naming the holders when another agent has any of them."""
+    skip = set(only_flag or [])
+    conflicts = await claims.claim_clients(db, user_id, agent_id, [g for g in ids if g not in skip], move=move)
+    if conflicts:
+        return JSONResponse(status_code=409, content={
+            "detail": "Another agent already acts on " + ", ".join(
+                sorted({c["holder_name"] or "another agent" for c in conflicts})),
+            "conflicts": conflicts})
+    return None
 
 
 @router.patch("/{agent_id}")
@@ -211,6 +234,14 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
                 merged_scope["schedule"] = {**(current.get("schedule") or {}),
                                             **_validate_schedule(body.scope["schedule"])}
             patch["scope"] = merged_scope
+            if ids is not None and agent.get("status") == "active":
+                resp = await _claim_scope(db, current_user, agent_id, ids,
+                                          move=body.move_claims, only_flag=body.only_flag)
+                if resp is not None:
+                    return resp
+                await claims.release_clients(
+                    db, current_user, agent_id,
+                    set((current.get("client_group_ids") or [])) - set(ids))
 
         if body.permissions is not None:
             unknown = set(body.permissions) - set(DEFAULT_PERMISSIONS)
@@ -637,7 +668,9 @@ async def resolve_practice(agent_id: str, case_id: str, body: PracticeResolution
 
 
 @router.post("/{agent_id}/activate")
-async def activate(agent_id: str, current_user: str = Depends(get_current_user)):
+async def activate(agent_id: str, body: Optional[ActivateBody] = None,
+                   current_user: str = Depends(get_current_user)):
+    body = body or ActivateBody()
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
@@ -647,6 +680,11 @@ async def activate(agent_id: str, current_user: str = Depends(get_current_user))
         if not conf["ready"]:
             return JSONResponse(status_code=409, content={
                 "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
+        resp = await _claim_scope(db, current_user, agent_id,
+                                  list((agent.get("scope") or {}).get("client_group_ids") or []),
+                                  move=body.move_claims, only_flag=body.only_flag)
+        if resp is not None:
+            return resp
         for rule in await agent_store.list_rules(db, agent_id):
             mode = ("ask" if rule["kind"] in agent_confidence.ASK_KINDS
                     else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)

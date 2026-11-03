@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from typing import Literal
 
+from ai.agents import claims
 from ai.agents import history as ad_history
 from ai.agents import memory_filters
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS, RULE_KINDS
@@ -216,6 +217,9 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
     updated_docs: list[dict] = []
     for gid, ctx, findings in evaluated:
         try:
+            # Another agent acts on this client: this one may report, but every item is a Flag.
+            held_by = await claims.holder(db, user_id, gid)
+            not_acting = bool(held_by) and held_by != agent_id
             to_apply: list[str] = []
             for f in findings:
                 f.evidence.window = AGENT_WINDOW
@@ -225,6 +229,8 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
                 keep.setdefault(f.agent, set()).add(doc["_id"])
                 rule = rules_by_id.get(f.rule_id)
                 rule_mode = rule.get("mode") if rule else None
+                if rule_mode and not_acting:
+                    rule_mode = "flag"
                 if rule_mode:
                     await db[sstore.SUGGESTIONS].update_one({"_id": doc["_id"]}, {"$set": {"rule_mode": rule_mode}})
                 if created:
