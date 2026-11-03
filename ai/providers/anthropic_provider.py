@@ -11,6 +11,7 @@ ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 
 class AnthropicProvider(BaseLLMProvider):
+    supports_vision = True
     def __init__(self, api_key: str | None = None, model: str | None = None):
         key = api_key or ANTHROPIC_API_KEY
         if not key:
@@ -92,6 +93,19 @@ class AnthropicProvider(BaseLLMProvider):
             })
         return anthropic_tools
 
+    @staticmethod
+    def _convert_parts(parts: list[dict]) -> list[dict]:
+        """OpenAI-style content parts -> Anthropic blocks (image_url becomes a url image source)."""
+        out = []
+        for part in parts:
+            if part.get("type") == "image_url":
+                url = (part.get("image_url") or {}).get("url")
+                if url:
+                    out.append({"type": "image", "source": {"type": "url", "url": url}})
+            else:
+                out.append(part)
+        return out
+
     def _convert_messages(self, messages: list[dict]) -> list[dict]:
         """Convert OpenAI/Groq message format to Anthropic message format."""
         anthropic_messages = []
@@ -144,9 +158,9 @@ class AnthropicProvider(BaseLLMProvider):
                 })
 
             elif role == "user":
-                anthropic_messages.append({
-                    "role": "user",
-                    "content": msg.get("content") or "",
-                })
+                content = msg.get("content") or ""
+                if isinstance(content, list):
+                    content = self._convert_parts(content)
+                anthropic_messages.append({"role": "user", "content": content})
 
         return anthropic_messages

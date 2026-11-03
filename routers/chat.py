@@ -91,6 +91,7 @@ async def chat(
                 dashboard_id=request.dashboard_id,
                 dashboard_summary=request.summary,
                 view_catalogues=request.view_catalogues,
+                attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
             )
             return ChatResponse(**result)
         except HTTPException:

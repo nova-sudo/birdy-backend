@@ -553,6 +553,35 @@ async def _conversation_scope(db, user_id: str, session_id: str) -> dict:
         return {"scope": "global", "client_group_id": None, "client_name": None}
 
 
+def _attachment_summary(attachments: list[dict]) -> str:
+    """`[Attached: 1 image (1080×1350), 1 video (0:27)]` — what history keeps instead of the image parts."""
+    parts = []
+    for kind, prefix in (("image", "image/"), ("video", "video/")):
+        group = [a for a in attachments if str(a.get("mime", "")).startswith(prefix)]
+        if not group:
+            continue
+        details = []
+        for a in group:
+            if kind == "image" and a.get("width") and a.get("height"):
+                details.append(f"{a['width']}\u00d7{a['height']}")
+            elif kind == "video" and a.get("duration_s") is not None:
+                secs = int(round(a["duration_s"]))
+                details.append(f"{secs // 60}:{secs % 60:02d}")
+        detail = f" ({', '.join(details)})" if details else ""
+        parts.append(f"{len(group)} {kind}{'s' if len(group) != 1 else ''}{detail}")
+    return f"[Attached: {', '.join(parts)}]"
+
+
+def _vision_parts(message: str, attachments: list[dict]) -> list[dict]:
+    """OpenAI-style content parts for this turn: the text, then each image (a video's thumbnail)."""
+    parts = [{"type": "text", "text": message}]
+    for a in attachments:
+        url = a.get("blob_url") if str(a.get("mime", "")).startswith("image/") else a.get("thumbnail_url")
+        if url:
+            parts.append({"type": "image_url", "image_url": {"url": url}})
+    return parts
+
+
 async def run_chat(
     provider: BaseLLMProvider,
     tool_registry: ToolRegistry,
@@ -568,9 +597,22 @@ async def run_chat(
     dashboard_id: Optional[str] = None,
     dashboard_summary: Optional[str] = None,
     view_catalogues: Optional[dict] = None,
+    attachments: Optional[list[dict]] = None,
 ) -> dict:
-    # Restore or create session
+    # Restore or create session (get_or_create only resumes sessions this user owns)
     session_id, history = await session_store.get_or_create(db, session_id, user_id)
+
+    # Persist attachments only after validation, and only on this owner's session.
+    attachments = [dict(a) for a in (attachments or [])]
+    if attachments:
+        from core.models import ChatAttachment, MAX_CHAT_ATTACHMENTS
+        if len(attachments) > MAX_CHAT_ATTACHMENTS:
+            raise ValueError(f"At most {MAX_CHAT_ATTACHMENTS} attachments per message")
+        attachments = [ChatAttachment(**a).model_dump(exclude_none=True) for a in attachments]
+        await db[session_store._COLLECTION].update_one(
+            {"_id": session_id, "user_id": user_id},
+            {"$push": {"session_attachments": {"$each": attachments}}},
+        )
 
     # Defensive clean-up: remove malformed history that causes Mistral 400s
     history[:] = session_store.sanitize_history(history)
@@ -596,7 +638,12 @@ async def run_chat(
             system_content = system_content + CREATIVE_TESTS_GUIDE
         history.append({"role": "system", "content": system_content})
 
-    history.append({"role": "user", "content": message})
+    # History keeps text plus a one-line summary; the image parts exist for this turn only.
+    history_message = f"{message}\n{_attachment_summary(attachments)}" if attachments else message
+    history.append({"role": "user", "content": history_message})
+    turn_index = len(history) - 1
+    turn_parts = (_vision_parts(history_message, attachments)
+                  if attachments and getattr(provider, "supports_vision", False) else None)
 
     # Durable archive (Admin console + analytics). Skip internal [UI_RESPONSE]
     # submissions — those are form answers, not real user questions, and the
@@ -746,6 +793,10 @@ async def run_chat(
                     ]
                 else:
                     call_messages = history + [{"role": "user", "content": final_turn_notice.strip()}]
+
+            if turn_parts:
+                call_messages = list(call_messages)
+                call_messages[turn_index] = {"role": "user", "content": turn_parts}
 
             response = await provider.chat_completion(
                 messages=call_messages,

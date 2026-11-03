@@ -9,6 +9,7 @@ DEFAULT_OPENAI_MODEL = "gpt-4o"
 
 
 class OpenAIProvider(BaseLLMProvider):
+    supports_vision = True
     """Runs on Birdy's own account key, falling back to it when none is passed.
 
     This used to be BYOK-only. Asking each agency for a key meant one wrong

@@ -28,6 +28,9 @@ class ProviderResponse:
 
 
 class BaseLLMProvider(ABC):
+    # True when chat_completion accepts OpenAI-style `image_url` content parts.
+    supports_vision: bool = False
+
     @abstractmethod
     async def chat_completion(
         self,

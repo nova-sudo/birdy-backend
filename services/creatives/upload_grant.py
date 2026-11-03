@@ -29,6 +29,7 @@ BLOB_DELETE_URL = "https://blob.vercel-storage.com/delete"
 DELETE_BATCH = 100
 BLOB_API_VERSION = "13"
 BLOB_HOST_SUFFIX = ".blob.vercel-storage.com"
+PUBLIC_BLOB_HOST_SUFFIX = ".public.blob.vercel-storage.com"
 
 
 def _b64(raw: bytes) -> str:
@@ -105,6 +106,24 @@ def _is_blob_url(url) -> bool:
     except ValueError:
         return False
     return host.endswith(BLOB_HOST_SUFFIX)
+
+
+def is_public_blob_url(url) -> bool:
+    """https URL whose parsed hostname ends with the public Blob suffix (never a substring match)."""
+    try:
+        parsed = urlparse(url)
+        host = parsed.hostname or ""
+    except (ValueError, AttributeError):
+        return False
+    return parsed.scheme == "https" and host.endswith(PUBLIC_BLOB_HOST_SUFFIX)
+
+
+def media_limit(mime) -> int | None:
+    if mime in IMAGE_MIMES:
+        return MAX_IMAGE_BYTES
+    if mime in VIDEO_MIMES:
+        return MAX_VIDEO_BYTES
+    return None
 
 
 def _blob_urls(media: dict) -> list[str]:

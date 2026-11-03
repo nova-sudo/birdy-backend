@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Dict, Optional, List
 
 
@@ -181,8 +181,43 @@ class UpdateCustomMetricRequest(BaseModel):
 
 # ── Birdy AI Chat ───────────────────────────────────────────────────────────
 
+MAX_CHAT_ATTACHMENTS = 4
+
+
+class ChatAttachment(BaseModel):
+    """An image or video the user uploaded straight to Vercel Blob and attached to a chat turn."""
+    blob_url: str
+    mime: str
+    bytes: int
+    width: Optional[int] = None
+    height: Optional[int] = None
+    duration_s: Optional[float] = None
+    thumbnail_url: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _check(self):
+        from services.creatives.upload_grant import is_public_blob_url, media_limit
+        limit = media_limit(self.mime)
+        if limit is None:
+            raise ValueError(f"Unsupported media type: {self.mime}")
+        if isinstance(self.bytes, bool) or self.bytes <= 0 or self.bytes > limit:
+            raise ValueError("Attachment size is out of range")
+        for url in (self.blob_url, self.thumbnail_url):
+            if url is not None and not is_public_blob_url(url):
+                raise ValueError("Attachment must be uploaded to Birdy media storage")
+        return self
+
+
 class ChatRequest(BaseModel):
     message: str
+    attachments: Optional[List[ChatAttachment]] = []
+
+    @field_validator("attachments")
+    @classmethod
+    def _max_attachments(cls, v):
+        if v and len(v) > MAX_CHAT_ATTACHMENTS:
+            raise ValueError(f"At most {MAX_CHAT_ATTACHMENTS} attachments per message")
+        return v
     session_id: Optional[str] = None
     page: Optional[str] = None
     client_group_id: Optional[str] = None
