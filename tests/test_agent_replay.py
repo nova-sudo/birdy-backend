@@ -520,3 +520,9 @@ async def test_case_snapshot_bounded_to_target_neighbourhood(mock_db, mock_mongo
     assert replay.rescore_case(agent, rule, mems, case) == "Pause"
     assert replay.rescore_case(agent, {**rule, "params": {**rule["params"], "cpl_multiple": 3}}, mems,
                                case) == "Leave it"
+
+
+def test_ads_on_day_leaves_archived_ads_archived():
+    arch = AdState(ad_id="x", adset_id="s", campaign_id="c", name="x", effective_status="ARCHIVED",
+                   created_time=None, paused_at=date(2026, 10, 1))
+    assert replay.ads_on_day({"x": arch}, {}, date(2026, 10, 10))["x"].effective_status == "ARCHIVED"

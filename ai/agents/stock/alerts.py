@@ -9,11 +9,13 @@ Prepaid is an estimate from top-ups the agency entered. Meta's `balance` is the 
 money remaining, so it is never shown as a balance.
 """
 
+import json
 import logging
 from datetime import date, datetime, timedelta
 
 import httpx
 
+from ai.agents.history import HISTORY, is_ready
 from ai.agents.meta_state import AD_STATE, ADSET_STATE, MetaTokenError, _is_active, _parse_time
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.stock.windows import last_full_day
@@ -50,6 +52,35 @@ async def fetch_account_health(ad_account_id: str, token: str) -> dict:
             "funding_source": body.get("funding_source"), "is_prepay_account": body.get("is_prepay_account"),
             "timezone_name": body.get("timezone_name"), "currency": body.get("currency"),
             "name": body.get("name")}
+
+
+async def fetch_account_spend(ad_account_id: str, token: str, since: date, until: date) -> dict[str, float]:
+    """Account-level spend per day, {iso_date: spend}, from Meta insights. Days with no spend have
+    no entry. Raises MetaTokenError, RuntimeError or httpx.HTTPError."""
+    acct = ad_account_id if str(ad_account_id).startswith("act_") else f"act_{ad_account_id}"
+    url = f"{_GRAPH}/{acct}/insights"
+    params = {"level": "account", "time_increment": "1", "fields": "spend,date_start",
+              "time_range": json.dumps({"since": since.isoformat(), "until": until.isoformat()}),
+              "limit": 100, "access_token": token}
+    out: dict[str, float] = {}
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        while url:
+            resp = await client.get(url, params=params)
+            try:
+                body = resp.json()
+            except Exception:
+                body = {}
+            if resp.status_code != 200:
+                err = body.get("error") or {}
+                if resp.status_code == 401 or err.get("code") in (190, 102):
+                    raise MetaTokenError(err.get("message") or "Meta token invalid")
+                raise RuntimeError(f"Meta Graph error on {acct}/insights: {err.get('message') or resp.status_code}")
+            for row in body.get("data") or []:
+                day = str(row.get("date_start") or "")[:10]
+                if day:
+                    out[day] = out.get(day, 0.0) + float(row.get("spend") or 0)
+            url, params = (body.get("paging") or {}).get("next"), None
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -113,6 +144,21 @@ def _ads_detail(ads: list[dict], text_of) -> str:
     return "\n".join(lines)
 
 
+def usable_topups(topups) -> list[dict]:
+    """Top-ups with a real ISO date and a numeric amount. Anything else is ignored."""
+    out = []
+    for t in topups or []:
+        if not isinstance(t, dict):
+            continue
+        try:
+            date.fromisoformat(str(t.get("date"))[:10])
+        except ValueError:
+            continue
+        if isinstance(t.get("amount"), (int, float)) and not isinstance(t.get("amount"), bool):
+            out.append(t)
+    return out
+
+
 def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
@@ -127,10 +173,18 @@ def _day(v) -> date | None:
 
 
 def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: dict, gid: str,
-                  now_utc: datetime, daily_budgets: list[float] | None = None) -> list[dict]:
-    """Alerts for one client. `ads` are its meta_ad_state rows. `daily_spend` is
-    {ad_id: {iso_date: spend}} from its daily ad rows. `daily_budgets` are its active daily ad set
-    budgets, used by the prepaid estimate when fewer than 3 days of spend exist."""
+                  now_utc: datetime, daily_budgets: list[float] | None = None,
+                  account_spend: dict | None = None, campaign_ids: list | None = None,
+                  history_state: str = "ready") -> list[dict]:
+    """Alerts for one client. `ads` are its meta_ad_state rows, narrowed to `campaign_ids` when
+    that list is set. `daily_spend` is {ad_id: {iso_date: spend}} from its daily ad rows.
+    `history_state` is "ready", "late" (synced, but not through the last full day) or "unready":
+    spend alerts run only on "ready", and "late" gives one low-severity spend_data_late.
+    `account_spend` is {iso_date: spend} for the whole ad account, from Meta, and feeds the
+    prepaid estimate. `daily_budgets` are the active daily ad set budgets, used by that estimate
+    when fewer than 3 days of spend exist."""
+    if campaign_ids is not None:
+        ads = [a for a in ads if a.get("campaign_id") in set(campaign_ids)]
     cfg = merge_settings(DEFAULT_SETTINGS, settings or {})
     thresholds = cfg["alerts"]
     out: list[dict] = []
@@ -184,7 +238,14 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
             per_day[d] = per_day.get(d, 0.0) + float(v or 0)
     y_spend, prev_spend = per_day.get(y.isoformat(), 0.0), per_day.get(prev.isoformat(), 0.0)
     ratio = thresholds["spend_drop_ratio"]
-    if y_spend <= 0 and prev_spend > 0:
+    spend_ok = history_state == "ready"
+    if history_state == "late":
+        out.append(_alert(gid, "spend_data_late", "info", "Spend data is behind",
+                          f"Ad data hasn't synced through {y.isoformat()} yet, so spend alerts were skipped.",
+                          today))
+    if not spend_ok:
+        pass
+    elif y_spend <= 0 and prev_spend > 0:
         out.append(_alert(gid, "spend_stopped", "critical", "No spend yesterday",
                           f"Spend was 0 on {y.isoformat()} after {_tidy(prev_spend)} the day before.", y.isoformat()))
     elif 0 < y_spend < prev_spend * ratio:
@@ -194,7 +255,7 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
 
     quiet_from = prev
     quiet = []
-    for a in ads:
+    for a in (ads if spend_ok else []):
         if not _is_active(a.get("effective_status")):
             continue
         created = _day(a.get("created_time"))
@@ -210,13 +271,17 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
 
     # -- prepaid, an estimate from the agency's top-ups
     prepaid = (((cfg.get("clients") or {}).get(gid)) or {}).get("prepaid") or {}
-    topups = prepaid.get("topups") or []
-    if topups:
-        latest = max(t["date"] for t in topups if t.get("date"))[:10]
-        since = [v for d, v in per_day.items() if d >= latest]
-        spend_since = sum(since)
+    entered = prepaid.get("topups") or []
+    topups = usable_topups(entered)
+    if entered and not topups:
+        out.append(_alert(gid, "check_failed", "warning", "Prepaid top-ups can't be used",
+                          "None of the top-ups entered has a valid date and amount, so no prepaid "
+                          "estimate was made. Check the top-ups in setup.", today))
+    elif topups and prepaid.get("is_prepay_account") is not False and account_spend is not None:
+        latest = max(t["date"] for t in topups)[:10]
+        spend_since = sum(v for d, v in account_spend.items() if d >= latest)
         days_in_range = [y - timedelta(days=i) for i in range(3)]
-        last3 = [per_day.get(d.isoformat(), 0.0) for d in days_in_range] \
+        last3 = [float(account_spend.get(d.isoformat(), 0.0)) for d in days_in_range] \
             if all(d.isoformat() >= latest for d in days_in_range) else []
         est = prepaid_estimate(topups, spend_since, last3, daily_budgets or [])
         if est and est["days_left"] is not None and est["days_left"] <= thresholds["prepaid_days"]:
@@ -224,8 +289,8 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
             out.append(_alert(
                 gid, "prepaid_low", "critical" if est["left"] <= 0 else "warning",
                 f"Prepaid estimate: about {_tidy(n)} {'day' if n == 1 else 'days'} left",
-                f"This is an estimate, not a Meta balance. Latest top-up on {latest} minus spend since "
-                f"leaves about {_tidy(est['left'])}, at about {_tidy(est['per_day'])} a day.", today))
+                f"This is an estimate, not a Meta balance. Latest top-up on {latest} minus account spend "
+                f"since leaves about {_tidy(est['left'])}, at about {_tidy(est['per_day'])} a day.", today))
     return out
 
 
@@ -253,38 +318,100 @@ async def _group_inputs(db, user_id: str, gid: str, since: str) -> tuple[list[di
 
 async def _prefill_prepaid(db, agent: dict, gid: str, detected) -> None:
     """Remember Meta's is_prepay_account on the client, but only while the agency hasn't set
-    prepaid. A choice already made is never overwritten."""
+    prepaid. A choice already made is never overwritten. Readers must use the stored
+    `is_prepay_account` flag, not the presence of `prepaid`."""
     if detected is None:
         return
     value = {"is_prepay_account": bool(detected), "topups": []}
-    res = await db[AGENTS].update_one(
-        {"_id": agent["_id"], f"settings.clients.{gid}.prepaid": None},
-        {"$set": {f"settings.clients.{gid}.prepaid": value}})
+    try:
+        res = await db[AGENTS].update_one(
+            {"_id": agent["_id"], f"settings.clients.{gid}.prepaid": None},
+            {"$set": {f"settings.clients.{gid}.prepaid": value}})
+    except Exception as e:  # noqa: BLE001 - a prefill is never worth failing the alerts for
+        logger.warning("prepaid prefill failed for %s: %s", gid, e)
+        return
     if res.modified_count:
-        agent.setdefault("settings", {}).setdefault("clients", {}).setdefault(gid, {})["prepaid"] = value
+        clients = agent.setdefault("settings", {}).get("clients")
+        if not isinstance(clients, dict):
+            clients = agent["settings"]["clients"] = {}
+        clients.setdefault(gid, {})["prepaid"] = value
+
+
+def _day_of(v) -> date | None:
+    try:
+        return date.fromisoformat(str(v)[:10])
+    except ValueError:
+        return None
+
+
+async def _history_state(db, gid: str, last_full: date) -> str:
+    """"ready" when the client's ad history is usable and synced through the last full day. The
+    sync marker is the history doc's `newest_done`: Meta returns no row for a day with no spend,
+    so the newest ad row would make a stopped account look like a late sync."""
+    doc = await db[HISTORY].find_one({"_id": gid})
+    if not is_ready(doc):
+        return "unready"
+    newest = _day_of(doc.get("newest_done"))
+    return "ready" if newest is not None and newest >= last_full else "late"
+
+
+async def _group_inputs(db, user_id: str, gid: str, since: str) -> tuple[list[dict], dict, list[float]]:
+    ads = [a async for a in db[AD_STATE].find({"client_group_id": gid})]
+    spend: dict[str, dict[str, float]] = {}
+    async for row in db[AD_DAYS].find({"user_id": user_id, "client_group_id": gid}):
+        day = str(row.get("date_start") or "")[:10]
+        if not day or day < since:
+            continue
+        try:
+            v = float((row.get("insight_data") or {}).get("spend") or 0)
+        except (TypeError, ValueError):
+            continue
+        spend.setdefault(row["ad_id"], {})
+        spend[row["ad_id"]][day] = spend[row["ad_id"]].get(day, 0.0) + v
+    budgets = [s.get("daily_budget") or 0 async for s in db[ADSET_STATE].find(
+        {"client_group_id": gid, "effective_status": "ACTIVE", "campaign_status": "ACTIVE"})]
+    return ads, spend, [b for b in budgets if b]
+
+
+def _topups_of(settings: dict, gid: str) -> list[dict]:
+    prepaid = ((((settings.get("clients") or {}).get(gid)) or {}).get("prepaid")) or {}
+    return usable_topups(prepaid.get("topups"))
 
 
 async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: list[str]) -> list[dict]:
     """Alerts for the given clients. `token_for(user_id)` is an async callable returning the Meta
-    token. Each ad account is read once per call, however many clients share it. A failed read
-    becomes a `check_failed` alert for that client, never an exception."""
+    token. Each ad account's health, and its spend when a client on it has top-ups, is read once
+    per call however many clients share it. A failed read becomes a `check_failed` alert for that
+    client, never an exception."""
     user_id = agent["user_id"]
-    settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
-    window_days = settings["creative"]["data_window_days"]
-    health_cache: dict[str, dict | Exception] = {}
     out: list[dict] = []
-    token = None
-    token_error: Exception | None = None
+    today = now_utc.date().isoformat()
+    groups: dict[str, dict] = {}
+    for gid in client_ids:
+        groups[gid] = await db["client_groups"].find_one({"id": gid, "user_id": user_id}) or {}
+
+    token, token_error = None, None
     try:
         token = await token_for(user_id)
     except Exception as e:  # noqa: BLE001 - reported as an alert
         token_error = e
 
+    health_cache: dict[str, dict | Exception] = {}
+    spend_cache: dict[str, dict | Exception] = {}
+
+    # The earliest top-up per ad account, so its spend is read once for every client sharing it.
+    settings0 = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
+    since_by_account: dict[str, date] = {}
+    for gid, g in groups.items():
+        acct = g.get("meta_ad_account_id")
+        days = [d for d in (_day_of(t["date"]) for t in _topups_of(settings0, gid)) if d]
+        if acct and days:
+            since_by_account[acct] = min(days + [since_by_account.get(acct, min(days))])
+
     for gid in client_ids:
-        group = await db["client_groups"].find_one({"id": gid, "user_id": user_id}) or {}
+        group = groups[gid]
         name = group.get("name") or gid
         account = group.get("meta_ad_account_id")
-        today = now_utc.date().isoformat()
         if not account:
             out.append(_alert(gid, "check_failed", "warning", f"Couldn't check {name}",
                               "This client has no Meta ad account connected.", today))
@@ -305,10 +432,27 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
 
         await _prefill_prepaid(db, agent, gid, health.get("is_prepay_account"))
         cfg = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
-        topups = ((((cfg.get("clients") or {}).get(gid)) or {}).get("prepaid") or {}).get("topups") or []
+        window_days = cfg["creative"]["data_window_days"]
         end = last_full_day(now_utc, health.get("timezone_name"))
-        earliest = [end - timedelta(days=max(window_days, 3) + 1)]
-        earliest += [date.fromisoformat(t["date"][:10]) for t in topups if t.get("date")]
-        ads, spend, budgets = await _group_inputs(db, user_id, gid, min(earliest).isoformat())
-        out.extend(health_alerts(health, ads, spend, cfg, gid, now_utc, daily_budgets=budgets))
+
+        account_spend = None
+        if account in since_by_account and cfg["clients"].get(gid, {}).get("prepaid", {}).get("is_prepay_account") is not False:
+            if account not in spend_cache:
+                try:
+                    spend_cache[account] = await fetch_account_spend(account, token, since_by_account[account], end)
+                except Exception as e:  # noqa: BLE001 - reported as an alert
+                    logger.warning("account spend read failed for %s: %s", account, e)
+                    spend_cache[account] = e
+            got = spend_cache[account]
+            if isinstance(got, Exception):
+                out.append(_alert(gid, "check_failed", "warning", f"Couldn't check prepaid for {name}",
+                                  f"Account spend could not be read from Meta: {got}", today))
+            else:
+                account_spend = got
+
+        since = (end - timedelta(days=max(window_days, 3) + 1)).isoformat()
+        ads, spend, budgets = await _group_inputs(db, user_id, gid, since)
+        out.extend(health_alerts(
+            health, ads, spend, cfg, gid, now_utc, daily_budgets=budgets, account_spend=account_spend,
+            campaign_ids=group.get("meta_campaign_ids"), history_state=await _history_state(db, gid, end)))
     return out

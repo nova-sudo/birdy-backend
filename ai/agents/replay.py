@@ -88,7 +88,9 @@ def ads_on_day(ads: dict[str, AdState], ad_days: dict[str, list[AdDay]], d: date
     out: dict[str, AdState] = {}
     for ad_id, ad in ads.items():
         status = (ad.effective_status or "").upper()
-        if ad.paused_at is not None and ad.paused_at <= d:
+        if status == "ARCHIVED":
+            out[ad_id] = ad  # never revivable: don't turn it into PAUSED or ACTIVE
+        elif ad.paused_at is not None and ad.paused_at <= d:
             out[ad_id] = ad if status == "PAUSED" else replace(ad, effective_status="PAUSED")
         elif status == "PAUSED" and any(r.spend > 0 and r.day in (d, prev) for r in ad_days.get(ad_id, [])):
             out[ad_id] = replace(ad, effective_status="ACTIVE", paused_at=None)

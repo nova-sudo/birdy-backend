@@ -154,3 +154,58 @@ async def test_refresh_without_creative_stores_empty_fields(mock_db, mock_mongo_
     doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
     assert doc["issues"] == [] and doc["review_feedback"] == {}
     assert doc["creative"]["id"] is None and doc["creative"]["link"] is None
+
+
+def _too_much():
+    return {"error": {"code": 1, "message": "Please reduce the amount of data you're asking for, then retry your request"}}
+
+
+async def test_fetch_all_halves_limit_on_reduce_data_error(monkeypatch):
+    limits = []
+
+    async def fake_get(self, url, params=None, **kw):
+        limit = (params or {}).get("limit")
+        limits.append(limit)
+        req = httpx.Request("GET", str(url))
+        if limit and limit > 50:
+            return httpx.Response(500, json=_too_much(), request=req)
+        return httpx.Response(200, json={"data": [{"id": "a"}]}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        out = await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert out == [{"id": "a"}] and limits == [200, 100, 50]
+
+
+async def test_fetch_all_rewrites_limit_in_next_url(monkeypatch):
+    urls = []
+
+    async def fake_get(self, url, params=None, **kw):
+        urls.append(str(url))
+        req = httpx.Request("GET", str(url))
+        if "page2" in str(url) and "limit=200" in str(url):
+            return httpx.Response(400, json=_too_much(), request=req)
+        if "page2" in str(url):
+            return httpx.Response(200, json={"data": [{"id": "b"}]}, request=req)
+        return httpx.Response(200, json={"data": [{"id": "a"}], "paging": {
+            "next": "https://graph.facebook.com/v25.0/act_1/ads?page2=1&limit=200&after=x"}}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        out = await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert [o["id"] for o in out] == ["a", "b"]
+    assert "limit=100" in urls[-1] and "after=x" in urls[-1]
+
+
+async def test_fetch_all_gives_up_at_25(monkeypatch):
+    limits = []
+
+    async def fake_get(self, url, params=None, **kw):
+        limits.append((params or {}).get("limit"))
+        return httpx.Response(500, json=_too_much(), request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(RuntimeError):
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert limits == [200, 100, 50, 25]

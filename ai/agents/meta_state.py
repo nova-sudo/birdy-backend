@@ -8,6 +8,7 @@ object type per refresh.
 
 import json
 import logging
+import re
 from datetime import date, datetime
 
 import httpx
@@ -72,10 +73,22 @@ def _creative(c: dict | None) -> dict:
             "link": data.get("link") or cta.get("link")}
 
 
+_MIN_LIMIT = 25
+
+
+def _too_much_data(status: int, body: dict) -> bool:
+    err = (body or {}).get("error") or {}
+    return "reduce the amount of data" in str(err.get("message") or "").lower() \
+        and (err.get("code") == 1 or status >= 500)
+
+
 async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: str,
                      extra: dict | None = None) -> list[dict]:
+    """Every page of a Graph edge. When Graph says the page is too big, the same page is retried
+    with half the limit (down to 25) before the error is raised."""
     out: list[dict] = []
-    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": 200, "access_token": token, **(extra or {})}
+    limit = 200
+    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": limit, "access_token": token, **(extra or {})}
     while url:
         resp = await client.get(url, params=params)
         if resp.status_code == 401:
@@ -88,6 +101,13 @@ async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: s
             err = body.get("error") or {}
             if err.get("code") in (190, 102):  # expired/invalid token, session invalid
                 raise MetaTokenError(err.get("message") or "Meta token invalid")
+            if _too_much_data(resp.status_code, body) and limit > _MIN_LIMIT:
+                limit = max(_MIN_LIMIT, limit // 2)
+                if params is not None:
+                    params = {**params, "limit": limit}
+                else:  # a paging URL carries its own limit
+                    url = re.sub(r"([?&])limit=\d+", rf"\g<1>limit={limit}", url)
+                continue
             raise RuntimeError(f"Meta Graph error on {path}: {err.get('message') or resp.status_code}")
         out.extend(body.get("data") or [])
         url, params = (body.get("paging") or {}).get("next"), None
