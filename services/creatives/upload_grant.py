@@ -9,6 +9,7 @@ import hmac
 import json
 import logging
 import os
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -26,6 +27,8 @@ GRANT_TTL = timedelta(minutes=10)
 RETENTION = timedelta(days=30)
 BLOB_DELETE_URL = "https://blob.vercel-storage.com/delete"
 DELETE_BATCH = 100
+BLOB_API_VERSION = "13"
+BLOB_HOST_SUFFIX = ".blob.vercel-storage.com"
 
 
 def _b64(raw: bytes) -> str:
@@ -54,7 +57,7 @@ def issue_grant(user_id: str, mime: str, size: int, now: datetime) -> str:
         limit = MAX_VIDEO_BYTES
     else:
         raise ValueError(f"Unsupported media type: {mime}")
-    if not isinstance(size, int) or size <= 0:
+    if not isinstance(size, int) or isinstance(size, bool) or size <= 0:
         raise ValueError("File size must be positive")
     if size > limit:
         raise ValueError(f"File too large: {mime} is limited to {limit // MB} MB")
@@ -86,18 +89,34 @@ async def _delete_blobs(urls: list[str]) -> None:
         for i in range(0, len(urls), DELETE_BATCH):
             r = await client.post(
                 BLOB_DELETE_URL,
-                headers={"Authorization": f"Bearer {token}"},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "x-api-version": BLOB_API_VERSION,
+                    "content-type": "application/json",
+                },
                 json={"urls": urls[i:i + DELETE_BATCH]},
             )
             r.raise_for_status()
 
 
+def _is_blob_url(url) -> bool:
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    return host.endswith(BLOB_HOST_SUFFIX)
+
+
 def _blob_urls(media: dict) -> list[str]:
-    return [u for u in (media.get("blob_url"), media.get("thumbnail_url")) if u]
+    return [u for u in (media.get("blob_url"), media.get("thumbnail_url")) if u and _is_blob_url(u)]
 
 
 async def cleanup_archived_media(db, now_utc: datetime) -> int:
-    """Delete Blob objects of tests archived >= 30 days ago; returns tests cleaned."""
+    """Delete Blob objects of tests archived >= 30 days ago; returns tests cleaned.
+
+    Tests are processed in chunks of at most DELETE_BATCH urls and marked per successful chunk,
+    so one failing chunk never blocks the others (it is retried on the next daily tick).
+    """
     cutoff = _utc(now_utc) - RETENTION
     tests = await db[TESTS].find({
         "status": ARCHIVED,
@@ -105,17 +124,34 @@ async def cleanup_archived_media(db, now_utc: datetime) -> int:
         "creative.media.deleted_at": {"$exists": False},
         "creative.media": {"$exists": True, "$ne": None},
     }).to_list(None)
-    due = [t for t in tests if not ((t.get("creative") or {}).get("media") or {}).get("deleted_at")]
-    urls = [u for t in due for u in _blob_urls(t["creative"]["media"])]
-    try:
-        if urls:
-            await _delete_blobs(urls)  # one batched call set for every due test
-    except Exception as e:  # nothing marked: retried on the next daily tick
-        logger.warning("creative media cleanup failed: %s", e)
-        return 0
-    for test in due:
-        await db[TESTS].update_one(
-            {"id": test["id"], "user_id": test["user_id"]},
-            {"$set": {"creative.media.deleted_at": _utc(now_utc)}},
-        )
-    return len(due)
+
+    chunks, current, count = [], [], 0
+    for test in tests:
+        media = (test.get("creative") or {}).get("media") or {}
+        if media.get("deleted_at"):
+            continue
+        urls = _blob_urls(media)
+        if current and count + len(urls) > DELETE_BATCH:
+            chunks.append(current)
+            current, count = [], 0
+        current.append((test, urls))
+        count += len(urls)
+    if current:
+        chunks.append(current)
+
+    cleaned = 0
+    for chunk in chunks:
+        urls = [u for _, us in chunk for u in us]
+        try:
+            if urls:
+                await _delete_blobs(urls)
+        except Exception as e:
+            logger.warning("creative media cleanup failed: %s", e)
+            continue
+        for test, _ in chunk:
+            await db[TESTS].update_one(
+                {"id": test["id"], "user_id": test["user_id"]},
+                {"$set": {"creative.media.deleted_at": _utc(now_utc)}},
+            )
+            cleaned += 1
+    return cleaned

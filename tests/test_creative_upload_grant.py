@@ -103,3 +103,64 @@ async def test_cleanup_failure_leaves_deleted_at_unset(mock_db, monkeypatch):
                 {"blob_url": "https://x.public.blob.vercel-storage.com/a.mp4"})
     assert await ug.cleanup_archived_media(mock_db, NOW) == 0
     assert (await mock_db[TESTS].find_one({"id": "old"}))["creative"]["media"].get("deleted_at") is None
+
+
+async def test_delete_blobs_http_shape(monkeypatch):
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(200, json={})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ug.httpx, "AsyncClient",
+                        lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    urls = [f"https://x.public.blob.vercel-storage.com/{i}.png" for i in range(101)]
+    await ug._delete_blobs(urls)
+    assert len(seen) == 2
+    r = seen[0]
+    assert r.method == "POST" and str(r.url) == "https://blob.vercel-storage.com/delete"
+    assert r.headers["authorization"] == "Bearer tok"
+    assert r.headers["x-api-version"] == "13"
+    assert r.headers["content-type"] == "application/json"
+    assert json.loads(r.content) == {"urls": urls[:100]}
+    assert json.loads(seen[1].content) == {"urls": urls[100:]}
+
+
+async def test_cleanup_skips_non_blob_urls(mock_db, monkeypatch):
+    calls = []
+
+    async def fake_delete(urls):
+        calls.append(urls)
+
+    monkeypatch.setattr(ug, "_delete_blobs", fake_delete)
+    await _seed(mock_db, "cdn", "archived", NOW - timedelta(days=40),
+                {"thumbnail_url": "https://scontent.xx.fbcdn.net/t.jpg"})
+    assert await ug.cleanup_archived_media(mock_db, NOW) == 1
+    assert calls == []
+    assert (await mock_db[TESTS].find_one({"id": "cdn"}))["creative"]["media"]["deleted_at"]
+
+
+async def test_failing_chunk_does_not_block_next(mock_db, monkeypatch):
+    monkeypatch.setattr(ug, "DELETE_BATCH", 1)
+    calls = []
+
+    async def flaky(urls):
+        calls.append(urls)
+        if "bad" in urls[0]:
+            raise RuntimeError("boom")
+
+    monkeypatch.setattr(ug, "_delete_blobs", flaky)
+    for tid in ("bad", "good"):
+        await _seed(mock_db, tid, "archived", NOW - timedelta(days=40),
+                    {"blob_url": f"https://x.public.blob.vercel-storage.com/{tid}.png"})
+    assert await ug.cleanup_archived_media(mock_db, NOW) == 1
+    assert (await mock_db[TESTS].find_one({"id": "bad"}))["creative"]["media"].get("deleted_at") is None
+    assert (await mock_db[TESTS].find_one({"id": "good"}))["creative"]["media"]["deleted_at"]
+
+
+def test_bool_size_rejected():
+    with pytest.raises(ValueError):
+        ug.issue_grant("u1", "image/png", True, NOW)
