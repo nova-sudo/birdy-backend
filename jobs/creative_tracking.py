@@ -25,6 +25,7 @@ from services.creatives.store import (
     list_test_ads,
     update_test,
 )
+from services.creatives.posting import run_post_jobs
 from services.creatives.reconcile import reconcile_all
 from services.creatives.targets import owning_group, resolve_account_targets
 from services.creatives.verdict import (
@@ -272,7 +273,14 @@ async def run_creatives_tick(now_utc: datetime | None = None) -> dict:
     deadline = time.monotonic() + TICK_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        result = {"tracking": await track_due_tests(db, mongo_client, now_utc, deadline=deadline)}
+        result: dict = {}
+        # Posting first: a Post click should not wait behind a long tracking pass.
+        try:
+            result["posting"] = await run_post_jobs(db, mongo_client, now_utc)
+        except Exception as e:
+            logger.error(f"[creatives-post] tick failed: {e}", exc_info=True)
+            result["posting"] = {"error": str(e)[:300]}
+        result["tracking"] = await track_due_tests(db, mongo_client, now_utc, deadline=deadline)
         day = _naive_utc(now_utc).date().isoformat()
         # Claim the once-per-UTC-day reconcile; only the first tick of the day wins.
         claimed = await db[COUNTERS].find_one_and_update(

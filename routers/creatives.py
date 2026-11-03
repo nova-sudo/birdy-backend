@@ -23,7 +23,7 @@ from integrations.facebook_utils.meta_creative_reader import (
 )
 from jobs.creative_tracking import track_test
 from services.facebook_cache_shape import read_preset
-from services.creatives import reconcile, store
+from services.creatives import posting, reconcile, store
 from services.creatives.naming import meta_ad_name, slugify
 from services.creatives.targets import owning_group, prefill_targets
 
@@ -57,6 +57,33 @@ class PatchBody(BaseModel):
 
 class AdoptBody(BaseModel):
     ad_id: str
+
+
+class PostAccount(BaseModel):
+    ad_account_id: str
+    adset_id: str
+    page_id: str
+    client_group_id: Optional[str] = None
+    adset_name: Optional[str] = None
+    lead_form_id: Optional[str] = None
+    campaign_id: Optional[str] = None
+    targets_override: Optional[dict] = None
+
+
+class PostBody(BaseModel):
+    accounts: list[PostAccount]
+
+
+class GoLiveBody(BaseModel):
+    partial_ok: bool = False
+
+
+class RetryBody(BaseModel):
+    patch: Optional[dict] = None
+
+
+class PauseBody(BaseModel):
+    ad_account_ids: Optional[list[str]] = None
 
 
 def _json(value):
@@ -356,3 +383,78 @@ async def adopt_creative(
                 {"status": store.TESTING, "started_at": datetime.now(timezone.utc)},
             )
         return _json(ad)
+
+
+def _posting_error(e: posting.PostingError) -> HTTPException:
+    return HTTPException(e.status_code, e.message)
+
+
+async def _enqueue(test_id: str, body: PostBody, user: str, *, add_accounts: bool):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _owned(db, user, test_id)
+        try:
+            res = await posting.enqueue_post(
+                db, user, test_id, accounts=[a.model_dump(exclude_none=True) for a in body.accounts],
+                add_accounts=add_accounts)
+        except posting.PostingError as e:
+            raise _posting_error(e)
+        return _json(res)
+
+
+@router.post("/{test_id}/post")
+async def post_creative(test_id: str, body: PostBody, current_user: str = Depends(get_current_user)):
+    """The wizard's Post click: queue paused ad creation. A second click is a 409."""
+    return await _enqueue(test_id, body, current_user, add_accounts=False)
+
+
+@router.post("/{test_id}/accounts")
+async def add_creative_accounts(
+    test_id: str, body: PostBody, current_user: str = Depends(get_current_user)
+):
+    """Add accounts to a posted test; on a live test the new ads go live once created."""
+    return await _enqueue(test_id, body, current_user, add_accounts=True)
+
+
+@router.post("/{test_id}/go-live")
+async def go_live_creative(
+    test_id: str, body: GoLiveBody, current_user: str = Depends(get_current_user)
+):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _owned(db, current_user, test_id)
+        try:
+            res = await posting.go_live(db, mongo_client, current_user, test_id,
+                                        partial_ok=body.partial_ok)
+        except posting.PostingError as e:
+            raise _posting_error(e)
+        return _json(res)
+
+
+@router.post("/{test_id}/ads/{ad_row_id}/retry")
+async def retry_creative_ad(
+    test_id: str, ad_row_id: str, body: RetryBody, current_user: str = Depends(get_current_user)
+):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _owned(db, current_user, test_id)
+        try:
+            res = await posting.retry(db, current_user, test_id, ad_row_id, patch=body.patch)
+        except posting.PostingError as e:
+            raise _posting_error(e)
+        return _json(res)
+
+
+@router.post("/{test_id}/pause")
+async def pause_creative(
+    test_id: str, body: PauseBody, current_user: str = Depends(get_current_user)
+):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _owned(db, current_user, test_id)
+        try:
+            res = await posting.pause_ads(db, mongo_client, current_user, test_id,
+                                          body.ad_account_ids)
+        except posting.PostingError as e:
+            raise _posting_error(e)
+        return _json(res)
