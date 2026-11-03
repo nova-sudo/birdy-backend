@@ -14,6 +14,7 @@ from ai.agents.stock.writer import _fmt_money
 from ai.agents.store import CARDS
 
 STATUS_OPEN, STATUS_FLAGGED, STATUS_SUPERSEDED = "open", "flagged", "superseded"
+STATUS_CLOSING = "closing"  # stored, but older open cards aren't closed yet: can't be applied or shown
 STATE_PROPOSED, STATE_FLAGGED = "proposed", "flagged"
 CHANGE_DECISION = "propose"
 _EDITABLE = ("lines", "additional_changes", "thought_process", "next_steps")

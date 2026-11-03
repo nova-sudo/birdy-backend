@@ -21,10 +21,9 @@ stale after STALE_CLAIM and is retried, at most MAX_RUN_ATTEMPTS times a day; af
 that the day is recorded as last_run {status: "error", reason: "timed_out"}.
 
 Stock agents run on their own state machine (ai/agents/stock/runner.py) from
-run_due_stock_agents: the same due check, refresh queue and grace window, plus a history
-top-up request, because their checks read agent_ad_days, which syncs about every 5 hours.
-Once a run exists, every tick resumes it until it is done, and only then is last_run_at
-stamped. Each tick works up to the shared deadline and saves, so a run may span many ticks.
+run_due_stock_agents: the same due check, but the run starts on time with no agent-wide wait,
+because its first job is alerts. Waiting for spend data is per client, inside the run. Once a run
+exists, every tick resumes it until it is done, and only then is last_run_at stamped.
 
 agents-outcomes (daily 05:00 UTC): stores the 7-day outcome on applied agent actions
 (see ai/agents/outcomes.py).
@@ -35,12 +34,10 @@ import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
-from ai.agents import history as ad_history
 from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents.runner import run_agent
 from ai.agents.stock import runner as stock_runner
-from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.store import AGENTS, TYPE_STOCK
 from core.database import DB_NAME
 from dependencies import get_mongo_client
@@ -246,40 +243,22 @@ def _stock_last_run(run: dict, at: datetime) -> dict:
     summary = run.get("summary") or {}
     status = "skipped_token" if run.get("reconnect") else "partial" if summary.get("could_not_check") else "ok"
     return {"status": status, "at": at, "run_id": run["_id"], "kind": run.get("kind"),
-            "cards": summary.get("cards", 0), "stale": bool(run.get("stale"))}
-
-
-async def _hold_for_fresh_data(db, mongo_client, agent: dict, now_utc: datetime, sched_utc: datetime,
-                               out: dict) -> tuple[bool, bool]:
-    """Before a stock agent's run starts: (hold, too_old). Inside the grace window, stale clients
-    get a refresh queued and clients whose ad rows end before the last full day get a top-up
-    asked for, and the run waits. Past it the run goes ahead: stale, with late clients finished
-    with a reason. On-hold clients are never waited for."""
-    settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
-    groups = [g for g in await _groups(db, agent)
-              if not (settings["clients"].get(g["id"]) or {}).get("on_hold")]
-    oldest = _oldest_refresh(groups)
-    too_old = oldest is None or now_utc - oldest > MAX_DATA_AGE
-    if now_utc >= sched_utc + GRACE:
-        return False, too_old
-    asked = await ad_history.request_topups(db, await stock_runner.late_clients(db, groups, now_utc))
-    if too_old:
-        out["refreshed"] += await _enqueue_refreshes(db, mongo_client, groups, now_utc)
-    out["topups"] += len(asked)
-    return bool(too_old or asked), too_old
+            "cards": summary.get("cards", 0), "stale": bool(summary.get("stale"))}
 
 
 async def run_due_stock_agents(mongo_client, *, now_utc: datetime, deadline: float | None = None) -> dict:
-    """Start each active stock agent's run when it is due and resume unfinished ones. `deadline`
+    """Start each active stock agent's run on time and resume unfinished ones, the agent advanced
+    longest ago first, so one agency can't use the whole budget every tick. `deadline`
     (time.monotonic()): past it nothing new starts and the rest waits for the next tick."""
     now_utc = _aware_utc(now_utc)
     db = mongo_client[DB_NAME]
-    out = {"ran": 0, "skipped": 0, "refreshed": 0, "topups": 0, "errors": 0, "deferred": 0}
+    out = {"ran": 0, "skipped": 0, "errors": 0, "deferred": 0}
 
     def out_of_time() -> bool:
         return deadline is not None and time.monotonic() > deadline
 
-    for agent in await db[AGENTS].find({"status": "active", "type": TYPE_STOCK}).to_list(length=None):
+    agents = await db[AGENTS].find({"status": "active", "type": TYPE_STOCK}).sort("stock_advanced_at", 1).to_list(length=None)
+    for agent in agents:
         try:
             _schedule(agent)
         except ValueError as e:
@@ -288,27 +267,26 @@ async def run_due_stock_agents(mongo_client, *, now_utc: datetime, deadline: flo
             continue
         try:
             sched_utc, today = _scheduled_utc(agent, now_utc)
-            await stock_runner.end_overdue_runs(db, agent, today.isoformat())
-            run = await stock_runner.find_run(db, agent["_id"], today.isoformat())
-            too_old = False
-            if run is None or run["phase"] == stock_runner.DONE:
+            await stock_runner.end_overdue_runs(db, agent, now_utc)
+            run = await stock_runner.find_open_run(db, agent["_id"])
+            if run is None:
                 if not _is_due(agent, now_utc):
                     continue
-            if run is None:
-                hold, too_old = await _hold_for_fresh_data(db, mongo_client, agent, now_utc, sched_utc, out)
-                if hold:
-                    out["skipped"] += 1
-                    continue
+                run = await stock_runner.find_run(db, agent["_id"], today.isoformat())
             if out_of_time():
                 out["deferred"] += 1
                 continue
             if run is None:
-                run = await stock_runner.get_or_create_run(db, agent, now_utc, stale=too_old)
+                run = await stock_runner.get_or_create_run(db, agent, now_utc, scheduled_utc=sched_utc)
             if run["phase"] != stock_runner.DONE:
-                run = await stock_runner.advance_run(db, mongo_client, run, agent, deadline=deadline)
-                out["ran"] += 1
+                await db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"stock_advanced_at": datetime.utcnow()}})
+                run = await stock_runner.advance_run(db, mongo_client, run, agent, deadline=deadline, now_utc=now_utc)
+                # Still claimed means another tick holds it and this one did nothing.
+                out["ran" if run.get("claimed_at") is None else "skipped"] += 1
             if run["phase"] == stock_runner.DONE:
-                at = datetime.utcnow()
+                # A run finishing after local midnight belongs to the day it started, or the new
+                # day's run would read as already done.
+                at = now_utc.replace(tzinfo=None) if run["local_date"] == today.isoformat() else run["as_of"]
                 await db[AGENTS].update_one({"_id": agent["_id"]},
                                             {"$set": {"last_run": _stock_last_run(run, at), "last_run_at": at}})
         except Exception as e:  # the run records its own failures; a retry comes next tick

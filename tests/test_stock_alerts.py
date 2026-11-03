@@ -3,8 +3,10 @@ from datetime import date, datetime, timedelta, timezone
 import httpx
 import pytest
 
+from ai.agents.meta_state import MetaRateLimit, MetaTokenError
 from ai.agents.stock import alerts as alerts_mod
-from ai.agents.stock.alerts import fetch_account_health, health_alerts, prepaid_estimate, run_alerts
+from ai.agents.stock.alerts import (fetch_account_health, fetch_account_spend, health_alerts, prepaid_estimate,
+                                    run_alerts)
 from ai.agents.stock.settings import DEFAULT_SETTINGS
 from ai.agents.store import AD_DAYS, AGENTS
 
@@ -511,3 +513,35 @@ async def test_run_alerts_remembers_the_accounts_timezone(mock_db, graph):
     agent = await _seed(mock_db, gids=("g1",))
     await run_alerts(mock_db, agent, _token, NOW, ["g1"])
     assert (await mock_db["client_groups"].find_one({"id": "g1"}))["ad_account_timezone"] == "Europe/London"
+
+
+async def test_parts_split_health_from_spend(mock_db, graph):
+    prepaid = {"clients": {"g1": {"prepaid": {"is_prepay_account": True, "topups": []}}}}
+    agent = await _seed(mock_db, gids=("g1",), settings={**DEFAULT_SETTINGS, **prepaid})
+    health = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health", today="2026-11-04")
+    assert [a["code"] for a in health] == ["ad_rejected"] and health[0]["since"] == "2026-11-04"
+    reads = len(graph["calls"])
+    spend = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="spend")
+    assert [a["code"] for a in spend] == ["prepaid_no_topups"]
+    assert len(graph["calls"]) == reads  # no second account read
+
+
+async def test_listed_errors_are_raised_not_turned_into_alerts(mock_db, graph):
+    agent = await _seed(mock_db, gids=("g1",))
+
+    async def no_token(user_id):
+        raise MetaTokenError("expired")
+
+    with pytest.raises(MetaTokenError):
+        await run_alerts(mock_db, agent, no_token, NOW, ["g1"], reraise=(MetaTokenError,))
+
+
+async def test_rate_limit_codes_are_named(mock_db, graph, monkeypatch):
+    async def limited(self, url, params=None, **kw):
+        return httpx.Response(400, json={"error": {"code": 17, "message": "too many"}}, request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", limited)
+    with pytest.raises(MetaRateLimit):
+        await fetch_account_health("act_1", "tok")
+    with pytest.raises(MetaRateLimit):
+        await fetch_account_spend("act_1", "tok", date(2026, 11, 1), date(2026, 11, 2))

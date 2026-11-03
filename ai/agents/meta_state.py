@@ -33,6 +33,17 @@ class MetaTokenError(Exception):
     """The user's Meta token is missing, expired or rejected."""
 
 
+class MetaRateLimit(RuntimeError):
+    """Meta is throttling this app or account. Trying again later should work."""
+
+
+_RATE_LIMIT_CODES = {4, 17, 32, 613, 80000, 80003, 80004, 80014}
+
+
+def is_rate_limit(err: dict) -> bool:
+    return (err or {}).get("code") in _RATE_LIMIT_CODES
+
+
 def _is_active(status) -> bool:
     return str(status or "").strip().upper() == "ACTIVE"
 
@@ -108,6 +119,8 @@ async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: s
                 else:  # a paging URL carries its own limit
                     url = re.sub(r"([?&])limit=\d+", rf"\g<1>limit={limit}", url)
                 continue
+            if is_rate_limit(err):
+                raise MetaRateLimit(f"Meta rate limit on {path}: {err.get('message') or resp.status_code}")
             raise RuntimeError(f"Meta Graph error on {path}: {err.get('message') or resp.status_code}")
         out.extend(body.get("data") or [])
         url, params = (body.get("paging") or {}).get("next"), None
@@ -132,12 +145,23 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
     if not token:
         raise MetaTokenError("No valid Facebook token found")
 
+    ads, adsets = await read_meta_state(ad_account_id, token)
+    return await store_meta_state(db, user_id, client_group_id, ad_account_id, ads, adsets, today=today)
+
+
+async def read_meta_state(ad_account_id: str, token: str) -> tuple[list[dict], list[dict]]:
+    """The ad account's ads and ad sets from Graph. No stored state changes."""
     acct = ad_account_id if str(ad_account_id).startswith("act_") else f"act_{ad_account_id}"
     async with httpx.AsyncClient(timeout=30.0) as client:
         ads = await _fetch_all(client, f"{acct}/ads", _AD_FIELDS, token,
                                {"effective_status": json.dumps(_AD_STATUSES)})
         adsets = await _fetch_all(client, f"{acct}/adsets", _ADSET_FIELDS, token)
+    return ads, adsets
 
+
+async def store_meta_state(db, user_id: str, client_group_id: str, ad_account_id: str, ads: list[dict],
+                           adsets: list[dict], *, today: date) -> dict:
+    """Mirror one read of an account into one client group's rows."""
     now = datetime.utcnow()
     for ad in ads:
         key = {"client_group_id": client_group_id, "ad_id": ad["id"]}
