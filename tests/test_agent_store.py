@@ -26,11 +26,11 @@ async def test_create_agent_seeds_four_rules_with_defaults(mock_db):
     assert pause["mode"] == "ask"
 
 
-async def test_one_agent_per_user_per_type(mock_db):
-    await create_agent(mock_db, "u1")
+async def test_one_stock_agent_per_user(mock_db):
+    await create_agent(mock_db, "u1", type="stock_media_buying")
     with pytest.raises(AgentExists):
-        await create_agent(mock_db, "u1")
-    await create_agent(mock_db, "u2")
+        await create_agent(mock_db, "u1", type="stock_media_buying")
+    await create_agent(mock_db, "u2", type="stock_media_buying")
 
 
 async def test_get_agent_is_owner_scoped(mock_db):

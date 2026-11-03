@@ -56,6 +56,8 @@ def _agent_to_api(doc: dict) -> dict:
     return {
         "id": doc["_id"],
         "type": doc.get("type"),
+        "name": doc.get("name"),
+        "settings": doc.get("settings") or {},
         "status": doc.get("status"),
         "scope": doc.get("scope") or {},
         "permissions": doc.get("permissions") or {},
@@ -135,14 +137,26 @@ async def list_agents(current_user: str = Depends(get_current_user)):
         return [_agent_to_api(a) for a in await agent_store.list_agents(db, current_user)]
 
 
+class CreateAgentBody(BaseModel):
+    type: str = agent_store.TYPE_CUSTOM
+    name: str | None = None
+
+
 @router.post("")
-async def create_agent(current_user: str = Depends(get_current_user)):
+async def create_agent(body: CreateAgentBody, current_user: str = Depends(get_current_user)):
+    if body.type not in (agent_store.TYPE_CUSTOM, agent_store.TYPE_STOCK):
+        raise HTTPException(status_code=400, detail="Unknown agent type")
+    name = None
+    if body.type == agent_store.TYPE_CUSTOM:
+        name = (body.name or "").strip()
+        if not name or len(name) > 60:
+            raise HTTPException(status_code=400, detail="Name must be 1 to 60 characters")
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         try:
-            agent = await agent_store.create_agent(db, current_user)
+            agent = await agent_store.create_agent(db, current_user, type=body.type, name=name)
         except agent_store.AgentExists:
-            raise HTTPException(status_code=409, detail="You already have a media buying agent")
+            raise HTTPException(status_code=409, detail="You already have the Birdy Media Buying Agent")
         return _agent_to_api(agent)
 
 

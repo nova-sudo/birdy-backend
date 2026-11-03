@@ -257,13 +257,13 @@ async def test_purger_skips_agent_clients(mock_db):
             "facebook_cache": {"last_7d": {"ads": [{"ad_id": "x"}]}},
         })
     await mock_db.agents.insert_many([
-        {"_id": "a1", "user_id": USER, "type": "media_buying", "status": "active",
+        {"_id": "a1", "user_id": USER, "type": "custom", "status": "active",
          "scope": {"client_group_ids": ["cg1"]}},
         {"_id": "a2", "user_id": USER, "type": "other", "status": "dry_run",
          "scope": {"client_group_ids": ["cg2"]}},
         {"_id": "a3", "user_id": USER, "type": "third", "status": "draft",
          "scope": {"client_group_ids": ["cg3"]}},
-        {"_id": "a4", "user_id": "someone-else", "type": "media_buying", "status": "active",
+        {"_id": "a4", "user_id": "someone-else", "type": "custom", "status": "active",
          "scope": {"client_group_ids": ["cg4"]}},
     ])
     seen = []

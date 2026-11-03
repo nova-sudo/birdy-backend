@@ -4,7 +4,7 @@ ai/agents/store.py
 Mongo-backed persistence for BirdyHub agents (Phase 1: the Media Buying Agent).
 
 Collections:
-  agents               one per (user_id, type) — unique index
+  agents               many custom per user; one stock agent per user (partial unique index)
   agent_rules          the rules each agent runs (seeded from defaults)
   agent_rule_versions  snapshot of a rule before each params/override change
   agent_memory         notes the agent has learned or been taught
@@ -43,7 +43,14 @@ JOBS = "agent_jobs"
 AD_DAYS = "agent_ad_days"
 
 
-AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training"}
+TYPE_STOCK = "stock_media_buying"
+TYPE_CUSTOM = "custom"
+STOCK_NAME = "Birdy Media Buying Agent"
+MIGRATED_NAME = "Pause and revive rules"
+DEFAULT_CUSTOM_NAME = "Custom agent"
+
+AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training",
+                    "name", "settings"}
 
 
 class AgentExists(Exception):
@@ -62,10 +69,18 @@ def _new_id() -> str:
 # Agents
 # ---------------------------------------------------------------------------
 
-async def create_agent(db, user_id: str, *, type: str = "media_buying", tz: str = "Europe/London") -> dict:
-    # The unique (user_id, type) index enforces this in production; the explicit
-    # check keeps the error clean and works where the index isn't enforced.
-    if await db[AGENTS].find_one({"user_id": user_id, "type": type}):
+async def migrate_agent_types(db) -> None:
+    """The first agent type, "media_buying", became "custom" (a user can have many).
+    Rename them and give them a name. Safe to run on every start."""
+    await db[AGENTS].update_many(
+        {"type": "media_buying"}, {"$set": {"type": TYPE_CUSTOM, "name": MIGRATED_NAME}})
+
+
+async def create_agent(db, user_id: str, *, type: str = TYPE_CUSTOM, name: str | None = None,
+                       tz: str = "Europe/London") -> dict:
+    # Only the stock agent is one per user. The partial unique index enforces this in
+    # production; the explicit check keeps the error clean and works where the index isn't.
+    if type == TYPE_STOCK and await db[AGENTS].find_one({"user_id": user_id, "type": type}):
         raise AgentExists(f"user already has a '{type}' agent")
 
     now = _now()
@@ -73,6 +88,7 @@ async def create_agent(db, user_id: str, *, type: str = "media_buying", tz: str 
         "_id": _new_id(),
         "user_id": user_id,
         "type": type,
+        "name": STOCK_NAME if type == TYPE_STOCK else (name or DEFAULT_CUSTOM_NAME),
         "status": "draft",
         "scope": {"client_group_ids": [], "schedule": {"time": "07:00", "tz": tz}},
         "permissions": copy.deepcopy(DEFAULT_PERMISSIONS),
@@ -89,6 +105,9 @@ async def create_agent(db, user_id: str, *, type: str = "media_buying", tz: str 
         if "duplicate key" in str(e).lower():
             raise AgentExists(f"user already has a '{type}' agent") from e
         raise
+
+    if type == TYPE_STOCK:
+        return agent  # the stock agent runs on its own settings, not rules
 
     rules = [
         {
@@ -234,7 +253,14 @@ async def deactivate_memory(db, agent_id: str, memory_id: str) -> bool:
 
 async def create_agent_indexes(mongo_client):
     db = mongo_client[DB_NAME]
-    await db[AGENTS].create_index([("user_id", 1), ("type", 1)], unique=True)
+    await migrate_agent_types(db)
+    try:
+        await db[AGENTS].drop_index("user_id_1_type_1")  # was unique over every type
+    except Exception:
+        pass  # already gone (or never created)
+    await db[AGENTS].create_index(
+        [("user_id", 1), ("type", 1)], unique=True, name="user_stock_agent",
+        partialFilterExpression={"type": TYPE_STOCK})
     await db[RULES].create_index("agent_id")
     await db[MEMORY].create_index([("agent_id", 1), ("active", 1)])
     await db[PRACTICE].create_index("agent_id")

@@ -356,7 +356,7 @@ async def _guardrail_split(db, user_id: str, finding: Finding, targets: list[dic
     from ai.agents.defaults import DEFAULT_GUARDRAILS
     from ai.agents.guardrails import check_guardrails
 
-    agent = await db["agents"].find_one({"user_id": user_id, "type": "media_buying"}) or {}
+    agent = await db["agents"].find_one({"user_id": user_id, "type": "custom"}) or {}
     guard = {
         # Not an agent rule: no permission or last-live-ad check, just tags and the cap.
         "permissions": {"ads": True},

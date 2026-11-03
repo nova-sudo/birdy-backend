@@ -40,7 +40,7 @@ async def group(db, gid="g1", user=U, targets=None):
 
 
 def make_agent(api):
-    r = api.post("/api/agents")
+    r = api.post("/api/agents", json={"type": "custom", "name": "Rules"})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -51,8 +51,9 @@ def test_create_list_get(api):
     assert a["status"] == "draft" and a["permissions"]["budgets"] is False
     for k in ("last_run", "last_run_at", "scope", "guardrails", "client_caps", "training", "confidence"):
         assert k in a
-    assert api.post("/api/agents").status_code == 409
-    assert [x["id"] for x in api.get("/api/agents").json()] == [a["id"]]
+    assert api.post("/api/agents", json={"type": "custom", "name": "Second"}).status_code == 200
+    assert a["name"] == "Rules"
+    assert a["id"] in [x["id"] for x in api.get("/api/agents").json()]
     assert api.get(f"/api/agents/{a['id']}").json()["id"] == a["id"]
 
 

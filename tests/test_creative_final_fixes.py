@@ -629,7 +629,7 @@ async def test_auto_pause_blocked_by_protected_tag(mock_db, mock_mongo_client, m
 async def test_auto_pause_respects_per_client_pause_cap(mock_db, mock_mongo_client, monkeypatch):
     from ai.suggestions import store as sstore
     st = Status(monkeypatch)
-    await mock_db["agents"].insert_one({"_id": "ag1", "user_id": U, "type": "media_buying",
+    await mock_db["agents"].insert_one({"_id": "ag1", "user_id": U, "type": "custom",
                                         "guardrails": {"max_pauses_per_client_day": 1}})
     await mock_db[sstore.ACTIVITY].insert_one({
         "user_id": U, "client_group_id": "g0", "kind": sstore.KIND_ACTION_APPLIED,
