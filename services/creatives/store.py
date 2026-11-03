@@ -26,6 +26,8 @@ LOSER = "loser"
 INCONCLUSIVE = "inconclusive"
 ARCHIVED = "archived"
 FINAL_VERDICTS = (WINNER, LOSER, INCONCLUSIVE)
+# Posted and tracked: the statuses posting, tracking, alerts and findings treat as live.
+LIVE_STATUSES = (TESTING, *FINAL_VERDICTS)
 
 DEFAULT_TARGETS: dict[str, Any] = {
     "mode": "thresholds",
@@ -37,6 +39,11 @@ DEFAULT_TARGETS: dict[str, Any] = {
 }
 
 _PROTECTED_FIELDS = ("code", "user_id", "id", "_id")
+
+
+def creative_format(test: dict) -> str:
+    """The test's creative format; a missing format means an image everywhere."""
+    return ((test or {}).get("creative") or {}).get("format") or "image"
 
 
 def _now() -> datetime:
@@ -182,3 +189,4 @@ async def create_creative_indexes(mongo_client) -> None:
         [("user_id", 1), ("ad_id", 1), ("date", 1)], unique=True, name="user_ad_date_unique"
     )
     await db[POST_JOBS].create_index([("state", 1), ("lease_until", 1)], name="state_lease")
+    await db[POST_JOBS].create_index([("test_ad_id", 1)], name="test_ad_id")

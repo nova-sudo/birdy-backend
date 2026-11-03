@@ -31,13 +31,14 @@ from services.creatives.errors import explain
 from services.creatives.store import (
     ARCHIVED,
     DRAFT,
-    FINAL_VERDICTS,
+    LIVE_STATUSES,
     POST_JOBS,
     POSTING,
     TEST_ADS,
     TESTING,
     TESTS,
     add_test_ads,
+    creative_format,
     get_test,
     list_test_ads,
     update_test,
@@ -62,7 +63,7 @@ ACCOUNT_FIELDS = ("ad_account_id", "client_group_id", "adset_id", "adset_name", 
                   "lead_form_id", "targets_override", "campaign_id")
 PATCH_FIELDS = ("destination", "website_url", "lead_form_id", "page_id", "adset_id", "adset_name")
 CREATIVE_FIELDS = ("destination", "website_url", "lead_form_id", "page_id")
-LIVE_STATES = (TESTING, *FINAL_VERDICTS)
+LIVE_STATES = LIVE_STATUSES
 
 
 class PostingError(Exception):
@@ -117,7 +118,7 @@ async def enqueue_post(db, user_id: str, test_id: str, *, accounts: list[dict],
         "meta_ad_account_id", {"user_id": user_id, "meta_ad_account_id": {"$in": acts}}))
     if missing := [a for a in acts if a not in owned]:
         raise PostingError(f"Unknown ad account: {', '.join(missing)}")
-    if (test.get("creative") or {}).get("format", "image") != "image":
+    if creative_format(test) != "image":
         for act in acts:
             if media_plan(test, act)[0] == "unavailable":
                 raise PostingError(f"{VIDEO_NEEDS_UPLOAD} ({act})")
@@ -186,7 +187,7 @@ def media_plan(test: dict, act: str) -> tuple[str, str | None]:
     source = test.get("source")
     src_act = _norm_act(source.get("ad_account_id")) if isinstance(source, dict) else ""
     same_account = not src_act or src_act == _norm_act(act)
-    if creative.get("format", "image") == "image":
+    if creative_format(test) == "image":
         if media.get("image_hash") and same_account:
             return "reuse", media["image_hash"]
         if media.get("blob_url"):
@@ -207,7 +208,7 @@ def media_plan(test: dict, act: str) -> tuple[str, str | None]:
 def _media_ref(test: dict, ad: dict):
     creative = test.get("creative") or {}
     meta = ad.get("meta") or {}
-    if creative.get("format", "image") == "image":
+    if creative_format(test) == "image":
         return meta["image_hash"]
     media = _media(creative)
     ref = {"video_id": meta["video_id"]}
@@ -256,7 +257,7 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick
     creative = test.get("creative") or {}
     meta = ad.get("meta") or {}
     act = ad["ad_account_id"]
-    fmt = creative.get("format", "image")
+    fmt = creative_format(test)
     name = test["meta_ad_name"]
     step = "media"
     try:
@@ -549,8 +550,8 @@ async def pause_ads(db, mongo_client, user_id: str, test_id: str,
             continue
         if ad_ids is not None and ad_id not in ad_ids:
             continue
-        if ad.get("meta_status") == "PAUSED":
-            continue
+        # No skip on a cached PAUSED: the ad may have been set live in Meta since
+        # (tracking refreshes meta_status). Pausing a paused ad is a no-op in Meta.
         try:
             await set_object_status(user_id, ad_id, "ad", "PAUSED", mongo_client)
         except MetaStatusError as e:

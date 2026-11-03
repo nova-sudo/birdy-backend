@@ -327,7 +327,12 @@ async def refresh_creative(test_id: str, current_user: str = Depends(get_current
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         test = await _owned(db, current_user, test_id)
-        result = await track_test(db, mongo_client, test, today=datetime.now(timezone.utc).date())
+        if test.get("status") in (store.ARCHIVED, store.DRAFT):
+            raise HTTPException(409, "Only a posted, unarchived test can be refreshed")
+        try:
+            result = await track_test(db, mongo_client, test, today=datetime.now(timezone.utc).date())
+        except MetaReadError as e:
+            raise _meta_error(e)
         return _json(result)
 
 

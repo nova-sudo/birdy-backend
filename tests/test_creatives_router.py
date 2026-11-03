@@ -157,8 +157,10 @@ def test_static_paths_not_captured_and_prefill(api, mock_db):
     assert api.get("/api/creatives/adoptable").json() == []
 
 
-def test_refresh_calls_track_test(api, monkeypatch):
+def test_refresh_calls_track_test(api, mock_db, monkeypatch):
+    import asyncio
     t = make(api)
+    asyncio.run(mock_db[store.TESTS].update_one({"id": t["id"]}, {"$set": {"status": "testing"}}))
     seen = {}
 
     async def fake_track(db, mongo_client, test, *, today):

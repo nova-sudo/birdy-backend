@@ -10,11 +10,11 @@ import logging
 from datetime import datetime, timezone
 
 from core.constants import OPERATOR_LABELS
-from services.creatives.store import ARCHIVED, FINAL_VERDICTS, POSTING, TEST_ADS, TESTING, TESTS
+from services.creatives.store import ARCHIVED, LIVE_STATUSES, POSTING, TEST_ADS, TESTS
 
 logger = logging.getLogger(__name__)
 
-LIVE_TEST_STATUSES = (TESTING, *FINAL_VERDICTS)
+LIVE_TEST_STATUSES = LIVE_STATUSES
 SCORE_LABELS = {"cpl": "CPL", "ctr": "CTR", "hook_rate": "Hook rate"}
 SCORE_METRICS = {"creative_cpl": "cpl", "creative_ctr": "ctr", "creative_hook_rate": "hook_rate"}
 NOT_AVAILABLE = "Not available for creative tests"

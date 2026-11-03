@@ -36,6 +36,7 @@ from ai.suggestions.contracts import (
     Finding,
     Stat,
 )
+from services.creatives.store import LIVE_STATUSES
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ RULE_ACCOUNT_FAIL = "creative_account_fail"
 RULE_POST_FAILED = "creative_post_failed"
 RULE_ADOPT = "creative_adopt"
 
-_LIVE = ("testing", "winner", "loser", "inconclusive")
+_LIVE = LIVE_STATUSES
 
 
 # ── helpers ──────────────────────────────────────────────────────────────────

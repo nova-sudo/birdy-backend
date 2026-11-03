@@ -6,6 +6,8 @@ import logging
 import time
 from datetime import date, datetime, timedelta, timezone
 
+from pymongo import ReturnDocument
+
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
@@ -19,11 +21,12 @@ from services.creatives.store import (
     AD_DAYS,
     COUNTERS,
     FINAL_VERDICTS,
+    LIVE_STATUSES,
     TEST_ADS,
     TESTS,
     TESTING,
+    creative_format,
     list_test_ads,
-    update_test,
 )
 from services.creatives.posting import run_post_jobs
 from services.creatives.reconcile import reconcile_all
@@ -122,12 +125,18 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     # 1. removed-in-Meta check, then fetch days for the rest
     still_live = []
     for ad in live:
-        if await fetch_ad_status(ad["meta"]["ad_id"], token) is None:
+        status = await fetch_ad_status(ad["meta"]["ad_id"], token)
+        if status is None:
             await db[TEST_ADS].update_one(
                 {"id": ad["id"], "user_id": user_id},
                 {"$set": {"post_state": "removed", "score": {"state": "removed"}}},
             )
         else:
+            # Meta's effective_status as read now (ACTIVE, PAUSED, ADSET_PAUSED, ...): a
+            # pause or a re-enable done in Ads Manager is what pause and findings see next.
+            ad["meta_status"] = status
+            await db[TEST_ADS].update_one(
+                {"id": ad["id"], "user_id": user_id}, {"$set": {"meta_status": status}})
             still_live.append(ad)
 
     days_by_ad: dict[str, list[dict]] = {}
@@ -150,7 +159,7 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
             account_rows[acct] = await fetch_account_daily(acct, token, start_day, until)
 
     # 3. score
-    fmt = (test.get("creative") or {}).get("format", "video")
+    fmt = creative_format(test)
     now = _naive_utc(datetime.now(timezone.utc))
     scored_ads = []
     for ad in still_live:
@@ -205,9 +214,25 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
             changed.append({"kind": "verdict"})
     elif test.get("status") in FINAL_VERDICTS:
         fields.update(verdict=None, status=TESTING)
-    fresh = await update_test(db, user_id, test["id"], fields)
-    await _sync_suggestions(db, mongo_client, fresh or {**test, **fields})
+    fresh = await _write_live(db, user_id, test["id"], fields)
+    if fresh is None:  # archived (or reset) since it was loaded: leave it alone
+        return {"test_id": test["id"], "verdict": None, "changed": [], "skipped": "not_live"}
+    await _sync_suggestions(db, mongo_client, fresh)
     return {"test_id": test["id"], "verdict": verdict, "changed": changed}
+
+
+async def _write_live(db, user_id: str, test_id: str, fields: dict) -> dict | None:
+    """Write tracking results only while the test is still live: the status filter is
+    part of the update, so an archive between load and write is never undone."""
+    row = await db[TESTS].find_one_and_update(
+        {"id": test_id, "user_id": user_id, "status": {"$in": list(LIVE_STATUSES)}},
+        {"$set": {**fields, "updated_at": datetime.now(timezone.utc)}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if row is not None and row.get("_id") != row.get("id"):
+        row = dict(row)
+        row.pop("_id", None)
+    return row
 
 
 async def _sync_suggestions(db, mongo_client, test: dict) -> None:
