@@ -17,16 +17,13 @@ from dependencies import get_current_user, get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
 from integrations.facebook_utils.meta_creative_reader import (
     MetaReadError,
-    adset_compatible,
     list_adsets,
     list_lead_forms,
     list_promote_pages,
 )
 from jobs.creative_tracking import track_test
-from services.facebook_cache_shape import read_preset
-from services.creatives import posting, reconcile, store, upload_grant
-from services.creatives.naming import meta_ad_name, slugify
-from services.creatives.targets import owning_group, prefill_targets
+from services.creatives import posting, reads, reconcile, store, upload_grant
+from services.creatives.targets import prefill_targets
 
 logger = logging.getLogger(__name__)
 
@@ -164,43 +161,32 @@ async def targets_prefill(
         return _json(await prefill_targets(mongo_client[DB_NAME], current_user, ids))
 
 
+def _http(e: reads.ReadError) -> HTTPException:
+    return HTTPException(e.status_code, e.detail)
+
+
 async def _account_groups(db, user_id: str, act: str) -> list[dict]:
-    groups = await db["client_groups"].find(
-        {"user_id": user_id, "meta_ad_account_id": act}, {"_id": 0}
-    ).to_list(length=None)
-    if not groups:
-        raise HTTPException(404, "Ad account not found")
-    return groups
+    try:
+        return await reads.account_groups(db, user_id, act)
+    except reads.ReadError as e:
+        raise _http(e)
 
 
 async def _meta_token(mongo_client, user_id: str) -> str:
-    fb = await get_facebook_token(user_id, mongo_client)
-    token = (fb or {}).get("access_token")
-    if not token:
-        raise HTTPException(400, "Meta is not connected")
-    return token
+    try:
+        return await reads.meta_token(mongo_client, user_id, get_facebook_token)
+    except reads.ReadError as e:
+        raise _http(e)
 
 
 def _meta_error(e: MetaReadError) -> HTTPException:
-    return HTTPException(502, {"message": str(e), "code": e.code})
+    return _http(reads.meta_error(e))
 
 
 @router.get("/ad-accounts")
 async def ad_accounts(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
-        groups = await mongo_client[DB_NAME]["client_groups"].find(
-            {"user_id": current_user, "meta_ad_account_id": {"$nin": [None, ""]}},
-            {"_id": 0, "id": 1, "name": 1, "meta_ad_account_id": 1, "ad_account_currency": 1},
-        ).to_list(length=None)
-    rows: dict[str, dict] = {}
-    for g in groups:
-        row = rows.setdefault(g["meta_ad_account_id"], {
-            "ad_account_id": g["meta_ad_account_id"], "name": None, "currency": None, "clients": []})
-        row["clients"].append({"id": g["id"], "name": g.get("name")})
-        row["currency"] = row["currency"] or g.get("ad_account_currency")
-    for row in rows.values():
-        row["name"] = ", ".join(c["name"] for c in row["clients"] if c["name"]) or row["ad_account_id"]
-    return list(rows.values())
+        return await reads.ad_accounts(mongo_client[DB_NAME], current_user)
 
 
 @router.get("/ad-accounts/{act}/adsets")
@@ -210,18 +196,12 @@ async def account_adsets(
     current_user: str = Depends(get_current_user),
 ):
     async with get_mongo_client() as mongo_client:
-        groups = await _account_groups(mongo_client[DB_NAME], current_user, act)
-        token = await _meta_token(mongo_client, current_user)
-    try:
-        adsets = await list_adsets(act, token)
-    except MetaReadError as e:
-        raise _meta_error(e)
-    out = []
-    for a in adsets:
-        ok, reason = adset_compatible(a, destination)
-        owner = owning_group(groups, (a.get("campaign") or {}).get("id"))
-        out.append({**a, "compatible": ok, "reason": reason, "owning_client_group_id": owner.get("id")})
-    return out
+        try:  # list_adsets is read here so tests can swap it on this module
+            return await reads.account_adsets(
+                mongo_client[DB_NAME], mongo_client, current_user, act, destination,
+                get_token=get_facebook_token, fetch_adsets=list_adsets)
+        except reads.ReadError as e:
+            raise _http(e)
 
 
 @router.get("/ad-accounts/{act}/pages")
@@ -260,25 +240,6 @@ async def page_lead_forms(page_id: str, current_user: str = Depends(get_current_
         raise _meta_error(e)
 
 
-def _num(v) -> float:
-    try:
-        return float(v or 0)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def _rank(name: str, q: str):
-    """0 exact code, 1 name prefix, 2 substring, None no match (everything is 3 without q)."""
-    if not q:
-        return 3
-    n = (name or "").lower()
-    if n.split(" | ", 1)[0].strip() == q:
-        return 0
-    if n.startswith(q):
-        return 1
-    return 2 if q in n else None
-
-
 @router.get("/ads/search")
 async def search_ads(
     q: str = "",
@@ -286,36 +247,11 @@ async def search_ads(
     limit: int = Query(30, ge=1, le=100),
     current_user: str = Depends(get_current_user),
 ):
-    query: dict = {"user_id": current_user, "meta_ad_account_id": {"$nin": [None, ""]}}
-    if ad_account_id:
-        query["meta_ad_account_id"] = ad_account_id
     async with get_mongo_client() as mongo_client:
-        groups = await mongo_client[DB_NAME]["client_groups"].find(query, {"_id": 0}).to_list(length=None)
-    if ad_account_id and not groups:
-        raise HTTPException(404, "Ad account not found")
-    needle = q.strip().lower()
-    seen: set[str] = set()
-    hits = []
-    for g in groups:
-        for ad in read_preset(g.get("facebook_cache") or {}, "last_30d").get("ads") or []:
-            ad_id = str(ad.get("id"))
-            tier = _rank(ad.get("name"), needle)
-            if tier is None or ad_id in seen:
-                continue
-            seen.add(ad_id)
-            spend = _num(ad.get("spend"))
-            leads = _num(ad.get("total_leads") or ad.get("results"))
-            hits.append((tier, -spend, {
-                "ad_id": ad_id, "name": ad.get("name"), "ad_account_id": g["meta_ad_account_id"],
-                "currency": g.get("ad_account_currency"),
-                "client_name": g.get("name"), "status": ad.get("status"),
-                "thumbnail": ad.get("creative_thumbnail"), "image": ad.get("creative_image"),
-                "video_id": ad.get("creative_video_id"), "title": ad.get("creative_title"),
-                "body": ad.get("creative_body"),
-                "metrics": {"spend": spend, "leads": leads, "cpl": spend / leads if leads else None},
-            }))
-    hits.sort(key=lambda h: (h[0], h[1]))
-    return [h[2] for h in hits[:limit]]
+        try:
+            return await reads.search_ads(mongo_client[DB_NAME], current_user, q, ad_account_id, limit)
+        except reads.ReadError as e:
+            raise _http(e)
 
 
 @router.post("")
@@ -355,19 +291,10 @@ async def patch_creative(
         db = mongo_client[DB_NAME]
         test = await _owned(db, current_user, test_id)
         fields = body.model_dump(exclude_unset=True, exclude_none=True)
-        if "targets" in fields:
-            fields["targets"] = {**(test.get("targets") or {}), **fields["targets"]}
-        if "creative" in fields and test.get("status") != store.DRAFT:
-            raise HTTPException(409, "The creative can only be changed while the test is a draft")
-        for locked in ("source", "origin"):
-            if locked in fields and test.get("status") != store.DRAFT:
-                raise HTTPException(409, f"{locked.capitalize()} can only be changed while the test is a draft")
-        if "slug" in fields:
-            if test.get("status") != store.DRAFT:
-                raise HTTPException(409, "Slug can only be changed while the test is a draft")
-            slug = slugify(fields["slug"]) or "untitled"
-            fields["slug"] = slug
-            fields["meta_ad_name"] = meta_ad_name(test["code"], slug)
+        try:
+            fields = reads.prepare_patch(test, fields)
+        except reads.ReadError as e:
+            raise _http(e)
         updated = await store.update_test(db, current_user, test_id, fields)
         return _json(updated)
 
@@ -432,8 +359,8 @@ async def _enqueue(test_id: str, body: PostBody, user: str, *, add_accounts: boo
         db = mongo_client[DB_NAME]
         await _owned(db, user, test_id)
         try:
-            res = await posting.enqueue_post(
-                db, user, test_id, accounts=[a.model_dump(exclude_none=True) for a in body.accounts],
+            res = await reads.enqueue_accounts(
+                db, user, test_id, [a.model_dump(exclude_none=True) for a in body.accounts],
                 add_accounts=add_accounts)
         except posting.PostingError as e:
             raise _posting_error(e)

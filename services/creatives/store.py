@@ -103,6 +103,10 @@ async def get_test(db, user_id: str, test_id: str) -> dict | None:
     return _clean(await db[TESTS].find_one({"id": test_id, "user_id": user_id}))
 
 
+async def get_test_by_code(db, user_id: str, code: str) -> dict | None:
+    return _clean(await db[TESTS].find_one({"code": code.strip().upper(), "user_id": user_id}))
+
+
 async def list_tests(
     db,
     user_id: str,
