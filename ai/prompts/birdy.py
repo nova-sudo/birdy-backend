@@ -1,5 +1,6 @@
 from datetime import date
 
+from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.prompts.rich_output import with_rich_output
 
 
@@ -332,4 +333,4 @@ When you need structured input from the user (not just a yes/no), embed a `:::ui
 
 **IMPORTANT:** The :::ui block MUST contain valid JSON. Use double quotes for keys and string values. Always include at least an id, type, and label for each field.
 """
-    return with_rich_output(prompt)
+    return with_rich_output(prompt + CREATIVE_TESTS_GUIDE)

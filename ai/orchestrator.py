@@ -11,7 +11,7 @@ from ai.prompts.media_buying import get_media_buying_module
 from ai.prompts import agent_training as agent_training_prompt
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
-from ai.tools.creative_tools import CREATIVE_READ_TOOLS
+from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
 from ai.tools.attribution_tools import TOOL_NAME as CLOSES_BY_AD_TOOL
@@ -156,6 +156,7 @@ for _page in ("dashboard", "campaigns", "leads", "opportunities", "client_detail
 # The write tools join `campaigns` (see CREATIVE_WRITE_TOOLS); the general chat gets all.
 for _page in ("dashboard", "campaigns"):
     _PAGE_TOOLS[_page].extend(CREATIVE_READ_TOOLS)
+_PAGE_TOOLS["campaigns"].extend(CREATIVE_WRITE_TOOLS)
 
 # Output budget per page. The default suits answers; the report copilot writes
 # whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
@@ -847,6 +848,8 @@ async def run_chat(
                     elif tc.name in PAGE_VIEW_TOOL_NAMES:
                         call_args = {**args, "view_catalogues": view_catalogues,
                                      "page_view_ops_sink": page_view_ops}
+                    elif tc.name in CREATIVE_SESSION_TOOLS:
+                        call_args = {**args, "session_id": session_id}
                     elif tc.name == RENDER_UI_TOOL_NAME:
                         call_args = {**args, "ui_blocks_sink": ui_blocks}
                     result = await tool_registry.execute(
