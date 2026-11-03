@@ -24,7 +24,7 @@ from jobs.cache_jobs import populate_cache_for_existing_groups
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives
+from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock
 from billing import router as billing_router
 from credits import router as credits_router
 
@@ -153,6 +153,7 @@ app.include_router(report_designer.router)
 app.include_router(slack_reports.router)
 app.include_router(dashboards.router)
 app.include_router(agents.router)
+app.include_router(agent_stock.router)
 app.include_router(creatives.router)
 app.include_router(client_notes.router)
 app.include_router(attribution.router)

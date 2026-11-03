@@ -23,6 +23,7 @@ from datetime import datetime
 
 from core.database import DB_NAME
 from ai.agents import claims
+from ai.agents.stock.settings import DEFAULT_SETTINGS
 from ai.suggestions.store import SUGGESTIONS
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
@@ -95,6 +96,7 @@ async def create_agent(db, user_id: str, *, type: str = TYPE_CUSTOM, name: str |
         "permissions": copy.deepcopy(DEFAULT_PERMISSIONS),
         "guardrails": copy.deepcopy(DEFAULT_GUARDRAILS),
         "client_caps": {},
+        **({"settings": copy.deepcopy(DEFAULT_SETTINGS)} if type == TYPE_STOCK else {}),
         "training": {"topics": {"targets": False, "pause": False, "revive": False, "flags": False}},
         "confidence": {"score": 0, "parts": {}, "at_activation": None},
         "last_run_at": None,

@@ -30,6 +30,7 @@ from ai.agents import outcomes
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents import validation
+from ai.agents.stock import settings as stock_settings
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
     DEFAULT_PARAMS,
@@ -684,6 +685,13 @@ async def activate(agent_id: str, body: Optional[ActivateBody] = None,
         agent = await _agent_or_404(db, current_user, agent_id)
         if agent.get("status") == "active":
             return _agent_to_api(agent)  # idempotent: nothing changes
+        if agent.get("type") == agent_store.TYPE_STOCK:
+            ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
+            groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": current_user}).to_list(length=None)
+            errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
+            if errors:
+                return JSONResponse(status_code=400, content={
+                    "detail": "Fix these settings before switching on", "errors": errors})
         conf = await _confidence(db, agent)
         if not conf["ready"]:
             return JSONResponse(status_code=409, content={
