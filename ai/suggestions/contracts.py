@@ -34,6 +34,10 @@ WINDOWS = (WINDOW_WEEKLY, WINDOW_MONTHLY)
 # each of these; add a new type here + an executor there to grow the surface.
 ACTION_PAUSE_ADS = "pause_ads"
 ACTION_ENABLE_ADS = "enable_ads"
+# Creative tests (ai/suggestions/creative_findings.py).
+ACTION_SCALE_CREATIVE = "scale_creative"
+ACTION_RETRY_CREATIVE_POST = "retry_creative_post"
+ACTION_ADOPT_CREATIVE_AD = "adopt_creative_ad"
 
 
 @dataclass

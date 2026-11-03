@@ -74,10 +74,16 @@ async def reconcile_all(db) -> dict:
     per_user: dict[str, int] = {}
     for uid in user_ids:
         try:
-            n = len(await find_adoptable(db, uid))
+            items = await find_adoptable(db, uid)
         except Exception as e:
             logger.error(f"[creatives-reconcile] {uid} failed: {e}", exc_info=True)
             continue
+        n = len(items)
+        try:
+            from ai.suggestions.creative_findings import sync_adopt_suggestions
+            await sync_adopt_suggestions(db, uid, items)
+        except Exception as e:
+            logger.error(f"[creatives-reconcile] adopt suggestions for {uid} failed: {e}", exc_info=True)
         if n:
             per_user[uid] = n
     return {"users": len(user_ids), "adoptable": sum(per_user.values()), "by_user": per_user}

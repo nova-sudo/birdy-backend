@@ -347,6 +347,21 @@ async def _fail(db, job: dict, ad: dict, err: dict, now: datetime) -> None:
     await db[TEST_ADS].update_one(
         {"id": ad["id"], "user_id": ad["user_id"]},
         {"$set": {"post_state": "failed", "post_error": err, "updated_at": now}})
+    await _sync_suggestions(db, ad["user_id"], job["test_id"])
+
+
+async def _sync_suggestions(db, user_id: str, test_id: str) -> None:
+    """Refresh the test's suggestions from its rows (a failed row is the
+    creative_post_failed finding); never fails the posting pipeline."""
+    try:
+        from ai.suggestions import creative_findings
+
+        test = await get_test(db, user_id, test_id)
+        if test is not None:
+            ads = await list_test_ads(db, test_id, user_id=user_id)
+            await creative_findings.sync_creative_suggestions(db, user_id, test, ads)
+    except Exception as e:
+        logger.error(f"[creatives-post] suggestions for {test_id} failed: {e}", exc_info=True)
 
 
 async def _after_created(db, mongo_client, test: dict, ad: dict, now: datetime) -> dict | None:
@@ -559,4 +574,5 @@ async def retry(db, user_id: str, test_id: str, test_ad_id: str, *, patch: dict 
                                          {"$set": reset, "$unset": {"last_error": ""}})
     if res.matched_count == 0:
         await db[POST_JOBS].insert_one(_new_job(user_id, test_id, test_ad_id, now))
+    await _sync_suggestions(db, user_id, test_id)  # the failure is no longer open
     return {"test_id": test_id, "test_ad_id": test_ad_id, "queued": True}

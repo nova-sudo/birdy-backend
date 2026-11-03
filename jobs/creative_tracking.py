@@ -205,8 +205,21 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
             changed.append({"kind": "verdict"})
     elif test.get("status") in FINAL_VERDICTS:
         fields.update(verdict=None, status=TESTING)
-    await update_test(db, user_id, test["id"], fields)
+    fresh = await update_test(db, user_id, test["id"], fields)
+    await _sync_suggestions(db, mongo_client, fresh or {**test, **fields})
     return {"test_id": test["id"], "verdict": verdict, "changed": changed}
+
+
+async def _sync_suggestions(db, mongo_client, test: dict) -> None:
+    """Refresh the test's suggestions; a failure here never fails tracking."""
+    try:
+        from ai.suggestions import creative_findings
+
+        ads = await list_test_ads(db, test["id"], user_id=test["user_id"])
+        await creative_findings.sync_creative_suggestions(
+            db, test["user_id"], test, ads, mongo_client=mongo_client)
+    except Exception as e:
+        logger.error(f"[creatives-track] suggestions for {test.get('id')} failed: {e}", exc_info=True)
 
 
 RETRY_AFTER = timedelta(minutes=20)
