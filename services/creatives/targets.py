@@ -9,9 +9,13 @@ from services.client_targets import defaults_for
 
 
 async def prefill_targets(db, user_id: str, client_group_ids: list[str]) -> dict:
+    """The test-level CPL is in the user's currency; `per_account` stays in each
+    group's ad-account currency (that is how client targets are entered)."""
+    from services.creatives.verdict import fx_rate, user_currency
+
     groups = await db["client_groups"].find(
         {"user_id": user_id, "id": {"$in": list(client_group_ids)}},
-        {"id": 1, "targets": 1, "_id": 0},
+        {"id": 1, "targets": 1, "ad_account_currency": 1, "_id": 0},
     ).to_list(length=None)
     by_id = {g["id"]: g for g in groups}
 
@@ -21,8 +25,22 @@ async def prefill_targets(db, user_id: str, client_group_ids: list[str]) -> dict
         if cpl is not None:
             per_account[gid] = {"cpl": cpl}
 
+    value = None
     if per_account:
-        value = Counter(v["cpl"] for v in per_account.values()).most_common(1)[0][0]
+        # Only look the user's currency up when a group has a currency to convert from.
+        has_cur = any((by_id.get(gid) or {}).get("ad_account_currency") for gid in per_account)
+        user_cur = await user_currency(user_id) if has_cur else None
+        converted = []
+        for gid, v in per_account.items():
+            rate = fx_rate((by_id.get(gid) or {}).get("ad_account_currency"), user_cur)
+            try:
+                if rate is not None:
+                    converted.append(round(float(v["cpl"]) * rate, 2))
+            except (TypeError, ValueError):
+                continue
+        if converted:
+            value = Counter(converted).most_common(1)[0][0]
+    if value is not None:
         source = "client"
     else:
         value = (await defaults_for(user_id, db)).get("cpl")

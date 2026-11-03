@@ -130,15 +130,35 @@ def test_verdict(scores: list[dict], win_share: float) -> str:
 test_verdict.__test__ = False  # not a pytest test when imported into test modules
 
 
+async def user_currency(user_id: str) -> str:
+    """The user's currency (targets and test totals are in it); GBP when unknown."""
+    from utils.currency_exchange import CurrencyService
+
+    try:
+        return await CurrencyService.get_user_currency(user_id) or "GBP"
+    except (ValueError, RuntimeError) as e:
+        logger.warning(f"creatives: user currency lookup failed for {user_id}: {e}")
+        return "GBP"
+
+
+def fx_rate(from_cur: str | None, to_cur: str) -> float | None:
+    """from_cur -> to_cur rate (1.0 when equal or unknown source); None when no rate exists."""
+    from utils.currency_exchange import CurrencyService
+
+    if not from_cur or from_cur == to_cur:
+        return 1.0
+    try:
+        return float(CurrencyService.get_rate(from_cur, to_cur))
+    except Exception as e:
+        logger.warning(f"creatives: no rate {from_cur}->{to_cur}: {e}")
+        return None
+
+
 async def rollup(db, user_id: str, ads: list[dict]) -> dict:
     """Test summary across ads, money converted to the user's currency."""
     from utils.currency_exchange import CurrencyService
 
-    try:
-        user_cur = await CurrencyService.get_user_currency(user_id) or "GBP"
-    except (ValueError, RuntimeError) as e:
-        logger.warning(f"creative rollup: user currency lookup failed for {user_id}: {e}")
-        user_cur = "GBP"
+    user_cur = await user_currency(user_id)
     spend = rated_leads = 0.0
     leads = imps = link_clicks = views = video_imps = 0.0
     rate_missing = mixed = False

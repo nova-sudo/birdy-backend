@@ -35,9 +35,11 @@ from services.creatives.targets import owning_group, resolve_account_targets
 from services.creatives.verdict import (
     aggregate_days,
     derive,
+    fx_rate,
     rollup,
     score_account,
     test_verdict,
+    user_currency,
 )
 from services.daily_refresh_slot import DEFAULT_TIMEZONE, last_slot_utc
 
@@ -83,7 +85,9 @@ async def _upsert_days(db, user_id: str, ad_id: str, rows: list[dict]) -> None:
         )
 
 
-def _baseline(account_rows: list[dict], ad_totals: dict) -> dict | None:
+def _baseline(account_rows: list[dict], ad_totals: dict, rate: float = 1.0) -> dict | None:
+    """Account totals minus the test ad's own; both in the account's currency, the
+    result's money converted by `rate`."""
     if not account_rows:
         return None
     acct = aggregate_days([_to_day(r) for r in account_rows])
@@ -91,7 +95,23 @@ def _baseline(account_rows: list[dict], ad_totals: dict) -> dict | None:
         k: max(acct[k] - ad_totals.get(k, 0), 0)
         for k in ("spend", "impressions", "clicks", "link_clicks", "leads", "video_views_3s")
     }
+    rest["spend"] = rest["spend"] * rate
     return derive(rest)
+
+
+def _in_user_currency(test_targets: dict, ad: dict, group_cpl, rate: float) -> dict:
+    """Targets for one ad, all in the user's currency. The test's own targets already are;
+    a client group's CPL target and a per-account override are entered in the ad account's
+    currency (the Targets tab and the wizard's per-account drawer show its symbol)."""
+    override = (ad.get("targets_override") or {}).get("cpl")
+    if override is not None:
+        ad = {**ad, "targets_override": {**ad["targets_override"], "cpl": float(override) * rate}}
+    if group_cpl not in (None, ""):
+        try:
+            group_cpl = float(group_cpl) * rate
+        except (TypeError, ValueError):
+            group_cpl = None
+    return resolve_account_targets(test_targets, ad, group_cpl)
 
 
 async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
@@ -159,25 +179,40 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
             account_rows[acct] = await fetch_account_daily(acct, token, start_day, until)
 
     # 3. score
+    # Targets are in the user's currency, so each account's money is converted before it is
+    # scored (CPL and CPC derive from the converted spend). Without a rate it is never scored.
     fmt = creative_format(test)
     now = _naive_utc(datetime.now(timezone.utc))
+    user_cur = await user_currency(user_id)
     scored_ads = []
+    account_curs: set = set()
     for ad in still_live:
         grp = by_gid.get(ad.get("client_group_id"))
         if grp is None:
             same = [g for g in account_groups if g.get("meta_ad_account_id") == ad["ad_account_id"]]
             grp = owning_group(same, ad.get("campaign_id")) if same else {}
+        acct_cur = grp.get("ad_account_currency") or user_cur
+        account_curs.add(acct_cur)
+        rate = fx_rate(acct_cur, user_cur)
+        raw = aggregate_days([_to_day(r) for r in days_by_ad.get(ad["meta"]["ad_id"], [])])
         group_cpl = (grp.get("targets") or {}).get("cpl")
-        targets = resolve_account_targets(test.get("targets") or {}, ad, group_cpl)
-        totals = aggregate_days([_to_day(r) for r in days_by_ad.get(ad["meta"]["ad_id"], [])])
-        baseline = _baseline(account_rows.get(ad["ad_account_id"], []), totals) if mode == "baseline" else None
-        score = score_account(totals, targets, fmt=fmt, baseline=baseline)
+        if rate is None:
+            score = {**derive(raw), "state": "scoring", "checks": [], "rate_missing": True}
+            baseline, currency = None, acct_cur
+        else:
+            totals = {**raw, "spend": round(raw["spend"] * rate, 4)}
+            targets = _in_user_currency(test.get("targets") or {}, ad, group_cpl, rate)
+            baseline = (_baseline(account_rows.get(ad["ad_account_id"], []), raw, rate)
+                        if mode == "baseline" else None)
+            score = score_account(totals, targets, fmt=fmt, baseline=baseline)
+            currency = user_cur
         score["baseline_cpl"] = baseline["cpl"] if baseline else None
         score["evaluated_at"] = now
+        money = {"currency": currency, "account_currency": acct_cur, "fx_rate": rate}
         await db[TEST_ADS].update_one(
             {"id": ad["id"], "user_id": user_id},
-            {"$set": {"score": score, "currency": grp.get("ad_account_currency"), "updated_at": now}})
-        scored_ads.append({**ad, "score": score, "currency": grp.get("ad_account_currency"), "format": fmt})
+            {"$set": {"score": score, **money, "updated_at": now}})
+        scored_ads.append({**ad, "score": score, **money, "format": fmt})
 
     def _agg(states):
         if "fail" in states:
@@ -201,6 +236,7 @@ async def track_test(db, mongo_client, test: dict, *, today: date) -> dict:
     win_share = (test.get("targets") or {}).get("win_share")
     verdict = test_verdict([a["score"] for a in scored_ads], win_share)
     summary = await rollup(db, user_id, scored_ads)
+    summary["mixed_currency"] = any(c != user_cur for c in account_curs)
     summary["updated_at"] = now
 
     fields: dict = {"summary": summary}

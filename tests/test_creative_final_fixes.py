@@ -433,3 +433,97 @@ async def test_lease_reclaim_counts_attempts_and_gives_up(mock_db, mock_mongo_cl
 
 class _Killed(BaseException):
     """Stands in for the process dying: not an Exception, so nothing in posting catches it."""
+
+
+# ── I5: targets are in the user's currency ──────────────────────────────────
+
+RATES = {("JPY", "GBP"): 0.005, ("GBP", "GBP"): 1.0}
+
+
+@pytest.fixture
+def jpy(monkeypatch):
+    from utils.currency_exchange import CurrencyService
+
+    def rate(a, b):
+        if a == b:
+            return 1.0
+        if (a, b) not in RATES:
+            raise ValueError(f"no rate {a}->{b}")
+        return RATES[(a, b)]
+
+    monkeypatch.setattr(CurrencyService, "get_rate", staticmethod(rate))
+
+
+async def test_jpy_account_scored_in_user_currency(mock_db, mock_mongo_client, monkeypatch, jpy):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=2, currencies={1: "JPY"})
+    m.leads = {"ad0": 10, "ad1": 10}
+    m.spend = {"ad0": 150, "ad1": 30000}   # ad1: ¥30,000 = £150, CPL ¥3,000 = £15
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    got = await rows(mock_db, t)
+    jp = got["ad1"]
+    assert jp["score"]["state"] == "pass"           # £15 <= £35 (¥3,000 would fail)
+    assert jp["score"]["spend"] == pytest.approx(150) and jp["score"]["cpl"] == pytest.approx(15)
+    assert jp["currency"] == "GBP" and jp["account_currency"] == "JPY"
+    assert jp["fx_rate"] == pytest.approx(0.005)
+    summary = (await get_test(mock_db, U, t["id"]))["summary"]
+    assert summary["spend"] == pytest.approx(300) and summary["currency"] == "GBP"
+    assert summary["mixed_currency"] is True and summary["rate_missing"] is False
+
+
+async def test_min_spend_floor_is_in_user_currency(mock_db, mock_mongo_client, monkeypatch, jpy):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=1, currencies={0: "JPY"})
+    m.leads = {"ad0": 10}
+    m.spend = {"ad0": 20000}   # ¥20,000 = £100 < £150, one day live: still scoring
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    assert (await rows(mock_db, t))["ad0"]["score"]["state"] == "scoring"
+
+
+async def test_group_cpl_and_override_convert_from_account_currency(mock_db, mock_mongo_client,
+                                                                   monkeypatch, jpy):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=2, currencies={0: "JPY", 1: "JPY"})
+    # g0's own CPL target ¥2,000 (= £10); ad1 has a per-account override ¥4,000 (= £20)
+    await mock_db["client_groups"].update_one({"id": "g0"}, {"$set": {"targets": {"cpl": 2000}}})
+    await mock_db[TEST_ADS].update_one({"meta.ad_id": "ad1"}, {"$set": {"targets_override": {"cpl": 4000}}})
+    m.leads = {"ad0": 10, "ad1": 10}
+    m.spend = {"ad0": 30000, "ad1": 30000}  # both CPL £15
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    got = await rows(mock_db, t)
+    assert got["ad0"]["score"]["state"] == "fail"    # £15 > £10
+    assert got["ad0"]["score"]["checks"][0]["target"] == pytest.approx(10)
+    assert got["ad1"]["score"]["state"] == "pass"    # £15 <= £20
+    assert got["ad1"]["score"]["checks"][0]["target"] == pytest.approx(20)
+
+
+async def test_missing_rate_never_scores(mock_db, mock_mongo_client, monkeypatch, jpy):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=1, currencies={0: "XYZ"})
+    m.leads = {"ad0": 1}
+    m.spend = {"ad0": 99999}
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    row = (await rows(mock_db, t))["ad0"]
+    assert row["score"]["state"] == "scoring" and row["score"]["rate_missing"] is True
+    assert row["currency"] == "XYZ"
+
+
+async def test_creative_cpl_alert_uses_converted_values(mock_db, mock_mongo_client, monkeypatch, jpy):
+    m = Meta(monkeypatch)
+    t = await make_test(mock_db, n=1, currencies={0: "JPY"})
+    m.leads = {"ad0": 10}
+    m.spend = {"ad0": 30000}
+    await ct.track_test(mock_db, mock_mongo_client, t, today=TODAY)
+    alert = {"id": "a1", "user_id": U, "scope": "creative_tests", "creative_test_ids": [t["id"]],
+             "condition": {"metric": "creative_cpl", "operator": "gt", "value": 20}}
+    res = await alerts.evaluate_creative_alert(alert, mock_db)
+    assert res["triggered"] is False and res["current_value"] == pytest.approx(15)
+
+
+async def test_prefill_converts_client_cpl_to_user_currency(mock_db, jpy):
+    from services.creatives.targets import prefill_targets
+    await mock_db["client_groups"].insert_one({"id": "gj", "user_id": U, "targets": {"cpl": 4000},
+                                               "ad_account_currency": "JPY"})
+    out = await prefill_targets(mock_db, U, ["gj"])
+    assert out["metrics"]["cpl"]["value"] == pytest.approx(20)
+    assert out["per_account"]["gj"]["cpl"] == 4000  # per-account stays in the account's currency
