@@ -4,6 +4,7 @@ the fake below: no test can reach Graph."""
 
 import asyncio
 import contextlib
+import inspect
 import time
 from datetime import date, datetime, timedelta, timezone
 
@@ -2259,8 +2260,17 @@ async def test_route_apply_all(api, mock_db, meta):
     agent = await _agent(mock_db, gids=("g1", "g2", "g3"))
     await _three_cards(mock_db, agent)
     r = api.post(f"/api/agents/{agent['_id']}/runs/r1/apply-all", json={})
-    assert r.status_code == 200 and r.json()["outcome"] == "queued" and r.json()["queued"] == 3
+    assert r.status_code == 200 and r.json()["outcome"] == "applied" and r.json()["applied"] == 3
+    assert len(meta.writes) == 3
     assert api.post(f"/api/agents/{agent['_id']}/runs/nope/apply-all", json={}).status_code == 404
+
+
+async def test_apply_run_default_budget_is_slacks_and_queues_everything(mock_db, mock_mongo_client, meta):
+    assert inspect.signature(apply_run).parameters["budget_s"].default == 2.5
+    agent = await _agent(mock_db, gids=("g1", "g2", "g3"))
+    await _three_cards(mock_db, agent)
+    res = await apply_run(mock_db, mock_mongo_client, USER, "r1", by="s", source="slack")
+    assert res["outcome"] == "queued" and res["queued"] == 3 and res["applied"] == 0 and meta.writes == []
 
 
 async def test_routes_stop_another_users_agent_and_another_agents_card(api, mock_db, meta):

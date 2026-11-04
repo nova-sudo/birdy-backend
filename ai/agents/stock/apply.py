@@ -732,7 +732,7 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
     pairs, finished = await _queue_run(db, run, decision, deadline=deadline)
     if finished:
         await _finish_apply_all(db, run_id)
-    # Apply all's usual budget is under MIN_TIME_FOR_LINE_S, so no line starts here and the cron runs them.
+    # Slack's default budget is under MIN_TIME_FOR_LINE_S, so no line starts there and the cron runs them.
     await _drain(db, mongo_client, pairs, deadline=deadline - MIN_TIME_FOR_LINE_S, budget_s=deadline - time.monotonic())
 
     states: dict[str, int] = {}

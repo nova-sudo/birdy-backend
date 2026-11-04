@@ -33,7 +33,7 @@ router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
 OUTCOME_ROWS = 100
 CARD_EDITABLE = ("additional_changes", "thought_process", "next_steps")
-APPLY_BUDGET_SECONDS = 20      # a card's lines wait this long in the request; the cron finishes the rest
+APPLY_BUDGET_SECONDS = 20      # the dashboard waits this long for lines in the request; the cron finishes the rest
 
 
 def _utcnow() -> datetime:
@@ -342,7 +342,8 @@ async def apply_all(agent_id: str, run_id: str, current_user: str = Depends(get_
         await _stock_agent(db, current_user, agent_id)
         if not await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id}, {"_id": 1}):
             raise HTTPException(status_code=404, detail="Run not found")
-        res = await stock_apply.apply_run(db, mongo_client, current_user, run_id, by=current_user, source="dashboard")
+        res = await stock_apply.apply_run(db, mongo_client, current_user, run_id, by=current_user, source="dashboard",
+                                          budget_s=APPLY_BUDGET_SECONDS)
         code = DECISION_STATUS.get(res["outcome"])
         if code:
             raise HTTPException(status_code=code, detail=res.get("reason") or "Run not found")
