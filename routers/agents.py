@@ -826,6 +826,8 @@ async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = D
             # A "Make it a rule?" suggestion becomes a lesson. It has no rule and changes none.
             try:
                 proposal, lesson = await stock_lessons.accept_promotion(db, agent, proposal_id, by=current_user)
+            except learning.ProposalNotFound:
+                raise HTTPException(status_code=404, detail="Proposal not found")
             except learning.ProposalClosed:
                 raise HTTPException(status_code=409, detail="This proposal was already decided")
             return {"proposal": _proposal_to_api(proposal), "rule": None, "lesson": _memory_to_api(lesson)}

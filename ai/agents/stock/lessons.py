@@ -31,7 +31,7 @@ from pymongo import ReturnDocument
 from ai.agents.guardrails import agent_tz, local_today
 from ai.agents.learning import (MEMORY_TEXT_MAX, NOTE_MAX, ProposalClosed, ProposalNotFound, memory_from_note)
 from ai.agents.snapshot import load_ad_days
-from ai.agents.stock.scoreboard import (LOST, NEVER_WENT_LIVE, NO_CLEAR_CHANGE, OUTCOMES, WON)
+from ai.agents.stock.scoreboard import (LOST, NEVER_WENT_LIVE, NO_CLEAR_CHANGE, OUTCOMES, UNSCORED, WON)
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_lost_spend, resolve_zones
 from ai.agents.store import MEMORY, PROPOSALS, add_memory
 
@@ -42,6 +42,7 @@ PROMOTE = "promote"
 LESSONS_FOR_PROMPT = 50
 FEATURE = "stock_lesson"           # the metering label for the AI call that turns text into a lesson
 MAX_SCORE_ROWS = 200               # rows scored in one catch-up; the rest wait for the next batch day
+UNSCORED_AFTER_DAYS = 14           # a row that still can't be judged this long after its window ends `unscored`
 DATA_GRACE_DAYS = 3                # past a window's end, score even if the client's ad data never arrived
 TYPO_WORD_SIMILARITY = 0.8
 _MEANING_FIELDS = (("additional_changes", "the additional changes"), ("thought_process", "the reasoning"),
@@ -194,8 +195,8 @@ def score_result(ad_spend, ad_leads, baseline_cpl, lost_spend, settings) -> str 
     """How an Add did over its scoring window, from fixed numbers (`settings` is the scoring block, or all settings):
 
       never_went_live  no spend at all: an execution problem, not a verdict on the ad
-      lost             spent `lost_spend` or more with at most `lose_max_leads` leads; or, with more leads
-                       than that, a CPL above `lose_cpl_multiple` times the baseline
+      lost             spent `lost_spend` or more with at most `lose_max_leads` leads; or, with any lead at all,
+                       a CPL above `lose_cpl_multiple` times the baseline (spec section 3)
       won              at least `win_min_leads` leads at or under the baseline CPL
       no_clear_change  anything else
 
@@ -210,7 +211,7 @@ def score_result(ad_spend, ad_leads, baseline_cpl, lost_spend, settings) -> str 
         return LOST
     cpl = spend / leads if leads else None
     if isinstance(baseline_cpl, (int, float)) and not isinstance(baseline_cpl, bool) and baseline_cpl > 0:
-        if cpl is not None and not few and cpl > scoring["lose_cpl_multiple"] * baseline_cpl:
+        if cpl is not None and cpl > scoring["lose_cpl_multiple"] * baseline_cpl:
             return LOST
         if cpl is not None and leads >= scoring["win_min_leads"] and cpl <= baseline_cpl:
             return WON
@@ -220,53 +221,79 @@ def score_result(ad_spend, ad_leads, baseline_cpl, lost_spend, settings) -> str 
 
 
 async def score_due(db, agent: dict, now_utc: datetime, *, deadline: float | None = None) -> list[dict]:
-    """Score every row whose first `scoring.min_days` days live are over. Rows already scored, undone
-    or another agent's are never touched. A row waits while its client's ad data for the last day of
-    the window hasn't arrived (up to DATA_GRACE_DAYS), and stays unscored, with the reason, when it
-    can't be judged. Stops at `deadline`. Returns the rows it scored."""
+    """Score every row whose first `scoring.min_days` days live are over, in the ad account's own timezone,
+    on the client's own campaigns only. Rows already scored, undone, cleared or another agent's are never
+    touched. A row waits until the client's ad history has synced past the window's last day: a day with
+    no spend writes no row, so the sync marker (as in the alerts) is what says the data is in. After
+    DATA_GRACE_DAYS without it, a row with no spend in the data ends `unscored`, never never_went_live or
+    lost. A row that can't be judged (no baseline, no spend limit) keeps its reason and ends `unscored`
+    after UNSCORED_AFTER_DAYS. At most MAX_SCORE_ROWS rows get a result per call; rows left waiting don't
+    count against that. Stops at `deadline`. Returns the rows it scored (not the unscored ones)."""
+    from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _history_state
+    from ai.agents.stock.checks import scoped_days
+
     settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
     min_days = int(settings["scoring"]["min_days"])
-    tz = agent_tz(agent)
-    today = local_today(now_utc, tz)
     rows = await db[OUTCOMES].find({"agent_id": agent["_id"], "result": None, "live_since": {"$ne": None}}) \
         .sort("live_since", 1).to_list(length=None)
-    due = []
+    groups: dict[str, dict] = {}
+    history: dict[tuple, str] = {}
+    ready: dict[str, list] = {}
     for row in rows:
+        gid = row.get("client_group_id")
+        if gid not in groups:
+            groups[gid] = await db["client_groups"].find_one({"id": gid, "user_id": agent.get("user_id")}) or {}
+        tz = groups[gid].get(ACCOUNT_TZ_FIELD) or agent_tz(agent)
+        today = local_today(now_utc, tz)
         start = local_today(_naive(row["live_since"]), tz)
         end = start + timedelta(days=min_days - 1)
-        if end < today:
-            due.append((row, start, end))
-    by_client: dict[str, list] = {}
-    for item in due[:MAX_SCORE_ROWS]:
-        by_client.setdefault(item[0].get("client_group_id"), []).append(item)
+        if end >= today:
+            continue   # the account's last day of the window is still running, or not here yet
+        if (gid, end) not in history:
+            history[(gid, end)] = await _history_state(db, gid, end, tz)
+        synced = history[(gid, end)] == "ready"
+        if not synced and today <= end + timedelta(days=DATA_GRACE_DAYS):
+            continue
+        ready.setdefault(gid, []).append((row, start, end, today, synced))
 
-    scored = []
-    for gid, items in by_client.items():
-        if _expired(deadline):
+    scored, finished = [], 0
+    for gid, items in ready.items():
+        if _expired(deadline) or finished >= MAX_SCORE_ROWS:
             break
-        days = await load_ad_days(db, agent.get("user_id"), gid, min(s for _, s, _ in items), max(e for _, _, e in items))
-        newest = max((d.day for ds in days.values() for d in ds), default=None)
-        for row, start, end in items:
-            if _expired(deadline):
+        group = groups[gid]
+        days = scoped_days(await load_ad_days(db, agent.get("user_id"), gid, min(i[1] for i in items),
+                                              max(i[2] for i in items)), group)
+        for row, start, end, today, synced in items:
+            if _expired(deadline) or finished >= MAX_SCORE_ROWS:
                 break
-            if (newest is None or newest < end) and today <= end + timedelta(days=DATA_GRACE_DAYS):
-                continue   # the client's numbers for the window's last day aren't in yet
             mine = [d for d in days.get(row.get("ad_id"), []) if start <= d.day <= end]
             spend, leads = round(sum(d.spend for d in mine), 2), sum(d.leads for d in mine)
-            zones = resolve_zones(settings, gid, row.get("currency"))
-            lost_spend = resolve_lost_spend(settings, zones) if zones else None
-            result = score_result(spend, leads, row.get("baseline_cpl"), lost_spend, settings)
-            if result is None:
-                reason = ("no baseline CPL to compare against" if not row.get("baseline_cpl")
-                          else "no spend limit: the client's zones aren't set")
-                await db[OUTCOMES].update_one({"_id": row["_id"], "result": None}, {"$set": {"unscored_reason": reason}})
-                continue
+            if not synced and spend <= 0:
+                result, reason = UNSCORED, "the ad data for the window never arrived"
+            else:
+                zones = resolve_zones(settings, gid, row.get("currency"))
+                lost_spend = resolve_lost_spend(settings, zones) if zones else None
+                result = score_result(spend, leads, row.get("baseline_cpl"), lost_spend, settings)
+                reason = None
+                if result is None:
+                    reason = ("no baseline CPL to compare against" if not row.get("baseline_cpl")
+                              else "no spend limit: the client's zones aren't set")
+                    if today > end + timedelta(days=UNSCORED_AFTER_DAYS):
+                        result = UNSCORED
+                    else:
+                        await db[OUTCOMES].update_one({"_id": row["_id"], "result": None},
+                                                      {"$set": {"unscored_reason": reason}})
+                        continue
             fields = {"spend": spend, "leads": leads, "cpl": round(spend / leads, 2) if leads else None,
                       "result": result, "scored_at": _naive(now_utc)}
-            res = await db[OUTCOMES].update_one({"_id": row["_id"], "result": None},
-                                                {"$set": fields, "$unset": {"unscored_reason": ""}})
+            if reason:
+                fields["unscored_reason"] = reason
+            update = {"$set": fields} if reason else {"$set": fields, "$unset": {"unscored_reason": ""}}
+            res = await db[OUTCOMES].update_one({"_id": row["_id"], "result": None}, update)
             if res.modified_count == 1:
-                scored.append({**row, **fields})
+                finished += 1
+                if result != UNSCORED:
+                    scored.append({**row, **fields})
     return scored
 
 

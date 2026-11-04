@@ -8,6 +8,7 @@ import pytest
 from ai.agents.stock import lessons, runner, scoreboard
 from ai.agents.stock.settings import DEFAULT_SETTINGS
 from ai.agents.stock.scoreboard import OUTCOMES, record_add, record_for
+from ai.agents.stock.alerts import HISTORY
 from ai.agents.store import AD_DAYS, CARDS
 
 NOW = datetime(2026, 10, 28, 8, tzinfo=timezone.utc)
@@ -17,11 +18,25 @@ AGENT = {"_id": "ag1", "user_id": "u", "scope": {"schedule": {"tz": "UTC"}},
 SCORING = DEFAULT_SETTINGS["scoring"]
 
 
+async def _dest(db, tz="UTC", campaigns=None, synced=datetime(2026, 10, 28, 6)):
+    """The destination client: its account timezone, its campaign scope, and when its ad history last synced."""
+    await db["client_groups"].replace_one({"id": "dest"}, {
+        "id": "dest", "user_id": "u", "name": "Dest", "ad_account_currency": "GBP", "ad_account_timezone": tz,
+        "meta_campaign_ids": campaigns}, upsert=True)
+    await db[HISTORY].replace_one({"_id": "dest"}, {"_id": "dest", "status": "ready", "last_topup_at": synced}, upsert=True)
+
+
+@pytest.fixture(autouse=True)
+async def dest_client(mock_db):
+    await _dest(mock_db)
+
+
 @pytest.mark.parametrize("spend,leads,base,want", [
     (0, 0, 8, "never_went_live"), (40, 5, 8, "won"), (40, 5, 7.99, "no_clear_change"),
     (50, 6, 8, "no_clear_change"), (66, 6, 8, "lost"),
     (48, 0, 8, "lost"), (47, 0, 8, "no_clear_change"),
     (10, 1, 8, "no_clear_change"), (48, 1, 8, "lost"),
+    (30, 1, 8, "lost"), (20, 1, 8, "lost"),          # one lead: CPL 3.75x and 2.5x the baseline
 ])
 def test_score_result(spend, leads, base, want):
     assert lessons.score_result(spend, leads, base, 48, SCORING) == want
@@ -31,8 +46,8 @@ def test_score_result_follows_the_settings_not_fixed_numbers():
     tight = {**SCORING, "win_min_leads": 3, "lose_cpl_multiple": 1.1, "lose_max_leads": 0}
     assert lessons.score_result(24, 3, 8, 48, tight) == "won"
     assert lessons.score_result(27, 3, 8, 48, tight) == "lost"      # 9 > 1.1 * 8
-    assert lessons.score_result(20, 1, 8, 48, tight) == "lost"      # one lead is now enough to judge by CPL: 20 > 8.8
-    assert lessons.score_result(20, 1, 8, 48, SCORING) == "no_clear_change"  # at most 1 lead: only the spend limit counts
+    assert lessons.score_result(20, 1, 8, 48, tight) == "lost"      # 20 > 8.8
+    assert lessons.score_result(9, 1, 8, 48, SCORING) == "no_clear_change"   # 9 is under 1.3 x 8 and under the limit
 
 
 def test_score_result_without_a_baseline_or_a_spend_limit_judges_only_what_it_can():
@@ -41,6 +56,7 @@ def test_score_result_without_a_baseline_or_a_spend_limit_judges_only_what_it_ca
     assert lessons.score_result(40, 5, None, 48, SCORING) is None              # won or not can't be told
     assert lessons.score_result(66, 6, 8, None, SCORING) == "lost"             # CPL alone
     assert lessons.score_result(60, 0, 8, None, SCORING) is None               # no spend limit, no leads to judge by
+    assert lessons.score_result(30, 1, 8, None, SCORING) == "lost"             # one lead still has a CPL
 
 
 async def _row(db, key="k1", gid="dest", ad="ad1", live=LIVE, base=8.0, card="c1", line="l1", tids=("t1",), agent="ag1"):
@@ -49,8 +65,8 @@ async def _row(db, key="k1", gid="dest", ad="ad1", live=LIVE, base=8.0, card="c1
     return f"{card}:{line}"
 
 
-async def _day(db, ad, day, spend, leads, gid="dest"):
-    await db[AD_DAYS].insert_one({"user_id": "u", "client_group_id": gid, "ad_id": ad, "campaign_id": "c", "date_start": day,
+async def _day(db, ad, day, spend, leads, gid="dest", campaign="c"):
+    await db[AD_DAYS].insert_one({"user_id": "u", "client_group_id": gid, "ad_id": ad, "campaign_id": campaign, "date_start": day,
                                   "ad_name": ad, "insight_data": {"spend": str(spend),
                                                                   "actions": [{"action_type": "lead", "value": str(leads)}]}})
 
@@ -127,20 +143,61 @@ async def test_never_went_live_is_not_won_or_lost(mock_db):
     assert (await mock_db[OUTCOMES].find_one({"_id": rid}))["spend"] == 0
 
 
-async def test_waits_while_the_clients_ad_data_has_not_arrived_then_gives_up(mock_db):
+async def test_waits_while_the_clients_history_has_not_synced_past_the_window(mock_db):
+    await _dest(mock_db, synced=datetime(2026, 10, 26, 12))      # synced on the window's last day: not complete
     await _row(mock_db)
-    assert await lessons.score_due(mock_db, AGENT, NOW) == []   # no ad rows at all yet
+    await _week(mock_db, "ad1", 8, 1)
+    assert await lessons.score_due(mock_db, AGENT, NOW) == []
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] is None
+    await _dest(mock_db, synced=datetime(2026, 10, 28, 6))
+    assert len(await lessons.score_due(mock_db, AGENT, NOW)) == 1
+
+
+async def test_after_the_wait_with_no_data_the_row_is_unscored_never_never_went_live_or_lost(mock_db):
+    await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
+    await _row(mock_db)
     late = datetime(2026, 11, 5, tzinfo=timezone.utc)
-    [done] = await lessons.score_due(mock_db, AGENT, late)
+    assert await lessons.score_due(mock_db, AGENT, late) == []
+    row = await mock_db[OUTCOMES].find_one({"_id": "c1:l1"})
+    assert row["result"] == "unscored" and "never arrived" in row["unscored_reason"]
+    assert await record_for(mock_db, "ag1", "k1") == {"won": 0, "lost": 0, "moves": 0}
+
+
+async def test_a_zero_spend_week_with_the_history_synced_is_never_went_live(mock_db):
+    await _row(mock_db)                     # no ad rows at all: Meta writes none for a day with no spend
+    [done] = await lessons.score_due(mock_db, AGENT, NOW)
     assert done["result"] == "never_went_live"
 
 
-async def test_no_baseline_leaves_the_row_unscored_without_raising(mock_db):
+async def test_late_data_that_shows_no_spend_is_unscored_not_never_went_live(mock_db):
+    await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
+    await _row(mock_db)
+    await _week(mock_db, "other-ad", 5, 1)
+    await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 5, tzinfo=timezone.utc))
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] == "unscored"
+
+
+async def test_no_baseline_waits_then_ends_unscored_after_14_days_and_stops_being_selected(mock_db):
     rid = await _row(mock_db, base=None)
     await _week(mock_db, "ad1", 8, 1)
     assert await lessons.score_due(mock_db, AGENT, NOW) == []
     row = await mock_db[OUTCOMES].find_one({"_id": rid})
     assert row["result"] is None and "baseline" in row["unscored_reason"]
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 12, tzinfo=timezone.utc)) == []
+    row = await mock_db[OUTCOMES].find_one({"_id": rid})
+    assert row["result"] == "unscored" and "baseline" in row["unscored_reason"] and row["scored_at"]
+    assert await record_for(mock_db, "ag1", "k1") == {"won": 0, "lost": 0, "moves": 0}
+
+
+async def test_rows_that_cant_be_judged_dont_starve_newer_ones_under_the_cap(mock_db, monkeypatch):
+    monkeypatch.setattr(lessons, "MAX_SCORE_ROWS", 1)
+    await _row(mock_db, base=None, card="stuck", ad="ad0", live=datetime(2026, 10, 19, 10))
+    await _week(mock_db, "ad0", 8, 1, first=19)
+    for i in (1, 2):
+        await _row(mock_db, card=f"c{i}", ad=f"ad{i}")
+        await _week(mock_db, f"ad{i}", 8, 1)
+    assert len(await lessons.score_due(mock_db, AGENT, NOW)) == 1
+    assert len(await lessons.score_due(mock_db, AGENT, NOW)) == 1
 
 
 async def test_lost_spend_comes_from_the_destination_zones(mock_db):
@@ -169,8 +226,8 @@ async def _flagged_card(db, cid="fc1", status="flagged", name="BS - Timelapse - 
                    "treatment_ids": ["t1"]}]})
 
 
-async def _meta_ad(db, ad_id, name, created=datetime(2026, 10, 21, 9)):
-    await db["meta_ad_state"].insert_one({"client_group_id": "dest", "ad_id": ad_id, "name": name,
+async def _meta_ad(db, ad_id, name, created=datetime(2026, 10, 21, 9), campaign="c"):
+    await db["meta_ad_state"].insert_one({"client_group_id": "dest", "ad_id": ad_id, "name": name, "campaign_id": campaign,
                                           "effective_status": "ACTIVE", "created_time": created})
 
 
@@ -265,6 +322,116 @@ async def test_every_outcome_field_the_api_lists_exists_on_a_scored_row(mock_db)
     await _week(mock_db, "ad1", 8, 1)
     await lessons.score_due(mock_db, AGENT, NOW)
     row = await mock_db[OUTCOMES].find_one({"_id": rid})
-    only_sometimes = {"flagged", "unscored_reason"}   # flagged Adds, and rows that can't be judged
+    only_sometimes = {"flagged", "unscored_reason", "cleared_by", "cleared_at", "cleared_from"}   # flagged Adds, and rows that can't be judged
     assert [k for k in api.OUTCOME_FIELDS if k not in row and k not in only_sometimes] == []
     assert {"ad_id", "baseline_cpl", "live_since"} <= set(api.OUTCOME_FIELDS)
+
+
+# ---------------------------------------------------------------------------
+# Account timezones, campaign scope, the tick budget
+# ---------------------------------------------------------------------------
+
+async def test_a_behind_account_isnt_due_while_its_last_day_is_still_running(mock_db):
+    await _dest(mock_db, tz="America/New_York", synced=datetime(2026, 10, 26, 4))
+    await _row(mock_db, live=datetime(2026, 10, 20, 3))          # 23:00 on the 19th in New York
+    await _week(mock_db, "ad1", 8, 1, first=19)
+    await _day(mock_db, "ad1", "2026-10-26", 100, 0)             # the day after the window: never counted
+    still_25th = datetime(2026, 10, 26, 3, tzinfo=timezone.utc)  # 23:00 on the 25th there; UTC calls it the 26th
+    assert await lessons.score_due(mock_db, AGENT, still_25th) == []
+    [done] = await lessons.score_due(mock_db, AGENT, datetime(2026, 10, 26, 5, tzinfo=timezone.utc))
+    assert done["spend"] == 56.0 and done["result"] == "won"
+
+
+async def test_an_ahead_account_is_due_when_its_own_window_has_ended(mock_db):
+    await _dest(mock_db, tz="Pacific/Auckland", synced=datetime(2026, 10, 26, 12))
+    await _row(mock_db, live=datetime(2026, 10, 20, 3))          # the 20th, 16:00 in Auckland
+    await _week(mock_db, "ad1", 8, 1)
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 10, 26, 10, tzinfo=timezone.utc)) == []   # 23:00 on the 26th there
+    [done] = await lessons.score_due(mock_db, AGENT, datetime(2026, 10, 26, 12, tzinfo=timezone.utc))      # 01:00 on the 27th
+    assert done["spend"] == 56.0
+
+
+async def test_flagged_row_live_since_is_the_real_instant_of_the_accounts_first_day(mock_db):
+    await _dest(mock_db, tz="America/New_York")
+    await _flagged_card(mock_db)
+    await _meta_ad(mock_db, "m1", "BS - Timelapse - Win")
+    await _day(mock_db, "m1", "2026-10-22", 5, 1)
+    assert await scoreboard.record_flagged_adds(mock_db, AGENT, NOW) == 1
+    row = await mock_db[OUTCOMES].find_one({"_id": "fc1:l1"})
+    assert row["live_since"] == datetime(2026, 10, 22, 4)        # midnight on the 22nd in New York (EDT)
+
+
+async def test_a_flagged_row_in_a_behind_account_gets_its_whole_window(mock_db):
+    await _dest(mock_db, tz="America/New_York", synced=datetime(2026, 10, 31, 12))
+    await _flagged_card(mock_db)
+    await _meta_ad(mock_db, "m1", "BS - Timelapse - Win")
+    for d in range(22, 29):
+        await _day(mock_db, "m1", f"2026-10-{d}", 8, 1)
+    await scoreboard.record_flagged_adds(mock_db, AGENT, datetime(2026, 10, 30, tzinfo=timezone.utc))
+    [done] = await lessons.score_due(mock_db, AGENT, datetime(2026, 10, 30, tzinfo=timezone.utc))
+    assert done["spend"] == 56.0
+
+
+async def test_a_sibling_clients_same_named_ad_on_a_shared_account_isnt_matched(mock_db):
+    await _dest(mock_db, campaigns=["c1"])
+    await _flagged_card(mock_db)
+    await _meta_ad(mock_db, "sib", "BS - Timelapse - Win", campaign="c2")      # another client's campaign
+    await _day(mock_db, "sib", "2026-10-22", 5, 1, campaign="c2")
+    assert await scoreboard.record_flagged_adds(mock_db, AGENT, NOW) == 0
+    await _meta_ad(mock_db, "mine", "BS - Timelapse - Win", campaign="c1")
+    await _day(mock_db, "mine", "2026-10-23", 5, 1, campaign="c1")
+    assert await scoreboard.record_flagged_adds(mock_db, AGENT, NOW) == 1
+    assert (await mock_db[OUTCOMES].find_one({"_id": "fc1:l1"}))["ad_id"] == "mine"
+
+
+async def test_an_ad_made_just_before_the_card_isnt_matched(mock_db):
+    await _flagged_card(mock_db, created=datetime(2026, 10, 19, 9))
+    await _meta_ad(mock_db, "early", "BS - Timelapse - Win", created=datetime(2026, 10, 19, 8))
+    await _day(mock_db, "early", "2026-10-20", 5, 1)
+    assert await scoreboard.record_flagged_adds(mock_db, AGENT, NOW) == 0
+
+
+async def test_catch_up_uses_the_smaller_of_the_tick_deadline_and_sixty_seconds(mock_db, mock_mongo_client, monkeypatch):
+    seen = []
+
+    async def spy(db, agent, now, *, deadline=None):
+        seen.append(deadline)
+        return 0
+
+    monkeypatch.setattr(scoreboard, "record_flagged_adds", spy)
+    run = {"_id": "r1", "agent_id": "ag1", "as_of": NOW.replace(tzinfo=None), "tick_deadline": time.monotonic() + 170}
+    await runner.catch_up_run(mock_db, mock_mongo_client, run, AGENT)
+    assert seen[0] <= time.monotonic() + runner.CATCH_UP_MAX_S + 1
+    near = time.monotonic() + 5
+    await runner.catch_up_run(mock_db, mock_mongo_client, {**run, "tick_deadline": near}, AGENT)
+    assert seen[1] == near
+
+
+async def test_the_tick_deadline_is_neither_saved_nor_returned(mock_db, mock_mongo_client, monkeypatch):
+    import routers.agent_stock as api
+
+    seen = []
+
+    async def spy(db, mongo_client, run, agent):
+        seen.append(run.get("tick_deadline"))
+
+    monkeypatch.setattr(runner, "catch_up_run", spy)
+    run = {"_id": "r9", "agent_id": "ag1", "user_id": "u", "kind": "batch", "phase": "catch_up", "as_of": NOW.replace(tzinfo=None),
+           "local_date": "2026-10-28", "clients": {}, "claimed_at": None}
+    await mock_db[runner.RUNS].insert_one(dict(run))
+    deadline = time.monotonic() + 100
+    out = await runner.advance_run(mock_db, mock_mongo_client, dict(run), AGENT, deadline=deadline)
+    assert seen == [deadline] and "tick_deadline" not in out
+    assert "tick_deadline" not in await mock_db[runner.RUNS].find_one({"_id": "r9"})
+    assert "tick_deadline" not in api._run_to_api({**run, "tick_deadline": 1.0})
+
+
+async def test_clearing_a_row_takes_it_out_of_the_record(mock_db):
+    rid = await _row(mock_db)
+    await mock_db[OUTCOMES].update_one({"_id": rid}, {"$set": {"result": "lost"}})
+    assert (await record_for(mock_db, "ag1", "k1"))["lost"] == 1
+    done = await scoreboard.clear_row(mock_db, "ag1", rid, by="sam", now=NOW)
+    assert done["result"] == "cleared" and done["cleared_by"] == "sam" and done["cleared_from"] == "lost" and done["cleared_at"]
+    assert await record_for(mock_db, "ag1", "k1") == {"won": 0, "lost": 0, "moves": 0}
+    assert await scoreboard.clear_row(mock_db, "ag1", rid, by="sam", now=NOW) is None      # once
+    assert await scoreboard.clear_row(mock_db, "other", rid, by="sam", now=NOW) is None

@@ -105,9 +105,9 @@ async def catch_up_run(db, mongo_client, run: dict, agent: dict) -> None:
     """Batch days: match flagged Adds a person made by hand, score due ads, look for patterns worth a rule.
     (Edits and dismiss reasons become lessons when they happen, not here.) It stops at the tick's deadline,
     each step is on its own so one failing leaves the others, and nothing here touches a client's run."""
-    deadline = run.get("tick_deadline")
-    if deadline is None:
-        deadline = time.monotonic() + CATCH_UP_MAX_S
+    deadline = time.monotonic() + CATCH_UP_MAX_S
+    if run.get("tick_deadline") is not None:
+        deadline = min(deadline, run["tick_deadline"])
     now = _run_now(run)
     for name, step in (("match flagged adds", lambda: scoreboard.record_flagged_adds(db, agent, now, deadline=deadline)),
                        ("score due ads", lambda: lessons.score_due(db, agent, now, deadline=deadline)),

@@ -397,3 +397,53 @@ async def test_run_report_shows_what_was_learned_and_open_suggestions(api, mock_
     body = api.get(f"/api/agents/{aid}/runs/r2").json()
     assert [x["text"] for x in body["learned"]] == ["no blue"] and body["learned"][0]["id"] == m["_id"]
     assert [p["kind"] for p in body["proposals"]] == ["promote"]
+
+
+async def test_clear_route_is_owner_scoped_and_brings_a_creative_back(api, mock_db):
+    agent = await _stock(mock_db)
+    aid = agent["_id"]
+    for i in (1, 2):
+        await mock_db[OUTCOMES].insert_one({"_id": f"o{i}", "agent_id": aid, "creative_key": "k", "result": "lost",
+                                            "treatment_ids": ["t1"], "created_at": datetime(2026, 11, i)})
+    r = api.post(f"/api/agents/{aid}/outcomes/o1/clear")
+    assert r.status_code == 200 and r.json()["result"] == "cleared" and r.json()["cleared_by"] == USER
+    from ai.agents.stock.scoreboard import record_for
+    assert (await record_for(mock_db, aid, "k", ["t1"]))["lost"] == 1
+    assert api.post(f"/api/agents/{aid}/outcomes/o1/clear").status_code == 404
+    assert api.post(f"/api/agents/{aid}/outcomes/nope/clear").status_code == 404
+    api.state["user"] = "u2"
+    assert api.post(f"/api/agents/{aid}/outcomes/o2/clear").status_code == 404
+    assert (await mock_db[OUTCOMES].find_one({"_id": "o2"}))["result"] == "lost"
+
+
+async def test_keep_on_another_users_agent_is_404(api, mock_db):
+    agent = await _stock(mock_db)
+    m = await add_memory(mock_db, agent["_id"], text="x", kind="fact", source="edit")
+    api.state["user"] = "u2"
+    assert api.post(f"/api/agents/{agent['_id']}/lessons/{m['_id']}/keep").status_code == 404
+
+
+async def test_accept_race_that_loses_the_proposal_is_a_404(api, mock_db, monkeypatch):
+    agent = await _stock(mock_db)
+    aid = agent["_id"]
+    await mock_db[PROPOSALS].insert_one({"_id": "p1", "agent_id": aid, "kind": "promote", "status": "open", "text": "t"})
+
+    async def gone(*a, **k):
+        from ai.agents.learning import ProposalNotFound
+        raise ProposalNotFound("p1")
+
+    monkeypatch.setattr(lessons, "accept_promotion", gone)
+    assert api.post(f"/api/agents/{aid}/proposals/p1/accept").status_code == 404
+
+
+async def test_learned_starts_where_the_previous_report_finished(api, mock_db):
+    agent = await _stock(mock_db)
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r1", as_of=datetime(2026, 11, 1, 7), finished_at=datetime(2026, 11, 1, 9))
+    await mock_db[MEMORY].insert_many([
+        {"_id": "mid", "agent_id": aid, "text": "during r1", "active": True, "created_at": datetime(2026, 11, 1, 8)},
+        {"_id": "after", "agent_id": aid, "text": "after r1", "active": True, "created_at": datetime(2026, 11, 2, 8)}])
+    body = api.get(f"/api/agents/{aid}/runs/r2").json()
+    assert [x["text"] for x in body["learned"]] == ["after r1"]
+    r1 = api.get(f"/api/agents/{aid}/runs/r1").json()
+    assert "during r1" in [x["text"] for x in r1["learned"]]

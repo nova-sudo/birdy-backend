@@ -25,7 +25,7 @@ from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
                                    guarded_update)
-from ai.agents.stock.scoreboard import LOST, OUTCOMES, WON
+from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from routers import agents as agents_router
@@ -60,13 +60,13 @@ def _with_id(doc: dict, drop: tuple = ()) -> dict:
 CLIENT_FIELDS = ("state", "error", "reason", "carded", "stale", "card_id", "wait_for", "health_due")
 OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids", "result", "spend", "leads",
                   "cpl", "currency", "card_id", "line_id", "ad_id", "baseline_cpl", "live_since", "flagged",
-                  "unscored_reason", "created_at", "scored_at")
+                  "unscored_reason", "cleared_by", "cleared_at", "cleared_from", "created_at", "scored_at")
 
 
 def _run_to_api(run: dict) -> dict:
     """The run as the report needs it: no owner id, no Slack channel, and per client only its
     outcome, not the working data a resumed tick keeps."""
-    out = _with_id(run, drop=("user_id", "claimed_at", "in_flight", "tick_now", "open_preview", "slack"))
+    out = _with_id(run, drop=("user_id", "claimed_at", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack"))
     out["slack"] = {"ts": (run.get("slack") or {}).get("ts")}
     out["clients"] = {g: {k: c[k] for k in CLIENT_FIELDS if k in c} for g, c in (run.get("clients") or {}).items()}
     return out
@@ -179,7 +179,8 @@ async def start_preview(agent_id: str, current_user: str = Depends(get_current_u
 async def _scoreboard(db, agent_id: str) -> dict:
     rows = await db[OUTCOMES].find({"agent_id": agent_id}).sort("created_at", -1).to_list(length=None)
     results = [str(r.get("result") or "").lower() for r in rows]
-    return {"won": results.count(WON), "lost": results.count(LOST), "moves": len(rows),
+    return {"won": results.count(WON), "lost": results.count(LOST),
+            "moves": len(rows) - results.count(UNSCORED) - results.count(CLEARED),
             "rows": [{"id": r["_id"], **{k: r[k] for k in OUTCOME_FIELDS if k in r}} for r in rows[:OUTCOME_ROWS]]}
 
 
@@ -192,8 +193,8 @@ async def _learned(db, agent_id: str, run: dict) -> list[dict]:
         {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}, "as_of": {"$lt": run["as_of"]}}
     ).sort("as_of", -1).limit(1).to_list(length=1)
     window = {"$lte": run.get("finished_at") or _utcnow().replace(tzinfo=None)}
-    if prev:
-        window["$gt"] = prev[0]["as_of"]
+    if prev:   # from where the report before it finished, so no lesson shows in two reports
+        window["$gt"] = prev[0].get("finished_at") or prev[0]["as_of"]
     rows = await db[agent_store.MEMORY].find({"agent_id": agent_id, "created_at": window}).sort("created_at", 1).to_list(length=None)
     return [agents_router._memory_to_api(m) for m in rows]
 
@@ -443,3 +444,15 @@ async def overrule_lesson(agent_id: str, lesson_id: str, current_user: str = Dep
         if lesson is None:
             raise HTTPException(status_code=404, detail="Lesson not found")
         return agents_router._memory_to_api(lesson)
+
+
+@router.post("/{agent_id}/outcomes/{row_id}/clear")
+async def clear_outcome(agent_id: str, row_id: str, current_user: str = Depends(get_current_user)):
+    """A result is wrong: take it out of the record. The row stays listed as cleared, with who and when."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        row = await clear_row(db, agent_id, row_id, by=current_user, now=_utcnow())
+        if row is None:
+            raise HTTPException(status_code=404, detail="Result not found")
+        return {"id": row["_id"], **{k: row[k] for k in OUTCOME_FIELDS if k in row}}

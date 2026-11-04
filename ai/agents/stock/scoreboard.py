@@ -7,10 +7,12 @@ flagged Add, scored later. `record_for` is the read side the candidate ranking u
 
 import time
 from datetime import datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 OUTCOMES = "agent_ad_outcomes"
 WON, LOST, UNDONE = "won", "lost", "undone"
 NO_CLEAR_CHANGE, NEVER_WENT_LIVE = "no_clear_change", "never_went_live"
+UNSCORED, CLEARED = "unscored", "cleared"   # no verdict could be reached / a person said the result was wrong
 FLAGGED_LOOKBACK = timedelta(days=30)   # how long after a flagged Add a person may still create the ad
 
 
@@ -25,6 +27,9 @@ async def record_for(db, agent_id, creative_key: str, treatment_ids: list[str] |
     async for row in db[OUTCOMES].find(q):
         out["moves"] += 1
         result = str(row.get("result") or "").lower()
+        if result in (UNSCORED, CLEARED):
+            out["moves"] -= 1   # no verdict, or a wrong one a person took back: not a move
+            continue
         if result in (WON, LOST):
             out[result] += 1
     return out
@@ -54,16 +59,28 @@ def _naive(dt: datetime) -> datetime:
     return dt if dt.tzinfo is None else dt.astimezone(timezone.utc).replace(tzinfo=None)
 
 
+def local_midnight_utc(day, tz_name: str | None) -> datetime:
+    """The real UTC instant (naive) at which `day` began in the account's timezone."""
+    try:
+        zone = ZoneInfo(tz_name) if tz_name else timezone.utc
+    except Exception:  # noqa: BLE001 - an unknown name reads as UTC, like the windows
+        zone = timezone.utc
+    return datetime.combine(day, dtime.min, tzinfo=zone).astimezone(timezone.utc).replace(tzinfo=None)
+
+
 async def record_flagged_adds(db, agent: dict, now_utc: datetime, *, deadline: float | None = None) -> int:
     """Nobody records a flagged Add when it is flagged: people create the ad. So each catch-up looks, for the
     flagged Add lines of the last 30 days (a card that a newer one has since superseded included, a dismissed
-    one not), for an ad in the card's client with the line's normalised name that was created after the card
-    and has spent. That ad gets a row, live from its first day of spend, so it is scored like any Add. An ad
-    already on the scoreboard isn't used twice. Returns how many rows it recorded."""
+    one not), for an ad in the card's client, within the client's campaigns, with the line's normalised name,
+    created after the card, that has spent. That ad gets a row, live from the start of its first day of spend
+    in the account's timezone, so it is scored like any Add. An ad already on the scoreboard isn't used
+    twice. Returns how many rows it recorded."""
     # Imported here: ai.agents.store imports this module for OUTCOMES, and candidates imports it for record_for.
     from ai.agents.guardrails import agent_tz, local_today
     from ai.agents.snapshot import load_ad_days, load_state
+    from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD
     from ai.agents.stock.candidates import normalise_name
+    from ai.agents.stock.checks import in_scope, scoped_days
     from ai.agents.store import CARDS
 
     now = _naive(now_utc)
@@ -80,7 +97,6 @@ async def record_flagged_adds(db, agent: dict, now_utc: datetime, *, deadline: f
         return 0
     have = {r["_id"] async for r in db[OUTCOMES].find({"_id": {"$in": [f"{c['_id']}:{ln['id']}" for c, ln in pending]}}, {"_id": 1})}
     used = {r.get("ad_id") async for r in db[OUTCOMES].find({"agent_id": agent["_id"]}, {"ad_id": 1})}
-    today = local_today(now_utc, agent_tz(agent))
     recorded, loaded = 0, {}
     for card, line in pending:
         if deadline is not None and time.monotonic() >= deadline:
@@ -89,23 +105,42 @@ async def record_flagged_adds(db, agent: dict, now_utc: datetime, *, deadline: f
             continue
         gid = card.get("client_group_id")
         if gid not in loaded:
+            group = await db["client_groups"].find_one({"id": gid, "user_id": agent.get("user_id")}) or {}
+            tz = group.get(ACCOUNT_TZ_FIELD) or agent_tz(agent)
+            today = local_today(now_utc, tz)
             states, _ = await load_state(db, gid)
-            loaded[gid] = (states, await load_ad_days(db, agent.get("user_id"), gid, today - FLAGGED_LOOKBACK - timedelta(days=1), today))
-        states, days = loaded[gid]
+            days = scoped_days(await load_ad_days(db, agent.get("user_id"), gid,
+                                                  today - FLAGGED_LOOKBACK - timedelta(days=1), today), group)
+            loaded[gid] = (tz, {i: a for i, a in states.items() if in_scope(a.campaign_id, group)}, days)
+        tz, states, days = loaded[gid]
         want, made = normalise_name(line.get("ad_name")), _naive(card["created_at"])
         first = {}
         for ad in states.values():
             if ad.ad_id in used or normalise_name(ad.name) != want:
                 continue
-            if ad.created_time is not None and _naive(ad.created_time) < made - timedelta(days=1):
+            if ad.created_time is not None and _naive(ad.created_time) < made:
                 continue
-            spent = [d.day for d in days.get(ad.ad_id, []) if d.spend > 0 and d.day >= made.date()]
+            spent = [d.day for d in days.get(ad.ad_id, []) if d.spend > 0 and d.day >= local_today(made, tz)]
             if spent:
                 first[ad.ad_id] = min(spent)
         if not first:
             continue
         ad_id = min(first, key=lambda a: (first[a], a))
-        await record_add(db, card, line, ad_id, datetime.combine(first[ad_id], dtime.min), flagged=True)
+        await record_add(db, card, line, ad_id, local_midnight_utc(first[ad_id], tz), flagged=True)
         used.add(ad_id)
         recorded += 1
     return recorded
+
+
+async def clear_row(db, agent_id: str, row_id: str, *, by: str | None, now) -> dict | None:
+    """A person says this row's result is wrong. It stays listed as `cleared` with who and when, and
+    the ranking no longer counts it, so a creative removed by wrong losses comes back. None when this
+    agent has no such row, or it is already cleared."""
+    from pymongo import ReturnDocument
+    prev = await db[OUTCOMES].find_one({"_id": row_id, "agent_id": agent_id})
+    if prev is None or prev.get("result") == CLEARED:
+        return None
+    return await db[OUTCOMES].find_one_and_update(
+        {"_id": row_id, "agent_id": agent_id, "result": prev.get("result")},
+        {"$set": {"result": CLEARED, "cleared_from": prev.get("result"), "cleared_by": by, "cleared_at": _naive(now)}},
+        return_document=ReturnDocument.AFTER)
