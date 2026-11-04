@@ -156,8 +156,9 @@ async def test_waits_while_the_clients_history_has_not_synced_past_the_window(mo
 async def test_after_the_wait_with_no_data_the_row_is_unscored_never_never_went_live_or_lost(mock_db):
     await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
     await _row(mock_db)
-    late = datetime(2026, 11, 5, tzinfo=timezone.utc)
-    assert await lessons.score_due(mock_db, AGENT, late) == []
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 5, tzinfo=timezone.utc)) == []
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] is None
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 12, tzinfo=timezone.utc)) == []
     row = await mock_db[OUTCOMES].find_one({"_id": "c1:l1"})
     assert row["result"] == "unscored" and "never arrived" in row["unscored_reason"]
     assert await record_for(mock_db, "ag1", "k1") == {"won": 0, "lost": 0, "moves": 0}
@@ -173,7 +174,41 @@ async def test_late_data_that_shows_no_spend_is_unscored_not_never_went_live(moc
     await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
     await _row(mock_db)
     await _week(mock_db, "other-ad", 5, 1)
-    await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 5, tzinfo=timezone.utc))
+    await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 12, tzinfo=timezone.utc))
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] == "unscored"
+
+
+async def test_an_unsynced_row_is_never_scored_on_partial_data(mock_db):
+    await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
+    await _row(mock_db)
+    await _week(mock_db, "ad1", 8, 1)                                # spend is there, the sync isn't
+    day = lambda d: datetime(2026, 11, d, tzinfo=timezone.utc)
+    assert await lessons.score_due(mock_db, AGENT, day(1)) == []     # more than 3 days past the window
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] is None
+    await _dest(mock_db, synced=datetime(2026, 11, 1, 6))            # the sync arrives on day 5 after the window
+    [done] = await lessons.score_due(mock_db, AGENT, day(1))
+    assert done["result"] == "won"
+
+
+async def test_an_unsynced_row_with_spend_ends_unscored_at_14_days(mock_db):
+    await _dest(mock_db, synced=datetime(2026, 10, 26, 12))
+    await _row(mock_db)
+    await _week(mock_db, "ad1", 8, 1)
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 12, tzinfo=timezone.utc)) == []
+    row = await mock_db[OUTCOMES].find_one({"_id": "c1:l1"})
+    assert row["result"] == "unscored" and "never arrived" in row["unscored_reason"]
+
+
+@pytest.mark.parametrize("doc", [None, {"_id": "dest", "status": "error", "error": "x", "last_topup_at": None}])
+async def test_no_history_doc_or_an_errored_one_without_a_sync_never_scores(mock_db, doc):
+    await mock_db[HISTORY].delete_many({"_id": "dest"})
+    if doc:
+        await mock_db[HISTORY].insert_one(doc)
+    await _row(mock_db)
+    await _week(mock_db, "ad1", 8, 1)
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 5, tzinfo=timezone.utc)) == []
+    assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] is None
+    assert await lessons.score_due(mock_db, AGENT, datetime(2026, 11, 12, tzinfo=timezone.utc)) == []
     assert (await mock_db[OUTCOMES].find_one({"_id": "c1:l1"}))["result"] == "unscored"
 
 
@@ -435,3 +470,14 @@ async def test_clearing_a_row_takes_it_out_of_the_record(mock_db):
     assert await record_for(mock_db, "ag1", "k1") == {"won": 0, "lost": 0, "moves": 0}
     assert await scoreboard.clear_row(mock_db, "ag1", rid, by="sam", now=NOW) is None      # once
     assert await scoreboard.clear_row(mock_db, "other", rid, by="sam", now=NOW) is None
+
+
+async def test_only_won_or_lost_rows_can_be_cleared(mock_db):
+    for i, result in enumerate((None, "undone", "unscored", "never_went_live", "no_clear_change")):
+        rid = await _row(mock_db, card=f"x{i}", line="l")
+        await mock_db[OUTCOMES].update_one({"_id": rid}, {"$set": {"result": result}})
+        assert await scoreboard.clear_row(mock_db, "ag1", rid, by="sam", now=NOW) is None
+        assert (await mock_db[OUTCOMES].find_one({"_id": rid}))["result"] == result
+    rid = await _row(mock_db, card="w")
+    await mock_db[OUTCOMES].update_one({"_id": rid}, {"$set": {"result": "won"}})
+    assert (await scoreboard.clear_row(mock_db, "ag1", rid, by="sam", now=NOW))["cleared_from"] == "won"

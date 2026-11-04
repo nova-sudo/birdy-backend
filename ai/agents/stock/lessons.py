@@ -43,7 +43,6 @@ LESSONS_FOR_PROMPT = 50
 FEATURE = "stock_lesson"           # the metering label for the AI call that turns text into a lesson
 MAX_SCORE_ROWS = 200               # rows scored in one catch-up; the rest wait for the next batch day
 UNSCORED_AFTER_DAYS = 14           # a row that still can't be judged this long after its window ends `unscored`
-DATA_GRACE_DAYS = 3                # past a window's end, score even if the client's ad data never arrived
 TYPO_WORD_SIMILARITY = 0.8
 _MEANING_FIELDS = (("additional_changes", "the additional changes"), ("thought_process", "the reasoning"),
                    ("next_steps", "the next steps"))
@@ -224,9 +223,8 @@ async def score_due(db, agent: dict, now_utc: datetime, *, deadline: float | Non
     """Score every row whose first `scoring.min_days` days live are over, in the ad account's own timezone,
     on the client's own campaigns only. Rows already scored, undone, cleared or another agent's are never
     touched. A row waits until the client's ad history has synced past the window's last day: a day with
-    no spend writes no row, so the sync marker (as in the alerts) is what says the data is in. After
-    DATA_GRACE_DAYS without it, a row with no spend in the data ends `unscored`, never never_went_live or
-    lost. A row that can't be judged (no baseline, no spend limit) keeps its reason and ends `unscored`
+    no spend writes no row, so the sync marker (as in the alerts) is what says the data is in. An unsynced
+    row is never scored on partial data, whatever the spend: it ends `unscored` after UNSCORED_AFTER_DAYS. A row that can't be judged (no baseline, no spend limit) keeps its reason and ends `unscored`
     after UNSCORED_AFTER_DAYS. At most MAX_SCORE_ROWS rows get a result per call; rows left waiting don't
     count against that. Stops at `deadline`. Returns the rows it scored (not the unscored ones)."""
     from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _history_state
@@ -252,7 +250,7 @@ async def score_due(db, agent: dict, now_utc: datetime, *, deadline: float | Non
         if (gid, end) not in history:
             history[(gid, end)] = await _history_state(db, gid, end, tz)
         synced = history[(gid, end)] == "ready"
-        if not synced and today <= end + timedelta(days=DATA_GRACE_DAYS):
+        if not synced and today <= end + timedelta(days=UNSCORED_AFTER_DAYS):
             continue
         ready.setdefault(gid, []).append((row, start, end, today, synced))
 
@@ -268,7 +266,7 @@ async def score_due(db, agent: dict, now_utc: datetime, *, deadline: float | Non
                 break
             mine = [d for d in days.get(row.get("ad_id"), []) if start <= d.day <= end]
             spend, leads = round(sum(d.spend for d in mine), 2), sum(d.leads for d in mine)
-            if not synced and spend <= 0:
+            if not synced:   # never scored on partial data: it waited the full time for the sync
                 result, reason = UNSCORED, "the ad data for the window never arrived"
             else:
                 zones = resolve_zones(settings, gid, row.get("currency"))

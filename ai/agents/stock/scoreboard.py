@@ -134,11 +134,11 @@ async def record_flagged_adds(db, agent: dict, now_utc: datetime, *, deadline: f
 
 async def clear_row(db, agent_id: str, row_id: str, *, by: str | None, now) -> dict | None:
     """A person says this row's result is wrong. It stays listed as `cleared` with who and when, and
-    the ranking no longer counts it, so a creative removed by wrong losses comes back. None when this
-    agent has no such row, or it is already cleared."""
+    the ranking no longer counts it, so a creative removed by wrong losses comes back. Only a won or lost
+    row can be cleared; None for anything else, another agent's row, or one already cleared."""
     from pymongo import ReturnDocument
     prev = await db[OUTCOMES].find_one({"_id": row_id, "agent_id": agent_id})
-    if prev is None or prev.get("result") == CLEARED:
+    if prev is None or prev.get("result") not in (WON, LOST):
         return None
     return await db[OUTCOMES].find_one_and_update(
         {"_id": row_id, "agent_id": agent_id, "result": prev.get("result")},
