@@ -56,7 +56,7 @@ def meta(monkeypatch):
 
 async def _seed_agent(db, **over):
     agent = {
-        "_id": "ag1", "user_id": "u1", "type": "media_buying",
+        "_id": "ag1", "user_id": "u1", "type": "custom",
         "scope": {"client_group_ids": [GID], "schedule": {"time": "07:00", "tz": "Europe/London"}},
         "permissions": copy.deepcopy(DEFAULT_PERMISSIONS),
         "guardrails": copy.deepcopy(DEFAULT_GUARDRAILS),
@@ -64,6 +64,8 @@ async def _seed_agent(db, **over):
     }
     agent.update(over)
     await db["agents"].insert_one(agent)
+    from ai.agents import claims
+    await claims.claim_clients(db, agent["user_id"], agent["_id"], agent["scope"]["client_group_ids"])
     return agent
 
 

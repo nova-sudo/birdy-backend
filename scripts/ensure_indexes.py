@@ -6,6 +6,11 @@ Run after a deploy that adds one — the daily cron
 local app start still does it automatically.
 
 Run with:  python -m scripts.ensure_indexes
+
+Exits 1 if any creator failed, and logs which one. This includes the agent
+migration, which runs inside create_agent_indexes, so a deploy can rely on the
+exit code. The database is MONGODB_URI + MONGODB_DB, from the environment first
+and then .env, and MONGODB_DB falls back to the dev database: set both.
 """
 
 import asyncio

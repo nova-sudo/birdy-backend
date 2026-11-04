@@ -6,6 +6,7 @@ ai/suggestions/actions.apply_suggestion for suggestions that carry an
 agent_id, whether a person approved them or the agent is auto-running.
 
 Checked in order, first failure wins:
+  0. not_acting_agent  this agent does not hold the client (see ai/agents/claims.py)
   1. no_permission  the agent may not touch this object type
   2. protected_tag  a target's name (or, for an ad set, any of its ads' names)
                     contains a protected tag
@@ -30,7 +31,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from ai.agents import memory_filters, meta_state
+from ai.agents import claims, memory_filters, meta_state
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS
 from ai.agents.meta_state import AD_STATE
 from ai.suggestions.contracts import ACTION_PAUSE_ADS, Action, Evidence, Finding
@@ -98,13 +99,30 @@ async def _ad_states(db, client_group_id, ad_ids: list[str]) -> dict[str, dict]:
     return {d["ad_id"]: d async for d in cur}
 
 
-async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> GuardrailResult:
+async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime,
+                           unconfirmed_pauses: int = 0) -> GuardrailResult:
+    """`unconfirmed_pauses` are pauses already sent with no activity row yet. They count toward the cap."""
     action = doc.get("action") or {}
     atype = action.get("type")
     targets = action.get("targets") or []
     gid = doc.get("client_group_id")
     permissions = {**DEFAULT_PERMISSIONS, **(agent.get("permissions") or {})}
     guardrails = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}
+
+    # 0. Only the client's acting agent may change its ads. Run for every write, so a stale
+    # card or a race can't touch a client that has moved to another agent. A client
+    # nobody holds is blocked too (flag-only watcher); a caller that is not a stored agent
+    # (no _id, e.g. creative auto-pause) is not checked here.
+    if agent.get("_id") and gid:
+        held_by = await claims.holder(db, agent.get("user_id") or doc.get("user_id"), gid)
+        if held_by is None:
+            # Taking it back is a button on a custom agent's page. The stock agent has its own wording by code.
+            how = "" if agent.get("type") == "stock_media_buying" else " Take it back from the top of this agent's page."
+            return GuardrailResult.blocked(
+                "not_acting_agent", f"No agent is acting on this client, so this agent can't change it.{how}")
+        if held_by != agent["_id"]:
+            return GuardrailResult.blocked(
+                "not_acting_agent", "Another agent now handles this client, so this agent can't change it.")
 
     # 1. Permission for every target's object type.
     for t in targets:
@@ -169,7 +187,7 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
     if cap is not None:
         now = _naive_utc(now_utc)
         start = local_day_start_utc(now, agent_tz(agent))
-        used = await db[ACTIVITY].count_documents({
+        used = unconfirmed_pauses + await db[ACTIVITY].count_documents({
             "client_group_id": gid,
             "kind": KIND_ACTION_APPLIED,
             "applied_action_type": ACTION_PAUSE_ADS,
@@ -190,9 +208,13 @@ LIVE_CHECK_FAILED_MESSAGE = ("Couldn't check the ads inside this ad set in Meta,
 
 
 async def check_adset_contents_live(db, mongo_client, agent: dict, doc: dict, *,
-                                    memories: list[dict], now_utc: datetime) -> GuardrailResult:
+                                    memories: list[dict], now_utc: datetime,
+                                    read_ads: dict | None = None) -> GuardrailResult:
     """For each ad set target, read its ads live from Meta and run the protected
-    tag and taught-exception checks over their names. Any read failure blocks."""
+    tag and taught-exception checks over their names. Any read failure blocks.
+
+    A target with `only_ad_id` changes one ad of that ad set, so only that ad's live name is checked.
+    `read_ads`, if given, receives each ad set's list, so the caller can judge it without reading twice."""
     targets = [t for t in ((doc.get("action") or {}).get("targets") or []) if t.get("object_type") == "adset"]
     if not targets:
         return GuardrailResult.passed()
@@ -207,7 +229,12 @@ async def check_adset_contents_live(db, mongo_client, agent: dict, doc: dict, *,
         except Exception as e:
             logger.warning("guardrails: live read of ad set %s failed: %s", t.get("object_id"), e)
             return GuardrailResult.blocked("live_check_failed", LIVE_CHECK_FAILED_MESSAGE)
+        if read_ads is not None:
+            read_ads[str(t.get("object_id"))] = ads
         names = [str(a.get("name") or "") for a in ads]
+        if t.get("only_ad_id"):
+            names = ([str(a.get("name") or "") for a in ads if str(a.get("id")) == str(t["only_ad_id"])]
+                     or [str(t.get("name") or "")])
         for name in names:
             low = name.lower()
             for tag in tags:

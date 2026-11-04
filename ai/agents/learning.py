@@ -348,7 +348,7 @@ async def _context(db, agent: dict, note: str, doc: dict) -> tuple[str, set[str]
     return json.dumps(ctx, default=str), set(gids)
 
 
-async def _meter(db, user_id: str, provider, resp) -> None:
+async def _meter(db, user_id: str, provider, resp, feature: str = "agent_note_memory") -> None:
     """Bill the call like the other server-side LLM calls. Never raises."""
     try:
         from credits import record_usage
@@ -357,17 +357,32 @@ async def _meter(db, user_id: str, provider, resp) -> None:
             db, user_id, model=getattr(provider, "model", None),
             prompt_tokens=getattr(usage, "input_tokens", 0) or 0,
             completion_tokens=getattr(usage, "output_tokens", 0) or 0,
-            source="agents", feature="agent_note_memory")
+            source="agents", feature=feature)
     except Exception as e:
         logger.warning("learning: metering the note call failed for %s: %s", user_id, e)
 
 
-async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
+async def _names_the_client(db, agent: dict, client_group_id: str, ad_name: str) -> bool:
+    """Whether an ad-name match is really the client's name, in either direction: "Acme" and "Acme London" both are for a
+    client named "Acme London". Plain containment: a near miss costs a note, and the other way costs all their changes."""
+    group = await db["client_groups"].find_one({"id": client_group_id, "user_id": agent.get("user_id")}, {"name": 1}) or {}
+    client, match = " ".join(str(group.get("name") or "").split()).casefold(), " ".join(ad_name.split()).casefold()
+    return bool(client) and (match in client or client in match)
+
+
+async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str = "denial",
+                           author: str | None = None, client_group_id: str | None = None,
+                           feature: str = "agent_note_memory", status: str | None = None,
+                           filter_one_client: bool = False) -> dict:
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
-    error, or output that can't be used, stores the note as a fact. Never raises."""
+    error, or output that can't be used, stores the note as a fact. Never raises.
+    `filter_one_client`: for words where nobody chose the scope in a form. A filter has to name ads, and may only touch
+    `client_group_id`'s. One naming a whole client or whole days could stop all of a client's changes on one sentence,
+    and so could the client's own name, which ads often carry. Anything like that stays a fact, and the memory comes back
+    with `filter_dropped`."""
     note = (note or "").strip()[:NOTE_MAX]
-    text, kind, flt = note, "fact", None
+    text, kind, flt, dropped = note, "fact", None, False
     try:
         from ai import provider_factory
         ctx, allowed = await _context(db, agent, note, doc or {})
@@ -375,24 +390,33 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict) -> dict:
         resp = await asyncio.wait_for(provider.chat_completion(
             messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": ctx}],
             temperature=0, max_tokens=300), timeout=LLM_TIMEOUT_S)
-        await _meter(db, agent["user_id"], provider, resp)
+        await _meter(db, agent["user_id"], provider, resp, feature=feature)
         parsed = _parse_json(getattr(resp, "content", None))
         if parsed is not None:
             if isinstance(parsed.get("text"), str) and parsed["text"].strip():
                 text = parsed["text"].strip()[:MEMORY_TEXT_MAX]
             if parsed.get("kind") == "exception":
                 flt = _clean_filter(parsed.get("filter"), allowed)
+                if flt and filter_one_client:
+                    if (client_group_id and flt.get("ad_name_contains") and set(flt) <= {"ad_name_contains", "client_group_id"}
+                            and flt.get("client_group_id", client_group_id) == client_group_id
+                            and not await _names_the_client(db, agent, client_group_id, flt["ad_name_contains"])):
+                        flt = {**flt, "client_group_id": client_group_id}
+                    else:
+                        flt, dropped = None, True
                 kind = "exception" if flt else "fact"
     except Exception as e:
         logger.warning("learning: note -> memory fell back to a fact for agent %s: %s",
                        agent.get("_id"), e)
-        text, kind, flt = note, "fact", None
+        text, kind, flt, dropped = note, "fact", None, False
     try:
-        return await add_memory(db, agent["_id"], text=text, kind=kind, source="denial",
-                                source_ref=(doc or {}).get("_id"), filter=flt)
+        memory = await add_memory(db, agent["_id"], text=text, kind=kind, source=source,
+                                  source_ref=(doc or {}).get("_id"), filter=flt,
+                                  author=author, client_group_id=client_group_id, status=status)
+        return {**memory, "filter_dropped": True} if dropped else memory
     except Exception as e:
         logger.error("learning: could not store memory for agent %s: %s", agent.get("_id"), e)
-        return {"text": text, "kind": kind, "filter": flt, "source": "denial",
+        return {"text": text, "kind": kind, "filter": flt, "source": source,
                 "source_ref": (doc or {}).get("_id"), "active": False}
 
 

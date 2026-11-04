@@ -135,7 +135,7 @@ def _retry_patch(test: dict, ad: dict) -> dict:
 
 def findings_for_test(test: dict, ads: list[dict], groups_by_id: dict) -> list[Finding]:
     """Every finding the test reproduces right now (adopt findings come from reconcile)."""
-    if test.get("status") not in (*_LIVE, "posting"):
+    if test.get("managed_by") or test.get("status") not in (*_LIVE, "posting"):
         return []
     code = test.get("code") or "Creative test"
     name = test.get("name") or ""
@@ -350,21 +350,25 @@ async def _auto_pause(db, mongo_client, user_id: str, test: dict, finding: Findi
 async def _guardrail_split(db, user_id: str, finding: Finding, targets: list[dict],
                            rows: dict) -> tuple[list[dict], dict | None]:
     """The same protected-tag and per-client daily pause-cap checks an agent's auto-run
-    pause passes (ai.agents.guardrails.check_guardrails), with the user's media-buying
-    agent's guardrails (defaults when there is no agent). Checked per client group.
+    pause passes (ai.agents.guardrails.check_guardrails), with the guardrails of the agent
+    acting for each client group (ai.agents.claims.acting_agent; defaults when no agent
+    holds the client). Checked per client group.
     Returns (allowed targets, first blocked_reason or None)."""
     from ai.agents.defaults import DEFAULT_GUARDRAILS
+    from ai.agents.claims import acting_agent
     from ai.agents.guardrails import check_guardrails
 
-    agent = await db["agents"].find_one({"user_id": user_id, "type": "media_buying"}) or {}
-    guard = {
-        # Not an agent rule: no permission or last-live-ad check, just tags and the cap.
-        "permissions": {"ads": True},
-        "guardrails": {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {}),
-                       "protect_last_live_ad": False},
-        "client_caps": agent.get("client_caps") or {},
-        "scope": agent.get("scope") or {},
-    }
+    def guard_for(agent: dict | None) -> dict:
+        agent = agent or {}
+        return {
+            # Not an agent rule: no permission or last-live-ad check, just tags and the cap.
+            "permissions": {"ads": True},
+            "guardrails": {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {}),
+                           "protect_last_live_ad": False},
+            "client_caps": agent.get("client_caps") or {},
+            "scope": agent.get("scope") or {},
+        }
+
     by_group: dict[str, list[dict]] = {}
     for t in targets:
         gid = (rows.get(t["object_id"]) or {}).get("client_group_id") or finding.client_group_id
@@ -372,6 +376,7 @@ async def _guardrail_split(db, user_id: str, finding: Finding, targets: list[dic
     allowed, reason = [], None
     for gid, group_targets in sorted(by_group.items(), key=lambda kv: str(kv[0])):
         doc = {"action": {"type": ACTION_PAUSE_ADS, "targets": group_targets}, "client_group_id": gid}
+        guard = guard_for(await acting_agent(db, user_id, gid))
         g = await check_guardrails(db, guard, doc, now_utc=_utcnow())
         if g.ok:
             allowed.extend(group_targets)
@@ -407,6 +412,8 @@ async def sync_creative_suggestions(db, user_id: str, test: dict, ads: list[dict
                                     mongo_client=None) -> int:
     """Write this test's findings and resolve the ones it no longer reproduces.
     Returns the number of findings upserted. `mongo_client` enables auto-pause."""
+    if test.get("managed_by"):  # an agent's test: its own scoreboard tracks it
+        return 0
     groups_by_id = await _groups(db, user_id)
     findings = findings_for_test(test, ads, groups_by_id)
 

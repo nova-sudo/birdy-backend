@@ -40,7 +40,7 @@ async def group(db, gid="g1", user=U, targets=None):
 
 
 def make_agent(api):
-    r = api.post("/api/agents")
+    r = api.post("/api/agents", json={"type": "custom", "name": "Rules"})
     assert r.status_code == 200, r.text
     return r.json()
 
@@ -51,9 +51,32 @@ def test_create_list_get(api):
     assert a["status"] == "draft" and a["permissions"]["budgets"] is False
     for k in ("last_run", "last_run_at", "scope", "guardrails", "client_caps", "training", "confidence"):
         assert k in a
-    assert api.post("/api/agents").status_code == 409
-    assert [x["id"] for x in api.get("/api/agents").json()] == [a["id"]]
+    assert api.post("/api/agents", json={"type": "custom", "name": "Second"}).status_code == 200
+    assert a["name"] == "Rules"
+    assert a["id"] in [x["id"] for x in api.get("/api/agents").json()]
     assert api.get(f"/api/agents/{a['id']}").json()["id"] == a["id"]
+
+
+@pytest.mark.parametrize("headers", [{}, {"Content-Type": "application/json"}])
+def test_create_with_no_body_is_a_custom_agent(api, headers):
+    """The old frontend posts nothing. It keeps working until the new one is deployed."""
+    r = api.post("/api/agents", headers=headers)
+    assert r.status_code == 200, r.text
+    assert r.json()["type"] == "custom" and r.json()["name"] == "Custom agent" and r.json()["status"] == "draft"
+
+
+@pytest.mark.parametrize("body,status", [
+    ({}, 400), ({"type": "custom"}, 400), ({"type": "custom", "name": "  "}, 400),
+    ({"type": "custom", "name": "x" * 61}, 400), ({"type": "nope", "name": "x"}, 400)])
+def test_create_with_a_body_is_still_validated(api, body, status):
+    assert api.post("/api/agents", json=body).status_code == status
+
+
+def test_a_name_cant_be_patched(api):
+    """So AgentPatch has no name to check. If renaming is added, it needs the 1 to 60 check create has."""
+    a = make_agent(api)
+    assert api.patch(f"/api/agents/{a['id']}", json={"name": "New"}).status_code == 422
+    assert api.get(f"/api/agents/{a['id']}").json()["name"] == "Rules"
 
 
 def test_other_users_agent_404(api):

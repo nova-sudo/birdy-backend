@@ -6,7 +6,9 @@ date an ad was paused, which Meta does not expose. One paged Graph call per
 object type per refresh.
 """
 
+import json
 import logging
+import re
 from datetime import date, datetime
 
 import httpx
@@ -19,12 +21,63 @@ logger = logging.getLogger(__name__)
 _GRAPH = "https://graph.facebook.com/v25.0"
 AD_STATE = "meta_ad_state"
 ADSET_STATE = "meta_adset_state"
-_AD_FIELDS = "id,name,adset_id,campaign_id,effective_status,created_time"
+_AD_FIELDS = ("id,name,adset_id,campaign_id,effective_status,created_time,issues_info,ad_review_feedback,"
+              "creative{id,image_hash,video_id,body,title,object_story_spec}")
+# Without this filter Meta leaves ARCHIVED ads out of /ads. DELETED stays out on purpose.
+_AD_STATUSES = ["ACTIVE", "PAUSED", "PENDING_REVIEW", "DISAPPROVED", "PREAPPROVED", "PENDING_BILLING_INFO",
+                "CAMPAIGN_PAUSED", "ARCHIVED", "ADSET_PAUSED", "IN_PROCESS", "WITH_ISSUES"]
 _ADSET_FIELDS = "id,name,campaign_id,effective_status,daily_budget,lifetime_budget,campaign{effective_status}"
 
 
 class MetaTokenError(Exception):
     """The user's Meta token is missing, expired or rejected."""
+
+
+SCOPE_ACCOUNT, SCOPE_APP = "account", "app"
+
+
+class MetaRateLimit(RuntimeError):
+    """Meta is throttling us. Trying again later should work. `scope` says who is affected:
+    SCOPE_ACCOUNT is one ad account, so others can still be read. SCOPE_APP is the app or the user,
+    so every read would fail. `retry_after_s` is Meta's own estimate, when it gave one."""
+
+    def __init__(self, message: str = "", *, scope: str = SCOPE_APP, retry_after_s: int | None = None):
+        super().__init__(message)
+        self.scope = scope
+        self.retry_after_s = retry_after_s
+
+
+_APP_LIMIT_CODES = {4, 17, 32, 613}
+_ACCOUNT_LIMIT_CODES = {80000, 80003, 80004, 80014}
+_ACCOUNT_LIMIT_SUBCODE = 2446079  # with code 17, the limit is on the account
+_USAGE_HEADER = "X-Business-Use-Case-Usage"
+
+
+def is_rate_limit(err: dict) -> bool:
+    return (err or {}).get("code") in _APP_LIMIT_CODES | _ACCOUNT_LIMIT_CODES
+
+
+def _limit_scope(err: dict) -> str:
+    code = err.get("code")
+    if code in _ACCOUNT_LIMIT_CODES or (code == 17 and err.get("error_subcode") == _ACCOUNT_LIMIT_SUBCODE):
+        return SCOPE_ACCOUNT
+    return SCOPE_APP
+
+
+def _regain_seconds(header: str | None) -> int | None:
+    """The longest estimated_time_to_regain_access in the usage header, which Meta gives in minutes
+    per business and use case. None when it's missing, unreadable or 0."""
+    try:
+        usage = json.loads(header or "{}")
+        minutes = [e.get("estimated_time_to_regain_access") or 0 for entries in usage.values() for e in entries]
+        return int(max(minutes, default=0) * 60) or None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def rate_limit_error(err: dict, resp: httpx.Response, where: str) -> MetaRateLimit:
+    return MetaRateLimit(f"Meta rate limit on {where}: {err.get('message') or resp.status_code}",
+                         scope=_limit_scope(err), retry_after_s=_regain_seconds(resp.headers.get(_USAGE_HEADER)))
 
 
 def _is_active(status) -> bool:
@@ -51,9 +104,39 @@ def _parse_time(v) -> datetime | None:
             return None
 
 
-async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: str) -> list[dict]:
+def _creative(c: dict | None) -> dict:
+    """The parts of an ad's creative the stock agent copies when it re-posts the ad."""
+    c = c or {}
+    spec = c.get("object_story_spec") or {}
+    data = spec.get("link_data") or spec.get("video_data") or spec.get("photo_data") or {}
+    cta = (data.get("call_to_action") or {}).get("value") or {}
+    return {"id": c.get("id"),
+            "image_hash": c.get("image_hash") or data.get("image_hash"),
+            "video_id": c.get("video_id") or data.get("video_id"),
+            "page_id": spec.get("page_id"),
+            "lead_form_id": cta.get("lead_gen_form_id"),
+            "cta_type": (data.get("call_to_action") or {}).get("type"),
+            "body": data.get("message") or data.get("caption") or c.get("body"),
+            "title": data.get("name") or data.get("title") or c.get("title"),
+            "link": data.get("link") or cta.get("link")}
+
+
+_MIN_LIMIT = 25
+
+
+def _too_much_data(status: int, body: dict) -> bool:
+    err = (body or {}).get("error") or {}
+    return "reduce the amount of data" in str(err.get("message") or "").lower() \
+        and (err.get("code") == 1 or status >= 500)
+
+
+async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: str,
+                     extra: dict | None = None) -> list[dict]:
+    """Every page of a Graph edge. When Graph says the page is too big, the same page is retried
+    with half the limit (down to 25) before the error is raised."""
     out: list[dict] = []
-    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": 200, "access_token": token}
+    limit = 200
+    url, params = f"{_GRAPH}/{path}", {"fields": fields, "limit": limit, "access_token": token, **(extra or {})}
     while url:
         resp = await client.get(url, params=params)
         if resp.status_code == 401:
@@ -66,6 +149,15 @@ async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: s
             err = body.get("error") or {}
             if err.get("code") in (190, 102):  # expired/invalid token, session invalid
                 raise MetaTokenError(err.get("message") or "Meta token invalid")
+            if _too_much_data(resp.status_code, body) and limit > _MIN_LIMIT:
+                limit = max(_MIN_LIMIT, limit // 2)
+                if params is not None:
+                    params = {**params, "limit": limit}
+                else:  # a paging URL carries its own limit
+                    url = re.sub(r"([?&])limit=\d+", rf"\g<1>limit={limit}", url)
+                continue
+            if is_rate_limit(err):
+                raise rate_limit_error(err, resp, path)
             raise RuntimeError(f"Meta Graph error on {path}: {err.get('message') or resp.status_code}")
         out.extend(body.get("data") or [])
         url, params = (body.get("paging") or {}).get("next"), None
@@ -90,11 +182,23 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
     if not token:
         raise MetaTokenError("No valid Facebook token found")
 
+    ads, adsets = await read_meta_state(ad_account_id, token)
+    return await store_meta_state(db, user_id, client_group_id, ad_account_id, ads, adsets, today=today)
+
+
+async def read_meta_state(ad_account_id: str, token: str) -> tuple[list[dict], list[dict]]:
+    """The ad account's ads and ad sets from Graph. No stored state changes."""
     acct = ad_account_id if str(ad_account_id).startswith("act_") else f"act_{ad_account_id}"
     async with httpx.AsyncClient(timeout=30.0) as client:
-        ads = await _fetch_all(client, f"{acct}/ads", _AD_FIELDS, token)
+        ads = await _fetch_all(client, f"{acct}/ads", _AD_FIELDS, token,
+                               {"effective_status": json.dumps(_AD_STATUSES)})
         adsets = await _fetch_all(client, f"{acct}/adsets", _ADSET_FIELDS, token)
+    return ads, adsets
 
+
+async def store_meta_state(db, user_id: str, client_group_id: str, ad_account_id: str, ads: list[dict],
+                           adsets: list[dict], *, today: date) -> dict:
+    """Mirror one read of an account into one client group's rows."""
     now = datetime.utcnow()
     for ad in ads:
         key = {"client_group_id": client_group_id, "ad_id": ad["id"]}
@@ -113,6 +217,9 @@ async def refresh_meta_state(db, mongo_client, user_id: str, client_group_id: st
             "name": ad.get("name") or "",
             "effective_status": status,
             "created_time": _parse_time(ad.get("created_time")),
+            "issues": ad.get("issues_info") or [],
+            "review_feedback": ad.get("ad_review_feedback") or {},
+            "creative": _creative(ad.get("creative")),
             "paused_at": paused_at,
             "updated_at": now,
         }}, upsert=True)

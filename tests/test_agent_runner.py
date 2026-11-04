@@ -11,7 +11,7 @@ from datetime import date, datetime, timedelta
 
 import pytest
 
-from ai.agents import memory_filters, runner
+from ai.agents import claims, memory_filters, runner
 from ai.agents.meta_state import MetaTokenError
 from ai.agents.store import add_memory, create_agent, list_rules, update_agent, update_rule
 from ai.suggestions import actions
@@ -71,6 +71,7 @@ async def _agent(db, gids):
         "status": "active",
         "scope": {"client_group_ids": list(gids), "schedule": {"time": "07:00", "tz": "Europe/London"}},
     })
+    await claims.claim_clients(db, USER, agent["_id"], list(gids))  # only the holder may change a client
     return agent
 
 
@@ -257,13 +258,13 @@ async def test_purger_skips_agent_clients(mock_db):
             "facebook_cache": {"last_7d": {"ads": [{"ad_id": "x"}]}},
         })
     await mock_db.agents.insert_many([
-        {"_id": "a1", "user_id": USER, "type": "media_buying", "status": "active",
+        {"_id": "a1", "user_id": USER, "type": "custom", "status": "active",
          "scope": {"client_group_ids": ["cg1"]}},
         {"_id": "a2", "user_id": USER, "type": "other", "status": "dry_run",
          "scope": {"client_group_ids": ["cg2"]}},
         {"_id": "a3", "user_id": USER, "type": "third", "status": "draft",
          "scope": {"client_group_ids": ["cg3"]}},
-        {"_id": "a4", "user_id": "someone-else", "type": "media_buying", "status": "active",
+        {"_id": "a4", "user_id": "someone-else", "type": "custom", "status": "active",
          "scope": {"client_group_ids": ["cg4"]}},
     ])
     seen = []

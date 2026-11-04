@@ -47,9 +47,8 @@ async def _resolve_test(db, user_id: str, ref) -> dict | None:
     ref = str(ref or "").strip()
     if not ref:
         return None
-    if CODE_RE.match(ref):
-        return await store.get_test_by_code(db, user_id, ref)
-    return await store.get_test(db, user_id, ref)
+    test = await (store.get_test_by_code if CODE_RE.match(ref) else store.get_test)(db, user_id, ref)
+    return None if test and test.get("managed_by") else test
 
 
 def _thumbnail(test: dict):

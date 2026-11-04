@@ -22,6 +22,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from ai.agents import claims
 from ai.agents import confidence as agent_confidence
 from ai.agents import history as ad_history
 from ai.agents import learning
@@ -29,6 +30,8 @@ from ai.agents import outcomes
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents import validation
+from ai.agents.stock import lessons as stock_lessons
+from ai.agents.stock import settings as stock_settings
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
     DEFAULT_PARAMS,
@@ -53,9 +56,11 @@ SETTABLE_MODES = ("flag", "ask")  # "auto" is granted only through graduation
 # ---------------------------------------------------------------------------
 
 def _agent_to_api(doc: dict) -> dict:
-    return {
+    out = {
         "id": doc["_id"],
         "type": doc.get("type"),
+        "name": doc.get("name"),
+        "settings": doc.get("settings") or {},
         "status": doc.get("status"),
         "scope": doc.get("scope") or {},
         "permissions": doc.get("permissions") or {},
@@ -66,7 +71,11 @@ def _agent_to_api(doc: dict) -> dict:
         "last_run": doc.get("last_run"),
         "last_run_at": doc.get("last_run_at"),
         "created_at": doc.get("created_at"),
+        "turned_off_at": doc.get("turned_off_at"),  # set when a person turned a live agent off; /activate clears it
     }
+    if doc.get("type") == agent_store.TYPE_STOCK:
+        out["add_writes_enabled"] = stock_settings.add_writes_enabled()  # setup shows Add as Flag only while off
+    return out
 
 
 def _rule_to_api(doc: dict) -> dict:
@@ -135,14 +144,30 @@ async def list_agents(current_user: str = Depends(get_current_user)):
         return [_agent_to_api(a) for a in await agent_store.list_agents(db, current_user)]
 
 
+class CreateAgentBody(BaseModel):
+    type: str = agent_store.TYPE_CUSTOM
+    name: str | None = None
+
+
 @router.post("")
-async def create_agent(current_user: str = Depends(get_current_user)):
+async def create_agent(body: CreateAgentBody | None = None, current_user: str = Depends(get_current_user)):
+    # No body is the old frontend, for the deploy window only: remove it, and make `body` required again, once the
+    # new frontend is live. It has no name to check, since the store gives it DEFAULT_CUSTOM_NAME.
+    agent_type, name = agent_store.TYPE_CUSTOM, None
+    if body is not None:
+        agent_type = body.type
+        if agent_type not in (agent_store.TYPE_CUSTOM, agent_store.TYPE_STOCK):
+            raise HTTPException(status_code=400, detail="Unknown agent type")
+        if agent_type == agent_store.TYPE_CUSTOM:
+            name = (body.name or "").strip()
+            if not name or len(name) > 60:
+                raise HTTPException(status_code=400, detail="Name must be 1 to 60 characters")
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         try:
-            agent = await agent_store.create_agent(db, current_user)
+            agent = await agent_store.create_agent(db, current_user, type=agent_type, name=name)
         except agent_store.AgentExists:
-            raise HTTPException(status_code=409, detail="You already have a media buying agent")
+            raise HTTPException(status_code=409, detail="You already have the Birdy Media Buying Agent")
         return _agent_to_api(agent)
 
 
@@ -158,6 +183,10 @@ async def delete_agent(agent_id: str, current_user: str = Depends(get_current_us
     """Start setup over: deletes a draft agent and its rules, practice and memory."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
+        existing = await agent_store.get_agent(db, current_user, agent_id)
+        if existing and existing.get("turned_off_at") and existing.get("status") != "active":
+            raise HTTPException(status_code=409, detail=(
+                "A turned off agent can't be started over: that would delete everything it learned. Turn it on again instead"))
         try:
             deleted = await agent_store.delete_draft_agent(db, current_user, agent_id)
         except agent_store.AgentActive:
@@ -173,6 +202,34 @@ class AgentPatch(BaseModel):
     permissions: Optional[dict] = None
     guardrails: Optional[dict] = None
     client_caps: Optional[dict] = None
+    move_claims: bool = False          # take over clients another agent acts on
+    only_flag: Optional[list[str]] = None  # stay watching these clients without claiming them
+
+
+class ActivateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    move_claims: bool = False
+    only_flag: Optional[list[str]] = None
+
+
+FLAG_ONLY_KEY = "flag_only_client_group_ids"  # scope key: watched, never claimed or acted on
+
+
+async def _claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move: bool,
+                       only_flag) -> JSONResponse | None:
+    """Claim the clients an active agent acts on. Clients in `only_flag` stay in its scope with
+    no claim (and any claim this agent holds on them is released). Returns a 409 response
+    naming the holders when another agent has any of the rest."""
+    skip = set(only_flag or [])
+    await claims.release_clients(db, user_id, agent_id, skip)
+    conflicts = await claims.claim_clients(db, user_id, agent_id, [g for g in ids if g not in skip], move=move)
+    if conflicts:
+        return JSONResponse(status_code=409, content={
+            "detail": "Another agent already acts on " + ", ".join(
+                sorted({c["holder_name"] or "another agent" for c in conflicts})),
+            "conflicts": conflicts})
+    await claims.mark_claimed(db, agent_id)  # it holds what it should, so the migration never touches it
+    return None
 
 
 @router.patch("/{agent_id}")
@@ -196,7 +253,18 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
             if "schedule" in body.scope:
                 merged_scope["schedule"] = {**(current.get("schedule") or {}),
                                             **_validate_schedule(body.scope["schedule"])}
+            eff_ids = ids if ids is not None else list(current.get("client_group_ids") or [])
+            flag_only = [g for g in (body.only_flag if body.only_flag is not None
+                                     else current.get(FLAG_ONLY_KEY) or []) if g in eff_ids]
+            merged_scope[FLAG_ONLY_KEY] = flag_only
             patch["scope"] = merged_scope
+            if agent.get("status") == "active":
+                resp = await _claim_scope(db, current_user, agent_id, eff_ids,
+                                          move=body.move_claims, only_flag=flag_only)
+                if resp is not None:
+                    return resp
+                await claims.release_clients(
+                    db, current_user, agent_id, set(current.get("client_group_ids") or []) - set(eff_ids))
 
         if body.permissions is not None:
             unknown = set(body.permissions) - set(DEFAULT_PERMISSIONS)
@@ -230,6 +298,30 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
 
         updated = await agent_store.update_agent(db, current_user, agent_id, patch)
         return _agent_to_api(updated)
+
+
+@router.get("/{agent_id}/claims")
+async def get_claims(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Who acts on each client this agent watches, so the page can offer a client nobody holds back to it.
+    Taking one back is the scope save in PATCH. A client that no longer exists isn't listed."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        gids = list(dict.fromkeys((agent.get("scope") or {}).get("client_group_ids") or []))
+        names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
+            {"id": {"$in": gids}, "user_id": current_user})}
+        held = {r["client_group_id"]: r["agent_id"] async for r in db[claims.CLAIMS].find(
+            {"user_id": current_user, "client_group_id": {"$in": gids}})}
+        holders = {a["_id"]: a.get("name") or "" async for a in db[agent_store.AGENTS].find(
+            {"_id": {"$in": [h for h in held.values() if h != agent_id]}, "user_id": current_user})}
+
+        def row(gid: str) -> dict:
+            holder = held.get(gid)
+            acting = "no_agent" if holder is None else "this_agent" if holder == agent_id else "other_agent"
+            return {"client_group_id": gid, "name": names[gid], "acting": acting,
+                    "holder_name": holders.get(holder) if acting == "other_agent" else None}
+
+        return {"clients": [row(g) for g in gids if g in names]}
 
 
 # ---------------------------------------------------------------------------
@@ -622,26 +714,85 @@ async def resolve_practice(agent_id: str, case_id: str, body: PracticeResolution
         return {"resolution": body.resolution}
 
 
+async def _stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list[dict]]:
+    """What stops the stock agent switching on: a client, zones that resolve for each, and a
+    finished preview. Also returns the settings errors behind any zone messages."""
+    ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
+    groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": user_id}).to_list(length=None)
+    errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
+    missing = [] if ids else ["Choose at least one client to watch"]
+    missing += [e["message"] for e in errors]
+    preview = await db[agent_store.RUNS].find_one(
+        {"agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}},
+        {"clients": 1}, sort=[("as_of", -1)])
+    # The newest finished preview must have covered every client in scope now.
+    covered = preview is not None and set(ids) <= set(preview.get("clients") or {})
+    # A preview that couldn't check any client proves nothing (an expired Meta token fails them all).
+    read = covered and any((preview["clients"].get(g) or {}).get("state") != "failed" for g in ids)
+    if not read:
+        missing.append("Preview the first report" if not covered
+                       else "Preview the first report again: it couldn't check any client")
+    return missing, errors
+
+
 @router.post("/{agent_id}/activate")
-async def activate(agent_id: str, current_user: str = Depends(get_current_user)):
+async def activate(agent_id: str, body: Optional[ActivateBody] = None,
+                   current_user: str = Depends(get_current_user)):
+    body = body or ActivateBody()
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         if agent.get("status") == "active":
             return _agent_to_api(agent)  # idempotent: nothing changes
-        conf = await _confidence(db, agent)
-        if not conf["ready"]:
-            return JSONResponse(status_code=409, content={
-                "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
+        if agent.get("type") == agent_store.TYPE_STOCK:
+            missing, errors = await _stock_missing(db, current_user, agent)
+            if missing:
+                return JSONResponse(status_code=409, content={
+                    "detail": "The agent isn't ready to switch on yet", "missing": missing, "errors": errors})
+            conf = {"score": None}
+        else:
+            conf = await _confidence(db, agent)
+            if not conf["ready"]:
+                return JSONResponse(status_code=409, content={
+                    "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
+        scope = agent.get("scope") or {}
+        ids = list(scope.get("client_group_ids") or [])
+        flag_only = [g for g in (body.only_flag if body.only_flag is not None
+                                 else scope.get(FLAG_ONLY_KEY) or []) if g in ids]
+        resp = await _claim_scope(db, current_user, agent_id, ids,
+                                  move=body.move_claims, only_flag=flag_only)
+        if resp is not None:
+            return resp
+        await db[agent_store.AGENTS].update_one(
+            {"_id": agent_id, "user_id": current_user}, {"$set": {f"scope.{FLAG_ONLY_KEY}": flag_only}})
         for rule in await agent_store.list_rules(db, agent_id):
             mode = ("ask" if rule["kind"] in agent_confidence.ASK_KINDS
                     else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)
             if mode is not None:
                 await agent_store.update_rule(db, agent_id, rule["_id"], mode=mode)  # syncs open items
         await db[agent_store.AGENTS].update_one(
-            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {"$set": {
-            "status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()}})
+            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {
+            "$set": {"status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()},
+            "$unset": {"turned_off_at": ""}})
         return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))
+
+
+@router.post("/{agent_id}/deactivate")
+async def deactivate(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Turn the Birdy Media Buying Agent off. It goes back to a draft, marked `turned_off_at` so the app
+    offers Turn on and never Start over. Its clients are released; scope, settings, runs, cards and lines
+    stay. The tick skips it, Apply is refused ("agent off") and Undo still works. An unfinished run is left
+    alone (ending it would post to Slack) and carries on when the agent is turned back on, or ends if it
+    is then over a day old."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        if agent.get("type") != agent_store.TYPE_STOCK:
+            raise HTTPException(status_code=409, detail="Only the Birdy Media Buying Agent can be turned off")
+        if agent.get("status") != "active":
+            return _agent_to_api(agent)  # idempotent: nothing changes
+        return _agent_to_api(await agent_store.update_agent(
+            db, current_user, agent_id, {"status": "draft", "turned_off_at": datetime.utcnow()}))
 
 
 # ---------------------------------------------------------------------------
@@ -730,6 +881,16 @@ async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = D
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
+        stored = await db[agent_store.PROPOSALS].find_one({"_id": proposal_id, "agent_id": agent_id}, {"kind": 1})
+        if stored and stored.get("kind") == stock_lessons.PROMOTE:
+            # A "Make it a rule?" suggestion becomes a lesson. It has no rule and changes none.
+            try:
+                proposal, lesson = await stock_lessons.accept_promotion(db, agent, proposal_id, by=current_user)
+            except learning.ProposalNotFound:
+                raise HTTPException(status_code=404, detail="Proposal not found")
+            except learning.ProposalClosed:
+                raise HTTPException(status_code=409, detail="This proposal was already decided")
+            return {"proposal": _proposal_to_api(proposal), "rule": None, "lesson": _memory_to_api(lesson)}
         try:
             proposal, rule = await learning.accept_proposal(db, agent, proposal_id)
         except learning.ProposalNotFound:

@@ -164,3 +164,50 @@ async def test_failing_chunk_does_not_block_next(mock_db, monkeypatch):
 def test_bool_size_rejected():
     with pytest.raises(ValueError):
         ug.issue_grant("u1", "image/png", True, NOW)
+
+
+@pytest.mark.parametrize("head,kind", [
+    (b"\x00\x00\x00\x20ftypisom\x00\x00\x02\x00", "video"),
+    (b"\x00\x00\x00\x14ftypqt  \x00\x00\x00\x00", "video"),
+    (b"\x00\x00\x00\x08wide\x00\x00\x00\x00mdat", "video"),
+    (b"\x00\x00\x00\x6cmoov\x00\x00\x00\x00mvhd", "video"),
+    (b"\xff\xd8\xff\xe0\x00\x10JFIF\x00\x01\x01\x01\x00", "image"),
+    (b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR", "image"),
+    (b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00", None),
+    (b"<html>not media</html>", None),
+    (b"", None),
+])
+def test_media_kind_comes_from_the_bytes(head, kind):
+    assert ug.media_kind_of(head) == kind
+
+
+async def test_read_media_kind_asks_for_only_the_start_and_ignores_the_name(monkeypatch):
+    import httpx
+
+    seen = []
+
+    def handler(request):
+        seen.append(request)
+        return httpx.Response(206, content=b"\xff\xd8\xff\xe0" + b"\x00" * 12)
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ug.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    assert await ug.read_media_kind("https://x.public.blob.vercel-storage.com/renamed.mp4") == "image"
+    assert seen[0].method == "GET" and seen[0].headers["range"] == "bytes=0-15"
+
+
+async def test_read_media_kind_doesnt_follow_redirects_and_raises_when_it_cant_read(monkeypatch):
+    import httpx
+
+    calls = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        return httpx.Response(302, headers={"location": "https://169.254.169.254/"})
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(ug.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    with pytest.raises(httpx.HTTPError):
+        await ug.read_media_kind("https://x.public.blob.vercel-storage.com/a.png")
+    assert len(calls) == 1
+

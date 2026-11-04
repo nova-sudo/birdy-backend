@@ -1,14 +1,29 @@
 import pytest
 
 from ai.agents.defaults import DEFAULT_PARAMS
-from ai.agents.store import RULE_VERSIONS, create_agent, get_agent, list_memory, list_rules
+from ai.agents import store
+from ai.agents.store import RULE_VERSIONS, get_agent, list_memory, list_rules
 from ai.orchestrator import _PAGE_SYSTEM_PROMPTS, _PAGE_TOOLS
 from ai.prompts import agent_training
 from ai.tools import agent_tools as t
 from ai.tools.registry import ToolRegistry
 
 U = "u1@example.com"
-NO_AGENT = {"ok": False, "error": "Set up the Media Buying Agent first"}
+NO_AGENT = {"ok": False, "error": "Set up this agent first"}
+
+
+@pytest.fixture(autouse=True)
+def _reset_training_agent():
+    token = t.current_training_agent.set(None)
+    yield
+    t.current_training_agent.reset(token)
+
+
+async def create_agent(db, user, **kw):
+    """Create an agent and point the training chat at it, like the chat router does."""
+    agent = await store.create_agent(db, user, **kw)
+    t.current_training_agent.set(agent["_id"])
+    return agent
 
 
 async def group(db, gid, name, user=U, cpl=None, currency=None):
@@ -227,3 +242,40 @@ async def test_run_chat_returns_agent_changes(mock_db, monkeypatch):
                                                "before": 1.5, "after": 2}},
         {"tool": "answer_topic", "changed": {"topic": "pause", "answered": True}},
     ]
+
+
+async def test_set_rule_param_targets_only_the_chosen_agent(mock_db):
+    a = await create_agent(mock_db, U, name="A")
+    b = await create_agent(mock_db, U, name="B")
+    t.current_training_agent.set(b["_id"])
+    out = await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="cpl_multiple", value=2)
+    assert out["ok"] is True
+    assert (await rule(mock_db, b, "pause_over_target"))["params"]["cpl_multiple"] == 2
+    assert (await rule(mock_db, a, "pause_over_target"))["params"]["cpl_multiple"] == 1.5
+
+
+async def test_other_users_agent_is_refused(mock_db):
+    other = await store.create_agent(mock_db, "u2@example.com")
+    t.current_training_agent.set(other["_id"])
+    out = await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="cpl_multiple", value=2)
+    assert out == NO_AGENT
+    assert (await rule(mock_db, other, "pause_over_target"))["params"]["cpl_multiple"] == 1.5
+
+
+async def test_stock_agent_is_refused(mock_db):
+    stock = await store.create_agent(mock_db, U, type=store.TYPE_STOCK)
+    t.current_training_agent.set(stock["_id"])
+    assert await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="cpl_multiple", value=2) == NO_AGENT
+    assert await t.get_playbook(mock_db, U) == NO_AGENT
+
+
+async def test_no_agent_id_does_not_guess(mock_db):
+    await store.create_agent(mock_db, U)
+    t.current_training_agent.set(None)
+    assert await t.get_playbook(mock_db, U) == NO_AGENT
+
+
+def test_chat_request_carries_agent_id():
+    from core.models import ChatRequest
+    assert ChatRequest(message="m").agent_id is None
+    assert ChatRequest(message="m", agent_id="a1").agent_id == "a1"

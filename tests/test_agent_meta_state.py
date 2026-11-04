@@ -1,3 +1,4 @@
+import json
 from datetime import date
 
 import httpx
@@ -70,7 +71,8 @@ async def test_refresh_sets_paused_at_on_transition_and_clears_on_reactivate(moc
     assert await mock_db.meta_ad_state.count_documents({}) == 1  # upsert, no dupes
 
     ad_calls = [c for c in graph["calls"] if "/ads" in c[0] and "/adsets" not in c[0]]
-    assert ad_calls[0][1]["fields"] == "id,name,adset_id,campaign_id,effective_status,created_time"
+    assert ad_calls[0][1]["fields"] == meta_state._AD_FIELDS
+    assert "ARCHIVED" in json.loads(ad_calls[0][1]["effective_status"])  # Meta omits archived ads by default
     assert any("page2" in c[0] for c in ad_calls)  # paged
 
 
@@ -123,3 +125,147 @@ async def test_ad_days_indexes_created(mock_mongo_client, mock_db):
     keys = {tuple(k for k, _ in i["key"]): bool(i.get("unique")) for i in infos}
     assert keys[("user_id", "client_group_id", "ad_id", "date_start")] is True
     assert ("client_group_id", "ad_id", "date_start") in keys
+
+
+async def test_refresh_stores_issues_review_feedback_and_creative(mock_db, mock_mongo_client, graph, monkeypatch):
+    ad = {**_ad("WITH_ISSUES"),
+          "issues_info": [{"error_summary": "Pixel", "error_message": "Pixel missing"}],
+          "ad_review_feedback": {"global": {"reason": "text"}},
+          "creative": {"id": "c9", "image_hash": "h1", "body": "top body", "title": "top title",
+                       "object_story_spec": {"page_id": "p1", "link_data": {
+                           "link": "https://x.test", "message": "msg", "name": "nm",
+                           "call_to_action": {"value": {"lead_gen_form_id": "f1"}}}}}}
+
+    async def fake_get(self, url, params=None, **kw):
+        req = httpx.Request("GET", str(url))
+        data = [ad] if "/ads" in str(url) and "/adsets" not in str(url) else []
+        return httpx.Response(200, json={"data": data}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    await refresh_meta_state(mock_db, mock_mongo_client, "u", GID, "act_1", today=date(2026, 10, 1))
+    doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
+    assert doc["issues"] == ad["issues_info"] and doc["review_feedback"] == ad["ad_review_feedback"]
+    assert doc["creative"] == {"id": "c9", "image_hash": "h1", "video_id": None, "page_id": "p1",
+                               "lead_form_id": "f1", "cta_type": None, "body": "msg", "title": "nm", "link": "https://x.test"}
+
+
+async def test_refresh_without_creative_stores_empty_fields(mock_db, mock_mongo_client, graph):
+    await refresh_meta_state(mock_db, mock_mongo_client, "u", GID, "act_1", today=date(2026, 10, 1))
+    doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
+    assert doc["issues"] == [] and doc["review_feedback"] == {}
+    assert doc["creative"]["id"] is None and doc["creative"]["link"] is None
+
+
+def _too_much():
+    return {"error": {"code": 1, "message": "Please reduce the amount of data you're asking for, then retry your request"}}
+
+
+async def test_fetch_all_halves_limit_on_reduce_data_error(monkeypatch):
+    limits = []
+
+    async def fake_get(self, url, params=None, **kw):
+        limit = (params or {}).get("limit")
+        limits.append(limit)
+        req = httpx.Request("GET", str(url))
+        if limit and limit > 50:
+            return httpx.Response(500, json=_too_much(), request=req)
+        return httpx.Response(200, json={"data": [{"id": "a"}]}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        out = await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert out == [{"id": "a"}] and limits == [200, 100, 50]
+
+
+async def test_fetch_all_rewrites_limit_in_next_url(monkeypatch):
+    urls = []
+
+    async def fake_get(self, url, params=None, **kw):
+        urls.append(str(url))
+        req = httpx.Request("GET", str(url))
+        if "page2" in str(url) and "limit=200" in str(url):
+            return httpx.Response(400, json=_too_much(), request=req)
+        if "page2" in str(url):
+            return httpx.Response(200, json={"data": [{"id": "b"}]}, request=req)
+        return httpx.Response(200, json={"data": [{"id": "a"}], "paging": {
+            "next": "https://graph.facebook.com/v25.0/act_1/ads?page2=1&limit=200&after=x"}}, request=req)
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        out = await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert [o["id"] for o in out] == ["a", "b"]
+    assert "limit=100" in urls[-1] and "after=x" in urls[-1]
+
+
+async def test_fetch_all_gives_up_at_25(monkeypatch):
+    limits = []
+
+    async def fake_get(self, url, params=None, **kw):
+        limits.append((params or {}).get("limit"))
+        return httpx.Response(500, json=_too_much(), request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(RuntimeError):
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert limits == [200, 100, 50, 25]
+
+
+def _limited(monkeypatch, code, subcode=None, headers=None):
+    async def fake_get(self, url, params=None, **kw):
+        err = {"code": code, "message": "slow", **({"error_subcode": subcode} if subcode else {})}
+        return httpx.Response(400, json={"error": err}, headers=headers or {}, request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+
+async def _limit_from_fetch():
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(meta_state.MetaRateLimit) as e:
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    return e.value
+
+
+@pytest.mark.parametrize("code,subcode,scope", [
+    (80000, None, "account"), (80003, None, "account"), (80004, None, "account"), (80014, None, "account"),
+    (80000, 2446079, "account"), (17, 2446079, "account"),
+    (4, None, "app"), (17, None, "app"), (32, None, "app"), (613, None, "app")])
+async def test_fetch_all_gives_each_rate_limit_code_its_scope(monkeypatch, code, subcode, scope):
+    _limited(monkeypatch, code, subcode)
+    assert (await _limit_from_fetch()).scope == scope
+
+
+async def test_fetch_all_other_errors_are_not_rate_limits(monkeypatch):
+    _limited(monkeypatch, 100)
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(RuntimeError) as e:
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert not isinstance(e.value, meta_state.MetaRateLimit)
+
+
+@pytest.mark.parametrize("header,seconds", [
+    (json.dumps({"1": [{"type": "ads_management", "estimated_time_to_regain_access": 19}]}), 19 * 60),
+    (json.dumps({"1": [{"estimated_time_to_regain_access": 2}], "2": [{"estimated_time_to_regain_access": 7},
+                                                                     {"estimated_time_to_regain_access": 0}]}), 7 * 60),
+    (json.dumps({"1": [{"estimated_time_to_regain_access": 0}]}), None),
+    (json.dumps({"1": [{"type": "ads_management"}]}), None),
+    (json.dumps(["odd"]), None), ("not json", None), (None, None)])
+async def test_fetch_all_reads_the_time_to_regain_access_in_minutes(monkeypatch, header, seconds):
+    _limited(monkeypatch, 80004, headers={"X-Business-Use-Case-Usage": header} if header else None)
+    assert (await _limit_from_fetch()).retry_after_s == seconds
+
+
+def test_rate_limit_defaults_to_the_wider_scope():
+    e = meta_state.MetaRateLimit("slow")
+    assert e.scope == "app" and e.retry_after_s is None
+
+
+def test_creative_reads_a_photo_posts_caption():
+    got = meta_state._creative({"id": "c", "image_hash": "h", "object_story_spec": {"page_id": "p", "photo_data": {"image_hash": "h", "caption": "Real words"}}})
+    assert got["body"] == "Real words" and got["image_hash"] == "h"
+
+
+def test_creative_doesnt_copy_a_dynamic_ads_text():
+    got = meta_state._creative({"id": "c", "video_id": "v", "asset_feed_spec": {"bodies": [{"text": "One of many"}], "titles": [{"text": "T"}]},
+                                "object_story_spec": {"page_id": "p"}})
+    assert got["body"] is None and got["title"] is None

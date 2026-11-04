@@ -222,6 +222,8 @@ class ChatRequest(BaseModel):
     page: Optional[str] = None
     client_group_id: Optional[str] = None
     client_name: Optional[str] = None
+    # Page "agent_training": the custom agent being trained.
+    agent_id: Optional[str] = None
     # "My dashboards" chat: the dashboard open in the editor, and the editor's
     # `summarize(doc)` of it (unsaved edits included) for dashboard_describe.
     dashboard_id: Optional[str] = None

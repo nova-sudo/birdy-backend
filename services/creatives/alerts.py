@@ -10,7 +10,7 @@ import logging
 from datetime import datetime, timezone
 
 from core.constants import OPERATOR_LABELS
-from services.creatives.store import ARCHIVED, LIVE_STATUSES, POSTING, TEST_ADS, TESTS
+from services.creatives.store import ARCHIVED, LIVE_STATUSES, NOT_MANAGED, POSTING, TEST_ADS, TESTS
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ def _progress(op: str, value: float, threshold: float, triggered: bool) -> float
 
 
 async def _tests(db, alert: dict, *, include_posting: bool = False) -> list[dict]:
-    query: dict = {"user_id": alert.get("user_id")}
+    query: dict = {"user_id": alert.get("user_id"), **NOT_MANAGED}
     ids = alert.get("creative_test_ids") or []
     if ids:
         query["id"] = {"$in": ids}

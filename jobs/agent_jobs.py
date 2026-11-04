@@ -20,6 +20,11 @@ A claim that was taken but never finished (the invocation was killed mid-run) go
 stale after STALE_CLAIM and is retried, at most MAX_RUN_ATTEMPTS times a day; after
 that the day is recorded as last_run {status: "error", reason: "timed_out"}.
 
+Stock agents run on their own state machine (ai/agents/stock/runner.py) from
+run_due_stock_agents: the same due check, but the run starts on time with no agent-wide wait,
+because its first job is alerts. Waiting for spend data is per client, inside the run. Once a run
+exists, every tick resumes it until it is done, and only then is last_run_at stamped.
+
 agents-outcomes (daily 05:00 UTC): stores the 7-day outcome on applied agent actions
 (see ai/agents/outcomes.py).
 """
@@ -32,7 +37,10 @@ from zoneinfo import ZoneInfo
 from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents.runner import run_agent
-from ai.agents.store import AGENTS
+from ai.agents.stock import runner as stock_runner
+from ai.agents.stock.slack import retry_unposted_runs
+from ai.agents.stock.weekly import retry_weeklies
+from ai.agents.store import AGENTS, TYPE_STOCK
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 
@@ -43,6 +51,7 @@ GRACE = timedelta(hours=2)
 FRESHNESS_FIELD = "last_meta_refresh"
 IN_FLIGHT = ("pending", "in_progress")
 TICK_BUDGET_SECONDS = 180          # of Vercel's 300s function timeout
+SLACK_RETRY_FLOOR_SECONDS = 30     # late Slack posts still get this after a tick that used its budget
 STALE_CLAIM = timedelta(minutes=30)
 MAX_RUN_ATTEMPTS = 3
 
@@ -178,7 +187,7 @@ async def run_due_agents(mongo_client, *, now_utc: datetime, deadline: float | N
     def out_of_time() -> bool:
         return deadline is not None and time.monotonic() > deadline
 
-    for agent in await db[AGENTS].find({"status": "active"}).to_list(length=None):
+    for agent in await db[AGENTS].find({"status": "active", "type": {"$ne": TYPE_STOCK}}).to_list(length=None):
         try:
             _schedule(agent)
         except ValueError as e:
@@ -233,10 +242,104 @@ async def run_due_agents(mongo_client, *, now_utc: datetime, deadline: float | N
     return out
 
 
+def _stock_last_run(run: dict, at: datetime) -> dict:
+    summary = run.get("summary") or {}
+    status = "skipped_token" if run.get("reconnect") else "partial" if summary.get("could_not_check") else "ok"
+    return {"status": status, "at": at, "run_id": run["_id"], "kind": run.get("kind"),
+            "cards": summary.get("cards", 0), "stale": bool(summary.get("stale"))}
+
+
+async def _resume_previews(mongo_client, now_utc: datetime, deadline: float | None) -> None:
+    """Finish previews a request left unfinished (draft agents aren't ticked otherwise). Stale ones
+    end first. A preview never posts to Slack or Meta."""
+    db = mongo_client[DB_NAME]
+    for row in await db[stock_runner.RUNS].find(
+            {"kind": stock_runner.PREVIEW, "phase": {"$ne": stock_runner.DONE}}).to_list(length=None):
+        if deadline is not None and time.monotonic() > deadline:
+            return
+        try:
+            agent = await db[AGENTS].find_one({"_id": row["agent_id"], "type": TYPE_STOCK})
+            if agent is None:
+                continue
+            await stock_runner.end_stale_previews(db, agent, now_utc)
+            run = await db[stock_runner.RUNS].find_one({"_id": row["_id"]})
+            if run and run["phase"] != stock_runner.DONE:
+                await stock_runner.advance_run(db, mongo_client, run, agent, deadline=deadline, now_utc=now_utc)
+        except Exception as e:  # noqa: BLE001 - the preview records its own failures
+            logger.error("agents-tick: preview %s failed: %s", row.get("_id"), e, exc_info=True)
+
+
+async def run_due_stock_agents(mongo_client, *, now_utc: datetime, deadline: float | None = None) -> dict:
+    """Start each active stock agent's run on time and resume unfinished ones, the agent advanced
+    longest ago first, so one agency can't use the whole budget every tick. `deadline`
+    (time.monotonic()): past it nothing new starts and the rest waits for the next tick."""
+    now_utc = _aware_utc(now_utc)
+    db = mongo_client[DB_NAME]
+    out = {"ran": 0, "skipped": 0, "errors": 0, "deferred": 0}
+
+    def out_of_time() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    await _resume_previews(mongo_client, now_utc, deadline)
+    agents = await db[AGENTS].find({"status": "active", "type": TYPE_STOCK}).sort("stock_advanced_at", 1).to_list(length=None)
+    for agent in agents:
+        try:
+            _schedule(agent)
+        except ValueError as e:
+            logger.error("agents-tick: skipping stock agent %s: %s", agent.get("_id"), e)
+            out["skipped"] += 1
+            continue
+        try:
+            sched_utc, today = _scheduled_utc(agent, now_utc)
+            await stock_runner.end_overdue_runs(db, agent, now_utc)
+            run = await stock_runner.find_open_run(db, agent["_id"])
+            if run is None:
+                if not _is_due(agent, now_utc):
+                    continue
+                run = await stock_runner.find_run(db, agent["_id"], today.isoformat())
+            if out_of_time():
+                out["deferred"] += 1
+                continue
+            if run is None:
+                run = await stock_runner.get_or_create_run(db, agent, now_utc, scheduled_utc=sched_utc)
+            if run["phase"] != stock_runner.DONE:
+                await db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"stock_advanced_at": datetime.utcnow()}})
+                run = await stock_runner.advance_run(db, mongo_client, run, agent, deadline=deadline, now_utc=now_utc)
+                # Still claimed means another tick holds it and this one did nothing.
+                out["ran" if run.get("claimed_at") is None else "skipped"] += 1
+            if run["phase"] == stock_runner.DONE:
+                # A run finishing after local midnight belongs to the day it started, or the new
+                # day's run would read as already done.
+                at = now_utc.replace(tzinfo=None) if run["local_date"] == today.isoformat() else run["as_of"]
+                await db[AGENTS].update_one({"_id": agent["_id"]},
+                                            {"$set": {"last_run": _stock_last_run(run, at), "last_run_at": at}})
+        except Exception as e:  # the run records its own failures; a retry comes next tick
+            logger.error("agents-tick: stock agent %s failed: %s", agent.get("_id"), e, exc_info=True)
+            out["errors"] += 1
+    logger.info("[agents-tick] stock %s", out)
+    return out
+
+
 async def run_agents_tick() -> dict:
     deadline = time.monotonic() + TICK_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
-        return await run_due_agents(mongo_client, now_utc=datetime.now(timezone.utc), deadline=deadline)
+        out = await run_due_agents(mongo_client, now_utc=datetime.now(timezone.utc), deadline=deadline)
+        try:
+            stock = await run_due_stock_agents(mongo_client, now_utc=datetime.now(timezone.utc), deadline=deadline)
+        except Exception as e:
+            logger.error("[agents-tick] stock agents raised: %s", e, exc_info=True)
+            stock = {"error": str(e)}
+        posted_late = 0
+        try:
+            posted_late = await retry_unposted_runs(mongo_client[DB_NAME], datetime.now(timezone.utc),
+                                                    max(deadline, time.monotonic() + SLACK_RETRY_FLOOR_SECONDS))
+        except Exception as e:
+            logger.error("[agents-tick] late Slack posts raised: %s", e, exc_info=True)
+        try:
+            await retry_weeklies(mongo_client[DB_NAME], datetime.now(timezone.utc), deadline)
+        except Exception as e:
+            logger.error("[agents-tick] weekly retries raised: %s", e, exc_info=True)
+        return {**out, "stock": stock, "slack_posted_late": posted_late}
 
 
 async def run_outcomes(mongo_client, now_utc: datetime) -> dict:

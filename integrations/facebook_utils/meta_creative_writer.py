@@ -11,6 +11,7 @@ Failures raise MetaWriteError tagged with the wizard `step` that failed.
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from typing import Optional, Union
 
@@ -69,6 +70,9 @@ IMAGE_TYPES = ("image/jpeg", "image/png")
 
 
 META_CDN_SUFFIX = ".fbcdn.net"
+VIDEO_PROCESS_FAILED = "Meta could not process the video"
+AD_READ_PAGES = 20
+ADOPT_CLOCK_MARGIN = timedelta(minutes=2)  # our clock against Meta's, for "made since we asked"
 
 
 def _check_blob_url(url: str, *, allow_meta_cdn: bool = False) -> None:
@@ -119,8 +123,10 @@ async def upload_image(act: str, token: str, *, image_url: str, allow_meta_cdn: 
     return first["hash"]
 
 
-async def upload_video(act: str, token: str, *, file_url: str, name: str) -> str:
-    _check_blob_url(file_url)
+async def upload_video(act: str, token: str, *, file_url: str, name: str, allow_meta_cdn: bool = False) -> str:
+    """Meta pulls the file from `file_url`. `allow_meta_cdn` is for a source ad's own short-lived URL,
+    posted into another account (video ids are account-scoped)."""
+    _check_blob_url(file_url, allow_meta_cdn=allow_meta_cdn)
     data = await _request("POST", f"{GRAPH}/{act}/advideos", "upload_video",
                           data={"access_token": token, "file_url": file_url, "name": name},
                           timeout=300.0)
@@ -129,12 +135,28 @@ async def upload_video(act: str, token: str, *, file_url: str, name: str) -> str
     return data["id"]
 
 
+async def video_source(video_id: str, token: str) -> Optional[str]:
+    """The video's short-lived download URL. None when Meta holds it back, as it does for many ad videos."""
+    data = await _request("GET", f"{GRAPH}/{video_id}", "video_source",
+                          params={"access_token": token, "fields": "source"}, timeout=30.0)
+    return data.get("source") or None
+
+
+async def image_url_for_hash(act: str, token: str, image_hash: str) -> Optional[str]:
+    """The URL of an image in `act`, the only account its hash means anything in."""
+    data = await _request("GET", f"{GRAPH}/{act}/adimages", "image_url",
+                          params={"access_token": token, "hashes": json.dumps([image_hash]), "fields": "hash,url"},
+                          timeout=30.0)
+    rows = data.get("data") or []
+    return (rows[0].get("url") or None) if rows else None
+
+
 async def video_ready(video_id: str, token: str) -> bool:
     data = await _request("GET", f"{GRAPH}/{video_id}", "video_status",
                           params={"access_token": token, "fields": "status"}, timeout=30.0)
     state = (data.get("status") or {}).get("video_status")
     if state == "error":
-        raise MetaWriteError("Meta could not process the video", step="video_status")
+        raise MetaWriteError(VIDEO_PROCESS_FAILED, step="video_status")
     return state == "ready"
 
 
@@ -205,3 +227,35 @@ async def create_ad(act: str, token: str, *, name: str, adset_id: str, creative_
         "access_token": token, "name": name, "adset_id": adset_id,
         "creative": json.dumps({"creative_id": creative_id}), "status": "PAUSED"})
     return data["id"]
+
+
+def _made_since(ad: dict, since: datetime) -> bool:
+    try:
+        made = datetime.strptime(str(ad.get("created_time")), "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return False
+    since = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    return made >= since - ADOPT_CLOCK_MARGIN
+
+
+async def find_ad_in_adset(adset_id: str, token: str, *, name: str, creative_id: str, since: datetime) -> Optional[str]:
+    """An ad already in this ad set that a lost `create_ad` reply left behind. The one on this creative, always.
+    Else, as a retry can have rebuilt the creative, one with exactly this name that is PAUSED, as every ad we
+    create starts, and was made since `since`, when we asked: names repeat, and a person's ad or an older live one
+    must never be taken for ours. None when there isn't one. Raises MetaWriteError when the whole ad set couldn't
+    be read, since then nobody can say there's none."""
+    params = {"access_token": token, "fields": "id,name,status,created_time,creative{id}", "limit": 200}
+    by_name = None
+    for _ in range(AD_READ_PAGES):
+        data = await _request("GET", f"{GRAPH}/{adset_id}/ads", "read_adset_ads", params=params, timeout=30.0)
+        for ad in data.get("data") or []:
+            if str((ad.get("creative") or {}).get("id")) == str(creative_id):
+                return ad["id"]
+            if by_name is None and ad.get("name") == name and ad.get("status") == "PAUSED" and _made_since(ad, since):
+                by_name = ad["id"]
+        paging = data.get("paging") or {}
+        after = (paging.get("cursors") or {}).get("after")
+        if not (paging.get("next") and after):
+            return by_name
+        params = {**params, "after": after}
+    raise MetaWriteError("Too many ads in this ad set to check", step="read_adset_ads")

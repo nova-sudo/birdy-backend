@@ -6,6 +6,8 @@ daily pause cap (local-midnight reset, DST-safe, counts every actor).
 """
 
 import copy
+
+import pytest
 from datetime import datetime, timedelta
 
 from ai.agents.defaults import DEFAULT_GUARDRAILS, DEFAULT_PERMISSIONS
@@ -58,6 +60,12 @@ async def _seed_pauses(db, times, gid=GID, actor=store.ACTOR_USER):
 
 
 NOW = datetime(2026, 10, 20, 12, 0)  # naive UTC
+
+
+@pytest.fixture(autouse=True)
+async def _ag1_holds_client(mock_db):
+    from ai.agents import claims
+    await claims.claim_clients(mock_db, "u1", "ag1", [GID])
 
 
 async def test_allows_plain_pause(mock_db):

@@ -29,6 +29,7 @@ from ai.tools.render_ui_tools import register_render_ui_tools
 from ai.tools.page_view_tools import register_page_view_tools
 from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
+from ai.tools.agent_tools import current_training_agent
 
 logger = logging.getLogger(__name__)
 
@@ -77,22 +78,27 @@ async def chat(
                     and not await _onboarding_complete(db, current_user)):
                 await check_credits(current_user, mongo_client)
             provider = await get_provider_for_user(current_user, db)
-            result = await run_chat(
-                provider=provider,
-                tool_registry=registry,
-                db=db,
-                user_id=current_user,
-                message=request.message,
-                session_id=request.session_id,
-                page=request.page,
-                mongo_client=mongo_client,
-                client_group_id=request.client_group_id,
-                client_name=request.client_name,
-                dashboard_id=request.dashboard_id,
-                dashboard_summary=request.summary,
-                view_catalogues=request.view_catalogues,
-                attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
-            )
+            agent_token = current_training_agent.set(
+                request.agent_id if request.page == "agent_training" else None)
+            try:
+                result = await run_chat(
+                    provider=provider,
+                    tool_registry=registry,
+                    db=db,
+                    user_id=current_user,
+                    message=request.message,
+                    session_id=request.session_id,
+                    page=request.page,
+                    mongo_client=mongo_client,
+                    client_group_id=request.client_group_id,
+                    client_name=request.client_name,
+                    dashboard_id=request.dashboard_id,
+                    dashboard_summary=request.summary,
+                    view_catalogues=request.view_catalogues,
+                    attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
+                )
+            finally:
+                current_training_agent.reset(agent_token)
             return ChatResponse(**result)
         except HTTPException:
             # Preserve deliberate status codes (e.g. 402 OUT_OF_CREDITS) instead

@@ -106,7 +106,7 @@ def _json(value):
 
 async def _owned(db, user_id: str, test_id: str) -> dict:
     test = await store.get_test(db, user_id, test_id)
-    if test is None:
+    if test is None or test.get("managed_by"):
         raise HTTPException(404, "Creative test not found")
     return test
 
@@ -148,7 +148,7 @@ async def create_upload_grant(body: UploadGrantBody, current_user: str = Depends
         raise HTTPException(400, str(e))
     except RuntimeError as e:
         raise HTTPException(503, str(e))
-    return {"grant": grant}
+    return {"grant": grant, "path_prefix": upload_grant.owner_prefix(current_user)}
 
 
 @router.get("/targets/prefill")
