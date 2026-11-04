@@ -6,6 +6,7 @@ lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a c
 """
 
 import copy
+import logging
 import time
 from datetime import datetime, timezone
 from typing import Optional
@@ -19,6 +20,7 @@ from ai.agents import store as agent_store
 from ai.agents import history as ad_history
 from ai.agents.stock import add as stock_add
 from ai.agents.stock import apply as stock_apply
+from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
@@ -30,6 +32,7 @@ from routers import agents as agents_router
 from services import client_targets
 
 router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
+logger = logging.getLogger(__name__)
 
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
 OUTCOME_ROWS = 100
@@ -56,7 +59,8 @@ def _with_id(doc: dict, drop: tuple = ()) -> dict:
 
 CLIENT_FIELDS = ("state", "error", "reason", "carded", "stale", "card_id", "wait_for", "health_due")
 OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids", "result", "spend", "leads",
-                  "cpl", "currency", "card_id", "line_id", "created_at", "scored_at")
+                  "cpl", "currency", "card_id", "line_id", "ad_id", "baseline_cpl", "live_since", "flagged",
+                  "unscored_reason", "created_at", "scored_at")
 
 
 def _run_to_api(run: dict) -> dict:
@@ -179,6 +183,28 @@ async def _scoreboard(db, agent_id: str) -> dict:
             "rows": [{"id": r["_id"], **{k: r[k] for k in OUTCOME_FIELDS if k in r}} for r in rows[:OUTCOME_ROWS]]}
 
 
+async def _learned(db, agent_id: str, run: dict) -> list[dict]:
+    """"What I learned" in a report: the lessons made since the report before it, up to this one's end
+    (or now, while it is still open). Each can be kept or overruled."""
+    if not run.get("as_of"):
+        return []
+    prev = await db[stock_runner.RUNS].find(
+        {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}, "as_of": {"$lt": run["as_of"]}}
+    ).sort("as_of", -1).limit(1).to_list(length=1)
+    window = {"$lte": run.get("finished_at") or _utcnow().replace(tzinfo=None)}
+    if prev:
+        window["$gt"] = prev[0]["as_of"]
+    rows = await db[agent_store.MEMORY].find({"agent_id": agent_id, "created_at": window}).sort("created_at", 1).to_list(length=None)
+    return [agents_router._memory_to_api(m) for m in rows]
+
+
+async def _suggestions(db, agent_id: str) -> list[dict]:
+    """The open "Make it a rule?" suggestions."""
+    rows = await db[agent_store.PROPOSALS].find(
+        {"agent_id": agent_id, "kind": stock_lessons.PROMOTE, "status": "open"}).sort("created_at", 1).to_list(length=None)
+    return [agents_router._proposal_to_api(p) for p in rows]
+
+
 @router.get("/{agent_id}/runs")
 async def list_runs(agent_id: str, limit: int = Query(20, ge=1, le=100), before: Optional[datetime] = None,
                     current_user: str = Depends(get_current_user)):
@@ -221,9 +247,10 @@ async def get_run(agent_id: str, run_id: str, current_user: str = Depends(get_cu
         ).sort("created_at", 1).to_list(length=None)
         follow_ups = [{"client_group_id": c["client_group_id"], **f}
                       for c in cards for f in c.get("follow_ups") or []]
-        # learned, proposals and weekly are filled in by the learning loop and the weekly message.
+        # weekly is filled in by the weekly message.
         return {"run": _run_to_api(run), "cards": [await _card_for_api(db, c) for c in cards], "follow_ups": follow_ups,
-                "scoreboard": await _scoreboard(db, agent_id), "learned": [], "proposals": [], "weekly": None}
+                "scoreboard": await _scoreboard(db, agent_id), "learned": await _learned(db, agent_id, run),
+                "proposals": await _suggestions(db, agent_id), "weekly": None}
 
 
 # ---------------------------------------------------------------------------
@@ -244,7 +271,7 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
     dropped or reordered, nothing else about it changes: what it does comes from the stored line."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        await _stock_agent(db, current_user, agent_id)
+        agent = await _stock_agent(db, current_user, agent_id)
         card = await db[stock_runner.CARDS].find_one(
             {"_id": card_id, "agent_id": agent_id, "status": {"$ne": STATUS_CLOSING}})
         if card is None:
@@ -265,7 +292,13 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
             patch["lines"] = [stored[i] for i in ids]
         if patch and not await guarded_update(db, card, patch):
             raise HTTPException(status_code=409, detail="This card changed while you were editing it. Reload it")
-        return _card_to_api(await db[stock_runner.CARDS].find_one({"_id": card_id}))
+        saved = await db[stock_runner.CARDS].find_one({"_id": card_id})
+        if patch:
+            try:
+                await stock_lessons.lesson_from_edit(db, agent, saved, current_user)
+            except Exception as e:  # noqa: BLE001 - a lesson is never worth failing a saved edit
+                logger.warning("stock card %s: could not record a lesson from the edit: %s", card_id, e)
+        return _card_to_api(saved)
 
 
 class ApplyBody(BaseModel):
@@ -388,3 +421,25 @@ async def get_lessons(agent_id: str, current_user: str = Depends(get_current_use
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
         return [agents_router._memory_to_api(m) for m in await agent_store.list_memory(db, agent_id, active_only=False)]
+
+
+@router.post("/{agent_id}/lessons/{lesson_id}/keep")
+async def keep_lesson(agent_id: str, lesson_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        lesson = await stock_lessons.keep_lesson(db, agent_id, lesson_id)
+        if lesson is None:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+        return agents_router._memory_to_api(lesson)
+
+
+@router.post("/{agent_id}/lessons/{lesson_id}/overrule")
+async def overrule_lesson(agent_id: str, lesson_id: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        lesson = await stock_lessons.overrule_lesson(db, agent_id, lesson_id)
+        if lesson is None:
+            raise HTTPException(status_code=404, detail="Lesson not found")
+        return agents_router._memory_to_api(lesson)

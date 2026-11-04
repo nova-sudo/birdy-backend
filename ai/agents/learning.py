@@ -363,7 +363,8 @@ async def _meter(db, user_id: str, provider, resp, feature: str = "agent_note_me
 
 
 async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str = "denial",
-                           author: str | None = None, client_group_id: str | None = None) -> dict:
+                           author: str | None = None, client_group_id: str | None = None,
+                           feature: str = "agent_note_memory", status: str | None = None) -> dict:
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
     error, or output that can't be used, stores the note as a fact. Never raises."""
@@ -376,7 +377,7 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
         resp = await asyncio.wait_for(provider.chat_completion(
             messages=[{"role": "system", "content": _SYSTEM}, {"role": "user", "content": ctx}],
             temperature=0, max_tokens=300), timeout=LLM_TIMEOUT_S)
-        await _meter(db, agent["user_id"], provider, resp)
+        await _meter(db, agent["user_id"], provider, resp, feature=feature)
         parsed = _parse_json(getattr(resp, "content", None))
         if parsed is not None:
             if isinstance(parsed.get("text"), str) and parsed["text"].strip():
@@ -391,7 +392,7 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
     try:
         return await add_memory(db, agent["_id"], text=text, kind=kind, source=source,
                                 source_ref=(doc or {}).get("_id"), filter=flt,
-                                author=author, client_group_id=client_group_id)
+                                author=author, client_group_id=client_group_id, status=status)
     except Exception as e:
         logger.error("learning: could not store memory for agent %s: %s", agent.get("_id"), e)
         return {"text": text, "kind": kind, "filter": flt, "source": source,

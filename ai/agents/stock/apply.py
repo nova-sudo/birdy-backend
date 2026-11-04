@@ -1161,6 +1161,20 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
 # Dismiss
 # ---------------------------------------------------------------------------
 
+async def _lesson_from_reason(db, card: dict, reason: str | None, by: str | None) -> None:
+    """A reason someone typed when dismissing is a lesson. It is theirs to give, so it never fails the dismiss."""
+    if not (reason or "").strip():
+        return
+    try:
+        from ai.agents.stock.lessons import lesson_from_text
+        agent = await db[AGENTS].find_one({"_id": card.get("agent_id")})
+        if agent is not None:
+            await lesson_from_text(db, agent, reason, source="dismiss", author=by,
+                                   client_group_id=card.get("client_group_id"), source_ref=card.get("_id"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stock card %s: could not record a lesson from the dismiss reason: %s", card.get("_id"), e)
+
+
 async def dismiss_card(db, user_id: str, card_id: str, *, by: str | None, source: str | None,
                        reason: str | None = None) -> dict:
     """Decline what's left on a card. Lines already applied stay applied and keep their Undo. Refused
@@ -1195,4 +1209,5 @@ async def dismiss_card(db, user_id: str, card_id: str, *, by: str | None, source
                        title=f"Dismissed: {card.get('client_name') or 'a card'}", client_name=card.get("client_name"),
                        client_group_id=card.get("client_group_id"), ref_id=card_id, label=f"Declined by {_who(decision)}",
                        source=source, agent_id=card.get("agent_id"), note=reason)
+    await _lesson_from_reason(db, card, reason, by)
     return _answer("dismissed", fresh)

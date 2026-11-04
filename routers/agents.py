@@ -30,6 +30,7 @@ from ai.agents import outcomes
 from ai.agents import replay
 from ai.agents import store as agent_store
 from ai.agents import validation
+from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import settings as stock_settings
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
@@ -820,6 +821,14 @@ async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = D
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
+        stored = await db[agent_store.PROPOSALS].find_one({"_id": proposal_id, "agent_id": agent_id}, {"kind": 1})
+        if stored and stored.get("kind") == stock_lessons.PROMOTE:
+            # A "Make it a rule?" suggestion becomes a lesson. It has no rule and changes none.
+            try:
+                proposal, lesson = await stock_lessons.accept_promotion(db, agent, proposal_id, by=current_user)
+            except learning.ProposalClosed:
+                raise HTTPException(status_code=409, detail="This proposal was already decided")
+            return {"proposal": _proposal_to_api(proposal), "rule": None, "lesson": _memory_to_api(lesson)}
         try:
             proposal, rule = await learning.accept_proposal(db, agent, proposal_id)
         except learning.ProposalNotFound:

@@ -56,11 +56,12 @@ from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _alert, _history_state, run
 from ai.agents.stock.apply import auto_apply_run
 from ai.agents.stock.candidates import build_candidates
 from ai.agents.stock.cards import STATUS_CLOSING, build_card, supersede_open
+from ai.agents.stock import lessons, scoreboard
 from ai.agents.stock.checks import client_facts, follow_ups
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.stock.windows import full_day_window, last_full_day
 from ai.agents.stock.writer import write_card
-from ai.agents.store import CARDS, RUNS, list_memory
+from ai.agents.store import CARDS, RUNS
 from integrations.facebook_utils.facebook import get_facebook_token
 
 logger = logging.getLogger(__name__)
@@ -97,8 +98,26 @@ async def post_urgent_alerts(db, run: dict, agent: dict) -> None:
     """Post what can't wait for the report: disabled accounts, payment, rejected ads. Task 15."""
 
 
+CATCH_UP_MAX_S = 60   # when the tick gave no deadline; the phase never holds a run up for longer
+
+
 async def catch_up_run(db, mongo_client, run: dict, agent: dict) -> None:
-    """Batch days: read edits and comments since the last run, score due ads."""
+    """Batch days: match flagged Adds a person made by hand, score due ads, look for patterns worth a rule.
+    (Edits and dismiss reasons become lessons when they happen, not here.) It stops at the tick's deadline,
+    each step is on its own so one failing leaves the others, and nothing here touches a client's run."""
+    deadline = run.get("tick_deadline")
+    if deadline is None:
+        deadline = time.monotonic() + CATCH_UP_MAX_S
+    now = _run_now(run)
+    for name, step in (("match flagged adds", lambda: scoreboard.record_flagged_adds(db, agent, now, deadline=deadline)),
+                       ("score due ads", lambda: lessons.score_due(db, agent, now, deadline=deadline)),
+                       ("scan patterns", lambda: lessons.scan_patterns(db, agent, now, deadline=deadline))):
+        if _out_of_time(deadline):
+            return
+        try:
+            await step()
+        except Exception as e:  # noqa: BLE001 - the others still run, and the phase never fails the day
+            logger.error("stock run %s: catch-up step %r failed: %s", run["_id"], name, e, exc_info=True)
 
 
 async def publish_run(db, run: dict, agent: dict, cards: list[dict]) -> None:
@@ -607,13 +626,6 @@ async def _last_card(db, agent_id: str, gid: str, run_id: str) -> dict | None:
     return rows[0] if rows else None
 
 
-async def _lessons(db, agent_id: str, gid: str) -> list[str]:
-    """Active lessons for this client or the whole agency, newest first."""
-    rows = await list_memory(db, agent_id, active_only=True)
-    keep = [m for m in rows if m.get("status") != "overruled" and m.get("client_group_id") in (None, gid)]
-    return [m["text"] for m in reversed(keep) if m.get("text")]
-
-
 async def _follow_ups(db, run: dict, last: dict | None, facts: dict) -> list[dict]:
     """Never raises: this runs after the AI call, and a missing tick isn't worth wasting it."""
     if last is None:
@@ -718,7 +730,7 @@ async def _write_client(db, run: dict, agent: dict, gid: str) -> None:
     flag_only = not await _is_acting(db, run, agent, gid)  # it may have moved since the checks
     draft = run["clients"][gid].get("draft")
     if draft is None:  # saved straight away, so a failure from here on doesn't pay for a second call
-        draft = await write_card(db, agent, facts, candidates, await _lessons(db, agent["_id"], gid), last_card=last,
+        draft = await write_card(db, agent, facts, candidates, await lessons.lessons_for_prompt(db, agent["_id"], gid), last_card=last,
                                  open_questions=(last or {}).get("open_questions") or [])
         await _save_client(db, run, gid, draft=draft)
     await _save_card(db, run, agent, facts, last, draft, candidates, flag_only)
@@ -920,6 +932,7 @@ async def advance_run(db, mongo_client, run: dict, agent: dict, *, deadline: flo
         return await db[RUNS].find_one({"_id": run["_id"]}) or run
     run = claimed
     run["tick_now"] = _naive(now_utc or datetime.now(timezone.utc))
+    run["tick_deadline"] = deadline
     try:
         if run.pop("taken_over", False):
             await _count_takeover(db, run)
@@ -941,4 +954,5 @@ async def advance_run(db, mongo_client, run: dict, agent: dict, *, deadline: flo
 
 def _finished(run: dict) -> dict:
     run.pop("tick_now", None)
+    run.pop("tick_deadline", None)
     return run
