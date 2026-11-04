@@ -262,8 +262,9 @@ async def _save_client(db, run: dict, gid: str, **fields) -> None:
         top["attempts"] = 0
     run["clients"][gid].update(fields)
     run.update(top)
-    await db[RUNS].update_one({"_id": run["_id"]}, {"$set": {
-        **top, **{f"clients.{gid}.{k}": v for k, v in fields.items()}}})
+    # The whole map, not `clients.<gid>.<field>`: a client id holds its owner's email, and Mongo would
+    # read the dots in it as a path. Only the invocation holding the claim writes here.
+    await db[RUNS].update_one({"_id": run["_id"]}, {"$set": {**top, "clients": run["clients"]}})
 
 
 def _short(e: Exception) -> str:

@@ -664,3 +664,19 @@ async def test_failed_prepaid_read_only_touches_clients_with_top_ups(mock_db, gr
     insights["error"] = "boom"
     out = await run_alerts(mock_db, agent, _token, NOW, ["g1", "g2"], parts="health")
     assert [a["client_group_id"] for a in out if a["code"] == "check_failed"] == ["g1"]
+
+
+async def test_prefill_keeps_a_dot_in_the_client_id(mock_db, graph):
+    """A client id holds its owner's email. Mongo must not read the dots in it as a path."""
+    gid = "user@example.com_123"
+    await mock_db[AGENTS].insert_one({"_id": "ag1", "settings": {"clients": {gid: {"batch_id": "a"}, "other.client": {"batch_id": "b"}}}})
+    agent = await mock_db[AGENTS].find_one({"_id": "ag1"})
+    await alerts_mod._prefill_prepaid(mock_db, agent, gid, True)
+    clients = (await mock_db[AGENTS].find_one({"_id": "ag1"}))["settings"]["clients"]
+    assert set(clients) == {gid, "other.client"}
+    assert clients[gid] == {"batch_id": "a", "prepaid": {"is_prepay_account": True, "topups": []}}
+    assert agent["settings"]["clients"][gid]["prepaid"]["is_prepay_account"] is True
+    # A choice the agency already made stays.
+    await mock_db[AGENTS].update_one({"_id": "ag1"}, {"$set": {"settings.clients": {gid: {"prepaid": {"is_prepay_account": False, "topups": []}}}}})
+    await alerts_mod._prefill_prepaid(mock_db, agent, gid, True)
+    assert (await mock_db[AGENTS].find_one({"_id": "ag1"}))["settings"]["clients"][gid]["prepaid"]["is_prepay_account"] is False
