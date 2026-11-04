@@ -106,6 +106,9 @@ _LEASE_POLL_S = 0.2
 RECOVERY_READ_TIMEOUT_S = 3            # a hung read counts as unreadable, so one can't eat the tick
 
 WRITABLE_KINDS = ("remove", "revive", "add")
+# What an ad set will have delivering without anyone doing anything. A new ad reads as one of the review
+# states for hours after it's turned on, and it still takes a place.
+WILL_RUN = {"ACTIVE", "PENDING_REVIEW", "IN_PROCESS", "PREAPPROVED"}
 _ACTIONABLE = (STATUS_OPEN, STATUS_PARTLY_APPLIED)
 _LIVE = (STATUS_OPEN, STATUS_FLAGGED, STATUS_PARTLY_APPLIED, STATUS_APPLIED, STATUS_SUPERSEDED, STATUS_DISMISSED)
 _RETRYABLE = (STATE_PROPOSED, STATE_FAILED, STATE_BLOCKED, STATE_NEEDS_FILE)    # only when a person names the line
@@ -130,6 +133,7 @@ ALREADY_APPLIED = "Already applied. Undo it instead."
 BUSY = "Birdy is applying this right now. Try again in a moment."
 STILL_POSTING = "Birdy is still posting this ad, so there's nothing to undo yet. You can undo it once it's live."
 NOW_FLAG = "This change is now set to Flag, so Birdy didn't make it. Make it in Meta if you want it."
+STAYS_PAUSED = " The ad Birdy made stays paused in Meta."
 OTHER_AGENT = "Another agent now handles this client, so Birdy can't undo this. Change it in Ads Manager if you need to."
 NO_ADSET = {"code": "no_adset", "message": "Birdy doesn't know which ad set this ad is in, so nothing was changed."}
 LAST_LIVE = {"code": "last_live_ad", "message": "Pausing this would leave its ad set with no live ads."}
@@ -311,16 +315,27 @@ async def adds_in_flight(db, gid: str, adset_id: str, skip: tuple, now: datetime
     so a caller can take the union with what it read. `skip` is (card id, line id) of the line being checked."""
     found: set[str] = set()
     query = {"client_group_id": gid, "lines": {"$elemMatch": {"kind": "add", "state": {"$in": [STATE_APPLYING, STATE_APPLIED]}}}}
-    async for row in db[CARDS].find(query):
-        for ln in row.get("lines") or []:
-            if (ln.get("kind") != "add" or (row["_id"], ln.get("id")) == skip
+    async for card in db[CARDS].find(query):
+        for ln in card.get("lines") or []:
+            if (ln.get("kind") != "add" or (card["_id"], ln.get("id")) == skip
                     or str((ln.get("destination") or {}).get("adset_id")) != str(adset_id)):
                 continue
             sent = ln.get("state") == STATE_APPLYING and ln.get("write_started_at")
             recent = ln.get("state") == STATE_APPLIED and ln.get("applied_at") and now - ln["applied_at"] < MIRROR_TRUSTED_FOR
             if sent or recent:
-                found.add(_ad_id(ln) or f"{row['_id']}:{ln.get('id')}")
+                # An ad on its way has its id on the pipeline's row: the read may already list it.
+                post = await db[TEST_ADS].find_one({"id": ln.get("test_ad_id"), "user_id": card.get("user_id")}) or {}
+                found.add(_ad_id(ln) or (post.get("meta") or {}).get("ad_id") or f"{card['_id']}:{ln.get('id')}")
     return found
+
+
+async def running_ads(db, gid: str, adset_id: str, ads: list[dict], now: datetime) -> set[str]:
+    """What takes a place under max_ads_live, from a read of the ad set. Off in the mirror just now is more
+    recent than a read that can lag: a swap's Remove has only just gone."""
+    running = {str(a.get("id")) for a in ads if str(a.get("effective_status") or "").upper() in WILL_RUN}
+    off = db[AD_STATE].find({"client_group_id": gid, "adset_id": adset_id, "effective_status": {"$ne": "ACTIVE"},
+                             "updated_at": {"$gte": now - MIRROR_TRUSTED_FOR}})
+    return running - {str(r["ad_id"]) async for r in off}
 
 
 def _over_live_limit(agent: dict, ad_id: str, live: set[str]) -> dict | None:
@@ -403,7 +418,8 @@ async def _guardrail_block(db, mongo_client, agent: dict, card: dict, line: dict
         return LAST_LIVE if empties else None
     if undo:
         return None
-    return _over_live_limit(agent, ad_id, live | await adds_in_flight(db, gid, adset_id, (card["_id"], line.get("id")), now))
+    running = await running_ads(db, gid, adset_id, read.get(adset_id) or [], now)
+    return _over_live_limit(agent, ad_id, running | await adds_in_flight(db, gid, adset_id, (card["_id"], line.get("id")), now))
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +524,8 @@ async def _finish_applied(db, card: dict, agent: dict | None, line: dict, atype:
 
 async def _block(db, card: dict, line: dict, reason: dict) -> None:
     await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_BLOCKED,
-                    error=reason["message"], reason_code=reason["code"])
+                    error=_short(reason["message"] + (STAYS_PAUSED if line.get("paused_ad_id") else "")),
+                    reason_code=reason["code"])
 
 
 async def _fail(db, card: dict, line: dict, error: str, **extra) -> None:
@@ -538,7 +555,7 @@ async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime
         mode = resolve_mode(_settings(agent), card.get("client_group_id"), line["kind"])
         if mode == "flag":
             await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_FLAGGED, mode="flag",
-                            error=None, reason_code=None, note=NOW_FLAG)
+                            error=None, reason_code=None, note=NOW_FLAG + (STAYS_PAUSED if line.get("paused_ad_id") else ""))
             return None
         if mode != "auto" and (line.get("decision") or {}).get("actor") == ACTOR_BIRDY:
             await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_PROPOSED, mode=mode,

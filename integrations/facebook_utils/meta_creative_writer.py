@@ -69,6 +69,8 @@ IMAGE_TYPES = ("image/jpeg", "image/png")
 
 
 META_CDN_SUFFIX = ".fbcdn.net"
+VIDEO_PROCESS_FAILED = "Meta could not process the video"
+AD_READ_PAGES = 20
 
 
 def _check_blob_url(url: str, *, allow_meta_cdn: bool = False) -> None:
@@ -152,7 +154,7 @@ async def video_ready(video_id: str, token: str) -> bool:
                           params={"access_token": token, "fields": "status"}, timeout=30.0)
     state = (data.get("status") or {}).get("video_status")
     if state == "error":
-        raise MetaWriteError("Meta could not process the video", step="video_status")
+        raise MetaWriteError(VIDEO_PROCESS_FAILED, step="video_status")
     return state == "ready"
 
 
@@ -223,3 +225,24 @@ async def create_ad(act: str, token: str, *, name: str, adset_id: str, creative_
         "access_token": token, "name": name, "adset_id": adset_id,
         "creative": json.dumps({"creative_id": creative_id}), "status": "PAUSED"})
     return data["id"]
+
+
+async def find_ad_in_adset(adset_id: str, token: str, *, name: str, creative_id: str) -> Optional[str]:
+    """An ad already in this ad set that a lost `create_ad` reply left behind: the one on this creative, else
+    the one with exactly this name (a retry can have rebuilt the creative). None when there isn't one. Raises
+    MetaWriteError when the whole ad set couldn't be read, since then nobody can say there's none."""
+    params = {"access_token": token, "fields": "id,name,creative{id}", "limit": 200}
+    by_name = None
+    for _ in range(AD_READ_PAGES):
+        data = await _request("GET", f"{GRAPH}/{adset_id}/ads", "read_adset_ads", params=params, timeout=30.0)
+        for ad in data.get("data") or []:
+            if str((ad.get("creative") or {}).get("id")) == str(creative_id):
+                return ad["id"]
+            if by_name is None and ad.get("name") == name:
+                by_name = ad["id"]
+        paging = data.get("paging") or {}
+        after = (paging.get("cursors") or {}).get("after")
+        if not (paging.get("next") and after):
+            return by_name
+        params = {**params, "after": after}
+    raise MetaWriteError("Too many ads in this ad set to check", step="read_adset_ads")

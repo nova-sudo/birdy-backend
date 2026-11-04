@@ -79,6 +79,7 @@ KIND_SUGGESTION_CREATED = "suggestion_created"
 KIND_ACTION_APPLIED = "action_applied"
 KIND_SUGGESTION_DISMISSED = "suggestion_dismissed"
 KIND_ACTION_UNDONE = "action_undone"
+KIND_AD_LEFT_PAUSED = "ad_left_paused"
 
 
 def _now() -> datetime:
