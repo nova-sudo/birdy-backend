@@ -119,14 +119,32 @@ async def upload_image(act: str, token: str, *, image_url: str, allow_meta_cdn: 
     return first["hash"]
 
 
-async def upload_video(act: str, token: str, *, file_url: str, name: str) -> str:
-    _check_blob_url(file_url)
+async def upload_video(act: str, token: str, *, file_url: str, name: str, allow_meta_cdn: bool = False) -> str:
+    """Meta pulls the file from `file_url`. `allow_meta_cdn` is for a source ad's own short-lived URL,
+    posted into another account (video ids are account-scoped)."""
+    _check_blob_url(file_url, allow_meta_cdn=allow_meta_cdn)
     data = await _request("POST", f"{GRAPH}/{act}/advideos", "upload_video",
                           data={"access_token": token, "file_url": file_url, "name": name},
                           timeout=300.0)
     if not data.get("id"):
         raise MetaWriteError("Meta returned no video id", step="upload_video")
     return data["id"]
+
+
+async def video_source(video_id: str, token: str) -> Optional[str]:
+    """The video's short-lived download URL. None when Meta holds it back, as it does for many ad videos."""
+    data = await _request("GET", f"{GRAPH}/{video_id}", "video_source",
+                          params={"access_token": token, "fields": "source"}, timeout=30.0)
+    return data.get("source") or None
+
+
+async def image_url_for_hash(act: str, token: str, image_hash: str) -> Optional[str]:
+    """The URL of an image in `act`, the only account its hash means anything in."""
+    data = await _request("GET", f"{GRAPH}/{act}/adimages", "image_url",
+                          params={"access_token": token, "hashes": json.dumps([image_hash]), "fields": "hash,url"},
+                          timeout=30.0)
+    rows = data.get("data") or []
+    return (rows[0].get("url") or None) if rows else None
 
 
 async def video_ready(video_id: str, token: str) -> bool:

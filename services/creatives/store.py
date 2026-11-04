@@ -39,6 +39,8 @@ DEFAULT_TARGETS: dict[str, Any] = {
 }
 
 _PROTECTED_FIELDS = ("code", "user_id", "id", "_id")
+# Tests an agent runs. Null also matches the documents with no such field, which is all the others.
+NOT_MANAGED: dict[str, Any] = {"managed_by": None}
 
 
 def creative_format(test: dict) -> str:
@@ -81,7 +83,11 @@ async def create_test(
     slug: str | None = None,
     created_via: str = "wizard",
     on_verdict: dict | None = None,
+    managed_by: str | None = None,
+    ad_name: str | None = None,
 ) -> dict:
+    """`managed_by` hands the test to an agent: Creatives doesn't list, track, alert on or make findings
+    for it. `ad_name` is the name its ad gets in Meta, instead of the CT- format."""
     code = await next_code(db, user_id)
     final_slug = (slugify(slug) if slug else slugify(name)) or "untitled"
     now = _now()
@@ -102,6 +108,10 @@ async def create_test(
         "created_at": now,
         "updated_at": now,
     }
+    if managed_by:
+        doc["managed_by"] = managed_by
+    if ad_name:
+        doc["ad_name"] = ad_name
     await db[TESTS].insert_one(dict(doc))
     return _clean(doc)
 
@@ -121,7 +131,7 @@ async def list_tests(
     status: str | None = None,
     ad_account_ids: list[str] | None = None,
 ) -> list[dict]:
-    query: dict[str, Any] = {"user_id": user_id}
+    query: dict[str, Any] = {"user_id": user_id, **NOT_MANAGED}
     if status:
         query["status"] = status
     else:

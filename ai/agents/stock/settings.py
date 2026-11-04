@@ -81,7 +81,7 @@ def resolve_mode(settings: dict, gid: str, kind: str) -> str:
         raise ValueError(f"no mode for change type {kind!r}; alerts are always Flag")
     client = (((settings.get("clients") or {}).get(gid)) or {}).get("modes") or {}
     mode = client.get(kind) or (settings.get("modes") or {}).get(kind) or "ask"
-    if kind == "add" and mode == "auto" and not add_writes_enabled():
+    if kind == "add" and not add_writes_enabled():
         return "flag"  # Add writes are gated; until enabled Add can only flag
     return mode
 

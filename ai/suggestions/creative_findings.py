@@ -135,7 +135,7 @@ def _retry_patch(test: dict, ad: dict) -> dict:
 
 def findings_for_test(test: dict, ads: list[dict], groups_by_id: dict) -> list[Finding]:
     """Every finding the test reproduces right now (adopt findings come from reconcile)."""
-    if test.get("status") not in (*_LIVE, "posting"):
+    if test.get("managed_by") or test.get("status") not in (*_LIVE, "posting"):
         return []
     code = test.get("code") or "Creative test"
     name = test.get("name") or ""
@@ -412,6 +412,8 @@ async def sync_creative_suggestions(db, user_id: str, test: dict, ads: list[dict
                                     mongo_client=None) -> int:
     """Write this test's findings and resolve the ones it no longer reproduces.
     Returns the number of findings upserted. `mongo_client` enables auto-pause."""
+    if test.get("managed_by"):  # an agent's test: its own scoreboard tracks it
+        return 0
     groups_by_id = await _groups(db, user_id)
     findings = findings_for_test(test, ads, groups_by_id)
 

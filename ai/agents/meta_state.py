@@ -115,6 +115,7 @@ def _creative(c: dict | None) -> dict:
             "video_id": c.get("video_id") or data.get("video_id"),
             "page_id": spec.get("page_id"),
             "lead_form_id": cta.get("lead_gen_form_id"),
+            "cta_type": (data.get("call_to_action") or {}).get("type"),
             "body": data.get("message") or c.get("body"),
             "title": data.get("name") or data.get("title") or c.get("title"),
             "link": data.get("link") or cta.get("link")}

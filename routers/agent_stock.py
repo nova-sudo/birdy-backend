@@ -17,6 +17,7 @@ from pydantic import BaseModel, ConfigDict
 from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
+from ai.agents.stock import add as stock_add
 from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
@@ -258,7 +259,8 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
             ids = [ln.get("id") for ln in body.lines]
             if any(i not in stored for i in ids) or len(set(ids)) != len(ids):
                 raise HTTPException(status_code=400, detail="Lines must be existing lines of this card")
-            if any(ln.get("state") not in ("proposed", "flagged") for i, ln in stored.items() if i not in ids):
+            if any(ln.get("state") not in ("proposed", "flagged", "needs_file")
+                   for i, ln in stored.items() if i not in ids):
                 raise HTTPException(status_code=409, detail="A line that is being or has been applied can't be removed")
             patch["lines"] = [stored[i] for i in ids]
         if patch and not await guarded_update(db, card, patch):
@@ -332,6 +334,23 @@ async def undo_line(agent_id: str, card_id: str, body: UndoBody, current_user: s
         res = await stock_apply.undo_line(db, mongo_client, current_user, card_id, body.line_id, by=current_user,
                                           source="dashboard")
         return await _decision_response(db, res, more={"not_undoable": 409, "busy": 409, "blocked": 409, "failed": 502})
+
+
+class FileBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blob_url: str
+
+
+@router.post("/{agent_id}/cards/{card_id}/lines/{line_id}/file")
+async def attach_line_file(agent_id: str, card_id: str, line_id: str, body: FileBody,
+                           current_user: str = Depends(get_current_user)):
+    """Keep a person's upload of an Add's video, for this line and any later Add of that creative."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        await _require_card(db, agent_id, card_id, current_user)
+        res = await stock_add.attach_file(db, current_user, card_id, line_id, body.blob_url)
+        return await _decision_response(db, res, more={"bad_file": 400, "refused": 409})
 
 
 @router.post("/{agent_id}/runs/{run_id}/apply-all")

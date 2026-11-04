@@ -23,6 +23,7 @@ from services.creatives.store import (
     COUNTERS,
     FINAL_VERDICTS,
     LIVE_STATUSES,
+    NOT_MANAGED,
     TEST_ADS,
     TESTS,
     TESTING,
@@ -300,7 +301,7 @@ async def track_due_tests(db, mongo_client, now_utc: datetime, *, deadline: floa
     tracked = skipped = 0
     events: list[dict] = []
 
-    docs = await db[TESTS].find({"status": {"$in": [TESTING, *FINAL_VERDICTS]}}).to_list(None)
+    docs = await db[TESTS].find({"status": {"$in": [TESTING, *FINAL_VERDICTS]}, **NOT_MANAGED}).to_list(None)
     docs.sort(key=lambda d: (d.get("tracked_at") is not None, _naive_utc(d["tracked_at"]) if d.get("tracked_at") else datetime.min))
     for doc in docs:
         if tracked >= MAX_TESTS_PER_TICK or (deadline and time.monotonic() > deadline):

@@ -26,6 +26,7 @@ from integrations.facebook_utils.meta_creative_writer import (
     upload_image,
     upload_video,
     video_ready,
+    video_source,
     video_thumbnail,
 )
 from services.creatives.errors import explain
@@ -57,6 +58,7 @@ MAX_ATTEMPTS = 5
 MAX_VIDEO_POLLS = 60  # ~1 h of minute ticks
 MAX_VIDEO_UPLOADS_PER_TICK = 1
 VIDEO_NEEDS_UPLOAD = "Upload the video file to post it to another ad account"
+MANAGED_WRITES_OFF = "Posting new ads is switched off, so Birdy stopped before posting this."
 
 QUEUED, RUNNING, DONE, FAILED = "queued", "running", "done", "failed"
 
@@ -92,6 +94,11 @@ def _new_job(user_id: str, test_id: str, test_ad_id: str, now: datetime) -> dict
     return {"id": uuid.uuid4().hex, "user_id": user_id, "test_id": test_id,
             "test_ad_id": test_ad_id, "state": QUEUED, "attempts": 0, "lease_until": None,
             "created_at": now, "updated_at": now}
+
+
+def _managed_job(test: dict) -> dict:
+    """An agent's job is claimed after the others, so a burst of them can't make a Creatives post wait."""
+    return {"managed": True} if test.get("managed_by") else {}
 
 
 # ── enqueue ──────────────────────────────────────────────────────────────────
@@ -150,7 +157,7 @@ async def enqueue_post(db, user_id: str, test_id: str, *, accounts: list[dict],
         ads = await add_test_ads(db, user_id, test_id,
                                  [{**r, "meta": {}, "post_state": "pending", "post_error": None,
                                    "post_batch": batch} for r in rows])
-        jobs = [{**_new_job(user_id, test_id, a["id"], now), "post_batch": batch} for a in ads]
+        jobs = [{**_new_job(user_id, test_id, a["id"], now), "post_batch": batch, **_managed_job(test)} for a in ads]
         await db[POST_JOBS].insert_many([dict(j) for j in jobs])
     except Exception:
         # Undo the claim so the user can press Post again.
@@ -182,7 +189,8 @@ def _norm_act(act) -> str:
 def media_plan(test: dict, act: str) -> tuple[str, str | None]:
     """How to get media into `act`: ("reuse", id) existing Meta media (no upload);
     ("blob", url) Birdy upload; ("meta_cdn", url) re-upload the source ad's image (revive into
-    another account: image hashes / video ids are account-scoped); ("unavailable", None)."""
+    another account: image hashes / video ids are account-scoped); ("meta_source", video id) the
+    source ad's video, whose short-lived URL is read at upload; ("unavailable", None)."""
     creative = test.get("creative") or {}
     media = _media(creative)
     source = test.get("source")
@@ -203,6 +211,8 @@ def media_plan(test: dict, act: str) -> tuple[str, str | None]:
         return "reuse", media["video_id"]
     if media.get("blob_url"):
         return "blob", media["blob_url"]
+    if media.get("source_video_id"):
+        return "meta_source", media["source_video_id"]
     return "unavailable", None
 
 
@@ -263,7 +273,7 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick
     meta = ad.get("meta") or {}
     act = ad["ad_account_id"]
     fmt = creative_format(test)
-    name = test["meta_ad_name"]
+    name = test.get("ad_name") or test["meta_ad_name"]
     step = "media"
     try:
         if not meta.get("image_hash" if fmt == "image" else "video_id"):
@@ -284,7 +294,12 @@ async def _run_step(db, job: dict, test: dict, ad: dict, token: str, tick: _Tick
                     _job_key(job), {"$set": {"lease_until": tick.now() + VIDEO_UPLOAD_LEASE}})
                 if res.matched_count == 0:  # lost the claim; another worker owns it now
                     return "stale"
-                value = await upload_video(act, token, file_url=ref, name=name)
+                cdn: dict = {}
+                if how == "meta_source":
+                    ref, cdn = await video_source(ref, token), {"allow_meta_cdn": True}
+                    if not ref:
+                        raise MetaWriteError(VIDEO_NEEDS_UPLOAD)
+                value = await upload_video(act, token, file_url=ref, name=name, **cdn)
             await _set_meta(db, ad, "image_hash" if fmt == "image" else "video_id", value,
                             tick.now())
             return step
@@ -349,7 +364,7 @@ async def _claim(db, now: datetime, exclude: list[str]) -> dict | None:
          "$or": [{"lease_until": None}, {"lease_until": {"$lte": now}}]},
         {"$set": {"state": RUNNING, "lease_until": now + LEASE, "lease_id": lease_id,
                   "updated_at": now}},
-        sort=[("created_at", 1)],
+        sort=[("managed", 1), ("created_at", 1)],
         return_document=ReturnDocument.BEFORE,
     )
     if before is None:
@@ -418,6 +433,13 @@ async def _process(db, mongo_client, job: dict, tick: _Tick, tokens: dict) -> st
     if ad.get("post_state") not in ("pending", "uploading"):
         await _finish(db, job, tick.now(), state=DONE, lease_until=None)
         return "skipped"
+    if test.get("managed_by"):
+        from ai.agents.stock.settings import add_writes_enabled
+
+        if not add_writes_enabled():  # the kill switch stops what's already queued too
+            await _fail(db, job, ad, {"code": None, "subcode": None, "step": None, "fix": None,
+                                      "message": MANAGED_WRITES_OFF}, tick.now())
+            return "failed"
     if ad.get("post_state") == "pending":
         await db[TEST_ADS].update_one({"id": ad["id"], "user_id": uid},
                                       {"$set": {"post_state": "uploading", "updated_at": tick.now()}})

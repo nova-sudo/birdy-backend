@@ -6,7 +6,7 @@ import logging
 from datetime import datetime, timezone
 
 from services.creatives.naming import parse_code
-from services.creatives.store import ARCHIVED, TEST_ADS, TESTS, add_test_ads
+from services.creatives.store import ARCHIVED, NOT_MANAGED, TEST_ADS, TESTS, add_test_ads
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +24,7 @@ async def _cached_ads(db, user_id: str):
 
 
 async def find_adoptable(db, user_id: str) -> list[dict]:
-    tests = await db[TESTS].find({"user_id": user_id, "status": {"$ne": ARCHIVED}}).to_list(None)
+    tests = await db[TESTS].find({"user_id": user_id, "status": {"$ne": ARCHIVED}, **NOT_MANAGED}).to_list(None)
     by_code = {t["code"]: t for t in tests}
     if not by_code:
         return []

@@ -109,6 +109,39 @@ def is_public_blob_url(url) -> bool:
     return parsed.scheme == "https" and host.endswith(PUBLIC_BLOB_HOST_SUFFIX)
 
 
+def owner_prefix(user_id: str) -> str:
+    """Where a user's upload goes when it must be provable as theirs later. Only the backend can work
+    it out for a user, so a URL under it is that user's. It doesn't show who that is."""
+    return f"creatives/u-{_sign(_secret(), f'blob-owner:{user_id}')[:32]}/"
+
+
+def _own_store_id() -> str | None:
+    """The id in vercel_blob_rw_<store id>_<secret>. The public hostname is shared with every other
+    Vercel customer's Blob store, so only this says a URL is on ours."""
+    parts = (os.environ.get("BLOB_READ_WRITE_TOKEN") or "").split("_")
+    return parts[3].lower() if len(parts) > 4 and parts[3] else None
+
+
+def is_own_blob_url(url, user_id: str) -> bool:
+    """A public URL on this app's own Blob store, under this user's owner_prefix, and nothing else."""
+    store = _own_store_id()
+    if not store or not is_public_blob_url(url):
+        return False
+    try:
+        parsed = urlparse(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    if port is not None or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    if parsed.hostname != f"{store}{PUBLIC_BLOB_HOST_SUFFIX}" or ".." in parsed.path or "%" in parsed.path:
+        return False
+    try:
+        return parsed.path.startswith(f"/{owner_prefix(user_id)}")
+    except RuntimeError:  # no secret: nothing can be proved
+        return False
+
+
 def media_limit(mime) -> int | None:
     if mime in IMAGE_MIMES:
         return MAX_IMAGE_BYTES

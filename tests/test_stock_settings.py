@@ -47,7 +47,8 @@ def test_usd_client_without_override_is_an_error_naming_it():
     assert len(errs) == 1 and errs[0]["client_group_id"] == "g2" and "Sunny" in errs[0]["message"]
 
 
-def test_mode_defaults_to_ask_and_client_override_wins():
+def test_mode_defaults_to_ask_and_client_override_wins(monkeypatch):
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
     assert resolve_mode(DEFAULT_SETTINGS, "g", "add") == "ask"
     s = {**DEFAULT_SETTINGS, "clients": {"g": {"modes": {"add": "flag"}}}}
     assert resolve_mode(s, "g", "add") == "flag"
@@ -56,6 +57,7 @@ def test_mode_defaults_to_ask_and_client_override_wins():
 def test_add_is_flag_while_writes_disabled(monkeypatch):
     monkeypatch.delenv("AGENT_ADD_WRITES_ENABLED", raising=False)
     assert resolve_mode({**DEFAULT_SETTINGS, "modes": {"add": "auto"}}, "g", "add") == "flag"
+    assert resolve_mode(DEFAULT_SETTINGS, "g", "add") == "flag"  # Ask me as well: nothing could post it
     monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
     assert resolve_mode({**DEFAULT_SETTINGS, "modes": {"add": "auto"}}, "g", "add") == "auto"
     assert resolve_mode({**DEFAULT_SETTINGS, "modes": {"remove": "auto"}}, "g", "remove") == "auto"
@@ -258,7 +260,7 @@ async def test_no_client_entry_without_something_to_prefill(api, mock_db):
     r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g2"]})
     assert r.json()["settings"]["clients"] == {}
     assert resolve_zones(r.json()["settings"], "g2", "GBP") is None
-    assert resolve_mode(r.json()["settings"], "g2", "add") == "ask"
+    assert resolve_mode(r.json()["settings"], "g2", "revive") == "ask"
 
 
 async def test_flag_only_is_preserved_across_client_list_patch(api, mock_db):

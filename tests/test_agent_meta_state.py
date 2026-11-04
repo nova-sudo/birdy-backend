@@ -146,7 +146,7 @@ async def test_refresh_stores_issues_review_feedback_and_creative(mock_db, mock_
     doc = await mock_db.meta_ad_state.find_one({"ad_id": "a1"})
     assert doc["issues"] == ad["issues_info"] and doc["review_feedback"] == ad["ad_review_feedback"]
     assert doc["creative"] == {"id": "c9", "image_hash": "h1", "video_id": None, "page_id": "p1",
-                               "lead_form_id": "f1", "body": "msg", "title": "nm", "link": "https://x.test"}
+                               "lead_form_id": "f1", "cta_type": None, "body": "msg", "title": "nm", "link": "https://x.test"}
 
 
 async def test_refresh_without_creative_stores_empty_fields(mock_db, mock_mongo_client, graph):

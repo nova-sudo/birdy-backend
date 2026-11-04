@@ -974,7 +974,8 @@ def test_build_card_shape():
     assert add["candidate_id"] == "g2:n1" and add["creative_key"] == "img:h" and add["currency"] == "USD"
 
 
-def test_every_line_has_state_and_remove_and_revive_have_the_ad_id():
+def test_every_line_has_state_and_remove_and_revive_have_the_ad_id(monkeypatch):
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
     lines = {ln["kind"]: ln for ln in _build()["lines"]}
     assert all(ln["state"] == "proposed" and ln["mode"] == "ask" and ln["error"] is None for ln in lines.values())
     assert lines["remove"]["meta_ids"] == ["o1"] and lines["revive"]["meta_ids"] == ["r1"]

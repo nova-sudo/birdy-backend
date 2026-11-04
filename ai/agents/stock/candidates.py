@@ -43,9 +43,12 @@ def normalise_name(name: str | None) -> str:
     text = _DATE_RUN.sub(lambda m: " " if _is_date(m.group()) else m.group(), text)
     parts = [" ".join(p.split()) for p in _SEP.split(text)]
     parts = [p for p in parts if p]
-    if parts:
-        parts[-1] = " ".join(_COPY.sub("", parts[-1]).split())
-    return " - ".join(p for p in parts if p)
+    while parts:  # Meta copies a copy as "Hook - Copy - Copy 2"
+        last = " ".join(_COPY.sub("", parts[-1]).split())
+        if last == parts[-1]:
+            break
+        parts[-1:] = [last] if last else []
+    return " - ".join(parts)
 
 
 def creative_key(ad: dict) -> str:

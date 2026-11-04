@@ -325,14 +325,15 @@ async def test_flag_line_never_writes(mock_db, mock_mongo_client, meta):
     assert (await _get(mock_db))["status"] == "applied"  # a Flag line isn't waiting on anyone
 
 
-async def test_add_line_stays_as_it_is(mock_db, mock_mongo_client, meta):
+async def test_add_line_turns_into_a_flag_with_add_writes_off(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.delenv("AGENT_ADD_WRITES_ENABLED", raising=False)
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "spare")
     await _card(mock_db, agent, _ln(1, kind="add", ad=""), _ln(2, ad="ad1"))
     await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
     assert meta.writes == [("ad1", "PAUSED")]
-    assert (await _line(mock_db, "l1"))["state"] == "proposed"
-    assert (await _get(mock_db))["status"] == "partly_applied"
+    assert (await _line(mock_db, "l1"))["state"] == "flagged"
+    assert (await _get(mock_db))["status"] == "applied"
 
 
 async def test_unknown_line_is_rejected(mock_db, mock_mongo_client, meta):
@@ -1025,8 +1026,10 @@ async def test_mixed_modes_only_ask_lines_wait(mock_db, mock_mongo_client, meta)
 
 
 @pytest.mark.parametrize("why", ["stale", "open_alert", "flagged_text", "ai_failed", "over_add_limit", "needs_file"])
-async def test_auto_falls_back_to_ask(why, mock_db, mock_mongo_client, meta):
-    agent = await _agent(mock_db, settings={"creative": {**DEFAULT_SETTINGS["creative"], "auto_max_adds": 1}})
+async def test_auto_falls_back_to_ask(why, mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
+    agent = await _agent(mock_db, settings={"creative": {**DEFAULT_SETTINGS["creative"], "auto_max_adds": 1},
+                                            "modes": {"remove": "auto", "revive": "auto", "add": "auto"}})
     await _ads(mock_db, "ad1", "spare")
     line, others, card_extra, run_extra = _ln(mode="auto"), [], {}, {}
     if why == "stale":
@@ -1057,8 +1060,9 @@ async def test_auto_falls_back_to_ask(why, mock_db, mock_mongo_client, meta):
     assert meta.writes == []
 
 
-async def test_needs_file_state_also_falls_back(mock_db, mock_mongo_client, meta):
-    agent = await _agent(mock_db)
+async def test_needs_file_state_also_falls_back(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
+    agent = await _agent(mock_db, settings={"modes": {"remove": "auto", "revive": "auto", "add": "auto"}})
     await _card(mock_db, agent, _ln(1, kind="add", ad="", mode="auto", state="needs_file"))
     await auto_apply_run(mock_db, mock_mongo_client, _run(agent), agent)
     line = await _line(mock_db)
@@ -2315,11 +2319,15 @@ async def test_route_dismiss_conflicts_say_why(api, mock_db, meta):
     assert r.status_code == 409 and "Undo" in r.json()["detail"]
 
 
-async def test_add_line_in_a_transient_state_is_left_for_the_add_pipeline(mock_db, mock_mongo_client, meta):
+async def test_recovery_sends_nothing_for_add_lines(mock_db, mock_mongo_client, meta, monkeypatch):
+    """test_stock_add.py has the rest."""
+    monkeypatch.delenv("AGENT_ADD_WRITES_ENABLED", raising=False)
     agent = await _agent(mock_db)
-    await _card(mock_db, agent, _ln(1, kind="add", ad="", state="queued"), _ln(2, kind="add", ad="", state="applying"))
+    await _card(mock_db, agent, _ln(1, kind="add", ad="", state="queued"),
+                _ln(2, kind="add", ad="", state="applying", write_started_at=datetime.utcnow() - timedelta(hours=1)))
     await _tick(mock_db, mock_mongo_client, minutes=10)
-    assert (await _line(mock_db, "l1"))["state"] == "queued" and (await _line(mock_db, "l2"))["state"] == "applying"
+    assert (await _line(mock_db, "l1"))["state"] == "flagged"
+    assert (await _line(mock_db, "l2"))["state"] == "blocked"  # the sync's call, as nothing was posted and writes are off
     assert meta.reads == [] and meta.writes == []
 
 

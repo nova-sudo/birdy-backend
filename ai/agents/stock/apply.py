@@ -1,8 +1,8 @@
 """
 ai/agents/stock/apply.py
 ------------------------
-Making a card's Remove and Bring back lines happen in Meta, and undoing them (spec section 7). This
-changes real client ad accounts, so every step is stored before the next one starts.
+Making a card's lines happen in Meta, and undoing them (spec section 7). This changes real client ad
+accounts, so every step is stored before the next one starts.
 
 A line moves:   proposed -> queued -> applying -> applied | failed | blocked
 and back:       applied -> undoing -> undone | applied
@@ -50,7 +50,15 @@ exceptions and the live ad limit are judged on that list. A mirror row saying "o
 set, refuses the line. The mode is resolved again at write time, for Remove and Bring back: now Flag means
 `flagged` and no write, and Auto only writes if it still resolves to Auto.
 
-Add lines are left as they are here. They reach Meta through the posting pipeline.
+An Add goes through all of this too, as far as its write, which is different: stock/add.py hands it to the
+Creatives posting pipeline, and a later tick moves it on. So for an Add:
+
+  queued                 approved, nothing looked at yet.
+  applying, no marker    being checked. Nothing exists anywhere. Recovery queues it again, as for any line.
+  applying, marker       handed to the pipeline, or about to be. Only add.sync_add_lines moves it from here,
+                         and recovery leaves it alone, so nothing can enqueue a second post.
+
+Undo on an Add pauses the new ad, by the same path as the Undo of a Bring back.
 """
 
 import asyncio
@@ -70,12 +78,14 @@ from ai.agents.stock.cards import (STATE_APPLIED, STATE_APPLYING, STATE_BLOCKED,
                                    STATE_NEEDS_FILE, STATE_PROPOSED, STATE_QUEUED, STATE_UNDOING, STATE_UNDONE,
                                    STATUS_APPLIED, STATUS_CLOSING, STATUS_DISMISSED, STATUS_FLAGGED, STATUS_OPEN,
                                    STATUS_PARTLY_APPLIED, STATUS_SUPERSEDED, guarded_update)
+from ai.agents.stock.scoreboard import mark_add_undone
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_mode
 from ai.agents.store import AGENTS, CARDS, RUNS, list_memory
 from ai.suggestions.actions import _is_desired, execute_action
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
 from ai.suggestions.store import (ACTIVITY, ACTOR_BIRDY, ACTOR_USER, KIND_ACTION_APPLIED, KIND_ACTION_UNDONE,
                                   KIND_SUGGESTION_DISMISSED, log_activity)
+from services.creatives.store import TEST_ADS
 from services.meta_status_service import get_object_state
 
 logger = logging.getLogger(__name__)
@@ -95,10 +105,10 @@ UNDO_LEASE_WAIT_S = 2.0                # Undo has a person waiting, so it waits 
 _LEASE_POLL_S = 0.2
 RECOVERY_READ_TIMEOUT_S = 3            # a hung read counts as unreadable, so one can't eat the tick
 
-WRITABLE_KINDS = ("remove", "revive")
+WRITABLE_KINDS = ("remove", "revive", "add")
 _ACTIONABLE = (STATUS_OPEN, STATUS_PARTLY_APPLIED)
 _LIVE = (STATUS_OPEN, STATUS_FLAGGED, STATUS_PARTLY_APPLIED, STATUS_APPLIED, STATUS_SUPERSEDED, STATUS_DISMISSED)
-_RETRYABLE = (STATE_PROPOSED, STATE_FAILED, STATE_BLOCKED)    # only when a person names the line
+_RETRYABLE = (STATE_PROPOSED, STATE_FAILED, STATE_BLOCKED, STATE_NEEDS_FILE)    # only when a person names the line
 _IN_PROGRESS = (STATE_QUEUED, STATE_APPLYING, STATE_UNDOING)
 _WAITING = (STATE_PROPOSED, STATE_QUEUED, STATE_APPLYING, STATE_FAILED, STATE_BLOCKED, STATE_NEEDS_FILE)
 _TOUCHED = (STATE_APPLIED, STATE_UNDOING, STATE_UNDONE)
@@ -118,6 +128,7 @@ ALREADY_DONE = "Already done in Meta. Nothing changed."
 UNDO_NOT_WRITTEN = "Birdy made no change here, so there was nothing to reverse."
 ALREADY_APPLIED = "Already applied. Undo it instead."
 BUSY = "Birdy is applying this right now. Try again in a moment."
+STILL_POSTING = "Birdy is still posting this ad, so there's nothing to undo yet. You can undo it once it's live."
 NOW_FLAG = "This change is now set to Flag, so Birdy didn't make it. Make it in Meta if you want it."
 OTHER_AGENT = "Another agent now handles this client, so Birdy can't undo this. Change it in Ads Manager if you need to."
 NO_ADSET = {"code": "no_adset", "message": "Birdy doesn't know which ad set this ad is in, so nothing was changed."}
@@ -212,7 +223,7 @@ def _decision(actor: str, by: str | None, source: str | None, now: datetime) -> 
 
 def _work_order(line: dict) -> int:
     """Removes first, so a swap never goes over the live ad limit on the way."""
-    return 1 if line.get("kind") == "revive" else 0
+    return 0 if line.get("kind") == "remove" else 1
 
 
 async def _queue_lines(db, card_id: str, wanted, decision: dict) -> list[tuple[str, str]]:
@@ -225,7 +236,8 @@ async def _queue_lines(db, card_id: str, wanted, decision: dict) -> list[tuple[s
         lines = []
         for ln in card.get("lines") or []:
             if wanted(ln):
-                ln = {**ln, "state": STATE_QUEUED, "error": None, "reason_code": None, "decision": decision}
+                ln = {**ln, "state": STATE_QUEUED, "error": None, "reason_code": None, "decision": decision,
+                      **({"needs_file": False} if ln.get("needs_file") else {})}
                 queued.append(ln)
             lines.append(ln)
         if not queued:
@@ -293,6 +305,24 @@ def _ad_id(line: dict) -> str | None:
     return str(ids[0]) if ids else None
 
 
+async def adds_in_flight(db, gid: str, adset_id: str, skip: tuple, now: datetime) -> set[str]:
+    """New ads the ad set will have that a read of Meta can't be relied on to show: Adds handed to the
+    pipeline, and ones applied too recently for a read to have caught up. Their ad ids where they have one,
+    so a caller can take the union with what it read. `skip` is (card id, line id) of the line being checked."""
+    found: set[str] = set()
+    query = {"client_group_id": gid, "lines": {"$elemMatch": {"kind": "add", "state": {"$in": [STATE_APPLYING, STATE_APPLIED]}}}}
+    async for row in db[CARDS].find(query):
+        for ln in row.get("lines") or []:
+            if (ln.get("kind") != "add" or (row["_id"], ln.get("id")) == skip
+                    or str((ln.get("destination") or {}).get("adset_id")) != str(adset_id)):
+                continue
+            sent = ln.get("state") == STATE_APPLYING and ln.get("write_started_at")
+            recent = ln.get("state") == STATE_APPLIED and ln.get("applied_at") and now - ln["applied_at"] < MIRROR_TRUSTED_FOR
+            if sent or recent:
+                found.add(_ad_id(ln) or f"{row['_id']}:{ln.get('id')}")
+    return found
+
+
 def _over_live_limit(agent: dict, ad_id: str, live: set[str]) -> dict | None:
     """Live ads per ad set never go over max_ads_live (spec section 6), however old the card is."""
     limit = _settings(agent)["creative"]["max_ads_live"]
@@ -303,10 +333,10 @@ def _over_live_limit(agent: dict, ad_id: str, live: set[str]) -> dict | None:
 
 
 def _sent_pause(line: dict) -> bool:
-    """A pause that has gone to Meta with no answer yet: a Remove, or the Undo of a Bring back."""
+    """A pause that has gone to Meta with no answer yet: a Remove, or the Undo of a Bring back or an Add."""
     state, kind = line.get("state"), line.get("kind")
     return bool((state == STATE_APPLYING and kind == "remove" and line.get("write_started_at"))
-                or (state == STATE_UNDOING and kind == "revive" and line.get("undo_write_started_at")))
+                or (state == STATE_UNDOING and kind in ("revive", "add") and line.get("undo_write_started_at")))
 
 
 async def _unconfirmed_pauses(db, gid: str, card: dict, line: dict) -> tuple[set[str], int]:
@@ -371,7 +401,9 @@ async def _guardrail_block(db, mongo_client, agent: dict, card: dict, line: dict
         protect = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}.get("protect_last_live_ad")
         empties = protect and await _would_empty_adset(db, gid, adset_id, ad_id, live, going_off, now)
         return LAST_LIVE if empties else None
-    return None if undo else _over_live_limit(agent, ad_id, live)
+    if undo:
+        return None
+    return _over_live_limit(agent, ad_id, live | await adds_in_flight(db, gid, adset_id, (card["_id"], line.get("id")), now))
 
 
 # ---------------------------------------------------------------------------
@@ -484,10 +516,22 @@ async def _fail(db, card: dict, line: dict, error: str, **extra) -> None:
                     error=_short(error), reason_code=None, **extra)
 
 
+async def _lost_the_last_check(db, agent: dict | None, card: dict, line: dict) -> None:
+    """The write that stores "something may have been sent" didn't happen, so nothing was. Either the
+    card can't be applied now, or another write got in first and the line goes round again."""
+    fresh = await db[CARDS].find_one({"_id": card["_id"]})
+    reason = await _refusal(db, agent, fresh)
+    if reason is not None:
+        return await _block(db, card, line, reason)
+    await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_QUEUED)
+    return None
+
+
 async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime, sent: list) -> None:
     agent = await _load_agent(db, card)
     refusal = await _refusal(db, agent, card)
-    if refusal is None:
+    is_add = line["kind"] == "add"
+    if refusal is None and not is_add:  # an Add has no ad until it is posted, and only ever makes one
         ids = line.get("meta_ids") or []
         refusal = SEVERAL_ADS if len(ids) > 1 else None if ids else NO_AD
     if refusal is None:
@@ -500,6 +544,9 @@ async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime
             await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_PROPOSED, mode=mode,
                             decision=None)
             return None
+    if is_add and refusal is None:
+        from ai.agents.stock.add import apply_add  # add builds on this module
+        return await apply_add(db, mongo_client, card, line, agent, now, sent)
     atype = _action_type(line["kind"])
     if refusal is None:
         refusal = await _guardrail_block(db, mongo_client, agent, card, line, atype, now)
@@ -524,12 +571,7 @@ async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime
     started = await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), statuses=_ACTIONABLE,
                               write_started_at=now)
     if started is None:
-        fresh = await db[CARDS].find_one({"_id": card["_id"]})
-        reason = await _refusal(db, agent, fresh)
-        if reason is not None:
-            return await _block(db, card, line, reason)
-        await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_QUEUED)
-        return None
+        return await _lost_the_last_check(db, agent, card, line)
     sent.append(True)
     landed, error = await _send_and_confirm(mongo_client, card, line, atype)
     if landed:
@@ -636,6 +678,8 @@ def _outcome(card: dict, line_ids: list[str]) -> dict:
         return _answer("flagged", card, reason=NOW_FLAG)
     if all(s == STATE_APPLIED for s in states):
         return _answer("applied", card)
+    if all(s == STATE_NEEDS_FILE for s in states):
+        return _answer("needs_file", card, ok=False, reason=why)
     if STATE_APPLIED in states:
         return _answer("partial", card, reason=why)
     return _answer("failed" if STATE_FAILED in states else "blocked", card, ok=False, reason=why)
@@ -664,8 +708,8 @@ async def _visible_card(db, user_id: str, card_id: str) -> dict | None:
 async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | None, source: str | None,
                      line_ids: list[str] | None = None, budget_s: float | None = None) -> dict:
     """Approve a card's lines. With no `line_ids`, every proposed line. Naming a line also retries
-    it if it failed or was blocked. Never writes a Flag line, or an Add. `budget_s` limits the wait,
-    and what doesn't fit is finished by the cron."""
+    it if it failed, was blocked or was waiting for a file. Never writes a Flag line. `budget_s` limits
+    the wait, and what doesn't fit is finished by the cron."""
     card = await _visible_card(db, user_id, card_id)
     if card is None:
         return _answer("not_found", None, ok=False)
@@ -747,7 +791,7 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
                 if ln["id"] in by_card[card["_id"]]:
                     states[ln["state"]] = states.get(ln["state"], 0) + 1
     counts = {"applied": states.get(STATE_APPLIED, 0), "blocked": states.get(STATE_BLOCKED, 0),
-              "failed": states.get(STATE_FAILED, 0),
+              "failed": states.get(STATE_FAILED, 0), "needs_file": states.get(STATE_NEEDS_FILE, 0),
               "queued": sum(states.get(s, 0) for s in (STATE_QUEUED, STATE_APPLYING))}
     if counts["queued"] or not finished:
         outcome = "queued"
@@ -755,7 +799,8 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
         outcome = "noop"
     else:
         outcome = ("applied" if counts["applied"] else "failed" if counts["failed"]
-                   else "blocked" if counts["blocked"] else "noop")  # noop: they had all turned into Flag
+                   else "blocked" if counts["blocked"] or counts["needs_file"]
+                   else "noop")  # noop: they had all turned into Flag
     return {"ok": True, "outcome": outcome, "reason": None, **counts}
 
 
@@ -790,8 +835,8 @@ def _fallback(card: dict, client: dict, run: dict, line: dict, adds_so_far: int,
 async def _queue_auto(db, card: dict, client: dict, run: dict, settings: dict, add_limit: int,
                       decision: dict) -> list[tuple[str, str]]:
     """In one write: send fall-backs to Ask me, for good, and queue what may run. A fall-back stays
-    even when its reason passes, because a person may already be looking at an Apply button. Remove and
-    Bring back follow the current settings: the mode may have changed since the card was written."""
+    even when its reason passes, because a person may already be looking at an Apply button. Lines follow
+    the current settings: the mode may have changed since the card was written."""
     queued: list[dict] = []
 
     def change(fresh):
@@ -801,15 +846,14 @@ async def _queue_auto(db, card: dict, client: dict, run: dict, settings: dict, a
             auto = ln.get("mode") == "auto"
             if auto and ln.get("kind") == "add":
                 adds += 1
-            writable = ln.get("kind") in WRITABLE_KINDS
-            mode = resolve_mode(settings, fresh.get("client_group_id"), ln["kind"]) if writable else "auto"
+            mode = resolve_mode(settings, fresh.get("client_group_id"), ln["kind"])
             if auto and ln.get("state") == STATE_PROPOSED and mode != "auto":
                 ln, changed = {**ln, "mode": mode, "state": STATE_FLAGGED if mode == "flag" else STATE_PROPOSED}, True
             elif auto and ln.get("state") in (STATE_PROPOSED, STATE_NEEDS_FILE):
                 why = _fallback(fresh, client, run, ln, adds, add_limit)
                 if why:
                     ln, changed = {**ln, "mode": "ask", "auto_fallback": why}, True
-                elif ln.get("kind") in WRITABLE_KINDS and ln.get("state") == STATE_PROPOSED:
+                elif ln.get("state") == STATE_PROPOSED:
                     ln, changed = {**ln, "state": STATE_QUEUED, "error": None, "decision": decision}, True
                     queued.append(ln)
             lines.append(ln)
@@ -892,6 +936,10 @@ async def _finish_undone(db, card: dict, agent: dict | None, line: dict, atype: 
     decision = line.get("undo_decision") or {}
     if atype:
         await _mirror(db, card, agent, line, atype, now)
+    if line.get("kind") == "add":
+        await mark_add_undone(db, card, line, now)
+        await db[TEST_ADS].update_one({"id": line.get("test_ad_id"), "user_id": card.get("user_id")},
+                                      {"$set": {"meta_status": "PAUSED", "paused_at": now, "updated_at": now}})
     await _log_once(db, card, line, KIND_ACTION_UNDONE, label=f"Undone by {_who(decision)}",
                     title=f"Undid: {line.get('ad_name') or 'an ad'}", decision=decision, note=note)
     await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), state=STATE_UNDONE, undone_at=now,
@@ -927,6 +975,8 @@ async def _recover_stuck(db, mongo_client, now: datetime, deadline: float | None
             if (state not in (STATE_APPLYING, STATE_UNDOING) or line.get("kind") not in WRITABLE_KINDS
                     or (since and now - since < STUCK_AFTER and not (state == STATE_APPLYING and line.get("cut_at")))):
                 continue
+            if line.get("kind") == "add" and state == STATE_APPLYING and line.get("write_started_at"):
+                continue  # the pipeline has it, and add.sync_add_lines follows it
             logger.warning("stock card %s line %s stuck in %s since %s", card["_id"], line["id"], state, since)
             recover = _recover_applying if state == STATE_APPLYING else _recover_undoing
             try:
@@ -946,14 +996,19 @@ async def _expand_apply_all(db, deadline: float | None) -> None:
 
 
 async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline: float) -> dict:
-    """Every minute: finish Apply all presses, recover stuck lines, then run what's queued. A queued
-    line on a card closed meanwhile is refused by the same check every line goes through. Recovery gets
-    half the time left, so stuck lines can't starve the queue. `now_utc` only ages stuck lines: each line
-    run gets its own clock, so the pause cap counts rows logged earlier in this same pass."""
+    """Every minute: finish Apply all presses, follow Adds in the pipeline, recover stuck lines, then run
+    what's queued. A queued line on a card closed meanwhile is refused by the same check every line goes
+    through. Recovery gets half the time left, so stuck lines can't starve the queue. `now_utc` only ages
+    stuck lines: each line run gets its own clock, so the pause cap counts rows logged earlier in this
+    same pass."""
+    from ai.agents.stock.add import sync_add_lines  # add builds on this module
+
     now = _naive_utc(now_utc)
     await _expand_apply_all(db, deadline)
+    synced = await sync_add_lines(db, now, mongo_client, deadline=deadline)
     recovered = await _recover_stuck(db, mongo_client, now, time.monotonic() + max(0.0, deadline - time.monotonic()) / 2)
     processed = 0
+    done = {"add_synced": synced, "recovered": recovered}
     cards = await db[CARDS].find({"lines.state": STATE_QUEUED}).sort("updated_at", 1).limit(QUEUE_BATCH).to_list(
         length=QUEUE_BATCH)
     for card in cards:
@@ -961,10 +1016,10 @@ async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline:
             if line.get("state") != STATE_QUEUED or line.get("kind") not in WRITABLE_KINDS:
                 continue
             if _no_time_for_a_line(deadline):
-                return {"recovered": recovered, "processed": processed}
+                return {**done, "processed": processed}
             if await _run_line_safely(db, mongo_client, card["_id"], line["id"], datetime.utcnow()):
                 processed += 1
-    return {"recovered": recovered, "processed": processed}
+    return {**done, "processed": processed}
 
 
 # ---------------------------------------------------------------------------
@@ -1056,6 +1111,8 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
         return _answer("already", card)
     if state == STATE_UNDOING:
         return _answer("busy", card, ok=False, reason=BUSY)
+    if line.get("kind") == "add" and state in (STATE_QUEUED, STATE_APPLYING):
+        return _answer("busy", card, ok=False, reason=STILL_POSTING)
     if state != STATE_APPLIED or line.get("kind") not in WRITABLE_KINDS:
         return _answer("not_undoable", card, ok=False, reason="Only an applied line can be undone.")
     now = datetime.utcnow()
