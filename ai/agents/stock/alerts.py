@@ -366,9 +366,16 @@ async def _prefill_prepaid(db, agent: dict, gid: str, detected) -> None:
         return
     value = {"is_prepay_account": bool(detected), "topups": []}
     try:
+        # The whole map, not `settings.clients.<gid>`: a client id holds its owner's email, and Mongo would
+        # read the dots in it as a path. The filter drops this if the settings changed since the read.
+        stored = await db[AGENTS].find_one({"_id": agent["_id"]}, {"settings.clients": 1}) or {}
+        current = (stored.get("settings") or {}).get("clients")  # None matches a missing map in the filter
+        entry = (current or {}).get(gid) or {}
+        if entry.get("prepaid") is not None:
+            return
         res = await db[AGENTS].update_one(
-            {"_id": agent["_id"], f"settings.clients.{gid}.prepaid": None},
-            {"$set": {f"settings.clients.{gid}.prepaid": value}})
+            {"_id": agent["_id"], "settings.clients": current},
+            {"$set": {"settings.clients": {**(current or {}), gid: {**entry, "prepaid": value}}}})
     except Exception as e:  # noqa: BLE001 - a prefill is never worth failing the alerts for
         logger.warning("prepaid prefill failed for %s: %s", gid, e)
         return
@@ -376,7 +383,7 @@ async def _prefill_prepaid(db, agent: dict, gid: str, detected) -> None:
         clients = agent.setdefault("settings", {}).get("clients")
         if not isinstance(clients, dict):
             clients = agent["settings"]["clients"] = {}
-        clients.setdefault(gid, {})["prepaid"] = value
+        clients[gid] = {**(clients.get(gid) or {}), "prepaid": value}
 
 
 def _day_of(v) -> date | None:

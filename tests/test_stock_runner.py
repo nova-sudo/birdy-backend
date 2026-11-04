@@ -2107,3 +2107,21 @@ async def test_throttled_prepaid_read_costs_a_client_without_top_ups_nothing(moc
     assert run["clients"]["g1"]["health_attempts"] == 1 and run["clients"]["g1"]["health_due"]
     assert run["clients"]["g2"]["health_done"] is True and not run["clients"]["g2"].get("health_attempts")
     assert run["summary"]["health_unread"] == ["g1"]
+
+
+# ---------------------------------------------------------------------------
+# Real client ids hold the owner's email, so they have dots in them
+# ---------------------------------------------------------------------------
+
+DOTTED = "user@example.com_123"
+
+
+async def test_a_run_finishes_with_a_dot_in_the_client_id(mock_db, mock_mongo_client, fakes):
+    """Mongo reads a dot in a `clients.<gid>` path as nesting, which left every client pending forever."""
+    agent = await _setup(mock_db, DOTTED, claim=False)
+    run = await _run_all(mock_db, mock_mongo_client, agent, kind=runner.PREVIEW)
+    assert run["phase"] == "done"
+    stored = await mock_db[RUNS].find_one({"_id": run["_id"]})
+    assert set(stored["clients"]) == {DOTTED}
+    assert stored["clients"][DOTTED]["state"] == "done"
+    assert (await _cards(mock_db, run_id=run["_id"]))[0]["client_group_id"] == DOTTED
