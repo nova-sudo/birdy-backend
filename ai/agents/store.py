@@ -58,7 +58,7 @@ MIGRATED_NAME = "Pause and revive rules"
 DEFAULT_CUSTOM_NAME = "Custom agent"
 
 AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training",
-                    "name", "settings"}
+                    "name", "settings", "turned_off_at"}
 
 
 class AgentExists(Exception):

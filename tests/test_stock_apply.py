@@ -2277,6 +2277,23 @@ async def test_route_apply_undo_and_results(api, mock_db, meta):
     assert meta.writes == [("ad1", "PAUSED"), ("ad1", "ACTIVE")]
 
 
+async def test_route_turned_off_refuses_apply_but_undo_still_works(api, mock_db, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "ad2", "spare")
+    await _card(mock_db, agent, _ln(1), _ln(2))
+    base = f"/api/agents/{agent['_id']}"
+    assert api.post(f"{base}/cards/c1/apply", json={"line_ids": ["l1"]}).status_code == 200
+    assert api.post(f"{base}/deactivate").status_code == 200
+
+    r = api.post(f"{base}/cards/c1/apply", json={"line_ids": ["l2"]})
+    assert r.status_code == 200 and r.json()["ok"] is False and "agent is off" in r.json()["reason"]
+    assert meta.writes == [("ad1", "PAUSED")]
+    assert (await _get(mock_db))["status"] == "partly_applied"  # still waiting for when the agent is back
+    r = api.post(f"{base}/cards/c1/undo", json={"line_id": "l1"})
+    assert r.status_code == 200 and r.json()["outcome"] == "undone"
+    assert meta.writes == [("ad1", "PAUSED"), ("ad1", "ACTIVE")]
+
+
 async def test_route_apply_refusal_is_a_409_with_the_reason(api, mock_db, meta):
     agent = await _agent(mock_db)
     await _card(mock_db, agent, _ln(), status="superseded")

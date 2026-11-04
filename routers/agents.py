@@ -71,6 +71,7 @@ def _agent_to_api(doc: dict) -> dict:
         "last_run": doc.get("last_run"),
         "last_run_at": doc.get("last_run_at"),
         "created_at": doc.get("created_at"),
+        "turned_off_at": doc.get("turned_off_at"),  # set when a person turned a live agent off; /activate clears it
     }
     if doc.get("type") == agent_store.TYPE_STOCK:
         out["add_writes_enabled"] = stock_settings.add_writes_enabled()  # setup shows Add as Flag only while off
@@ -178,6 +179,10 @@ async def delete_agent(agent_id: str, current_user: str = Depends(get_current_us
     """Start setup over: deletes a draft agent and its rules, practice and memory."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
+        existing = await agent_store.get_agent(db, current_user, agent_id)
+        if existing and existing.get("turned_off_at") and existing.get("status") != "active":
+            raise HTTPException(status_code=409, detail=(
+                "A turned off agent can't be started over: that would delete everything it learned. Turn it on again instead"))
         try:
             deleted = await agent_store.delete_draft_agent(db, current_user, agent_id)
         except agent_store.AgentActive:
@@ -737,9 +742,28 @@ async def activate(agent_id: str, body: Optional[ActivateBody] = None,
             if mode is not None:
                 await agent_store.update_rule(db, agent_id, rule["_id"], mode=mode)  # syncs open items
         await db[agent_store.AGENTS].update_one(
-            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {"$set": {
-            "status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()}})
+            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {
+            "$set": {"status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()},
+            "$unset": {"turned_off_at": ""}})
         return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))
+
+
+@router.post("/{agent_id}/deactivate")
+async def deactivate(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Turn the Birdy Media Buying Agent off. It goes back to a draft, marked `turned_off_at` so the app
+    offers Turn on and never Start over. Its clients are released; scope, settings, runs, cards and lines
+    stay. The tick skips it, Apply is refused ("agent off") and Undo still works. An unfinished run is left
+    alone (ending it would post to Slack) and carries on when the agent is turned back on, or ends if it
+    is then over a day old."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        if agent.get("type") != agent_store.TYPE_STOCK:
+            raise HTTPException(status_code=409, detail="Only the Birdy Media Buying Agent can be turned off")
+        if agent.get("status") != "active":
+            return _agent_to_api(agent)  # idempotent: nothing changes
+        return _agent_to_api(await agent_store.update_agent(
+            db, current_user, agent_id, {"status": "draft", "turned_off_at": datetime.utcnow()}))
 
 
 # ---------------------------------------------------------------------------

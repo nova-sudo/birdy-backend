@@ -134,11 +134,47 @@ def test_client_table_only_in_the_summary_and_only_agent_run():
     assert tpl.validate_template("summary", {"blocks": [{**table, "birdy_data": {"source": "agent_run", "columns": ["zone"]}}]})
 
 
-def test_report_placeholders_still_work():
+def test_report_placeholders_are_refused_and_the_error_names_the_allowed_ones():
+    """Agent messages carry no report data, so {{spend}} would preview with sample figures and post blank."""
     template = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "Spend {{spend}} for {{client}}"}}]}
-    clean = tpl.validate_template("card", template)
-    blocks, _ = tpl.render_kind("card", clean, {"client": "Glow"}, None, _ctx())
-    assert "Glow" in blocks[0]["text"]["text"] and "142" in blocks[0]["text"]["text"]
+    with pytest.raises(tpl.TemplateError) as e:
+        tpl.validate_template("card", template)
+    [msg] = e.value.errors
+    assert "{{spend}}" in msg and "{{client}}" in msg and "{{thought_process}}" in msg
+    for kind in tpl.KIND_TOKENS:
+        with pytest.raises(tpl.TemplateError):
+            tpl.validate_template(kind, {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "{{ranking metric=leads}}"}}]})
+
+
+@pytest.mark.parametrize("block", [
+    {"type": "data_visualization", "title": "Spend", "birdy_data": {"chart": "bar", "by": "client", "metrics": ["spend"]}},
+    {"type": "carousel", "birdy_data": {"metrics": ["spend"], "limit": 5}},
+    {"type": "data_table", "caption": "Clients", "birdy_data": {"metrics": ["spend", "leads"], "sort": "spend"}},
+    {"type": "table", "birdy_data": {"metrics": ["spend"], "limit": 5}},
+])
+def test_metric_blocks_are_refused(block):
+    for kind in tpl.KIND_TOKENS:
+        with pytest.raises(tpl.TemplateError) as e:
+            tpl.validate_template(kind, {"blocks": [block]})
+        assert "block 1" in " ".join(e.value.errors) and "report" in " ".join(e.value.errors)
+
+
+def test_the_defaults_and_the_client_table_still_pass():
+    for kind, default in tpl.DEFAULT_TEMPLATES.items():
+        assert tpl.validate_template(kind, copy.deepcopy(default))
+    assert any(b.get("birdy_data") for b in tpl.validate_template("summary", tpl.DEFAULT_TEMPLATES["summary"])["blocks"])
+
+
+def test_send_refuses_what_validation_refuses_so_preview_and_send_agree(caplog):
+    saved = {"blocks": [{"type": "section", "text": {"type": "mrkdwn", "text": "Spend {{spend}}"}}]}  # saved before the rule
+    with pytest.raises(tpl.TemplateError):
+        tpl.render_kind("card", saved, {}, None, _ctx())
+    with pytest.raises(tpl.TemplateError):
+        tpl.render_kind("card", {"blocks": [{"type": "data_visualization", "title": "x",
+                                             "birdy_data": {"chart": "pie", "by": "client", "metrics": ["spend"]}}]}, {}, None, _ctx())
+    with caplog.at_level(logging.WARNING):
+        blocks, _, fell_back = tpl.render_kind_safe("card", saved, tpl.card_values(_card()), None, _ctx())
+    assert fell_back is True and not any("Spend" in t for t in _texts(blocks))
 
 
 def test_agent_tokens_are_refused_in_reports():

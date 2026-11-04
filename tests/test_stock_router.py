@@ -154,6 +154,76 @@ async def test_activate_claim_conflict_is_409_with_conflicts(api, mock_db):
 
 
 # ---------------------------------------------------------------------------
+# Deactivate (turn off)
+# ---------------------------------------------------------------------------
+
+async def test_deactivate_turns_a_live_agent_off_and_keeps_what_setup_chose(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"scope.flag_only_client_group_ids": ["g1"]}})
+    before = await mock_db[AGENTS].find_one({"_id": aid})
+    assert await claims.holder(mock_db, USER, "g1") == aid
+
+    r = api.post(f"/api/agents/{aid}/deactivate")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "draft" and r.json()["turned_off_at"]
+    assert await claims.holder(mock_db, USER, "g1") is None
+    after = await mock_db[AGENTS].find_one({"_id": aid})
+    assert after["scope"] == before["scope"] and after["settings"] == before["settings"]
+
+    again = api.post(f"/api/agents/{aid}/deactivate")  # nothing to do the second time
+    assert again.status_code == 200 and again.json()["turned_off_at"] == r.json()["turned_off_at"]
+    assert api.get(f"/api/agents/{aid}").json()["turned_off_at"] == r.json()["turned_off_at"]
+
+
+async def test_deactivate_a_draft_agent_changes_nothing(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "draft"}})
+    r = api.post(f"/api/agents/{agent['_id']}/deactivate")
+    assert r.status_code == 200 and r.json()["status"] == "draft" and r.json()["turned_off_at"] is None
+
+
+async def test_deactivate_is_for_the_stock_agent_and_its_owner(api, mock_db):
+    custom = await create_agent(mock_db, USER, type="custom", name="Rules")
+    await mock_db[AGENTS].update_one({"_id": custom["_id"]}, {"$set": {"status": "active"}})
+    r = api.post(f"/api/agents/{custom['_id']}/deactivate")
+    assert r.status_code == 409 and "Birdy Media Buying Agent" in r.json()["detail"]
+    assert (await mock_db[AGENTS].find_one({"_id": custom["_id"]}))["status"] == "active"
+    stock = await _setup(mock_db, "g1")
+    api.state["user"] = OTHER
+    assert api.post(f"/api/agents/{stock['_id']}/deactivate").status_code == 404
+
+
+async def test_a_turned_off_agent_is_not_ticked_and_turning_it_on_needs_no_new_preview(api, mock_db, mock_mongo_client):
+    agent = await _setup(mock_db, "g1", claim=False)
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    assert api.post(f"/api/agents/{aid}/activate").status_code == 200
+    previews = await mock_db[RUNS].count_documents({"agent_id": aid, "kind": "preview"})
+
+    assert api.post(f"/api/agents/{aid}/deactivate").status_code == 200
+    await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW)
+    assert await mock_db[RUNS].count_documents({"agent_id": aid, "kind": {"$ne": "preview"}}) == 0
+
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active" and r.json()["turned_off_at"] is None
+    assert "turned_off_at" not in await mock_db[AGENTS].find_one({"_id": aid})
+    assert await claims.holder(mock_db, USER, "g1") == aid
+    assert await mock_db[RUNS].count_documents({"agent_id": aid, "kind": "preview"}) == previews
+    await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW)
+    assert await mock_db[RUNS].count_documents({"agent_id": aid, "kind": {"$ne": "preview"}}) == 1
+
+
+async def test_a_turned_off_agent_cannot_be_started_over(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    api.post(f"/api/agents/{agent['_id']}/deactivate")
+    r = api.delete(f"/api/agents/{agent['_id']}")
+    assert r.status_code == 409 and "turned off" in r.json()["detail"].lower()
+    assert await mock_db[AGENTS].count_documents({"_id": agent["_id"]}) == 1
+
+
+# ---------------------------------------------------------------------------
 # Runs, cards, outcomes, lessons
 # ---------------------------------------------------------------------------
 

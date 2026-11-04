@@ -145,13 +145,40 @@ def _binding_columns(bd, where: str, errors: list[str]) -> list[str] | None:
     return list(dict.fromkeys(cols))
 
 
+METRIC_BLOCKS = ("data_visualization", "carousel")
+
+
+def report_content_errors(kind: str, blocks: list) -> list[str]:
+    """What in these blocks needs the user's report figures, which an agent message doesn't have: charts,
+    carousels and tables bound to metrics, and report placeholders such as {{spend}}. They would preview
+    with sample figures and post blank, so validation and sending both refuse them."""
+    own = ", ".join("{{%s}}" % t for t in KIND_TOKENS[kind])
+    errors = []
+    for i, b in enumerate(blocks):
+        bd = b.get("birdy_data") if isinstance(b, dict) else None
+        if isinstance(b, dict) and (b.get("type") in METRIC_BLOCKS or (isinstance(bd, dict) and bd.get("source") != BINDING["source"])):
+            errors.append(f"block {i + 1}: charts, carousels and tables of report figures aren't available in the {kind} "
+                          f"message, which carries no report data; use text with {own}"
+                          + (" or the client table" if kind == "summary" else ""))
+    try:
+        tokens = rb.all_tokens([b for b in blocks if isinstance(b, dict)])
+    except Exception:  # noqa: BLE001 - malformed blocks are reported by the engine's own validation
+        tokens = []
+    for tok in tokens:
+        # A name the report engine doesn't know is left to its own "unknown placeholder" error.
+        if tok["name"] not in KIND_TOKENS[kind] and not rt._check_token(tok, None):
+            errors.append(f"{tok['raw']}: report placeholders such as {{{{spend}}}} aren't available in the {kind} message, "
+                          f"which carries no report data; the {kind} template has {own}")
+    return list(dict.fromkeys(errors))
+
+
 def validate_template(kind: str, raw: dict) -> dict:
     """A clean template `{"blocks": [...]}`, or TemplateError listing everything wrong with it.
-    Placeholders are held to this template's own list plus the report ones. Only the summary may
+    Placeholders are held to this template's own list: report ones such as {{spend}} and metric blocks are refused. Only the summary may
     carry the client table binding, which is kept as written."""
     _kind(kind)
     blocks_in = _blocks_of(raw)
-    errors: list[str] = []
+    errors: list[str] = report_content_errors(kind, blocks_in)
     if sum(1 for b in blocks_in if isinstance(b, dict) and b.get("type") in TABLE_BLOCKS) > 1:
         errors.append("a message can have only one table: use the client table or a table of your own, not both")
     stubbed: dict[int, dict] = {}
@@ -241,8 +268,11 @@ def render_kind(kind: str, template: dict, values: dict, rows: list[dict] | None
     the engine escapes them. Raises TemplateError when the template no longer validates; the caller
     posts the default template instead."""
     _kind(kind)
+    original = _blocks_of(template)
+    if problems := report_content_errors(kind, original):
+        raise TemplateError(problems)
     blocks = []
-    for b in copy.deepcopy(_blocks_of(template)):
+    for b in copy.deepcopy(original):
         if isinstance(b, dict) and isinstance(b.get("birdy_data"), dict) and b["birdy_data"].get("source") == BINDING["source"]:
             blocks.extend(_table_for(b, rows))
             continue
