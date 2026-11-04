@@ -287,3 +287,65 @@ async def test_runner_forces_flag_for_flag_only_unheld_client(mock_db, mock_mong
     assert res.created and res.auto_applied == 0
     docs = await mock_db[sstore.SUGGESTIONS].find({"rule_mode": {"$exists": True}}).to_list(None)
     assert docs and {d["rule_mode"] for d in docs} == {"flag"}
+
+
+# --- a client nobody holds: true copy and a way back -------------------------
+
+async def _guard(db, agent):
+    return await check_guardrails(db, agent, {"client_group_id": "g1", "user_id": U,
+                                              "action": {"type": "pause_ads", "targets": []}},
+                                  now_utc=datetime(2026, 11, 4))
+
+
+async def test_refusal_says_another_agent_only_when_one_holds_the_client(mock_db):
+    a, b = await _agent(mock_db, "Alpha"), await _agent(mock_db, "Beta")
+    nobody = await _guard(mock_db, b)
+    assert nobody.reason == "not_acting_agent"
+    assert "Another agent" not in nobody.message
+    assert "No agent is acting on this client" in nobody.message and "Take it back" in nobody.message
+
+    await claims.claim_clients(mock_db, U, a["_id"], ["g1"])
+    held = await _guard(mock_db, b)
+    assert held.reason == "not_acting_agent" and held.message.startswith("Another agent now handles this client")
+
+
+async def test_stock_agent_refusal_doesnt_point_at_the_custom_page(mock_db):
+    stock = await _agent(mock_db, "Stock", type=store.TYPE_STOCK)
+    nobody = await _guard(mock_db, stock)
+    assert "No agent is acting on this client" in nobody.message and "Take it back" not in nobody.message
+
+
+async def test_claims_route_says_who_acts_on_each_client(api, mock_db):
+    await _groups(mock_db, "g1", "g2", "g3")
+    other = await _agent(mock_db, "Stock agent", gids=("g2",))
+    me = await _agent(mock_db, "Mine", gids=("g1", "g2", "g3", "gone"))
+    await claims.claim_clients(mock_db, U, me["_id"], ["g1"])
+    await claims.claim_clients(mock_db, U, other["_id"], ["g2"])
+    r = api.get(f"/api/agents/{me['_id']}/claims")
+    assert r.status_code == 200, r.text
+    assert r.json()["clients"] == [  # a client that no longer exists isn't listed
+        {"client_group_id": "g1", "name": "g1", "acting": "this_agent", "holder_name": None},
+        {"client_group_id": "g2", "name": "g2", "acting": "other_agent", "holder_name": "Stock agent"},
+        {"client_group_id": "g3", "name": "g3", "acting": "no_agent", "holder_name": None},
+    ]
+
+
+async def test_claims_route_is_owner_scoped(api, mock_db):
+    other = await store.create_agent(mock_db, "someone-else", type=store.TYPE_CUSTOM, name="Theirs")
+    assert api.get(f"/api/agents/{other['_id']}/claims").status_code == 404
+
+
+async def test_the_take_back_save_claims_it_and_leaves_another_agents_client_alone(api, mock_db):
+    """What the page sends: the same clients, with the ones held elsewhere as only_flag so they don't refuse the save."""
+    await _groups(mock_db, "g1", "g2")
+    other = await _agent(mock_db, "Stock agent", gids=("g2",))
+    me = await _agent(mock_db, "Mine", gids=("g1", "g2"))
+    await claims.claim_clients(mock_db, U, other["_id"], ["g2"])
+    await claims.mark_claimed(mock_db, me["_id"])  # the migration won't help: it has already run for this agent
+
+    assert api.patch(f"/api/agents/{me['_id']}", json={"scope": {"client_group_ids": ["g1", "g2"]}}).status_code == 409
+    r = api.patch(f"/api/agents/{me['_id']}", json={"scope": {"client_group_ids": ["g1", "g2"]}, "only_flag": ["g2"]})
+    assert r.status_code == 200, r.text
+    assert await claims.holder(mock_db, U, "g1") == me["_id"]
+    assert await claims.holder(mock_db, U, "g2") == other["_id"]
+    assert (await _guard(mock_db, await mock_db.agents.find_one({"_id": me["_id"]}))).ok

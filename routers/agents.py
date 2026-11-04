@@ -151,7 +151,9 @@ class CreateAgentBody(BaseModel):
 
 @router.post("")
 async def create_agent(body: CreateAgentBody | None = None, current_user: str = Depends(get_current_user)):
-    agent_type, name = agent_store.TYPE_CUSTOM, None  # no body: the old frontend, during a deploy window
+    # No body is the old frontend, for the deploy window only: remove it, and make `body` required again, once the
+    # new frontend is live. It has no name to check, since the store gives it DEFAULT_CUSTOM_NAME.
+    agent_type, name = agent_store.TYPE_CUSTOM, None
     if body is not None:
         agent_type = body.type
         if agent_type not in (agent_store.TYPE_CUSTOM, agent_store.TYPE_STOCK):
@@ -296,6 +298,30 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
 
         updated = await agent_store.update_agent(db, current_user, agent_id, patch)
         return _agent_to_api(updated)
+
+
+@router.get("/{agent_id}/claims")
+async def get_claims(agent_id: str, current_user: str = Depends(get_current_user)):
+    """Who acts on each client this agent watches, so the page can offer a client nobody holds back to it.
+    Taking one back is the scope save in PATCH. A client that no longer exists isn't listed."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _agent_or_404(db, current_user, agent_id)
+        gids = list(dict.fromkeys((agent.get("scope") or {}).get("client_group_ids") or []))
+        names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
+            {"id": {"$in": gids}, "user_id": current_user})}
+        held = {r["client_group_id"]: r["agent_id"] async for r in db[claims.CLAIMS].find(
+            {"user_id": current_user, "client_group_id": {"$in": gids}})}
+        holders = {a["_id"]: a.get("name") or "" async for a in db[agent_store.AGENTS].find(
+            {"_id": {"$in": [h for h in held.values() if h != agent_id]}, "user_id": current_user})}
+
+        def row(gid: str) -> dict:
+            holder = held.get(gid)
+            acting = "no_agent" if holder is None else "this_agent" if holder == agent_id else "other_agent"
+            return {"client_group_id": gid, "name": names[gid], "acting": acting,
+                    "holder_name": holders.get(holder) if acting == "other_agent" else None}
+
+        return {"clients": [row(g) for g in gids if g in names]}
 
 
 # ---------------------------------------------------------------------------

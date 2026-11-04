@@ -115,6 +115,11 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime,
     # (no _id, e.g. creative auto-pause) is not checked here.
     if agent.get("_id") and gid:
         held_by = await claims.holder(db, agent.get("user_id") or doc.get("user_id"), gid)
+        if held_by is None:
+            # Taking it back is a button on a custom agent's page. The stock agent has its own wording by code.
+            how = "" if agent.get("type") == "stock_media_buying" else " Take it back from the top of this agent's page."
+            return GuardrailResult.blocked(
+                "not_acting_agent", f"No agent is acting on this client, so this agent can't change it.{how}")
         if held_by != agent["_id"]:
             return GuardrailResult.blocked(
                 "not_acting_agent", "Another agent now handles this client, so this agent can't change it.")
