@@ -19,6 +19,7 @@ and `render_kind` swaps it for a normal table of the run's own rows before the e
 
 import copy
 import json
+import logging
 import re
 from datetime import date, datetime, timedelta, timezone
 
@@ -32,8 +33,10 @@ from ai.agents.stock.settings import TEMPLATE_KINDS
 from ai.agents.stock.writer import _fmt_money
 from services.report_template import TemplateError
 
-__all__ = ["DEFAULT_TEMPLATES", "TemplateError", "KIND_TOKENS", "validate_template", "render_kind", "make_context",
+__all__ = ["render_kind_safe", "report_url", "DEFAULT_TEMPLATES", "TemplateError", "KIND_TOKENS", "validate_template", "render_kind", "make_context",
            "card_buttons", "summary_buttons", "assemble", "card_values", "summary_values", "rows_from_cards"]
+
+logger = logging.getLogger(__name__)
 
 KIND_TOKENS = {
     "card": ("client", "window", "previous_cpl", "current_cpl", "zone", "changes", "additional_changes",
@@ -51,6 +54,14 @@ BUSY_STATES = (STATE_QUEUED, STATE_APPLYING, STATE_UNDOING)
 UNDOABLE_KINDS = ("remove", "revive", "add")   # apply.WRITABLE_KINDS; not imported to keep apply out of the import graph
 ZONE_LABELS = {"green": "🟢 Green", "yellow": "🟡 Yellow", "red": "🔴 Red", "no_data": "⚪ No data"}
 REPORT_PATH = "/hub/agents/media-buying"
+# Slack's table limits (docs.slack.dev/reference/block-kit/blocks/table-block): 100 rows, 10,000 characters
+# across all cells. The engine's data_table allows 200 rows and 20,000.
+TABLE_LIMITS = {"table": (99, rb.MAX_TABLE_CHARS), "data_table": (200, rb.MAX_DATA_TABLE_CHARS)}
+MAX_CELL = 200
+
+
+def report_url(frontend_url: str, run_id) -> str:
+    return f"{frontend_url.rstrip('/')}{REPORT_PATH}?run={run_id}"
 
 
 def _section(text: str) -> dict:
@@ -141,6 +152,8 @@ def validate_template(kind: str, raw: dict) -> dict:
     _kind(kind)
     blocks_in = _blocks_of(raw)
     errors: list[str] = []
+    if sum(1 for b in blocks_in if isinstance(b, dict) and b.get("type") in TABLE_BLOCKS) > 1:
+        errors.append("a message can have only one table: use the client table or a table of your own, not both")
     stubbed: dict[int, dict] = {}
     stand_in = []
     for i, b in enumerate(blocks_in):
@@ -162,7 +175,10 @@ def validate_template(kind: str, raw: dict) -> dict:
         clean = rb.validate({"frequency": FREQUENCY[kind], "blocks": stand_in}, None,
                             allowed_tokens=frozenset(KIND_TOKENS[kind]))["blocks"]
     except TemplateError as e:
-        raise TemplateError(list(dict.fromkeys([*errors, *e.errors])))
+        own = ", ".join("{{%s}}" % t for t in KIND_TOKENS[kind])
+        raise TemplateError(list(dict.fromkeys([*errors, *(
+            f"{m.split(': unknown placeholder')[0]}: unknown placeholder; the {kind} template has {own}, "
+            f"and report ones such as {{{{spend}}}}" if ": unknown placeholder" in m else m for m in e.errors)])))
     if errors:
         raise TemplateError(list(dict.fromkeys(errors)))
     for i, binding in stubbed.items():
@@ -183,8 +199,8 @@ def make_context(frequency: str = "daily", *, now_utc: datetime, currency: str =
 
 
 def _plain_cell(text) -> dict:
-    """A table cell from a name: it can't start a placeholder, and Slack syntax is escaped."""
-    return {"type": "raw_text", "text": rt._escape_all(str(text if text is not None else "")).replace("{{", "{​{")}
+    """A table cell from a name. Raw text can't ping, so it is shown as written; it can't start a placeholder."""
+    return {"type": "raw_text", "text": str(text if text is not None else "")[:MAX_CELL].replace("{{", "{\u200b{")}
 
 
 def rows_from_cards(cards: list[dict]) -> list[dict]:
@@ -195,14 +211,28 @@ def rows_from_cards(cards: list[dict]) -> list[dict]:
              "zone": ZONE_LABELS.get(c.get("zone"), str(c.get("zone") or "n/a"))} for c in cards]
 
 
-def _table_for(block: dict, rows: list[dict] | None) -> dict:
+def _table_for(block: dict, rows: list[dict] | None) -> list[dict]:
+    """The binding as blocks: a table kept inside Slack's row and character limits, then a note
+    saying how many clients did not fit."""
     cols = (block.get("birdy_data") or {}).get("columns") or list(TABLE_COLUMNS)
     rest = {k: v for k, v in block.items() if k != "birdy_data"}
     if not rows:
-        return {"type": "context", "elements": [{"type": "mrkdwn", "text": "_Clients: nothing to show yet_"}]}
-    body = [[_plain_cell(r.get("client"))] + [_plain_cell(r.get(c)) for c in cols] for r in rows]
+        return [{"type": "context", "elements": [{"type": "mrkdwn", "text": "_Clients: nothing to show yet_"}]}]
+    max_rows, max_chars = TABLE_LIMITS[block.get("type") if block.get("type") in TABLE_LIMITS else "table"]
     head = [{"type": "raw_text", "text": "Client"}] + [{"type": "raw_text", "text": TABLE_COLUMNS[c]} for c in cols]
-    return {**rest, "rows": [head, *body]}
+    used = sum(len(c["text"]) for c in head)
+    body = []
+    for r in rows[:max_rows]:
+        row = [_plain_cell(r.get("client"))] + [_plain_cell(r.get(c)) for c in cols]
+        size = sum(len(c["text"]) for c in row)
+        if used + size > max_chars:
+            break
+        used += size
+        body.append(row)
+    out = [{**rest, "rows": [head, *body]}]
+    if len(rows) > len(body):
+        out.append({"type": "context", "elements": [{"type": "mrkdwn", "text": f"_and {len(rows) - len(body)} more clients, see the report_"}]})
+    return out
 
 
 def render_kind(kind: str, template: dict, values: dict, rows: list[dict] | None, ctx: rt.Context) -> tuple[list, str]:
@@ -214,12 +244,47 @@ def render_kind(kind: str, template: dict, values: dict, rows: list[dict] | None
     blocks = []
     for b in copy.deepcopy(_blocks_of(template)):
         if isinstance(b, dict) and isinstance(b.get("birdy_data"), dict) and b["birdy_data"].get("source") == BINDING["source"]:
-            b = _table_for(b, rows)
+            blocks.extend(_table_for(b, rows))
+            continue
         blocks.append(b)
     fitted, _ = rb.fit_to_slack({"frequency": FREQUENCY[kind], "blocks": blocks}, max_blocks=rb.MAX_BLOCKS - ACTIONS_RESERVED)
     clean = rb.validate(fitted, None, allowed_tokens=frozenset(KIND_TOKENS[kind]))
     ctx.agent = {name: str(values.get(name) or "") for name in KIND_TOKENS[kind]}
-    return rb.render(clean, ctx)
+    blocks, _ = rb.render(clean, ctx)
+    return blocks, _notification_text(blocks)
+
+
+def _escape_unparsed(node):
+    """A copy with the text of every field the engine leaves unescaped (plain text, raw text, markdown
+    block) escaped. Those can't ping inside a block, but a message's `text` is read as mrkdwn."""
+    if isinstance(node, list):
+        return [_escape_unparsed(v) for v in node]
+    if not isinstance(node, dict):
+        return node
+    out = {k: _escape_unparsed(v) for k, v in node.items()}
+    if (node.get("type") in ("plain_text", "raw_text", "markdown") and isinstance(node.get("text"), str)):
+        out["text"] = rt._escape_all(node["text"])
+    return out
+
+
+def _notification_text(blocks: list) -> str:
+    return rb.fallback_text(_escape_unparsed(blocks))
+
+
+def render_kind_safe(kind: str, template: dict | None, values: dict, rows: list[dict] | None,
+                     ctx: rt.Context) -> tuple[list, str, bool]:
+    """(blocks, text, fell_back). A saved template that no longer renders (a placeholder or block
+    removed since it was saved, or stored junk) is logged and the default is used instead, so a run
+    never loses its report to a template. `fell_back` is for the notice in settings. No saved
+    template is not a fall back."""
+    if template is not None:
+        try:
+            return (*render_kind(kind, template, values, rows, ctx), False)
+        except Exception as e:  # noqa: BLE001 - the report must go out whatever the template holds
+            logger.warning("stock %s template can't be rendered, using the default: %s", kind, e, exc_info=True)
+            blocks, text = render_kind(kind, DEFAULT_TEMPLATES[kind], values, rows, ctx)
+            return blocks, text, True
+    return (*render_kind(kind, DEFAULT_TEMPLATES[kind], values, rows, ctx), False)
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +319,7 @@ def _line_text(line: dict, currency) -> str:
     return " ".join(bits)
 
 
-def _follow_ups(card: dict) -> str:
+def _follow_ups(card: dict, frontend_url: str = "") -> str:
     out = []
     for ln in card.get("lines") or []:
         name = ln.get("ad_name") or "ad"
@@ -265,11 +330,15 @@ def _follow_ups(card: dict) -> str:
             out.append(f"• {name}: upload the video")
         elif ln.get("state") in ("blocked", "failed") and ln.get("error"):
             out.append(f"• {name}: {ln['error']}")
+    if any(ln.get("state") in ("needs_file", "blocked", "failed") for ln in card.get("lines") or []):
+        link = f": {report_url(frontend_url, card['run_id'])}" if frontend_url and card.get("run_id") else ""
+        out.append(f"Slack can't retry these. Open the report to retry or upload{link}")
     return "\n".join(out)
 
 
-def card_values(card: dict) -> dict:
-    """Values for the card template. Plain text; the engine escapes it."""
+def card_values(card: dict, frontend_url: str = "") -> dict:
+    """Values for the card template. Plain text; the engine escapes it. `frontend_url` gives the
+    follow-ups a link to the report when a line needs a person."""
     cur = card.get("currency")
     lines = card.get("lines") or []
     return {"client": card.get("client_name") or "Client", "window": _window(card.get("window")),
@@ -278,7 +347,7 @@ def card_values(card: dict) -> dict:
             "changes": "\n".join(_line_text(ln, cur) for ln in lines) or "No changes",
             "additional_changes": card.get("additional_changes") or "None",
             "thought_process": card.get("thought_process") or "None",
-            "next_steps": card.get("next_steps") or "None", "follow_ups": _follow_ups(card) or "None"}
+            "next_steps": card.get("next_steps") or "None", "follow_ups": _follow_ups(card, frontend_url) or "None"}
 
 
 _USER_ID = re.compile(r"^[UW][A-Z0-9]{2,20}$")
@@ -320,7 +389,7 @@ def _undo_open(line: dict, now: datetime) -> bool:
     return now <= until
 
 
-def card_buttons(card: dict, now: datetime | None = None, *, has_newer: bool = False) -> dict | None:
+def card_buttons(card: dict, now: datetime | None = None, *, has_newer: bool) -> dict | None:
     """The card's actions block, from its state alone, or None. A superseded, closing or preview card
     gets none. Apply needs a proposed line (a Flag line is never one) on a card nobody has replaced;
     Edit and Dismiss wait while any line is going out; Undo is per applied line, inside its window.
@@ -356,7 +425,7 @@ def summary_buttons(run: dict, frontend_url: str, *, waiting: int | None = None)
     if count and run.get("kind") != "preview":
         elements.append(_button("Apply all", "agent_run_apply_all", rid, "primary"))
     elements.append({"type": "button", "text": {"type": "plain_text", "text": "Open report", "emoji": True},
-                     "action_id": "agent_open_report", "url": f"{frontend_url.rstrip('/')}{REPORT_PATH}?run={rid}"})
+                     "action_id": "agent_open_report", "url": report_url(frontend_url, rid)})
     return {"type": "actions", "block_id": f"agent_run_{rid}"[:255], "elements": elements}
 
 
@@ -396,7 +465,7 @@ def sample_preview(kind: str, template: dict, *, now: datetime, currency: str, f
            "alerts": [{"client_group_id": "s2", "severity": "warning", "title": "Spend dropped by half"}]}
     if kind == "card":
         blocks, text = render_kind(kind, template, card_values(cards[0]), None, ctx)
-        return assemble(blocks, card_buttons(cards[0], now.replace(tzinfo=None))), text
+        return assemble(blocks, card_buttons(cards[0], now.replace(tzinfo=None), has_newer=False)), text
     if kind == "summary":
         blocks, text = render_kind(kind, template, summary_values(run, cards, tag_user_id="U0SAMPLE"), rows_from_cards(cards), ctx)
         return assemble(blocks, summary_buttons(run, frontend_url, waiting=1)), text

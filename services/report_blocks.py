@@ -841,15 +841,22 @@ def _no_data(text: str) -> dict:
     return {"type": "context", "elements": [{"type": "mrkdwn", "text": f"_{text}: no data for this period yet_"}]}
 
 
+def _cut(text: str, limit: int) -> str:
+    """text cut to limit, never leaving half an entity ("&l") behind."""
+    if len(text) <= limit:
+        return text
+    return re.sub(r"&[a-z]{0,4}$", "", text[:limit])
+
+
 def _cap_text(b: dict) -> dict:
     """Slack's per-field limits, applied after placeholders have filled."""
     caps = {"header": {"text": 150}, "section": {"text": 3000}, "card": {"title": 150, "subtitle": 150, "body": 200, "subtext": 200}}
     for key, limit in caps.get(b["type"], {}).items():
         if isinstance(b.get(key), dict) and isinstance(b[key].get("text"), str):
-            b[key]["text"] = b[key]["text"][:limit] or " "
+            b[key]["text"] = _cut(b[key]["text"], limit) or " "
     if b["type"] == "section" and b.get("fields"):
         for f in b["fields"]:
-            f["text"] = f["text"][:2000] or " "
+            f["text"] = _cut(f["text"], 2000) or " "
     if b["type"] == "data_visualization":
         b["title"] = b["title"][:50]
     return b
@@ -868,7 +875,7 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
                 value = value[1:]  # a list already on its own line: no extra break, no stray indent
                 if out:
                     out[-1] = out[-1].rstrip(" \t")
-            if tok["name"] in ctx.agent and tok["name"] not in core.TRUSTED_AGENT_TOKENS:
+            if md and tok["name"] in ctx.agent and tok["name"] not in core.TRUSTED_AGENT_TOKENS:
                 out.append(core._escape_all(value))  # an ad or client name must never ping or link
             else:
                 out.append(core._escape(value) if md else value)
