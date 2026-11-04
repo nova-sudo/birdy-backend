@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 import routers.agent_stock as stock_router
 import routers.agents as agents_router
 from ai.agents import claims
+from ai.agents.history import HISTORY
 from ai.agents.stock import runner, templates
 from ai.agents.stock.runner import RUNS
 from ai.agents.stock.scoreboard import OUTCOMES
@@ -72,6 +73,45 @@ async def test_preview_409_while_history_is_not_ready(api, mock_db):
     agent = await _setup(mock_db, "g1", history_status="pending")
     r = api.post(f"/api/agents/{agent['_id']}/preview")
     assert r.status_code == 409 and r.json()["not_ready"] == ["g1"]
+    assert await mock_db[RUNS].count_documents({}) == 0
+
+
+async def _unreadable(db, gid):
+    """Meta won't let Birdy read this client: its backfill never finished."""
+    await db[HISTORY].update_one({"_id": gid}, {"$set": {"status": "error", "error": "no_access", "last_topup_at": None}},
+                                 upsert=True)
+
+
+async def test_preview_runs_without_a_client_meta_wont_let_birdy_read(api, mock_db):
+    agent = await _setup(mock_db, "g1", "g2", claim=False)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "draft"}})
+    await _unreadable(mock_db, "g2")
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 200, r.text
+    assert r.json()["phase"] == "done"
+    run = await mock_db[RUNS].find_one({"_id": r.json()["run_id"]})
+    assert run["clients"]["g1"]["state"] != "no_data"
+    assert run["clients"]["g2"]["state"] == "no_data"
+    assert "couldn't read" in run["clients"]["g2"]["reason"]
+    assert await mock_db[CARDS].count_documents({"run_id": run["_id"], "client_group_id": "g2"}) == 0
+    # It doesn't stop the agent being turned on either.
+    assert api.post(f"/api/agents/{agent['_id']}/activate").status_code == 200
+
+
+async def test_preview_still_waits_for_a_client_that_is_syncing(api, mock_db):
+    agent = await _setup(mock_db, "g1", "g2", claim=False)
+    await _unreadable(mock_db, "g1")
+    await mock_db[HISTORY].update_one({"_id": "g2"}, {"$set": {"status": "running"}}, upsert=True)
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 409 and r.json()["not_ready"] == ["g2"]
+
+
+async def test_preview_refuses_when_no_client_can_be_read(api, mock_db):
+    agent = await _setup(mock_db, "g1", "g2", claim=False)
+    await _unreadable(mock_db, "g1")
+    await _unreadable(mock_db, "g2")
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 409 and set(r.json()["unreadable"]) == {"g1", "g2"} and "not_ready" not in r.json()
     assert await mock_db[RUNS].count_documents({}) == 0
 
 
