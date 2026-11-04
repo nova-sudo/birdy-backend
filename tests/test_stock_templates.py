@@ -159,6 +159,14 @@ def test_metric_blocks_are_refused(block):
         assert "block 1" in " ".join(e.value.errors) and "report" in " ".join(e.value.errors)
 
 
+def test_a_malformed_birdy_data_block_gets_a_malformed_message_not_a_report_figures_one():
+    for bd in ({}, "x", []):
+        with pytest.raises(tpl.TemplateError) as e:
+            tpl.validate_template("summary", {"blocks": [{"type": "table", "birdy_data": bd}]})
+        text = " ".join(e.value.errors)
+        assert "malformed" in text and "report figures" not in text
+
+
 def test_the_defaults_and_the_client_table_still_pass():
     for kind, default in tpl.DEFAULT_TEMPLATES.items():
         assert tpl.validate_template(kind, copy.deepcopy(default))

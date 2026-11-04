@@ -156,7 +156,9 @@ def report_content_errors(kind: str, blocks: list) -> list[str]:
     errors = []
     for i, b in enumerate(blocks):
         bd = b.get("birdy_data") if isinstance(b, dict) else None
-        if isinstance(b, dict) and (b.get("type") in METRIC_BLOCKS or (isinstance(bd, dict) and bd.get("source") != BINDING["source"])):
+        if isinstance(b, dict) and "birdy_data" in b and (not isinstance(bd, dict) or not bd):
+            errors.append(f"block {i + 1}: birdy_data is malformed; the client table is {{\"source\": \"agent_run\"}}")
+        elif isinstance(b, dict) and (b.get("type") in METRIC_BLOCKS or (isinstance(bd, dict) and bd.get("source") != BINDING["source"])):
             errors.append(f"block {i + 1}: charts, carousels and tables of report figures aren't available in the {kind} "
                           f"message, which carries no report data; use text with {own}"
                           + (" or the client table" if kind == "summary" else ""))
