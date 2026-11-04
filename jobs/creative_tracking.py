@@ -50,7 +50,8 @@ logger = logging.getLogger(__name__)
 TICK_BUDGET_SECONDS = 45
 # Posting gets the first slice of the tick, then stock agent lines waiting to be applied; tracking
 # then runs against its own TICK_BUDGET_SECONDS deadline from the tick start (so always at least ~10 s).
-# The stock budget is hard, since one Graph call can take 30 s: a line cut off stays recoverable.
+# The stock budget is hard, since one Graph call can take 30 s. Stock stops starting lines before it
+# runs out, so this cut is only a backstop, and a line it catches is read on the next tick.
 POST_BUDGET_SECONDS = 25
 STOCK_LINES_BUDGET_SECONDS = 10
 MAX_TESTS_PER_TICK = 25

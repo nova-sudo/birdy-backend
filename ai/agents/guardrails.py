@@ -99,7 +99,9 @@ async def _ad_states(db, client_group_id, ad_ids: list[str]) -> dict[str, dict]:
     return {d["ad_id"]: d async for d in cur}
 
 
-async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> GuardrailResult:
+async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime,
+                           unconfirmed_pauses: int = 0) -> GuardrailResult:
+    """`unconfirmed_pauses` are pauses already sent with no activity row yet. They count toward the cap."""
     action = doc.get("action") or {}
     atype = action.get("type")
     targets = action.get("targets") or []
@@ -180,7 +182,7 @@ async def check_guardrails(db, agent: dict, doc: dict, *, now_utc: datetime) -> 
     if cap is not None:
         now = _naive_utc(now_utc)
         start = local_day_start_utc(now, agent_tz(agent))
-        used = await db[ACTIVITY].count_documents({
+        used = unconfirmed_pauses + await db[ACTIVITY].count_documents({
             "client_group_id": gid,
             "kind": KIND_ACTION_APPLIED,
             "applied_action_type": ACTION_PAUSE_ADS,

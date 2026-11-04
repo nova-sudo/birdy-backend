@@ -945,7 +945,7 @@ async def test_undo_contended_returns_a_retry_message(mock_db, mock_mongo_client
     await _card(mock_db, agent, _ln())
     await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
     monkeypatch.setattr(apply_mod, "UNDO_LEASE_WAIT_S", 0.02)
-    await mock_db[apply_mod.LEASES].insert_one({"_id": agent["_id"], "token": "other",
+    await mock_db[apply_mod.LEASES].insert_one({"_id": apply_mod._lease_key(agent["_id"], GID), "token": "other",
                                                 "expires_at": datetime.utcnow() + timedelta(minutes=1)})
     res = await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d")
     assert res["ok"] is False and res["outcome"] == "busy" and "moment" in res["reason"]
@@ -1320,7 +1320,8 @@ async def test_apply_run_inside_budget_finishes_now(mock_db, mock_mongo_client, 
     assert len(meta.writes) == 3
 
 
-async def test_apply_run_returns_at_budget_when_meta_hangs_and_nothing_is_sent_twice(mock_db, mock_mongo_client, meta):
+async def test_apply_run_returns_at_budget_when_meta_hangs_and_nothing_is_sent_twice(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MIN_TIME_FOR_LINE_S", 0)
     agent = await _agent(mock_db, gids=("g1", "g2", "g3"))
     await _three_cards(mock_db, agent)
     meta.write_delay = 0.3
@@ -1528,6 +1529,7 @@ async def test_live_says_a_spare_exists_but_birdy_just_paused_it(mock_db, mock_m
     """Meta and the mirror disagree on the spare: a read straight after a write can lag, so refuse."""
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", off=["spare"])
+    await mock_db["meta_ad_state"].update_one({"ad_id": "spare"}, {"$set": {"updated_at": datetime.utcnow()}})
     meta.set("spare", "ACTIVE")
     await _card(mock_db, agent, _ln())
     res = await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
@@ -1664,7 +1666,7 @@ async def test_a_held_lease_leaves_the_line_queued_and_expires(mock_db, mock_mon
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "spare")
     await _card(mock_db, agent, _ln())
-    await mock_db[apply_mod.LEASES].insert_one({"_id": agent["_id"], "token": "crashed",
+    await mock_db[apply_mod.LEASES].insert_one({"_id": apply_mod._lease_key(agent["_id"], GID), "token": "crashed",
                                                 "expires_at": datetime.utcnow() + timedelta(milliseconds=50)})
     res = await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
     assert res["outcome"] == "queued" and meta.reads == [] and (await _line(mock_db))["state"] == "queued"
@@ -1673,14 +1675,14 @@ async def test_a_held_lease_leaves_the_line_queued_and_expires(mock_db, mock_mon
     assert (await _line(mock_db))["state"] == "applied"
 
 
-async def test_lease_is_per_agent_and_released_after_each_line(mock_db, mock_mongo_client, meta):
+async def test_lease_is_per_client_and_released_after_each_line(mock_db, mock_mongo_client, meta):
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "spare")
     await _card(mock_db, agent, _ln())
-    await mock_db[apply_mod.LEASES].insert_one({"_id": "another-agent", "token": "x",
+    await mock_db[apply_mod.LEASES].insert_one({"_id": apply_mod._lease_key("another-agent", GID), "token": "x",
                                                 "expires_at": datetime.utcnow() + timedelta(minutes=1)})
     assert (await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d"))["outcome"] == "applied"
-    assert await mock_db[apply_mod.LEASES].find_one({"_id": agent["_id"]}) is None
+    assert await mock_db[apply_mod.LEASES].count_documents({"_id": apply_mod._lease_key(agent["_id"], GID)}) == 0
 
 
 async def test_lease_released_when_the_budget_cuts_a_line_off(mock_db, mock_mongo_client, meta):
@@ -1689,7 +1691,7 @@ async def test_lease_released_when_the_budget_cuts_a_line_off(mock_db, mock_mong
     await _card(mock_db, agent, _ln())
     meta.write_delay = 0.3
     await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0.05)
-    assert await mock_db[apply_mod.LEASES].find_one({"_id": agent["_id"]}) is None
+    assert await mock_db[apply_mod.LEASES].count_documents({"_id": apply_mod._lease_key(agent["_id"], GID)}) == 0
 
 
 async def test_auto_stops_when_the_mode_became_flag(mock_db, mock_mongo_client, meta):
@@ -1859,6 +1861,7 @@ async def test_stuck_lines_recover_oldest_first_and_a_hung_read_does_not_starve_
 
 
 async def test_creatives_tick_has_a_hard_budget_and_a_cut_line_recovers(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MIN_TIME_FOR_LINE_S", 0)  # the backstop, which normal running doesn't reach
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "spare")
     await _card(mock_db, agent, _ln())
@@ -1893,7 +1896,7 @@ async def test_creatives_tick_has_a_hard_budget_and_a_cut_line_recovers(mock_db,
     line = await _line(mock_db)
     assert line["state"] == "applying" and line["write_started_at"]  # cut off mid-send
     meta.write_delay = 0
-    await _tick(mock_db, mock_mongo_client, minutes=7)
+    await _tick(mock_db, mock_mongo_client)
     assert (await _line(mock_db))["state"] == "failed" and meta.writes == []
 
 
@@ -1924,6 +1927,236 @@ async def test_candidates_and_facts_carry_ad_sets(mock_db):
     assert facts["main_adset_id"] == "s1"  # most spend, though s2 has more ads
     cands = await build_candidates(mock_db, agent, group, window)
     assert {c["ad_id"]: c["adset_id"] for c in cands["remove"]}["c"] == "s2"
+
+
+# ---------------------------------------------------------------------------
+# Second review: budgets, unconfirmed sends, the lease per client, stale mirror rows
+# ---------------------------------------------------------------------------
+
+def _inflight(meta, *, land=True, reply_delay=0.3):
+    """A POST that reaches Meta (or doesn't) straight away, and whose reply is slow enough to be cut."""
+    async def execute(mc, user, action):
+        ad = action["targets"][0]["object_id"]
+        desired = "PAUSED" if action["type"] == "pause_ads" else "ACTIVE"
+        meta.writes.append((ad, desired))
+        if land:
+            meta.set(ad, desired)
+        await asyncio.sleep(reply_delay)
+        return {"succeeded": [ad], "failed": []}
+    return execute
+
+
+def _lost_send(meta):
+    """Graph times out and the write isn't visible yet."""
+    async def execute(mc, user, action):
+        ad = action["targets"][0]["object_id"]
+        meta.writes.append((ad, "PAUSED"))
+        return {"succeeded": [], "failed": [{"object_id": ad, "error": "Failed to reach Meta: timed out"}]}
+    return execute
+
+
+async def test_cron_starts_no_line_without_time_to_finish_it(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln())
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0)
+    res = await process_queued_lines(mock_db, mock_mongo_client, _later(), deadline=time.monotonic() + 3.9)
+    assert res["processed"] == 0 and meta.reads == [] and (await _line(mock_db))["state"] == "queued"
+    res = await process_queued_lines(mock_db, mock_mongo_client, _later(), deadline=time.monotonic() + 4.5)
+    assert res["processed"] == 1 and (await _line(mock_db))["state"] == "applied"
+
+
+async def test_apply_all_at_its_real_budget_queues_every_line_and_cuts_none(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "ad2", "spare")
+    await _card(mock_db, agent, _ln(1), _ln(2))
+    await mock_db[RUNS].insert_one(_run(agent))
+    res = await apply_run(mock_db, mock_mongo_client, USER, "r1", by="s", source="slack")
+    assert res["outcome"] == "queued" and res["queued"] == 2 and meta.writes == [] and meta.adset_reads == []
+    await _tick(mock_db, mock_mongo_client)
+    assert len(meta.writes) == 2
+
+
+async def test_a_line_cut_mid_send_is_read_on_the_next_tick(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "execute_action", _inflight(meta))
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln())
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0.05)
+    line = await _line(mock_db)
+    assert line["state"] == "applying" and line["cut_at"] and meta.writes == [("ad1", "PAUSED")]
+    await _tick(mock_db, mock_mongo_client)  # no STUCK_AFTER wait
+    line = await _line(mock_db)
+    assert line["state"] == "applied" and line["wrote"] is True and len(await _applied_rows(mock_db)) == 1
+    assert len(meta.writes) == 1
+    monkeypatch.setattr(apply_mod, "execute_action", meta.execute)
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "undone"
+    assert meta.ads["ad1"]["status"] == "ACTIVE"
+
+
+async def test_a_retry_of_a_cut_line_is_not_read_as_cut_while_it_is_alive(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "execute_action", _inflight(meta, land=False))
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln())
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0.05)
+    await _tick(mock_db, mock_mongo_client)
+    assert (await _line(mock_db))["state"] == "failed"  # the read says it hasn't landed
+    monkeypatch.setattr(apply_mod, "execute_action", _lost_send(meta))
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", line_ids=["l1"])
+    line = await _line(mock_db)
+    assert line["state"] == "applying" and not line.get("cut_at")
+    await _tick(mock_db, mock_mongo_client)  # too soon for this try
+    assert (await _line(mock_db))["state"] == "applying"
+
+
+async def test_lost_sends_count_toward_the_pause_cap(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "execute_action", _lost_send(meta))
+    agent = await _agent(mock_db, guardrails={"max_pauses_per_client_day": 2})
+    await _ads(mock_db, "a1", "a2", "a3", "a4", "spare")
+    await _card(mock_db, agent, *[_ln(i, ad=f"a{i}") for i in range(1, 5)])
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    assert len(meta.writes) == 2 and await _applied_rows(mock_db) == []
+    assert [ln.get("reason_code") for ln in (await _get(mock_db))["lines"]] == [None, None, "pause_cap", "pause_cap"]
+
+
+async def test_cut_sends_count_toward_the_pause_cap_across_ticks(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "MIN_TIME_FOR_LINE_S", 0)
+    monkeypatch.setattr(apply_mod, "execute_action", _inflight(meta, land=False))
+    monkeypatch.setattr(apply_mod, "_recover_stuck", _no_recovery)
+    agent = await _agent(mock_db, guardrails={"max_pauses_per_client_day": 3})
+    ads = [f"a{i}" for i in range(1, 7)]
+    await _ads(mock_db, *ads, "spare")
+    await _card(mock_db, agent, *[_ln(i, ad=a) for i, a in enumerate(ads, 1)])
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0)
+    for _ in range(6):
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(process_queued_lines(mock_db, mock_mongo_client, _later(),
+                                                        deadline=time.monotonic() + 0.05), 0.05)
+    assert len(meta.writes) == 3
+
+
+async def _no_recovery(*a):
+    return 0
+
+
+async def test_a_line_with_its_row_logged_counts_once(mock_db, mock_mongo_client, meta):
+    """Killed between writing the activity row and marking the line."""
+    agent = await _agent(mock_db, guardrails={"max_pauses_per_client_day": 2})
+    await _ads(mock_db, "a1", "a2", "spare")
+    now = datetime.utcnow()
+    logged = _ln(1, ad="a1", state="applying", write_started_at=now, applying_at=now, decision={"actor": "user"})
+    done = await _card(mock_db, agent, logged, _id="c0", gid=GID, run_id="r0")
+    await apply_mod._log_once(mock_db, done, logged, KIND_ACTION_APPLIED, label="x", title="x", decision={"actor": "user"},
+                              action_type=ACTION_PAUSE_ADS)
+    await _card(mock_db, agent, _ln(2, ad="a2"), created=now)
+    res = await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    assert res["outcome"] == "applied" and meta.writes == [("a2", "PAUSED")]
+
+
+async def test_a_retry_does_not_count_its_own_old_send(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db, guardrails={"max_pauses_per_client_day": 1})
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln(state="failed", write_started_at=datetime.utcnow() - timedelta(hours=1)))
+    res = await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", line_ids=["l1"])
+    assert res["outcome"] == "applied" and meta.writes == [("ad1", "PAUSED")]
+
+
+async def test_an_unconfirmed_pause_counts_as_off_for_the_last_live_ad(mock_db, mock_mongo_client, meta, monkeypatch):
+    monkeypatch.setattr(apply_mod, "execute_action", _lost_send(meta))
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "ad2")
+    await _card(mock_db, agent, _ln(1), _ln(2))
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    assert meta.writes == [("ad1", "PAUSED")]
+    assert (await _line(mock_db, "l2"))["reason_code"] == "last_live_ad"
+
+
+async def test_an_unconfirmed_undo_of_bring_back_counts_as_off(mock_db, mock_mongo_client, meta, monkeypatch):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", off=["old"])
+    meta.set("old", "PAUSED")
+    await _card(mock_db, agent, _ln(1, kind="revive", ad="old"))
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    monkeypatch.setattr(apply_mod, "execute_action", _lost_send(meta))
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "queued"
+    monkeypatch.setattr(apply_mod, "execute_action", meta.execute)
+    await _card(mock_db, agent, _ln(1), _id="c2", created=datetime.utcnow() - timedelta(minutes=30), run_id="r2")
+    await mock_db[CARDS].update_one({"_id": "c1"}, {"$set": {"created_at": datetime.utcnow() - timedelta(hours=2)}})
+    res = await apply_card(mock_db, mock_mongo_client, USER, "c2", by="s", source="d")
+    assert res["outcome"] == "blocked" and (await _line(mock_db, "l1", "c2"))["reason_code"] == "last_live_ad"
+
+
+async def test_undo_for_one_client_goes_through_while_another_client_drains(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db, gids=(GID, "g2"))
+    await _ads(mock_db, "b1", "b2", adset="s9", gid="g2")
+    await _card(mock_db, agent, _ln(1, ad="b1"), _id="c2", gid="g2")
+    await apply_card(mock_db, mock_mongo_client, USER, "c2", by="s", source="d")
+    await mock_db[apply_mod.LEASES].insert_one({"_id": apply_mod._lease_key(agent["_id"], GID), "token": "drain",
+                                                "expires_at": datetime.utcnow() + timedelta(minutes=1)})
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c2", "l1", by="s", source="d"))["outcome"] == "undone"
+
+
+async def test_a_line_that_lost_the_lease_is_not_processed(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln())
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", budget_s=0)
+    await mock_db[apply_mod.LEASES].insert_one({"_id": apply_mod._lease_key(agent["_id"], GID), "token": "other",
+                                                "expires_at": datetime.utcnow() + timedelta(minutes=1)})
+    assert (await _tick(mock_db, mock_mongo_client))["processed"] == 0
+    assert (await _line(mock_db))["state"] == "queued"
+
+
+async def test_a_spare_turned_on_in_ads_manager_lets_the_retry_through(mock_db, mock_mongo_client, meta):
+    """The mirror's "off" is old, so Meta's live read decides."""
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", off=["b"])
+    await _card(mock_db, agent, _ln(1))
+    assert (await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d"))["outcome"] == "blocked"
+    meta.set("b", "ACTIVE")
+    res = await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d", line_ids=["l1"])
+    assert res["outcome"] == "applied" and meta.writes == [("ad1", "PAUSED")]
+
+
+async def test_auto_trusts_metas_spare_over_an_old_mirror_row(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", off=["b"])
+    await _card(mock_db, agent, _ln(1, mode="auto"))
+    meta.set("b", "ACTIVE")
+    await auto_apply_run(mock_db, mock_mongo_client, _run(agent), agent)
+    assert (await _line(mock_db))["state"] == "applied"
+
+
+async def test_undo_of_bring_back_trusts_metas_spare_over_an_old_mirror_row(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, off=["old", "b"])
+    meta.set("old", "PAUSED")
+    await _card(mock_db, agent, _ln(1, kind="revive", ad="old"))
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    meta.set("b", "ACTIVE")
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "undone"
+
+
+@pytest.mark.parametrize("age,outcome", [(timedelta(minutes=4), "blocked"), (timedelta(minutes=6), "applied")])
+async def test_a_mirror_off_only_outranks_meta_for_five_minutes(age, outcome, mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", off=["spare"])
+    await mock_db["meta_ad_state"].update_one({"ad_id": "spare"}, {"$set": {"updated_at": datetime.utcnow() - age}})
+    meta.set("spare", "ACTIVE")  # Meta's read still lags Birdy's own pause, or someone turned it on
+    await _card(mock_db, agent, _ln())
+    assert (await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d"))["outcome"] == outcome
+
+
+async def test_undo_is_not_trapped_by_a_lesson_taught_after_the_pause(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln())
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="s", source="d")
+    await mock_db["agent_memory"].insert_one({"_id": "m", "agent_id": agent["_id"], "text": "Leave ad1 alone",
+                                              "active": True, "filter": {"ad_name_contains": "ad1"}})
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "undone"
+    assert meta.ads["ad1"]["status"] == "ACTIVE"
 
 
 # ---------------------------------------------------------------------------
@@ -2026,7 +2259,7 @@ async def test_route_apply_all(api, mock_db, meta):
     agent = await _agent(mock_db, gids=("g1", "g2", "g3"))
     await _three_cards(mock_db, agent)
     r = api.post(f"/api/agents/{agent['_id']}/runs/r1/apply-all", json={})
-    assert r.status_code == 200 and r.json()["applied"] == 3
+    assert r.status_code == 200 and r.json()["outcome"] == "queued" and r.json()["queued"] == 3
     assert api.post(f"/api/agents/{agent['_id']}/runs/nope/apply-all", json={}).status_code == 404
 
 
