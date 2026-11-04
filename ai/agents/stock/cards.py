@@ -182,7 +182,7 @@ async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
          "run_id": {"$ne": run_id},
          "preview": {"$ne": True}},
         {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow(),
-                  "slack.needs_update": True},
+                  "slack.needs_update": True, "press_note": None},
          "$inc": {"version": 1}})  # so a line write that read the card before this has to read it again
     return res.modified_count
 
@@ -195,7 +195,9 @@ async def guarded_update(db, card: dict, fields: dict, *, statuses: tuple = (STA
     card can't be edited. Each write marks the card's Slack message as due an update."""
     version = card.get("version") or 0
     match = {"version": version} if version else {"$or": [{"version": 0}, {"version": {"$exists": False}}]}
+    # A note about a press only stays true until a line or the card moves, whichever path moved it.
+    moved = {"press_note": None} if "lines" in fields or "status" in fields else {}
     res = await db[CARDS].update_one(
         {"_id": card["_id"], "status": {"$in": list(statuses)}, **match},
-        {"$set": {**fields, "updated_at": datetime.utcnow(), "slack.needs_update": True}, "$inc": {"version": 1}})
+        {"$set": {**fields, **moved, "updated_at": datetime.utcnow(), "slack.needs_update": True}, "$inc": {"version": 1}})
     return res.modified_count == 1

@@ -96,7 +96,7 @@ ACTION_MAX_AGE = timedelta(minutes=10)  # and a press this old isn't what the pe
 ACTION_BATCH = 20
 ACTION_UPDATE_S = 1.5         # the follow-ups of a stored press: the cron's sync repeats either
 ACTION_TELL_S = 1.0
-PRESS_CAP_S = 3.0             # of the 10 s cron tick. The rest is for Meta's queued lines, whatever Slack is doing
+PRESS_CAP_S = 5.0             # of the 10 s cron tick, so one Undo fits apply.MIN_TIME_FOR_LINE_S. The rest is for Meta's lines
 SYNC_CALL_S = 2.0             # one message in the cron's update pass
 SYNC_MAX_TIMEOUTS = 2         # that many and Slack is down: the pass stops, the messages stay due
 RETRY_MINUTES = (15, 30, 60, 120, 240)  # a run's unposted messages, then every 4 hours
@@ -122,8 +122,8 @@ TEMPLATE_NOTICE = ("This template couldn't be sent on {at}, so Birdy used the de
 NOTICES = "slack_template_notices"  # on the agent: settings.slack only accepts what a person can set
 DIDNT_HAPPEN = "Birdy couldn't do that, so it didn't happen. Try again from the report."
 STILL_SETTLING = "Birdy couldn't confirm that yet. The card updates once it knows what happened in Meta."
-STILL_WORKING = "Birdy is still working on this. The card updates when it's done."
 OUTSIDER = "Only people in the workspace that connected Birdy can do this."
+OUTSIDER_MENTION = "People outside this workspace can't teach this agent. Birdy didn't record that."
 FORM_DIDNT_OPEN = "The edit form didn't open. Press Edit again."
 POSTED_LATE = "Posted late: Slack couldn't take this when it was ready."
 REFUSED_ANSWERS = {"not_found": "That card is no longer available.", "not_undoable": "This can't be undone.",
@@ -680,6 +680,11 @@ def _next_try(n: int, now: datetime, until: datetime) -> datetime:
     return min(now + timedelta(minutes=RETRY_MINUTES[min(n, len(RETRY_MINUTES) - 1)]), until)
 
 
+def _waiting_look(now: datetime) -> datetime:
+    """A run waiting for a reconnect is looked at every sweep. This puts it behind what's due, so waiting can't fill a batch."""
+    return now + timedelta(minutes=RETRY_MINUTES[0])
+
+
 def slack_attempt_fields(run: dict, now: datetime) -> dict:
     """Saved before an attempt: should it be killed, it's due again at the next step."""
     until, n = run.get("slack_retry_until") or now + RETRY_FOR, run.get("slack_retry_n") or 0
@@ -692,7 +697,7 @@ def slack_failed_fields(run: dict, error: Exception, now: datetime) -> dict:
     neither is anything once the 24 hours are up. Anything else backs off, and getting further doesn't cost a step."""
     until, n = run.get("slack_retry_until") or now + RETRY_FOR, run.get("slack_retry_n") or 0
     if getattr(error, "reconnect", False):
-        return {"slack_pending": True, "slack_wait_reconnect": True, "slack_retry_until": until}
+        return {"slack_pending": True, "slack_wait_reconnect": True, "slack_retry_until": until, "slack_retry_at": _waiting_look(now)}
     if not getattr(error, "retry", True) or now >= until:
         return {"slack_pending": False, "slack_wait_reconnect": False, "slack_retry_at": None}
     return {"slack_pending": True, "slack_wait_reconnect": False, "slack_retry_until": until, "slack_retry_at": _next_try(n, now, until),
@@ -723,13 +728,17 @@ async def _retry_run(db, run_id, now: datetime, deadline: float) -> bool:
     if agent is None:
         await release(slack_pending=False, slack_retry_at=None, slack_wait_reconnect=False)
         return False
-    if run.get("slack_wait_reconnect") and await _client_for(db, run["user_id"]) is None:
-        # No call to Slack. Waiting for the reconnect only ends when a newer report would make this one old news.
-        over = now >= (run.get("slack_retry_until") or now) and await _newer_report(db, run)
-        await release(**({"slack_pending": False, "slack_wait_reconnect": False, "slack_retry_at": None} if over else {}))
-        return False
+    if run.get("slack_wait_reconnect"):
+        if await _client_for(db, run["user_id"]) is None:
+            # No call to Slack. Waiting for the reconnect only ends when a newer report would make this one old news.
+            over = now >= (run.get("slack_retry_until") or now) and await _newer_report(db, run)
+            await release(**({"slack_pending": False, "slack_wait_reconnect": False, "slack_retry_at": None} if over
+                             else {"slack_retry_at": _waiting_look(now)}))
+            return False
+        # Reconnected, which is what it was waiting for: a passing error from here gets the usual slow retries.
+        run = {**run, "slack_retry_until": None, "slack_retry_n": 0, "slack_wait_reconnect": False}
 
-    fields = {**slack_attempt_fields(run, now), "slack_late": True}
+    fields = {**slack_attempt_fields(run, now), "slack_late": True, "slack_wait_reconnect": False}
     await db[RUNS].update_one({"_id": run_id}, {"$set": fields})
     run = {**run, **fields, "tick_deadline": deadline}
     cards = await db[CARDS].find({"run_id": run_id, "status": {"$ne": STATUS_CLOSING}}).to_list(length=None)
@@ -913,27 +922,52 @@ async def finish_action(db, mongo_client, row_id: str) -> bool:
     """Do a stored Undo or Dismiss and update its message. Runs right after Slack's answer and again from the cron, and
     only one of them gets the row. False when another has it. A frozen run leaves its row claimed, and it's taken over
     after ACTION_RECLAIM: undo_line and dismiss_card are safe to repeat, and an undo frozen mid-line is settled first
-    (apply.recover_stale_undo), its token keeping a late thaw from sending. `busy` keeps the row for another try. Being
-    cut off by a caller's time limit costs no try."""
+    (apply.recover_stale_undo). Thawing later can't send: the row is checked last thing before the line is claimed, and
+    the line's token and send window catch the rest. `busy` keeps the row for another try. Being cut off by a caller's
+    time limit costs no try. The person is told before the row goes, so a kill can repeat a note but not lose it."""
     row = await _claim_action(db, row_id)
     if row is None:
         return False
     actions, token = db[SLACK_ACTIONS], row["claim"]
     mine = {"_id": row_id, "claim": token}
     user_id, card_id, line_id = row["user_id"], row["card_id"], row.get("line_id")
-    too_old = _utcnow() - row["created_at"] > ACTION_MAX_AGE
-    if row["tries"] > ACTION_TRIES or too_old:
+
+    async def still_mine() -> datetime | None:
+        now = _utcnow()
+        return now if await actions.find_one_and_update(mine, {"$set": {"claimed_at": now}}) else None
+
+    async def give_up() -> None:
         settling = row["kind"] == "undo" and await _line_state(db, card_id, line_id) == STATE_UNDOING
-        if (await actions.delete_one(mine)).deleted_count:
+        if await actions.find_one(mine, {"_id": 1}):
             await _give_up_on_press(db, row, settling=settling)
-        return True
+            await actions.delete_one(mine)
+
     who = {"by": row["by"], "by_id": row.get("by_id"), "source": "slack"}
     try:
+        if row["tries"] > ACTION_TRIES or _utcnow() - row["created_at"] > ACTION_MAX_AGE:
+            await give_up()
+            return True
         if row["kind"] == "undo":
             await recover_stale_undo(db, mongo_client, card_id, line_id, older_than=ACTION_RECLAIM)
-            res = await undo_line(db, mongo_client, user_id, card_id, line_id, **who)
+            res = await undo_line(db, mongo_client, user_id, card_id, line_id, press_gate=still_mine, **who)
         else:
             res = await dismiss_card(db, user_id, card_id, **who)
+        if res.get("outcome") == "taken_over":
+            return True
+        if res.get("outcome") == "busy":
+            if row["tries"] < ACTION_TRIES:
+                await actions.update_one(mine, {"$set": {"claimed_at": None}})
+            else:
+                await give_up()
+            return True
+        if not await actions.find_one(mine, {"_id": 1}):
+            return True  # a takeover has it, and answers for it
+        if res.get("ok"):
+            await db[CARDS].update_one({"_id": card_id, "press_note": {"$nin": [None]}}, {"$set": {"press_note": None}})
+        else:
+            where = (row.get("channel"), row.get("slack_user"), row.get("thread_ts"))
+            await _tell_or_note(db, card_id, user_id, where, _answer_text(res), ACTION_TELL_S)
+        await _bounded(update_card_message(db, {"_id": card_id}), ACTION_UPDATE_S)
     except asyncio.CancelledError:
         await actions.update_one(mine, {"$set": {"claimed_at": None}, "$inc": {"tries": -1}})
         raise
@@ -941,22 +975,7 @@ async def finish_action(db, mongo_client, row_id: str) -> bool:
         logger.error("stock slack: %s failed: %s", row_id, e, exc_info=True)
         await actions.update_one(mine, {"$set": {"claimed_at": None}})
         return True
-    if res.get("outcome") == "busy":
-        if row["tries"] < ACTION_TRIES:
-            await actions.update_one(mine, {"$set": {"claimed_at": None}})
-            return True
-        settling = row["kind"] == "undo" and await _line_state(db, card_id, line_id) == STATE_UNDOING
-        if (await actions.delete_one(mine)).deleted_count:
-            await _give_up_on_press(db, row, settling=settling)
-        return True
-    if not (await actions.delete_one(mine)).deleted_count:
-        return True  # a takeover has it, and answers for it
-    if res.get("ok"):
-        await db[CARDS].update_one({"_id": card_id, "press_note": {"$nin": [None]}}, {"$set": {"press_note": None}})
-    await _bounded(update_card_message(db, {"_id": card_id}), ACTION_UPDATE_S)
-    if not res.get("ok"):
-        where = (row.get("channel"), row.get("slack_user"), row.get("thread_ts"))
-        await _tell_or_note(db, card_id, user_id, where, _answer_text(res), ACTION_TELL_S)
+    await actions.delete_one(mine)
     return True
 
 
@@ -1020,12 +1039,9 @@ async def _press_apply_all(db, payload: dict, mongo_client, run_id, by: str, use
     if await db[RUNS].find_one({"_id": run_id, "user_id": user_id}, {"_id": 1}) is None:
         logger.warning("stock slack: Apply all for run %s from another team, ignored", run_id)
         return {}
-    budget = min(APPLY_ALL_BUDGET_S, _left(deadline) - ANSWER_RESERVE_S)
-    try:
-        res = await asyncio.wait_for(apply_run(db, mongo_client, user_id, run_id, by=by, by_id=_presser_id(payload), source="slack",
-                                               budget_s=budget), max(budget, 0.01))
-    except asyncio.TimeoutError:  # the press is stored first, and the cron finishes it
-        res = {"ok": True, "outcome": "queued"}
+    # Not cut from outside: apply_run stores the press before it looks at the budget, and what's over it goes to the cron.
+    res = await apply_run(db, mongo_client, user_id, run_id, by=by, by_id=_presser_id(payload), source="slack",
+                          budget_s=max(0.0, min(APPLY_ALL_BUDGET_S, _left(deadline) - ANSWER_RESERVE_S)))
     channel, slack_user, thread_ts = _where(payload)
     if not res.get("ok"):
         text = _answer_text(res)
@@ -1062,16 +1078,12 @@ async def _press_edit(db, payload: dict, card: dict, deadline: float) -> dict:
 
 
 async def _press_apply(db, payload: dict, mongo_client, card: dict, by: str, deadline: float) -> dict:
-    """The second of two presses gets what the first one did: apply_card's claim is atomic. All of it, reads included,
-    is held to `deadline`. Cut off, the decision is either stored and the cron runs it, or the person is told to look at
-    the card, which the cron also updates."""
-    budget = min(APPLY_BUDGET_S, _left(deadline) - ANSWER_RESERVE_S)
-    try:
-        res = await asyncio.wait_for(apply_card(db, mongo_client, card["user_id"], card["_id"], by=by, by_id=_presser_id(payload),
-                                                source="slack", budget_s=budget), max(budget + 0.1, 0.01))
-        text = None if res.get("ok") else _answer_text(res)
-    except asyncio.TimeoutError:
-        res, text = {"ok": False}, STILL_WORKING
+    """The second of two presses gets what the first one did: apply_card's claim is atomic. The claim is never cut, or
+    the person would be told about work nobody has. Only the drain is held to `deadline`, and what it leaves stays queued
+    for the cron. A database slow enough to pass Slack's 3 s costs the answer, not the press."""
+    res = await apply_card(db, mongo_client, card["user_id"], card["_id"], by=by, by_id=_presser_id(payload), source="slack",
+                           budget_s=APPLY_BUDGET_S, drain_until=deadline - ANSWER_RESERVE_S)
+    text = None if res.get("ok") else _answer_text(res)
     if res.get("ok") and card.get("press_note"):
         await db[CARDS].update_one({"_id": card["_id"]}, {"$set": {"press_note": None}})
     await _bounded(update_card_message(db, card), min(REFRESH_BUDGET_S, _left(deadline) - NOTE_BUDGET_S))
@@ -1290,7 +1302,8 @@ def _lesson_reply(lesson: dict | None, client_name: str | None) -> tuple[str, li
     if not (lesson and lesson.get("_id")):
         return "Birdy couldn't record that, so it won't use it. Try again in a moment.", None
     scope = _esc(client_name or "this client")
-    extra = " It stays a note, so it won't stop any change: what it asked for wasn't limited to this client." if lesson.get("filter_dropped") else ""
+    extra = (" It stays a note, so it won't stop any change: from Slack, Birdy only makes rules about ads with a certain name "
+             "in this client. Set anything wider in Birdy." if lesson.get("filter_dropped") else "")
     text = rb._cut(f"Noted for {scope}: {_esc(lesson.get('text'))}{extra}", MAX_TEXT)
     return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}},
                   {"type": "actions", "elements": [{"type": "button", "action_id": LESSON_UNDO, "value": lesson["_id"],
@@ -1306,9 +1319,20 @@ async def _say_in_thread(db, user_id: str, channel: str, thread_ts: str, reply: 
         logger.warning("stock slack: lesson reply failed: %s", e)
 
 
-async def handle_thread_mention(db, team_id: str | None, channel: str, thread_ts: str | None, text: str, author: str) -> bool:
+def mention_from_outside(team_id: str | None, event: dict, envelope: dict) -> bool:
+    """Whether an @Birdy comes from another organisation. The author's team where Slack says so, and with no word on the
+    author, any externally shared channel counts as outside. Whether a Slack Connect mention carries these is undocumented."""
+    author_team = event.get("user_team") or event.get("team")
+    if author_team:
+        return author_team != team_id
+    return bool(envelope.get("is_ext_shared_channel"))
+
+
+async def handle_thread_mention(db, team_id: str | None, channel: str, thread_ts: str | None, text: str, author: str,
+                                *, from_outside: bool = False) -> bool:
     """@Birdy in the thread of a run's cards becomes a lesson, not a chat turn, and Birdy says what it recorded with
-    an Undo, or asks which client when it can't tell, recording nothing. True when this was such a thread. The AI call that shapes the lesson is fine here: the events route
+    an Undo, or asks which client when it can't tell, recording nothing. Someone from another organisation is told no,
+    with nothing recorded. True when this was such a thread. The AI call that shapes the lesson is fine here: the events route
     already answers late and skips Slack's retries."""
     if not team_id or not thread_ts:
         return False
@@ -1316,6 +1340,10 @@ async def handle_thread_mention(db, team_id: str | None, channel: str, thread_ts
     if not user_id:
         return False
     cards = await db[CARDS].find({"user_id": user_id, "slack.channel_id": channel, "slack.thread_ts": thread_ts}).to_list(length=None)
+    if cards and from_outside:
+        logger.warning("stock slack: a mention from outside the workspace in a card thread, refused")
+        await _say_in_thread(db, user_id, channel, thread_ts, OUTSIDER_MENTION, None)
+        return True
     words = _clean_mention(text)
     if not cards or not words:
         return False

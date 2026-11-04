@@ -369,8 +369,9 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
     error, or output that can't be used, stores the note as a fact. Never raises.
-    `filter_one_client`: a filter may only ever touch `client_group_id`'s ads. One that can't be held to it stays a
-    fact, and the memory comes back with `filter_dropped`. For words where nobody chose the scope in a form."""
+    `filter_one_client`: for words where nobody chose the scope in a form. A filter has to name ads, and may only touch
+    `client_group_id`'s. One naming a whole client or whole days could stop all of a client's changes on one sentence,
+    so anything else stays a fact, and the memory comes back with `filter_dropped`."""
     note = (note or "").strip()[:NOTE_MAX]
     text, kind, flt, dropped = note, "fact", None, False
     try:
@@ -388,7 +389,8 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
             if parsed.get("kind") == "exception":
                 flt = _clean_filter(parsed.get("filter"), allowed)
                 if flt and filter_one_client:
-                    if client_group_id and flt.get("client_group_id", client_group_id) == client_group_id:
+                    if (client_group_id and flt.get("ad_name_contains") and set(flt) <= {"ad_name_contains", "client_group_id"}
+                            and flt.get("client_group_id", client_group_id) == client_group_id):
                         flt = {**flt, "client_group_id": client_group_id}
                     else:
                         flt, dropped = None, True

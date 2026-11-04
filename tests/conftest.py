@@ -14,6 +14,8 @@ patch each module's own imported reference individually.
 import ipaddress
 import os
 import socket
+import sys
+import threading
 import traceback
 import types
 from urllib.parse import urlsplit
@@ -73,7 +75,7 @@ def no_current_user(monkeypatch):
 BLOCKED: list[tuple[str | None, str]] = []  # (the test's id, what it tried)
 _current: dict = {"test": None, "live": False}
 _real_connect, _real_connect_ex = socket.socket.connect, socket.socket.connect_ex
-_real_sendto, _real_getaddrinfo = socket.socket.sendto, socket.getaddrinfo
+_real_sendto, _real_sendmsg, _real_getaddrinfo = socket.socket.sendto, socket.socket.sendmsg, socket.getaddrinfo
 _real_gethostbyname = socket.gethostbyname
 _resolved: dict[str, dict] = {}  # an allowed name's addresses, as the connect that follows its lookup only knows those
 
@@ -105,9 +107,14 @@ def _mongo_cluster_suffix() -> str | None:
 
 # What already reached out before this guard, and still does. Nothing new goes here: it gets a fake instead.
 ALLOWED_OUTBOUND: list[dict] = [
-    # utils/currency_exchange.py builds its own Motor client from MONGODB_URI, so test_meta_campaign_filtering,
-    # test_meta_campaign_scope and test_meta_daily_spend read the real dev database. Any test: its monitors run on threads.
-    {"name": "real Mongo from CurrencyService", "host": _mongo_cluster_suffix(), "tests": None},
+    # utils/currency_exchange.py builds its own Motor client from MONGODB_URI, so these tests read the real dev database.
+    # Each test's client is closed at its teardown, so its monitor threads don't outlive the allowance.
+    {"name": "real Mongo from CurrencyService", "host": _mongo_cluster_suffix(), "tests": (
+        "tests/test_meta_campaign_filtering.py::test_all_presets_reads_selection_from_group",
+        "tests/test_meta_campaign_scope.py::test_preset_write_skipped_when_selection_changes_mid_fetch",
+        "tests/test_meta_campaign_scope.py::test_preset_write_lands_when_selection_unchanged",
+        "tests/test_meta_daily_spend.py::test_an_unknown_account_currency_leaves_rows_unstamped",
+        "tests/test_meta_daily_spend.py::test_cache_reads_group_selection_and_stores_empty_for_empty_list")},
     # ai/suggestions/composer.py uses the provider factory, which since "Run chat on Birdy's own OpenAI account" finds the
     # key in .env. This file only pops ANTHROPIC_API_KEY, so it isn't hermetic as its docstring says.
     {"name": "real OpenAI from the suggestion composer", "host": "api.openai.com", "tests": "tests/test_suggestion_flow.py"},
@@ -128,7 +135,7 @@ def _allowance(name: str) -> dict | None:
     for entry in entries:
         host, tests = entry["host"], entry["tests"]
         named = host and (name == host or (host.startswith(".") and name.endswith(host)))
-        if (named or name in _resolved) and (tests is None or (_current["test"] or "").startswith(tests)):
+        if (named or name in _resolved) and (_current["test"] or "").startswith(tests):
             ALLOWED_USED.add(entry["name"])
             return entry
     return None
@@ -152,7 +159,9 @@ def _check(host, what: str) -> None:
     name = host.decode(errors="replace") if isinstance(host, (bytes, bytearray)) else str(host)
     if _allowance(name):
         return
-    BLOCKED.append((_current["test"], f"{what} {name} from {_app_frame()}"))
+    # A monitor of a client being closed can land in the next test. It gets nowhere, and it isn't that test's doing.
+    if not threading.current_thread().name.startswith("pymongo_"):
+        BLOCKED.append((_current["test"], f"{what} {name} from {_app_frame()}"))
     raise OutboundConnectionBlocked(f"{_current['test'] or 'outside any test'}: {what} {name}. Mark it `live` or use a fake.")
 
 
@@ -179,6 +188,13 @@ def _guarded_sendto(self, data, *args):
     return _real_sendto(self, data, *args)
 
 
+def _guarded_sendmsg(self, buffers, ancdata=(), flags=0, address=None):
+    if address is None:
+        return _real_sendmsg(self, buffers, ancdata, flags)
+    _check_socket(self, address, "send to")
+    return _real_sendmsg(self, buffers, ancdata, flags, address)
+
+
 def _guarded_getaddrinfo(host, *args, **kwargs):
     _check(host, "look up")
     results = _real_getaddrinfo(host, *args, **kwargs)
@@ -196,8 +212,15 @@ def _guarded_gethostbyname(host):
 
 def pytest_configure(config):
     socket.socket.connect, socket.socket.connect_ex = _guarded_connect, _guarded_connect_ex
-    socket.socket.sendto = _guarded_sendto
+    socket.socket.sendto, socket.socket.sendmsg = _guarded_sendto, _guarded_sendmsg
     socket.getaddrinfo, socket.gethostbyname = _guarded_getaddrinfo, _guarded_gethostbyname
+
+
+def _close_currency_client() -> None:
+    service = getattr(sys.modules.get("utils.currency_exchange"), "CurrencyService", None)
+    if service is not None and service._mongo_client is not None:
+        service._mongo_client.close()
+        service._mongo_client = service._db = service._users_collection = None
 
 
 @pytest.fixture(autouse=True)
@@ -205,10 +228,16 @@ def _no_outbound_connections(request):
     start = len(BLOCKED)
     _current.update(test=request.node.nodeid, live=request.node.get_closest_marker("live") is not None)
     yield
+    _close_currency_client()
     _current.update(test=None, live=False)
     tried = sorted({what for _, what in BLOCKED[start:]})
     if tried:
         pytest.fail(f"tried to leave this machine: {tried}", pytrace=False)
+
+
+def pytest_sessionfinish(session):
+    if any(test is None for test, _ in BLOCKED) and session.exitstatus == pytest.ExitCode.OK:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def pytest_terminal_summary(terminalreporter):

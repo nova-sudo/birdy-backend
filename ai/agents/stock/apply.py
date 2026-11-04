@@ -91,8 +91,9 @@ from services.meta_status_service import get_object_state
 logger = logging.getLogger(__name__)
 
 STUCK_AFTER = timedelta(minutes=6)     # an invocation lives 300 s at most, so nothing alive is this old
-UNDO_SEND_WINDOW = timedelta(seconds=55)  # an undo older than this sends nothing. With Graph's 30 s, its write is over by
-                                          # the time a stored press's takeover reads Meta (slack.ACTION_RECLAIM, 90 s)
+UNDO_SEND_WINDOW = timedelta(seconds=55)  # an undo older than this sends nothing. With UNDO_SEND_TIMEOUT_S, its write is
+UNDO_SEND_TIMEOUT_S = 30                  # over by the time a stored press's takeover reads Meta (slack.ACTION_RECLAIM, 90 s).
+                                          # The whole send: httpx's own 30 s is per phase, and fetching the token comes first
 CONFIRM_GIVE_UP = timedelta(hours=2)   # how long a sent write can wait for Meta to be readable
 MAX_RECOVERIES = 2                     # kills before the send that a line survives
 QUEUE_BATCH = 200                      # cards looked at per cron pass; the rest wait a minute
@@ -469,7 +470,8 @@ async def _release_lease(db, key: str, token: str) -> None:
 # Sending
 # ---------------------------------------------------------------------------
 
-async def _send_and_confirm(mongo_client, card: dict, line: dict, atype: str) -> tuple[bool | None, str | None]:
+async def _send_and_confirm(mongo_client, card: dict, line: dict, atype: str, *,
+                            limit_s: float | None = None) -> tuple[bool | None, str | None]:
     """(landed, Meta's error). A reply that isn't a success doesn't prove the write failed, so it is
     read back. landed is False only when Meta said no. It is None when only a later read can say: Meta
     can't be read, or the send was lost, since a timed-out write can land after this read."""
@@ -477,7 +479,7 @@ async def _send_and_confirm(mongo_client, card: dict, line: dict, atype: str) ->
     target = {"object_id": ad_id, "object_type": "ad", "name": line.get("ad_name")}
     error, lost = None, False
     try:
-        res = await execute_action(mongo_client, user_id, {"type": atype, "targets": [target]})
+        res = await asyncio.wait_for(execute_action(mongo_client, user_id, {"type": atype, "targets": [target]}), limit_s)
         if res.get("succeeded"):
             return True, None
         error = ((res.get("failed") or [{}])[0]).get("error") or "Meta didn't accept this."
@@ -733,10 +735,12 @@ async def _visible_card(db, user_id: str, card_id: str) -> dict | None:
 
 
 async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | None, source: str | None,
-                     line_ids: list[str] | None = None, budget_s: float | None = None, by_id: str | None = None) -> dict:
+                     line_ids: list[str] | None = None, budget_s: float | None = None, by_id: str | None = None,
+                     drain_until: float | None = None) -> dict:
     """Approve a card's lines. With no `line_ids`, every proposed line. Naming a line also retries
     it if it failed, was blocked or was waiting for a file. Never writes a Flag line. `budget_s` limits
-    the wait, and what doesn't fit is finished by the cron."""
+    the wait, and what doesn't fit is finished by the cron. `drain_until` (time.monotonic()) ends that wait however
+    long the reads and the claim took. The claim itself is never cut: what was pressed gets stored."""
     card = await _visible_card(db, user_id, card_id)
     if card is None:
         return _answer("not_found", None, ok=False)
@@ -764,6 +768,8 @@ async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | 
         looked_at = [ln for ln in fresh.get("lines") or [] if line_ids is None or ln.get("id") in line_ids]
         acted = any(ln.get("state") not in (STATE_PROPOSED, STATE_FLAGGED) for ln in looked_at)
         return _answer("already" if acted else "noop", fresh)
+    if drain_until is not None:
+        budget_s = min(budget_s if budget_s is not None else float("inf"), drain_until - time.monotonic())
     await _drain(db, mongo_client, pairs, budget_s=budget_s)
     return _outcome(await db[CARDS].find_one({"_id": card_id}), [p[1] for p in pairs])
 
@@ -1130,7 +1136,7 @@ async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, a
         await _undo_back(db, card, line, NOTHING_CHANGED)
         return {"outcome": "busy", "reason": BUSY}
     sent.append(True)
-    landed, error = await _send_and_confirm(mongo_client, card, line, atype)
+    landed, error = await _send_and_confirm(mongo_client, card, line, atype, limit_s=UNDO_SEND_TIMEOUT_S)
     if landed:
         await _finish_undone(db, card, agent, line, atype, now)
         return {"outcome": "undone", "reason": None}
@@ -1183,11 +1189,13 @@ async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | 
 
 
 async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, *, by: str | None,
-                    source: str | None, by_id: str | None = None) -> dict:
+                    source: str | None, by_id: str | None = None, press_gate=None) -> dict:
     """Reverse one applied line, within UNDO_AUTO_WINDOW of it applying. It only restores what Birdy
     changed, so it skips the pause cap, the live ad limit and taught exceptions, and still works with
     the agent off. It keeps the other checks. If Birdy wrote nothing for this line, it sends nothing, since the ad was
-    changed by someone else."""
+    changed by someone else. `press_gate` is for a stored press that can freeze and be taken over. Awaited last thing
+    before the line is claimed, it gives the time this press still held its row, or None to stop. The send window runs
+    from that time, so a freeze after the check is still caught at the fence."""
     card = await _visible_card(db, user_id, card_id)
     line = _find_line(card, line_id) if card else None
     if card is None or line is None or card.get("preview"):
@@ -1208,8 +1216,17 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
     wrote = bool(line.get("wrote"))
     agent = await _load_agent(db, card)
     decision = _decision(ACTOR_USER, by, source, now, by_id)
+
+    async def write(wrote_it: bool) -> dict:
+        at = now
+        if press_gate is not None:
+            at = await press_gate()
+            if at is None:
+                return _answer("taken_over", card, ok=False)
+        return await _undo_write(db, mongo_client, card, line_id, agent, wrote_it, decision, at)
+
     if not wrote:
-        return await _undo_write(db, mongo_client, card, line_id, agent, False, decision, now)
+        return await write(False)
     refusal = await _undo_refusal(db, agent, card)
     if refusal:
         return _answer("blocked", card, ok=False, reason=refusal)
@@ -1218,7 +1235,7 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
     if token is None:
         return _answer("busy", card, ok=False, reason=BUSY)
     try:
-        return await _undo_write(db, mongo_client, card, line_id, agent, True, decision, now)
+        return await write(True)
     finally:
         await _release_lease(db, key, token)
 
