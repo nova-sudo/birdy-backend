@@ -354,9 +354,11 @@ _USER_ID = re.compile(r"^[UW][A-Z0-9]{2,20}$")
 _SEVERITY = {"critical": "🔴", "warning": "🟡"}
 
 
-def summary_values(run: dict, cards: list[dict], *, tag_user_id: str | None = None, batch_name: str | None = None) -> dict:
-    """Values for the summary template. `tag` is a mention only for a well-formed Slack user id."""
-    names = {c.get("client_group_id"): c.get("client_name") for c in cards}
+def summary_values(run: dict, cards: list[dict], *, tag_user_id: str | None = None, batch_name: str | None = None,
+                   client_names: dict | None = None) -> dict:
+    """Values for the summary template. `tag` is a mention only for a well-formed Slack user id. `client_names`
+    names the clients with an alert and no card, as on an alert-only day."""
+    names = {**(client_names or {}), **{c.get("client_group_id"): c.get("client_name") for c in cards}}
     alerts = [a for a in run.get("alerts") or [] if isinstance(a, dict)]
     lines = [f"{_SEVERITY.get(a.get('severity'), 'ℹ️')} {names.get(a.get('client_group_id')) + ': ' if names.get(a.get('client_group_id')) else ''}"
              f"{a.get('title') or a.get('code') or 'Alert'}" for a in alerts[:10]]

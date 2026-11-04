@@ -24,6 +24,7 @@ from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
+from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
 from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
                                    guarded_update)
@@ -443,13 +444,15 @@ def _template_error(e: stock_templates.TemplateError) -> JSONResponse:
 def _template_view(kind: str, agent: dict) -> dict:
     stored = _stored_templates(agent).get(kind)
     return {"kind": kind, "customised": bool(stored), "template": stored or stock_templates.DEFAULT_TEMPLATES[kind],
-            "defaults": stock_templates.DEFAULT_TEMPLATES[kind], "placeholders": list(stock_templates.KIND_TOKENS[kind])}
+            "defaults": stock_templates.DEFAULT_TEMPLATES[kind], "placeholders": list(stock_templates.KIND_TOKENS[kind]),
+            "notice": ((agent.get(stock_slack.NOTICES) or {}).get(kind) or {}).get("message")}
 
 
 async def _save_template(db, agent: dict, user_id: str, kind: str, template: dict | None) -> dict:
     """None resets it: merge_settings drops a null template, so it is really gone."""
     current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
     merged = stock_settings.merge_settings(current, {"slack": {"templates": {kind: template}}})
+    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$unset": {f"{stock_slack.NOTICES}.{kind}": ""}})
     return await agent_store.update_agent(db, user_id, agent["_id"], {"settings": merged})
 
 

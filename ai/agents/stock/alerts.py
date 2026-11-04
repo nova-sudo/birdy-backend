@@ -122,6 +122,12 @@ def _alert(gid: str, code: str, severity: str, title: str, detail: str, since: s
             "detail": detail, "since": since}
 
 
+def _alert_key(a: dict) -> tuple:
+    """One alert per client and code. check_failed carries different problems under one code, so
+    its detail is part of the key."""
+    return a.get("client_group_id"), a.get("code"), a.get("detail") if a.get("code") == "check_failed" else None
+
+
 def _texts(v) -> list[str]:
     """Every string inside Meta's nested feedback / issue payloads."""
     if isinstance(v, str):

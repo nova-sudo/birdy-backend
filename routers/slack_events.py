@@ -20,6 +20,7 @@ import re
 
 from fastapi import APIRouter, Request
 
+from ai.agents.stock.slack import handle_thread_mention
 from ai.orchestrator import run_chat
 from ai.provider_factory import get_provider_for_user, NoAiCredentialError
 from ai.tools.registry import registry
@@ -91,6 +92,15 @@ async def slack_events(request: Request):
         bot_token = await get_decrypted_bot_token_for_user(db, user_id)
         if not bot_token:
             return {}
+
+        # In the thread of a stock agent's cards, @Birdy teaches it something instead of starting a chat.
+        if event_type == "app_mention" and event.get("thread_ts"):
+            try:
+                author = f"<@{event.get('user')}>"
+                if await handle_thread_mention(db, team_id, channel, event["thread_ts"], text, author):
+                    return {}
+            except Exception:
+                logger.error("Stock agent thread lookup failed, treating this as chat", exc_info=True)
 
         from slack_sdk.web.async_client import AsyncWebClient
         slack_client = AsyncWebClient(token=bot_token)

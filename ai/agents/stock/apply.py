@@ -1016,19 +1016,34 @@ async def _expand_apply_all(db, deadline: float | None) -> None:
 
 
 async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline: float) -> dict:
-    """Every minute: finish Apply all presses, follow Adds in the pipeline, recover stuck lines, then run
-    what's queued. A queued line on a card closed meanwhile is refused by the same check every line goes
+    """Every minute: finish Apply all presses and stored Slack presses, follow Adds in the pipeline, recover
+    stuck lines, run what's queued, then bring Slack's messages up to date. A queued line on a card closed meanwhile is refused by the same check every line goes
     through. Recovery gets half the time left, so stuck lines can't starve the queue. `now_utc` only ages
     stuck lines: each line run gets its own clock, so the pause cap counts rows logged earlier in this
     same pass."""
+    from ai.agents.stock import slack as stock_slack  # slack builds on this module
     from ai.agents.stock.add import sync_add_lines  # add builds on this module
 
     now = _naive_utc(now_utc)
     await _expand_apply_all(db, deadline)
+    await _slack_step("finish stored presses", stock_slack.finish_pending_actions(db, mongo_client, deadline))
     synced = await sync_add_lines(db, now, mongo_client, deadline=deadline)
     recovered = await _recover_stuck(db, mongo_client, now, time.monotonic() + max(0.0, deadline - time.monotonic()) / 2)
+    processed = await _run_queue(db, mongo_client, deadline)
+    await _slack_step("update messages", stock_slack.sync_card_messages(db, deadline))
+    return {"add_synced": synced, "recovered": recovered, "processed": processed}
+
+
+async def _slack_step(name: str, step) -> None:
+    """Slack never holds up a line. What didn't happen is still due next minute."""
+    try:
+        await step
+    except Exception as e:  # noqa: BLE001
+        logger.warning("stock lines: Slack step %r failed: %s", name, e, exc_info=True)
+
+
+async def _run_queue(db, mongo_client, deadline: float) -> int:
     processed = 0
-    done = {"add_synced": synced, "recovered": recovered}
     cards = await db[CARDS].find({"lines.state": STATE_QUEUED}).sort("updated_at", 1).limit(QUEUE_BATCH).to_list(
         length=QUEUE_BATCH)
     for card in cards:
@@ -1036,10 +1051,10 @@ async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline:
             if line.get("state") != STATE_QUEUED or line.get("kind") not in WRITABLE_KINDS:
                 continue
             if _no_time_for_a_line(deadline):
-                return {**done, "processed": processed}
+                return processed
             if await _run_line_safely(db, mongo_client, card["_id"], line["id"], datetime.utcnow()):
                 processed += 1
-    return {**done, "processed": processed}
+    return processed
 
 
 # ---------------------------------------------------------------------------

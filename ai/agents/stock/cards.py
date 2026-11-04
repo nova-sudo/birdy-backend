@@ -180,7 +180,8 @@ async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
         {"agent_id": agent_id, "client_group_id": gid, "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]},
          "run_id": {"$ne": run_id},
          "preview": {"$ne": True}},
-        {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow()},
+        {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow(),
+                  "slack.needs_update": True},
          "$inc": {"version": 1}})  # so a line write that read the card before this has to read it again
     return res.modified_count
 
@@ -190,10 +191,10 @@ async def guarded_update(db, card: dict, fields: dict, *, statuses: tuple = (STA
     read: its `version` must match, and goes up by one. False when it lost a race (or the card
     was decided meanwhile), so the caller answers 409. Every write that changes a card's lines
     (edit, apply, undo) goes through here. Only apply paths widen `statuses`: a partly applied
-    card can't be edited."""
+    card can't be edited. Each write marks the card's Slack message as due an update."""
     version = card.get("version") or 0
     match = {"version": version} if version else {"$or": [{"version": 0}, {"version": {"$exists": False}}]}
     res = await db[CARDS].update_one(
         {"_id": card["_id"], "status": {"$in": list(statuses)}, **match},
-        {"$set": {**fields, "updated_at": datetime.utcnow()}, "$inc": {"version": 1}})
+        {"$set": {**fields, "updated_at": datetime.utcnow(), "slack.needs_update": True}, "$inc": {"version": 1}})
     return res.modified_count == 1

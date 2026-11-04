@@ -932,7 +932,9 @@ async def test_publishing_failure_is_recorded_and_auto_still_runs(mock_db, mock_
     monkeypatch.setattr(runner, "publish_run", bad)
     agent = await _setup(mock_db, "g1")
     run = await _run_all(mock_db, mock_mongo_client, agent)
-    assert run["phase"] == "done" and "slack down" in run["publish_error"] and len(fakes.autos) == 1
+    # One try per tick, then the run ends with the error showing. Auto is safe to repeat and goes on regardless.
+    assert run["phase"] == "done" and "slack down" in run["publish_error"]
+    assert run["publish_tries"] == runner.PUBLISH_TRIES and len(fakes.autos) == runner.PUBLISH_TRIES
 
 
 # ---------------------------------------------------------------------------

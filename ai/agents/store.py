@@ -48,6 +48,7 @@ JOBS = "agent_jobs"
 AD_DAYS = "agent_ad_days"
 RUNS = "agent_runs"
 CARDS = "agent_cards"
+SLACK_ACTIONS = "agent_slack_actions"   # a Slack press stored for the work after its answer
 
 
 TYPE_STOCK = "stock_media_buying"
@@ -151,7 +152,7 @@ async def delete_draft_agent(db, user_id: str, agent_id: str) -> bool:
     res = await db[AGENTS].delete_one({"_id": agent_id, "user_id": user_id, "status": {"$ne": "active"}})
     if res.deleted_count == 0:
         raise AgentActive(agent_id)  # switched on between the read and the delete
-    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS, RUNS, CARDS, OUTCOMES):
+    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS, RUNS, CARDS, OUTCOMES, SLACK_ACTIONS):
         await db[coll].delete_many({"agent_id": agent_id})
     await claims.release_clients(db, user_id, agent_id)
     return True
@@ -303,6 +304,8 @@ async def create_agent_indexes(mongo_client):
     await db[CARDS].create_index([("run_id", 1), ("client_group_id", 1)], unique=True)
     await db[CARDS].create_index([("agent_id", 1), ("client_group_id", 1), ("created_at", -1)])
     await db[CARDS].create_index("lines.state")  # the per-minute queue of lines to apply
+    await db[CARDS].create_index([("slack.needs_update", 1), ("slack.ts", 1)])  # the per-minute Slack message updates
+    await db[SLACK_ACTIONS].create_index("created_at")
     await db[RUNS].create_index("apply_all.pending", sparse=True)
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)

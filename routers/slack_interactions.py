@@ -23,8 +23,9 @@ correctness, exactly like the events handler.
 import json
 import logging
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, BackgroundTasks, Request
 
+from ai.agents.stock import slack as stock_slack
 from ai.orchestrator import run_chat
 from ai.provider_factory import get_provider_for_user, NoAiCredentialError
 from ai.tools.registry import registry
@@ -268,8 +269,18 @@ async def _handle_suggestion_action(payload: dict, action: dict, db, mongo_clien
     return {}
 
 
+async def _finish_stock_action(row_id: str) -> None:
+    """The work behind an Undo or Dismiss, once Slack has its answer. This is the case the module docstring warns
+    about: it may never finish on Vercel. The press is stored, so the per-minute cron does it if this doesn't."""
+    try:
+        async with get_mongo_client() as mongo_client:
+            await stock_slack.finish_action(get_db(mongo_client), mongo_client, row_id)
+    except Exception as e:
+        logger.error(f"stock agent action {row_id} failed after the response: {e}", exc_info=True)
+
+
 @router.post("/api/slack/interactions")
-async def slack_interactions(request: Request):
+async def slack_interactions(request: Request, background_tasks: BackgroundTasks):
     raw_body = await request.body()
     verify_slack_request(request, raw_body)
 
@@ -284,8 +295,14 @@ async def slack_interactions(request: Request):
             action0 = (payload.get("actions") or [{}])[0]
             if action0.get("action_id") in ("suggestion_apply", "suggestion_ignore", "suggestion_undo"):
                 return await _handle_suggestion_action(payload, action0, db, mongo_client)
+            if stock_slack.is_agent_action(action0.get("action_id")):
+                return await stock_slack.handle_card_action(
+                    payload, action0, db, mongo_client,
+                    defer=lambda row_id: background_tasks.add_task(_finish_stock_action, row_id))
             return await _handle_block_actions(payload, db, mongo_client)
         if ptype == "view_submission":
+            if (payload.get("view") or {}).get("callback_id") == stock_slack.EDIT_CALLBACK:
+                return await stock_slack.handle_edit_submission(payload, db)
             return await _handle_view_submission(payload, db, mongo_client)
         if ptype == "view_closed":
             iid = (payload.get("view") or {}).get("private_metadata", "")
