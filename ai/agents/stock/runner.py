@@ -80,6 +80,7 @@ CLIENT_ATTEMPTS = 3
 MAX_RUN_ATTEMPTS = 3
 RETRY_AFTER = timedelta(minutes=10)  # so a retry lands on a later tick
 STALE_CLAIM = timedelta(minutes=10)  # an invocation lives 300 s at most, and every save renews the claim
+DEADLINE_MARGIN_S = 20               # a read may run this long past the deadline
 CLIENT_READ_TIMEOUT_S = 100          # started just before the 180 s budget, this still ends inside the 300 s limit
 ERROR_MAX = 300
 RECONNECT = "Meta needs reconnecting. Reconnect to check this client."
@@ -162,7 +163,8 @@ def _new_run(agent: dict, now_utc: datetime, kind: str | None, scheduled_utc: da
             "phase": ALERTS, "clients": clients, "alerts": [], "summary": {},
             "slack": {"channel_id": None, "ts": None}, "claimed_at": None, "attempts": 0, "in_flight": [],
             "reconnect": False, "as_of": as_of, "scheduled_at": _naive(scheduled_utc) if scheduled_utc else as_of,
-            "created_at": datetime.utcnow(), **({} if kind == PREVIEW else {"scheduled": True})}
+            "created_at": datetime.utcnow(),
+            **({"open_preview": True} if kind == PREVIEW else {"scheduled": True})}
 
 
 async def find_run(db, agent_id: str, local_date: str) -> dict | None:
@@ -183,10 +185,15 @@ async def get_or_create_run(db, agent: dict, now_utc: datetime, *, kind: str | N
     fresh = _new_run(agent, now_utc, kind, scheduled_utc)
     if kind == PREVIEW:
         await end_stale_previews(db, agent, now_utc)
-        open_preview = await db[RUNS].find_one({"agent_id": agent["_id"], "kind": PREVIEW, "phase": {"$ne": DONE}})
-        if open_preview:
+        key = {"agent_id": agent["_id"], "kind": PREVIEW, "phase": {"$ne": DONE}}
+        if open_preview := await db[RUNS].find_one(key):
             return open_preview
-        await db[RUNS].insert_one(fresh)
+        try:
+            await db[RUNS].insert_one(fresh)  # the unique open_preview index lets one concurrent insert win
+        except Exception as e:
+            if "duplicate key" not in str(e).lower():
+                raise
+            return await db[RUNS].find_one(key) or fresh
         return fresh
     key = {"agent_id": agent["_id"], "local_date": fresh["local_date"], "scheduled": True}
     try:
@@ -200,6 +207,14 @@ async def get_or_create_run(db, agent: dict, now_utc: datetime, *, kind: str | N
 # ---------------------------------------------------------------------------
 # Claims and saving
 # ---------------------------------------------------------------------------
+
+def _read_timeout(deadline: float | None) -> float:
+    """A Meta read or store step gets CLIENT_READ_TIMEOUT_S, or less near the deadline, so the
+    invocation ends shortly after it whatever budget the caller chose."""
+    if deadline is None:
+        return CLIENT_READ_TIMEOUT_S
+    return max(1.0, min(CLIENT_READ_TIMEOUT_S, deadline - time.monotonic() + DEADLINE_MARGIN_S))
+
 
 def _out_of_time(deadline: float | None) -> bool:
     return deadline is not None and time.monotonic() > deadline
@@ -221,6 +236,8 @@ async def _save(db, run: dict, **fields) -> None:
     """Set top-level run fields, in memory and stored, and renew the claim."""
     if "claimed_at" not in fields:
         fields["claimed_at"] = datetime.utcnow()
+    if fields.get("phase") == DONE:
+        fields["open_preview"] = False  # frees the agent's one open-preview slot
     run.update(fields)
     await db[RUNS].update_one({"_id": run["_id"]}, {"$set": fields})
 
@@ -418,7 +435,7 @@ async def _read_account(db, mongo_client, run: dict, agent: dict, token: str, ac
     if stale_ones:
         data = None
         try:
-            data = await asyncio.wait_for(read_meta_state(account, token), CLIENT_READ_TIMEOUT_S)
+            data = await asyncio.wait_for(read_meta_state(account, token), _read_timeout(deadline))
         except MetaTokenError:
             raise
         except MetaRateLimit as e:
@@ -432,7 +449,7 @@ async def _read_account(db, mongo_client, run: dict, agent: dict, token: str, ac
             if _out_of_time(deadline):
                 return False
             try:
-                await asyncio.wait_for(_store(db, run, gid, account, data), CLIENT_READ_TIMEOUT_S)
+                await asyncio.wait_for(_store(db, run, gid, account, data), _read_timeout(deadline))
                 await _save_client(db, run, gid, refreshed=True, stale=False, wait_for=None, error=None)
             except Exception as e:  # noqa: BLE001 - as above
                 await _refresh_failed(db, run, gid, group, e)

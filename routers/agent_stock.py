@@ -19,7 +19,7 @@ from ai.agents import store as agent_store
 from ai.agents import history as ad_history
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
-from ai.agents.stock.cards import STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN
+from ai.agents.stock.cards import STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, guarded_update
 from ai.agents.stock.scoreboard import LOST, OUTCOMES, WON
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -28,7 +28,7 @@ from services import client_targets
 
 router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 
-PREVIEW_BUDGET_SECONDS = 200   # of Vercel's 300 s; the tick finishes what doesn't fit
+PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
 OUTCOME_ROWS = 100
 CARD_EDITABLE = ("additional_changes", "thought_process", "next_steps")
 
@@ -50,11 +50,17 @@ def _with_id(doc: dict, drop: tuple = ()) -> dict:
     return out
 
 
+CLIENT_FIELDS = ("state", "error", "reason", "carded", "stale", "card_id", "wait_for", "health_due")
+OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids", "result", "spend", "leads",
+                  "cpl", "currency", "card_id", "line_id", "created_at", "scored_at")
+
+
 def _run_to_api(run: dict) -> dict:
-    """The run without the working data a resumed tick keeps on each client."""
-    out = _with_id(run, drop=("claimed_at", "in_flight", "tick_now"))
-    out["clients"] = {g: {k: v for k, v in c.items() if k not in ("facts", "draft")}
-                      for g, c in (run.get("clients") or {}).items()}
+    """The run as the report needs it: no owner id, no Slack channel, and per client only its
+    outcome, not the working data a resumed tick keeps."""
+    out = _with_id(run, drop=("user_id", "claimed_at", "in_flight", "tick_now", "open_preview", "slack"))
+    out["slack"] = {"ts": (run.get("slack") or {}).get("ts")}
+    out["clients"] = {g: {k: c[k] for k in CLIENT_FIELDS if k in c} for g, c in (run.get("clients") or {}).items()}
     return out
 
 
@@ -157,7 +163,7 @@ async def _scoreboard(db, agent_id: str) -> dict:
     rows = await db[OUTCOMES].find({"agent_id": agent_id}).sort("created_at", -1).to_list(length=None)
     results = [str(r.get("result") or "").lower() for r in rows]
     return {"won": results.count(WON), "lost": results.count(LOST), "moves": len(rows),
-            "rows": [_with_id(r) for r in rows[:OUTCOME_ROWS]]}
+            "rows": [{"id": r["_id"], **{k: r[k] for k in OUTCOME_FIELDS if k in r}} for r in rows[:OUTCOME_ROWS]]}
 
 
 @router.get("/{agent_id}/runs")
@@ -230,6 +236,8 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
             {"_id": card_id, "agent_id": agent_id, "status": {"$ne": STATUS_CLOSING}})
         if card is None:
             raise HTTPException(status_code=404, detail="Card not found")
+        if card.get("preview"):
+            raise HTTPException(status_code=409, detail="A preview card can't be edited")
         if card.get("status") not in (STATUS_OPEN, STATUS_FLAGGED):
             raise HTTPException(status_code=409, detail="This card has already been decided")
         patch = {k: getattr(body, k) for k in CARD_EDITABLE if getattr(body, k) is not None}
@@ -238,13 +246,11 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
             ids = [ln.get("id") for ln in body.lines]
             if any(i not in stored for i in ids) or len(set(ids)) != len(ids):
                 raise HTTPException(status_code=400, detail="Lines must be existing lines of this card")
+            if any(ln.get("state") not in ("proposed", "flagged") for i, ln in stored.items() if i not in ids):
+                raise HTTPException(status_code=409, detail="A line that is being or has been applied can't be removed")
             patch["lines"] = [stored[i] for i in ids]
-        if patch:
-            res = await db[stock_runner.CARDS].update_one(
-                {"_id": card_id, "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]}},
-                {"$set": {**patch, "updated_at": datetime.utcnow()}})
-            if res.matched_count == 0:
-                raise HTTPException(status_code=409, detail="This card has already been decided")
+        if patch and not await guarded_update(db, card, patch):
+            raise HTTPException(status_code=409, detail="This card changed while you were editing it. Reload it")
         return _card_to_api(await db[stock_runner.CARDS].find_one({"_id": card_id}))
 
 

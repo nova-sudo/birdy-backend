@@ -25,6 +25,7 @@ from datetime import datetime
 
 from core.database import DB_NAME
 from ai.agents import claims
+from ai.agents.stock.scoreboard import OUTCOMES
 from ai.agents.stock.settings import DEFAULT_SETTINGS
 from ai.suggestions.store import SUGGESTIONS
 from ai.agents.defaults import (
@@ -150,7 +151,7 @@ async def delete_draft_agent(db, user_id: str, agent_id: str) -> bool:
     res = await db[AGENTS].delete_one({"_id": agent_id, "user_id": user_id, "status": {"$ne": "active"}})
     if res.deleted_count == 0:
         raise AgentActive(agent_id)  # switched on between the read and the delete
-    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS, RUNS, CARDS):
+    for coll in (RULES, RULE_VERSIONS, MEMORY, PRACTICE, PROPOSALS, JOBS, RUNS, CARDS, OUTCOMES):
         await db[coll].delete_many({"agent_id": agent_id})
     await claims.release_clients(db, user_id, agent_id)
     return True
@@ -295,6 +296,8 @@ async def create_agent_indexes(mongo_client):
     await db[RUNS].create_index([("agent_id", 1), ("local_date", 1)], unique=True, name="agent_daily_run",
                                 partialFilterExpression={"scheduled": True})
     await db[RUNS].create_index([("agent_id", 1), ("phase", 1)])
+    await db[RUNS].create_index("agent_id", unique=True, name="agent_open_preview",
+                                partialFilterExpression={"open_preview": True})
     await db[CARDS].create_index([("run_id", 1), ("client_group_id", 1)], unique=True)
     await db[CARDS].create_index([("agent_id", 1), ("client_group_id", 1), ("created_at", -1)])
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)

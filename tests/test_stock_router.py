@@ -1,6 +1,8 @@
 """The stock agent's API (spec section 12): preview, runs, cards, outcomes, lessons, activate."""
 
+import asyncio
 import contextlib
+import time
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -12,7 +14,8 @@ from ai.agents import claims
 from ai.agents.stock import runner
 from ai.agents.stock.runner import RUNS
 from ai.agents.stock.scoreboard import OUTCOMES
-from ai.agents.store import AGENTS, CARDS, MEMORY, TYPE_STOCK, create_agent
+from ai.agents.store import (AGENTS, CARDS, MEMORY, TYPE_STOCK, create_agent, create_agent_indexes,
+                             delete_draft_agent)
 from dependencies import get_current_user
 from jobs import agent_jobs
 from main import app
@@ -241,3 +244,166 @@ async def test_outcomes_and_lessons(api, mock_db):
     await mock_db[MEMORY].insert_one({"_id": "m1", "agent_id": aid, "text": "no blue", "active": True,
                                       "created_at": datetime(2026, 11, 1)})
     assert [m["id"] for m in api.get(f"/api/agents/{aid}/lessons").json()] == ["m1"]
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1
+# ---------------------------------------------------------------------------
+
+def test_preview_budget_leaves_room_for_the_last_read():
+    assert stock_router.PREVIEW_BUDGET_SECONDS <= 170
+
+
+async def test_read_timeout_shrinks_near_the_deadline():
+    assert runner._read_timeout(None) == runner.CLIENT_READ_TIMEOUT_S
+    assert runner._read_timeout(time.monotonic() + 170) == runner.CLIENT_READ_TIMEOUT_S
+    near = runner._read_timeout(time.monotonic() + 5)
+    assert near <= 5 + runner.DEADLINE_MARGIN_S < runner.CLIENT_READ_TIMEOUT_S
+    assert runner._read_timeout(time.monotonic() - 50) >= 1  # never zero or negative
+
+
+async def test_a_racing_preview_insert_returns_the_existing_run(mock_db, mock_mongo_client):
+    """Mongomock runs requests one after another, so the race is forced: the second caller's
+    open-preview check misses (as it would between the first caller's check and insert), and the
+    unique open_preview index sends it to the run the first caller made. Real concurrent
+    behaviour is a Task 21 real-Mongo check."""
+    await create_agent_indexes(mock_mongo_client)
+    agent = await _setup(mock_db, "g1", claim=False)
+    first = await runner.get_or_create_run(mock_db, agent, NOW, kind="preview")
+
+    class Miss:
+        def __init__(self, coll):
+            self.coll, self.missed = coll, False
+
+        async def find_one(self, *a, **kw):
+            if not self.missed:
+                self.missed = True
+                return None
+            return await self.coll.find_one(*a, **kw)
+
+        def __getattr__(self, name):
+            return getattr(self.coll, name)
+
+    miss = Miss(mock_db[RUNS])
+
+    class Db:
+        def __getitem__(self, name):
+            return miss if name == RUNS else mock_db[name]
+
+    second = await runner.get_or_create_run(Db(), agent, NOW, kind="preview")
+    assert second["_id"] == first["_id"] and await mock_db[RUNS].count_documents({"kind": "preview"}) == 1
+
+
+async def test_open_preview_flag_clears_when_done(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    r = api.post(f"/api/agents/{agent['_id']}/preview").json()
+    assert (await mock_db[RUNS].find_one({"_id": r["run_id"]}))["open_preview"] is False
+
+
+async def test_card_edit_is_versioned_and_refuses_a_stale_version(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2")
+    api.patch(f"/api/agents/{aid}/cards/c1", json={"next_steps": "x"})
+    assert (await mock_db[CARDS].find_one({"_id": "c1"}))["version"] == 1
+    from ai.agents.stock.cards import guarded_update
+    card = await mock_db[CARDS].find_one({"_id": "c1"})
+    assert await guarded_update(mock_db, card, {"next_steps": "a"}) is True
+    assert await guarded_update(mock_db, card, {"next_steps": "b"}) is False  # card was read before that write
+    assert (await mock_db[CARDS].find_one({"_id": "c1"}))["next_steps"] == "a"
+
+
+async def test_dropping_a_line_that_was_applied_is_refused(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2")
+    await mock_db[CARDS].update_one({"_id": "c1", "lines.id": "l1"}, {"$set": {"lines.$.state": "applied"}})
+    r = api.patch(f"/api/agents/{aid}/cards/c1", json={"lines": [{"id": "l2"}]})
+    assert r.status_code == 409
+    assert len((await mock_db[CARDS].find_one({"_id": "c1"}))["lines"]) == 2
+    assert api.patch(f"/api/agents/{aid}/cards/c1", json={"lines": [{"id": "l1"}, {"id": "l2"}]}).status_code == 200
+
+
+async def test_preview_cards_cannot_be_patched(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    await _seed_run(mock_db, agent, rid="rp", kind="preview")
+    await _seed_card(mock_db, agent, "cp", "rp", preview=True)
+    assert api.patch(f"/api/agents/{agent['_id']}/cards/cp", json={"next_steps": "x"}).status_code == 409
+
+
+async def test_deleting_a_draft_agent_removes_its_outcomes(mock_db):
+    agent = await create_agent(mock_db, USER, type=TYPE_STOCK)
+    await mock_db[OUTCOMES].insert_many([{"_id": "o1", "agent_id": agent["_id"]}, {"_id": "o2", "agent_id": "x"}])
+    assert await delete_draft_agent(mock_db, USER, agent["_id"])
+    assert [o["_id"] async for o in mock_db[OUTCOMES].find()] == ["o2"]
+
+
+async def test_activate_needs_a_preview_covering_the_current_clients(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    await _client(mock_db, "g2")
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {
+        "scope.client_group_ids": ["g1", "g2"], "settings.clients.g2": {"batch_id": "a", "treatment_ids": []}}})
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
+
+
+async def test_run_view_trims_internals_and_outcome_rows_name_their_fields(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2", slack={"channel_id": "C1", "ts": "1.2"})
+    run = api.get(f"/api/agents/{aid}/runs/r2").json()["run"]
+    assert "user_id" not in run and "channel_id" not in run["slack"]
+    await mock_db[OUTCOMES].insert_one({"_id": "o1", "agent_id": aid, "creative_key": "k", "result": "won",
+                                        "secret": "x", "created_at": datetime(2026, 11, 1)})
+    [row] = api.get(f"/api/agents/{aid}/outcomes").json()["rows"]
+    assert "secret" not in row and row["id"] == "o1" and row["result"] == "won"
+
+
+async def test_other_agents_and_users_runs_and_cards_are_not_reachable(api, mock_db):
+    mine = await _setup(mock_db, "g1")
+    await _seed_run(mock_db, {"_id": "foreign-agent"}, rid="rf")
+    await _seed_card(mock_db, {"_id": "foreign-agent"}, "cf", "rf")
+    await _seed_run(mock_db, mine, rid="rm")
+    await _seed_card(mock_db, mine, "cm", "rm")
+    aid = mine["_id"]
+    assert api.get(f"/api/agents/{aid}/runs/rf").status_code == 404
+    assert api.patch(f"/api/agents/{aid}/cards/cf", json={"next_steps": "x"}).status_code == 404
+    assert (await mock_db[CARDS].find_one({"_id": "cf"}))["thought_process"] == "t"
+    # a card of my own agent, asked for through another run id, is not listed there
+    await mock_db[CARDS].insert_one({"_id": "cx", "agent_id": "foreign-agent", "run_id": "rm", "client_group_id": "z",
+                                     "status": "open", "lines": [], "created_at": datetime(2026, 11, 3)})
+    assert [c["id"] for c in api.get(f"/api/agents/{aid}/runs/rm").json()["cards"]] == ["cm"]
+
+
+async def test_bad_before_and_limit_bounds(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    base = f"/api/agents/{agent['_id']}/runs"
+    assert api.get(base, params={"before": "yesterday"}).status_code == 422
+    assert api.get(base, params={"limit": 0}).status_code == 422
+    assert api.get(base, params={"limit": 101}).status_code == 422
+    assert api.get(base, params={"limit": 100}).status_code == 200
+
+
+async def test_flagged_cards_are_returned(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "cf", "r2", status="flagged")
+    cards = api.get(f"/api/agents/{agent['_id']}/runs/r2").json()["cards"]
+    assert [(c["id"], c["can_apply"]) for c in cards] == [("cf", False)]
+
+
+async def test_a_claim_conflict_on_activate_changes_nothing(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    await claims.claim_clients(mock_db, USER, "other-agent", ["g1"])
+    assert api.post(f"/api/agents/{aid}/activate").status_code == 409
+    assert await claims.holder(mock_db, USER, "g1") == "other-agent"
+    doc = await mock_db[AGENTS].find_one({"_id": aid})
+    assert doc["status"] == "draft"

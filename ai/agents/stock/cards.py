@@ -138,3 +138,16 @@ async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
          "preview": {"$ne": True}},
         {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow()}})
     return res.modified_count
+
+
+async def guarded_update(db, card: dict, fields: dict) -> bool:
+    """Write `fields` to a card that is still open or flagged and hasn't changed since `card` was
+    read: its `version` must match, and goes up by one. False when it lost a race (or the card
+    was decided meanwhile), so the caller answers 409. Every write that changes a card's lines
+    (edit, apply, undo) goes through here."""
+    version = card.get("version") or 0
+    match = {"version": version} if version else {"$or": [{"version": 0}, {"version": {"$exists": False}}]}
+    res = await db[CARDS].update_one(
+        {"_id": card["_id"], "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]}, **match},
+        {"$set": {**fields, "updated_at": datetime.utcnow()}, "$inc": {"version": 1}})
+    return res.modified_count == 1

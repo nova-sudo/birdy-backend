@@ -684,9 +684,11 @@ async def _stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list
     errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
     missing = [] if ids else ["Choose at least one client to watch"]
     missing += [e["message"] for e in errors]
-    preview = await db[agent_store.RUNS].find_one({
-        "agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}}, {"_id": 1})
-    if preview is None:
+    preview = await db[agent_store.RUNS].find_one(
+        {"agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}},
+        {"clients": 1}, sort=[("as_of", -1)])
+    # The newest finished preview must have covered every client in scope now.
+    if preview is None or not set(ids) <= set(preview.get("clients") or {}):
         missing.append("Preview the first report")
     return missing, errors
 
