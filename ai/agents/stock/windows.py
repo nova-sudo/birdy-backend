@@ -11,6 +11,13 @@ from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 
+DEFAULT_TZ = "Europe/London"   # the agency's timezone when none is set; the runner and the weekly both use it
+
+
+def agency_tz(agent: dict) -> str:
+    return ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or DEFAULT_TZ
+
+
 @dataclass(frozen=True)
 class Window:
     start: date

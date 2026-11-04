@@ -435,6 +435,8 @@ async def post_weekly(agent_id: str, run_id: str, current_user: str = Depends(ge
             res = await stock_weekly.post_weekly(db, run, agent, by=current_user)
         except stock_slack.SlackPublishError as e:
             raise HTTPException(status_code=502, detail=str(e))
+        if res["outcome"] == "not_built":
+            raise HTTPException(status_code=404, detail="This run has no weekly report")
         if res["outcome"] == "preview":
             raise HTTPException(status_code=409, detail=WEEKLY_REFUSED["preview"])
         if res["outcome"] == "in_progress":

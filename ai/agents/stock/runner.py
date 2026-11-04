@@ -63,8 +63,8 @@ from ai.agents.stock.checks import client_facts, follow_ups
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.stock.slack import (SLACK_CLAIM, SLACK_POSTED, post_urgent_alerts, publish_run, slack_attempt_fields,
                                    slack_failed_fields)
-from ai.agents.stock.weekly import build_weekly, weekly_due
-from ai.agents.stock.windows import full_day_window, last_full_day
+from ai.agents.stock.weekly import build_weekly, record_build_failure, weekly_due
+from ai.agents.stock.windows import agency_tz, full_day_window, last_full_day
 from ai.agents.stock.writer import write_card
 from ai.agents.store import CARDS, RUNS
 from integrations.facebook_utils.facebook import get_facebook_token
@@ -137,8 +137,7 @@ def run_kind(settings: dict, local_date: date) -> tuple[str, str | None]:
 
 
 def _local_date(agent: dict, now_utc: datetime) -> date:
-    tz = ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or "Europe/London"
-    return now_utc.astimezone(ZoneInfo(tz)).date()
+    return now_utc.astimezone(ZoneInfo(agency_tz(agent))).date()
 
 
 def _run_now(run: dict) -> datetime:
@@ -793,13 +792,19 @@ def _states(run: dict) -> dict:
 
 async def _weekly_step(db, run: dict, agent: dict, now_utc: datetime | None = None) -> None:
     """Build the weekly report on its weekday, before the run publishes so an automatic post goes out with it. It
-    never holds the run: a failure is logged and the next publish tries again. `kind` is left as it is."""
+    never changes the run's outcome: a failed build is recorded on the run (`weekly_pending`, `weekly_error`) and
+    weekly.retry_weeklies tries again on later ticks, whether or not the run publishes again. `kind` is left as it is."""
     if not weekly_due(_settings(agent), run):
         return
     try:
-        await _save(db, run, weekly=await build_weekly(db, agent, now_utc or _run_now(run)))
+        await _save(db, run, weekly=await build_weekly(db, agent, now_utc or _run_now(run)), weekly_pending=False,
+                    weekly_error=None)
     except Exception as e:  # noqa: BLE001
         logger.error("stock run %s: weekly report failed: %s", run["_id"], e, exc_info=True)
+        try:
+            await record_build_failure(db, run, e, _naive(now_utc) if now_utc else run.get("tick_now") or datetime.utcnow())
+        except Exception as again:  # noqa: BLE001
+            logger.error("stock run %s: couldn't record the weekly failure: %s", run["_id"], again, exc_info=True)
 
 
 async def _publishing_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:

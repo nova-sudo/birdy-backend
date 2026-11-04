@@ -39,6 +39,7 @@ from ai.agents import outcomes
 from ai.agents.runner import run_agent
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock.slack import retry_unposted_runs
+from ai.agents.stock.weekly import retry_weeklies
 from ai.agents.store import AGENTS, TYPE_STOCK
 from core.database import DB_NAME
 from dependencies import get_mongo_client
@@ -334,6 +335,10 @@ async def run_agents_tick() -> dict:
                                                     max(deadline, time.monotonic() + SLACK_RETRY_FLOOR_SECONDS))
         except Exception as e:
             logger.error("[agents-tick] late Slack posts raised: %s", e, exc_info=True)
+        try:
+            await retry_weeklies(mongo_client[DB_NAME], datetime.now(timezone.utc), deadline)
+        except Exception as e:
+            logger.error("[agents-tick] weekly retries raised: %s", e, exc_info=True)
         return {**out, "stock": stock, "slack_posted_late": posted_late}
 
 
