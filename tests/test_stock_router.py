@@ -423,3 +423,33 @@ async def test_latest_counts_the_cards_a_person_can_still_apply(api, mock_db):
     shown = api.get(f"/api/agents/{aid}/runs/r2").json()["cards"]
     assert latest["open_cards"] == sum(1 for c in shown if c["can_apply"])
     assert api.get(f"/api/agents/{aid}/runs/latest?kind=preview").json()["open_cards"] == 0
+
+
+# ---------------------------------------------------------------------------
+# Setup support: the add-writes switch in the agent view, and a preview that read nothing
+# ---------------------------------------------------------------------------
+
+async def test_agent_view_tells_the_stock_agent_whether_add_writes_are_on(api, mock_db, monkeypatch):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    monkeypatch.delenv("AGENT_ADD_WRITES_ENABLED", raising=False)
+    assert api.get(f"/api/agents/{aid}").json()["add_writes_enabled"] is False
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "true")
+    assert api.get(f"/api/agents/{aid}").json()["add_writes_enabled"] is True
+    assert api.get("/api/agents").json()[0]["add_writes_enabled"] is True
+
+
+async def test_custom_agent_view_has_no_add_writes_field(api, mock_db):
+    custom = await create_agent(mock_db, USER, type="custom", name="Rules")
+    assert "add_writes_enabled" not in api.get(f"/api/agents/{custom['_id']}").json()
+
+
+async def test_a_preview_where_every_client_failed_does_not_count(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    await mock_db[RUNS].update_many({"agent_id": aid, "kind": "preview"}, {"$set": {
+        "clients.g1": {"state": "failed", "error": "Meta needs reconnecting. Reconnect to check this client."}}})
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])

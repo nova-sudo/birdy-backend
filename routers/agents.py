@@ -56,7 +56,7 @@ SETTABLE_MODES = ("flag", "ask")  # "auto" is granted only through graduation
 # ---------------------------------------------------------------------------
 
 def _agent_to_api(doc: dict) -> dict:
-    return {
+    out = {
         "id": doc["_id"],
         "type": doc.get("type"),
         "name": doc.get("name"),
@@ -72,6 +72,9 @@ def _agent_to_api(doc: dict) -> dict:
         "last_run_at": doc.get("last_run_at"),
         "created_at": doc.get("created_at"),
     }
+    if doc.get("type") == agent_store.TYPE_STOCK:
+        out["add_writes_enabled"] = stock_settings.add_writes_enabled()  # setup shows Add as Flag only while off
+    return out
 
 
 def _rule_to_api(doc: dict) -> dict:
@@ -689,8 +692,12 @@ async def _stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list
         {"agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}},
         {"clients": 1}, sort=[("as_of", -1)])
     # The newest finished preview must have covered every client in scope now.
-    if preview is None or not set(ids) <= set(preview.get("clients") or {}):
-        missing.append("Preview the first report")
+    covered = preview is not None and set(ids) <= set(preview.get("clients") or {})
+    # A preview that couldn't check any client proves nothing (an expired Meta token fails them all).
+    read = covered and any((preview["clients"].get(g) or {}).get("state") != "failed" for g in ids)
+    if not read:
+        missing.append("Preview the first report" if not covered
+                       else "Preview the first report again: it couldn't check any client")
     return missing, errors
 
 
