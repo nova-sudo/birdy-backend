@@ -108,7 +108,7 @@ def _creative(c: dict | None) -> dict:
     """The parts of an ad's creative the stock agent copies when it re-posts the ad."""
     c = c or {}
     spec = c.get("object_story_spec") or {}
-    data = spec.get("link_data") or spec.get("video_data") or {}
+    data = spec.get("link_data") or spec.get("video_data") or spec.get("photo_data") or {}
     cta = (data.get("call_to_action") or {}).get("value") or {}
     return {"id": c.get("id"),
             "image_hash": c.get("image_hash") or data.get("image_hash"),
@@ -116,7 +116,7 @@ def _creative(c: dict | None) -> dict:
             "page_id": spec.get("page_id"),
             "lead_form_id": cta.get("lead_gen_form_id"),
             "cta_type": (data.get("call_to_action") or {}).get("type"),
-            "body": data.get("message") or c.get("body"),
+            "body": data.get("message") or data.get("caption") or c.get("body"),
             "title": data.get("name") or data.get("title") or c.get("title"),
             "link": data.get("link") or cta.get("link")}
 

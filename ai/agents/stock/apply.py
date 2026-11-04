@@ -524,7 +524,7 @@ async def _finish_applied(db, card: dict, agent: dict | None, line: dict, atype:
 
 async def _block(db, card: dict, line: dict, reason: dict) -> None:
     await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_BLOCKED,
-                    error=_short(reason["message"] + (STAYS_PAUSED if line.get("paused_ad_id") else "")),
+                    error=_short(reason["message"] + (STAYS_PAUSED if line.get("paused_ad_id") and "paused in Meta" not in reason["message"] else "")),
                     reason_code=reason["code"])
 
 
@@ -915,9 +915,12 @@ async def auto_apply_run(db, mongo_client, run: dict, agent: dict, *, deadline: 
 # The cron: finishing and recovering
 # ---------------------------------------------------------------------------
 
+async def read_ad_state(user_id: str, ad_id: str, mongo_client) -> dict | None:
+    return await asyncio.wait_for(get_object_state(user_id, ad_id, "ad", mongo_client), timeout=RECOVERY_READ_TIMEOUT_S)
+
+
 async def _read_ad(card: dict, line: dict, mongo_client) -> dict | None:
-    return await asyncio.wait_for(get_object_state(card["user_id"], _ad_id(line), "ad", mongo_client),
-                                  timeout=RECOVERY_READ_TIMEOUT_S)
+    return await read_ad_state(card["user_id"], _ad_id(line), mongo_client)
 
 
 async def _recover_applying(db, mongo_client, card: dict, line: dict, now: datetime) -> None:

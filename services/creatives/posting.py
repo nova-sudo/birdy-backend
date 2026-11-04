@@ -386,7 +386,8 @@ async def _stray_ad(db, ad: dict, name: str, token: str, tick: _Tick) -> str | N
         await _set_meta(db, ad, "ad_create_started_at", tick.now(), tick.now())
         return None
     try:
-        return await find_ad_in_adset(ad["adset_id"], token, name=name, creative_id=meta["creative_id"])
+        return await find_ad_in_adset(ad["adset_id"], token, name=name, creative_id=meta["creative_id"],
+                                      since=meta["ad_create_started_at"])
     except MetaWriteError as e:
         if e.code == 190:
             raise

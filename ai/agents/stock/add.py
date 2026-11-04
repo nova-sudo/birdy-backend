@@ -17,7 +17,8 @@ That's where it differs, since the post takes minutes and outlives the request:
   4. The pipeline leaves the ad paused. A video can take an hour, so before turning it on `sync_add_lines`
      checks again under the client's lease: the agent, the hold, who acts for the client, the mode, a newer
      card, and the live ad limit from Meta's own list of the ad's ad set. If any of those says no, the ad
-     stays paused, the line says why, and a person can Retry.
+     stays paused, the line says why, and a person can Retry. A reply to "turn it on" can be lost after it
+     landed, so once that's been sent the line reads the ad's own status before it says anything about it.
 
 Never twice:
 
@@ -54,10 +55,10 @@ from pymongo.errors import DuplicateKeyError
 from ai.agents.guardrails import _naive_utc, agent_tz, check_adset_contents_live, check_guardrails, local_today
 from ai.agents.meta_state import AD_STATE, ADSET_STATE
 from ai.agents.snapshot import load_ad_days
-from ai.agents.stock.apply import (_ACTIONABLE, NOW_FLAG, STUCK_AFTER, _answer, _block, _fail, _find_line, _lease_key,
+from ai.agents.stock.apply import (_ACTIONABLE, NOW_FLAG, STUCK_AFTER, _answer, _block, _fail, _find_line, _landed, _lease_key,
                                    _load_agent, _log_once, _lost_the_last_check, _no_time_for_a_line, _out_of_time,
                                    _refusal, _release_lease, _set_line, _settings, _short, _take_lease, _target_doc,
-                                   _visible_card, _who, adds_in_flight, has_newer_card, running_ads)
+                                   _visible_card, _who, adds_in_flight, has_newer_card, read_ad_state, running_ads)
 from ai.agents.stock.candidates import _DATE_RUN, _DATE_SEP, _is_date, creative_key
 from ai.agents.stock.cards import (STATE_APPLIED, STATE_APPLYING, STATE_BLOCKED, STATE_FAILED, STATE_NEEDS_FILE,
                                     STATE_PROPOSED, STATE_QUEUED, STATE_UNDOING, STATE_UNDONE)
@@ -73,7 +74,7 @@ from integrations.facebook_utils.meta_creative_writer import (VIDEO_PROCESS_FAIL
                                                               video_source)
 from services.creatives import posting
 from services.creatives.posting import DONE, FAILED, POST_JOBS, PostingError, _managed_job, _new_job, _norm_act, enqueue_post
-from services.creatives.store import DRAFT, POSTING, TEST_ADS, TESTS, create_test, get_test, update_test
+from services.creatives.store import DRAFT, POSTING, TEST_ADS, TESTING, TESTS, create_test, get_test, update_test
 from services.creatives.upload_grant import is_own_blob_url
 
 logger = logging.getLogger(__name__)
@@ -82,7 +83,7 @@ FILES = "agent_creative_files"     # one row per (user, source account, source m
 POSTS = "agent_add_posts"          # one row per (user, ad account, creative key): who may post it
 MANAGED_BY = "media_agent"
 SYNC_BATCH = 200                   # cards looked at per cron pass; the rest wait a minute
-GO_LIVE_TRIES = 5                  # one a minute: Meta is having a moment, or it won't happen
+GO_LIVE_TRIES = 15                 # one a minute: after a video may have waited an hour, a quarter of an hour more
 MEDIA_READ_TRIES = 5               # the same, reading the source's media before anything is posted
 DEFAULT_WINDOW_DAYS = 7
 HOLDING = (STATE_QUEUED, STATE_APPLYING, STATE_APPLIED, STATE_UNDOING, STATE_UNDONE)
@@ -102,9 +103,10 @@ PAUSED_ELSEWHERE = {"code": "already_posted",
 MAYBE_PAUSED_ELSEWHERE = {"code": "already_posted",
                           "message": "Birdy may already have made this ad from an earlier card. If so, it's paused in Meta. "
                                      "Check Ads Manager."}
-NO_BODY = {"code": "no_words", "message": "Birdy can't read any primary text on the source ad, so it didn't post a blank ad."}
+NO_BODY = {"code": "no_words", "message": "Birdy can't read any primary text on the source ad, so it didn't post a blank ad. "
+                                          "Post it by hand in Ads Manager if you want it."}
 NO_HEADLINE = {"code": "no_words", "message": "Birdy can't read a headline on the source ad, and this ad has no web page for "
-                                              "Meta to take one from, so it didn't post it."}
+                                              "Meta to take one from, so it didn't post it. Post it by hand in Ads Manager if you want it."}
 NOW_FLAGGED = {"code": "now_flag", "message": NOW_FLAG}
 NOT_AUTO_NOW = {"code": "not_auto", "message": "This change no longer runs by itself, so it's waiting for a person."}
 ALREADY_RUN = {"code": "already_run", "message": "This ad account has already run this creative, so Birdy didn't post it again."}
@@ -120,10 +122,30 @@ CANT_TAKE_FILE = "This line can't take a file right now."
 POST_FAILED = "Meta didn't accept this ad. Try again."
 STOPPED_WITH_AD = ("Posting new ads is switched off, so Birdy left this ad paused in Meta. "
                    "It needs turning on in Ads Manager, or trying again later.")
-NOT_LIVE = "Birdy created this ad but couldn't turn it on, so it's paused in Meta: {why} Try again."
-LEFT_PAUSED = "Birdy created this ad but left it paused in Meta: {why} Try again when that's changed."
+NOT_LIVE = "Birdy created this ad but couldn't turn it on, so it's paused in Meta: {why}"
+UNCONFIRMED = {"code": "unconfirmed", "message": "Birdy tried to turn this ad on and couldn't confirm whether it worked. Check it "
+                                                 "in Ads Manager, or try again: Birdy looks first."}
+# What's said when a check stops an ad that exists, or may. Written for that moment: the messages for a check
+# before posting say nothing was posted.
+LEFT_AD = "left the new ad paused in Meta"
+BY_HAND = "Turn it on in Ads Manager if you want it."
+STOP_WORDS = {
+    "agent_off": "This agent was turned off, so Birdy {left}. Turn the agent on and try again.",
+    "on_hold": "This client was put on hold, so Birdy {left}. Take it off hold and try again.",
+    "not_acting_agent": "Another agent now handles this client, so Birdy {left}. " + BY_HAND,
+    "now_flag": "This change is now set to Flag, so Birdy {left}. " + BY_HAND,
+    "not_auto": "This change no longer runs by itself, so Birdy {left}. Apply it to turn it on.",
+    "superseded": "A newer card replaced this one, so Birdy {left}. " + BY_HAND,
+    "dismissed": "This card was dismissed, so Birdy {left}. " + BY_HAND,
+    "max_ads_live": "This ad set is at its live ad limit now, so Birdy {left}. Try again when there's room.",
+    "no_destination": "The other ads in this ad set aren't live now, so Birdy {left}. Try again once one is back on.",
+    "live_check_failed": "Birdy couldn't read this ad set from Meta, so it {left}. Try again in a few minutes.",
+}
+STOP_OTHER = "One of this agent's safety checks stopped this, so Birdy {left}. Look at its rules, then try again."
 CLOSED_PAUSED = ("Birdy created this ad and it's paused in Meta. This card was replaced or closed, so Birdy won't turn it "
                  "on. Turn it on in Ads Manager if you want it.")
+CLOSED_UNCONFIRMED = ("Birdy tried to turn this ad on and couldn't confirm whether it worked. This card was replaced or closed, "
+                      "so Birdy won't look again. Check it in Ads Manager.")
 CLOSED_MAYBE = ("Birdy may have created this ad, and if so it's paused in Meta. This card was replaced or closed, so Birdy "
                 "won't look again. Check Ads Manager.")
 
@@ -358,6 +380,11 @@ async def _holds(db, post: dict) -> bool:
     return _ad_may_exist(row)
 
 
+def _status_unknown(line: dict) -> bool:
+    """"Turn it on" was sent, and nothing since has shown the ad to be paused."""
+    return bool(line.get("go_live_sent") and not line.get("paused_ad_id"))
+
+
 async def _already_posted(db, post: dict | None) -> dict:
     """Why another line has this post. It says so if that's an ad sitting paused with nobody coming for it."""
     if not post or not post.get("test_id"):
@@ -368,7 +395,7 @@ async def _already_posted(db, post: dict | None) -> dict:
     if row.get("post_state") not in ("created", "failed") or (owner or {}).get("state") in HOLDING:
         return ALREADY_POSTED
     if (row.get("meta") or {}).get("ad_id"):
-        return PAUSED_ELSEWHERE
+        return PAUSED_ELSEWHERE if not _status_unknown(owner or {}) else ALREADY_POSTED
     return MAYBE_PAUSED_ELSEWHERE if _ad_may_exist(row) else ALREADY_POSTED
 
 
@@ -638,6 +665,9 @@ async def apply_add(db, mongo_client, card: dict, line: dict, agent: dict, now: 
     read: dict = {}
     refusal = await _live_read_block(db, mongo_client, agent, card, line, dest, now, read)
     if refusal is not None:
+        if fixed:  # nothing here is "before posting": say where the ad stands
+            left = LEFT_AD if line.get("paused_ad_id") or (own["meta"].get("ad_id") and not _status_unknown(line)) else "stopped here"
+            refusal = {**refusal, "message": _stop_text(refusal, left)}
         return await _block(db, card, line, refusal)
     if not fixed:  # now that Meta has said what's live, take the Page and form from one of those
         live = {str(a.get("id")) for a in read.get(str(dest["adset_id"])) or [] if str(a.get("effective_status") or "").upper() == "ACTIVE"}
@@ -755,18 +785,54 @@ async def _go_live_refusal(db, mongo_client, card: dict, line: dict, row: dict, 
                                   _row_destination(row, line), now)
 
 
-async def _leave_paused(db, card: dict, line: dict, row: dict, reason: dict) -> None:
-    await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_FAILED, reason_code=reason["code"],
-                    error=_short(LEFT_PAUSED.format(why=reason["message"].rstrip(".") + ".")), write_started_at=None,
-                    paused_ad_id=row["meta"]["ad_id"], **({"mode": "ask"} if reason is NOT_AUTO_NOW else {}))
+def _stop_text(reason: dict, left: str = LEFT_AD) -> str:
+    return STOP_WORDS.get(reason["code"], STOP_OTHER).format(left=left)
+
+
+async def _mark_live(db, card: dict, row: dict, now: datetime) -> dict:
+    """"Turn it on" landed and its reply didn't. What `_activate` would have stored."""
+    fields = {"post_state": "active", "post_error": None, "meta_status": "ACTIVE", "live_at": now, "updated_at": now}
+    await db[TEST_ADS].update_one({"id": row["id"], "user_id": card["user_id"]}, {"$set": fields})
+    await db[TESTS].update_one({"id": row["test_id"], "user_id": card["user_id"], "status": POSTING},
+                               {"$set": {"status": TESTING, "started_at": now, "updated_at": now}})
+    return {**row, **fields}
+
+
+async def _end_not_live(db, mongo_client, card: dict, line: dict, row: dict, now: datetime, *, text: str, code: str | None,
+                        **extra) -> None:
+    """The line is ending without having seen the ad go on. If "turn it on" was ever sent, it may have landed, so
+    the ad's own status decides what's true: live is `applied`, so Undo works, and only a paused ad is called paused."""
+    ad_id = row["meta"]["ad_id"]
+    if line.get("go_live_sent"):
+        try:
+            state = await read_ad_state(card["user_id"], ad_id, mongo_client)
+        except Exception as e:  # noqa: BLE001 - it says it doesn't know, and a person can look
+            logger.warning("stock card %s line %s: can't read ad %s: %s", card["_id"], line["id"], ad_id, e)
+            return await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_FAILED, write_started_at=None,
+                                   paused_ad_id=None, error=UNCONFIRMED["message"], reason_code=UNCONFIRMED["code"])
+        if state is None:
+            return await _fail(db, card, line, GONE_FROM_META, write_started_at=None, paused_ad_id=None)
+        if _landed(ACTION_ENABLE_ADS, state):
+            return await _finish_add(db, card, line, await _mark_live(db, card, row, now), now)
+    await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_FAILED, error=_short(text), reason_code=code,
+                    write_started_at=None, paused_ad_id=ad_id, **extra)
+
+
+async def _leave_paused(db, mongo_client, card: dict, line: dict, row: dict, reason: dict, now: datetime | None = None) -> None:
+    await _end_not_live(db, mongo_client, card, line, row, now or datetime.utcnow(), text=_stop_text(reason), code=reason["code"],
+                        **({"mode": "ask"} if reason is NOT_AUTO_NOW else {}))
+
+
+def _not_live_text(why: str | None) -> str:
+    why = (why or "Meta didn't answer.").rstrip(".") + "."
+    return NOT_LIVE.format(why=why) + ("" if "try again" in why.lower() else " Try again.")
 
 
 async def _sync_created(db, mongo_client, card: dict, line: dict, row: dict, now: datetime, deadline: float | None) -> None:
     """The ad exists, paused, and this is the only thing that turns it on. Under the client's lease, like any
     write, so what the check counted can't change before the ad goes on."""
-    ad_id = row["meta"]["ad_id"]
     if not add_writes_enabled():
-        return await _fail(db, card, line, STOPPED_WITH_AD, write_started_at=None, paused_ad_id=ad_id)
+        return await _end_not_live(db, mongo_client, card, line, row, now, text=STOPPED_WITH_AD, code=None)
     if mongo_client is None or _no_time_for_a_line(deadline):
         return None
     key = _lease_key(card.get("agent_id"), card.get("client_group_id"))
@@ -782,11 +848,17 @@ async def _sync_created(db, mongo_client, card: dict, line: dict, row: dict, now
         # Counted before the call: one that hangs is cut off by the tick's budget and has to count too.
         tries = (line.get("go_live_tries") or 0) + 1
         await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), go_live_tries=tries)
+        if tries > GO_LIVE_TRIES:  # an earlier try raised or was cut off before it could say so
+            return await _end_not_live(db, mongo_client, card, line, row, now, code=None,
+                                       text=_not_live_text((row.get("post_error") or {}).get("message")))
         refusal = await _go_live_refusal(db, mongo_client, card, line, row, now)
         if refusal is not None:
             if refusal["code"] == "live_check_failed" and tries < GO_LIVE_TRIES:
                 return None  # couldn't read: it stays off, and the next minute asks again
-            return await _leave_paused(db, card, line, row, refusal)
+            return await _leave_paused(db, mongo_client, card, line, row, refusal, now)
+        # Stored before the call: a reply lost after this may mean it's on, whatever happens to the line next.
+        line = {**line, "go_live_sent": True}
+        await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), go_live_sent=True)
         try:
             await posting.go_live(db, mongo_client, card["user_id"], row["test_id"], now=now)
         except Exception as e:  # noqa: BLE001 - counts as a try, and the next minute asks again
@@ -796,9 +868,9 @@ async def _sync_created(db, mongo_client, card: dict, line: dict, row: dict, now
             return await _finish_add(db, card, line, fresh, now)
         if tries < GO_LIVE_TRIES:
             return None
-        why = (fresh.get("post_error") or {}).get("message") or "Meta didn't answer."
-        return await _fail(db, card, line, NOT_LIVE.format(why=why.rstrip(".") + "."), write_started_at=None,
-                           fix=(fresh.get("post_error") or {}).get("fix"), paused_ad_id=ad_id)
+        err = fresh.get("post_error") or {}
+        return await _end_not_live(db, mongo_client, card, line, fresh, now, code=None, text=_not_live_text(err.get("message")),
+                                   fix=err.get("fix"))
     finally:
         await _release_lease(db, key, token)
 
@@ -899,7 +971,7 @@ async def _say_what_was_left(db, deadline: float | None) -> None:
             if not _ad_may_exist(row):
                 await _set_line(db, card["_id"], line["id"], expect=(line["state"],), left_told=True)
                 continue
-            text = CLOSED_PAUSED if row["meta"].get("ad_id") else CLOSED_MAYBE
+            text = CLOSED_MAYBE if not row["meta"].get("ad_id") else CLOSED_UNCONFIRMED if _status_unknown(line) else CLOSED_PAUSED
             await _log_once(db, card, line, KIND_AD_LEFT_PAUSED, label="Needs a person", decision=line.get("decision") or {},
                             title=f"Left paused in Meta: {line.get('ad_name') or 'an ad'}", note=text)
             await _set_line(db, card["_id"], line["id"], expect=(line["state"],), error=text, reason_code="left_paused", left_told=True)

@@ -258,3 +258,14 @@ async def test_fetch_all_reads_the_time_to_regain_access_in_minutes(monkeypatch,
 def test_rate_limit_defaults_to_the_wider_scope():
     e = meta_state.MetaRateLimit("slow")
     assert e.scope == "app" and e.retry_after_s is None
+
+
+def test_creative_reads_a_photo_posts_caption():
+    got = meta_state._creative({"id": "c", "image_hash": "h", "object_story_spec": {"page_id": "p", "photo_data": {"image_hash": "h", "caption": "Real words"}}})
+    assert got["body"] == "Real words" and got["image_hash"] == "h"
+
+
+def test_creative_doesnt_copy_a_dynamic_ads_text():
+    got = meta_state._creative({"id": "c", "video_id": "v", "asset_feed_spec": {"bodies": [{"text": "One of many"}], "titles": [{"text": "T"}]},
+                                "object_story_spec": {"page_id": "p"}})
+    assert got["body"] is None and got["title"] is None

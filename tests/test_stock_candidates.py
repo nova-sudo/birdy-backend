@@ -1,5 +1,7 @@
 from datetime import datetime, timezone
 
+import pytest
+
 from ai.agents.stock.candidates import build_candidates, creative_key, normalise_name
 from ai.agents.stock.scoreboard import OUTCOMES, record_for
 from ai.agents.stock.windows import full_day_window
@@ -40,7 +42,7 @@ async def _groups(db, *groups):
 async def _ad(db, gid, ad_id, name=None, status="ACTIVE", campaign="c1", img=None, vid=None, **kw):
     await db["meta_ad_state"].insert_one({"client_group_id": gid, "ad_id": ad_id, "name": name or ad_id,
                                           "campaign_id": campaign, "effective_status": status,
-                                          "creative": {"image_hash": img, "video_id": vid}, **kw})
+                                          "creative": {"image_hash": img, "video_id": vid, "body": "Words"}, **kw})
 
 
 async def _days(db, gid, ad_id, spend, leads, day="2026-10-30", campaign="c1"):
@@ -250,3 +252,24 @@ async def test_revive_with_no_spend_and_no_paused_at_is_skipped(mock_db):
     await _groups(mock_db, DEST, SRC)
     await _ad(mock_db, "dest", "x", status="PAUSED", campaign="dc1", img="A", paused_at=None)
     assert _ids(await build_candidates(mock_db, AGENT, DEST, WIN), "revive") == []
+
+
+async def _worded_winner(db, ad_id, **creative):
+    await db["meta_ad_state"].insert_one({"client_group_id": "src", "ad_id": ad_id, "name": ad_id, "campaign_id": "c1",
+                                          "effective_status": "ACTIVE", "creative": {"image_hash": f"h-{ad_id}", **creative}})
+    await _days(db, "src", ad_id, 40, 10)
+
+
+@pytest.mark.parametrize("body,offered", [("Words", True), (None, False), ("", False), ("   ", False)])
+async def test_a_winner_with_no_readable_words_isnt_offered(body, offered, mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _worded_winner(mock_db, "w1", body=body)
+    res = await build_candidates(mock_db, AGENT, DEST, WIN)
+    assert bool(res["add"]) is offered
+
+
+async def test_a_wordless_winner_doesnt_take_a_good_ones_place(mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _worded_winner(mock_db, "blank", body=None)
+    await _worded_winner(mock_db, "good", body="Words")
+    assert [c["ad_id"] for c in (await build_candidates(mock_db, AGENT, DEST, WIN))["add"]] == ["good"]

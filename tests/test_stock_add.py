@@ -97,18 +97,25 @@ class Poster:
             err = self.err.pop("create_ad", None)
             if err:
                 raise err
-            self.made.append({"id": ad_id, "name": name, "adset_id": adset_id, "creative_id": creative_id})
+            self.made.append({"id": ad_id, "name": name, "adset_id": adset_id, "creative_id": creative_id,
+                              "created_time": datetime.utcnow()})
+            self.fake_meta.set(ad_id, "PAUSED")
             if self.lose_ad_reply:
                 self.lose_ad_reply = False
                 raise MetaWriteError("Meta request failed: ", step="create_ad")
             return ad_id
 
-        async def find_ad(adset_id, token, *, name, creative_id):
+        async def find_ad(adset_id, token, *, name, creative_id, since):
+            """Answers as the real read would: tested on its own in test_the_real_read_applies_the_name_rule."""
             self.ad_reads.append(adset_id)
             if self.ad_read_err:
                 raise self.ad_read_err
             here = [a for a in self.made if a["adset_id"] == adset_id]
-            hit_ = next((a for a in here if a["creative_id"] == creative_id), None) or next((a for a in here if a["name"] == name), None)
+            hit_ = next((a for a in here if a["creative_id"] == creative_id), None)
+            for a in here:
+                if hit_ is None and a["name"] == name and (self.fake_meta.ads.get(a["id"]) or {}).get("status") == "PAUSED" \
+                        and a["created_time"] >= since - timedelta(minutes=2):
+                    hit_ = a
             return hit_["id"] if hit_ else None
 
         async def set_status(user_id, object_id, object_type, status, mongo_client):
@@ -206,6 +213,29 @@ async def _apply(db, client, *lines, line_ids=None):
 
 def _now():
     return datetime.now(timezone.utc)
+
+
+def _hangs(monkeypatch, target, name) -> asyncio.Event:
+    """A Graph call that never answers, and the moment something reaches it."""
+    reached = asyncio.Event()
+
+    async def hang(*a, **k):
+        reached.set()
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(target, name, hang)
+    return reached
+
+
+async def _sync_cut_off_at(db, client, reached: asyncio.Event):
+    """A tick whose budget ends just as it reaches the hang, however slow the machine is. Finishes by itself if
+    it never gets there."""
+    reached.clear()
+    sync, waiter = asyncio.create_task(sync_add_lines(db, _now(), client)), asyncio.create_task(reached.wait())
+    await asyncio.wait({sync, waiter}, return_when=asyncio.FIRST_COMPLETED)
+    waiter.cancel()
+    sync.cancel()
+    await asyncio.gather(sync, waiter, return_exceptions=True)
 
 
 async def _tick(db, client, minutes=0):
@@ -1040,7 +1070,7 @@ async def test_go_live_that_keeps_failing_says_the_ad_is_paused_and_retry_doesnt
     await _card(mock_db, agent, _add())
     await _apply(mock_db, mock_mongo_client)
     poster.status_err = MetaStatusError("Meta hiccup", 500)
-    await _ticks(mock_db, mock_mongo_client, 12)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
     line = await _line(mock_db)
     assert line["state"] == "failed" and "paused" in line["error"] and len(poster.ads) == 1
     tries = len(poster.calls["status"])
@@ -1182,7 +1212,7 @@ async def test_a_paused_ad_from_a_failed_go_live_still_holds_the_creative(mock_d
     await _card(mock_db, agent, _add(), created=datetime.utcnow() - timedelta(hours=3))
     await _apply(mock_db, mock_mongo_client)
     poster.status_err = MetaStatusError("Meta hiccup", 500)
-    await _ticks(mock_db, mock_mongo_client, 12)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
     assert (await _line(mock_db))["state"] == "failed"
     poster.status_err = None
     await _card(mock_db, agent, _add(), _id="c2", run_id="r2")
@@ -1513,7 +1543,7 @@ async def test_a_retry_of_a_paused_new_ad_doesnt_count_itself(mock_db, mock_mong
     await _card(mock_db, agent, _add())
     await _apply(mock_db, mock_mongo_client)
     poster.status_err = MetaStatusError("hiccup", 500)
-    await _ticks(mock_db, mock_mongo_client, 12)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
     assert (await _line(mock_db))["state"] == "failed"
     poster.status_err = None
     await _live_ad(mock_db, "new1", status="ACTIVE")  # Meta turned it on after all
@@ -1674,12 +1704,9 @@ async def test_a_go_live_that_hangs_still_counts_as_a_try(mock_db, mock_mongo_cl
     for _ in range(4):
         await posting.run_post_jobs(mock_db, mock_mongo_client, _now(), limit=20)
 
-    async def hang(*a, **k):
-        await asyncio.sleep(30)
-
-    monkeypatch.setattr(posting, "go_live", hang)
-    with pytest.raises(asyncio.TimeoutError):
-        await asyncio.wait_for(sync_add_lines(mock_db, _now(), mock_mongo_client), timeout=0.05)
+    reached = _hangs(monkeypatch, posting, "go_live")
+    await _sync_cut_off_at(mock_db, mock_mongo_client, reached)
+    assert reached.is_set()
     assert (await _line(mock_db))["go_live_tries"] == 1
 
 
@@ -1856,7 +1883,7 @@ async def test_a_failed_read_at_go_live_never_turns_it_on(mock_db, mock_mongo_cl
     await _tick(mock_db, mock_mongo_client)
     await _tick(mock_db, mock_mongo_client)
     assert (await _line(mock_db))["state"] == "applying"  # a blip: it tries again
-    await _ticks(mock_db, mock_mongo_client, 10)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 2)
     line = await _line(mock_db)
     assert poster.calls["status"] == [] and line["state"] == "failed" and "paused" in line["error"]
 
@@ -2051,13 +2078,16 @@ async def test_find_ad_in_adset_prefers_the_creative_and_reads_every_page(monkey
         return pages[len(seen) - 1]
 
     monkeypatch.setattr(writer, "_request", request)
-    assert await writer.find_ad_in_adset("s", "t", name="Same", creative_id="cr") == "a2"
+    since = datetime(2026, 11, 4, 12)
+    fresh = {"status": "PAUSED", "created_time": "2026-11-04T12:00:30+0000"}
+    pages[0]["data"][0].update(fresh)
+    assert await writer.find_ad_in_adset("s", "t", name="Same", creative_id="cr", since=since) == "a2"
     assert seen[1]["after"] == "x" and "creative{id}" in seen[0]["fields"]
     seen.clear()
-    pages[:] = [{"data": [{"id": "a1", "name": "Same", "creative": {"id": "other"}}]}]
-    assert await writer.find_ad_in_adset("s", "t", name="Same", creative_id="cr") == "a1"
+    pages[:] = [{"data": [{"id": "a1", "name": "Same", "creative": {"id": "other"}, **fresh}]}]
+    assert await writer.find_ad_in_adset("s", "t", name="Same", creative_id="cr", since=since) == "a1"
     seen.clear()
-    assert await writer.find_ad_in_adset("s", "t", name="Nope", creative_id="cr") is None
+    assert await writer.find_ad_in_adset("s", "t", name="Nope", creative_id="cr", since=since) is None
 
 
 # ---------------------------------------------------------------------------
@@ -2127,7 +2157,7 @@ async def test_retry_of_a_paused_ad_checks_its_own_ad_set(mock_db, mock_mongo_cl
     await _card(mock_db, agent, _add())
     await _apply(mock_db, mock_mongo_client)
     poster.status_err = MetaStatusError("hiccup", 500)
-    await _ticks(mock_db, mock_mongo_client, 12)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
     poster.status_err = None
     assert (await _line(mock_db))["state"] == "failed"
     await _live_ad(mock_db, "d3")  # s1 is now full
@@ -2341,7 +2371,7 @@ async def test_a_paused_ad_on_a_replaced_card_ends_clearly(mock_db, mock_mongo_c
     await _card(mock_db, agent, _add())
     await _apply(mock_db, mock_mongo_client)
     poster.status_err = MetaStatusError("hiccup", 500)
-    await _ticks(mock_db, mock_mongo_client, 12)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
     poster.status_err = None
     assert "Try again" in (await _line(mock_db))["error"]
 
@@ -2449,3 +2479,324 @@ async def test_missing_job_repair_waits_when_the_lease_is_taken(mock_db, mock_mo
     token = await apply_mod._take_lease(mock_db, apply_mod._lease_key(agent["_id"], GID))
     await add_mod._repair_job(mock_db, await _get(mock_db), await mock_db[TEST_ADS].find_one({}), datetime.utcnow())
     assert token and await mock_db[POST_JOBS].count_documents({}) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: go-live tries
+# ---------------------------------------------------------------------------
+
+async def _to_created(db, client):
+    for _ in range(4):
+        await posting.run_post_jobs(db, client, _now(), limit=20)
+
+
+def test_go_live_tries_allow_about_a_quarter_of_an_hour():
+    assert add_mod.GO_LIVE_TRIES == 15
+
+
+async def test_a_check_that_keeps_raising_ends_paused(mock_db, mock_mongo_client, meta, poster, monkeypatch):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+
+    async def bug(*a, **k):
+        raise ValueError("unexpected shape")
+
+    monkeypatch.setattr(add_mod, "_go_live_refusal", bug)
+    for _ in range(add_mod.GO_LIVE_TRIES):
+        await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    assert (await _line(mock_db))["state"] == "applying"
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and line["paused_ad_id"] == "new1" and "paused in Meta" in line["error"]
+    assert poster.calls["status"] == [] and not line.get("write_started_at")
+
+
+async def test_a_read_cut_off_every_tick_ends_paused(mock_db, mock_mongo_client, meta, poster, monkeypatch):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+
+    reached = _hangs(monkeypatch, meta_state, "fetch_adset_ads")
+    for _ in range(add_mod.GO_LIVE_TRIES):
+        await _sync_cut_off_at(mock_db, mock_mongo_client, reached)
+        assert reached.is_set() and (await _line(mock_db))["state"] == "applying"
+    await _sync_cut_off_at(mock_db, mock_mongo_client, reached)
+    assert not reached.is_set()  # past the limit: no more reads
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and line["paused_ad_id"] == "new1" and poster.calls["status"] == []
+    assert await mock_db[apply_mod.LEASES].count_documents({}) == 0
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: adopting by name
+# ---------------------------------------------------------------------------
+
+async def _lost_reply_then_retry(db, client, poster, other: dict):
+    """create_ad's reply is lost and nothing landed, and another ad with this name sits in the ad set."""
+    poster.err["create_ad"] = MetaWriteError("Meta request failed: ")
+    await _ticks(db, client)
+    await _apply(db, client, line_ids=["l1"])
+    poster.made.append(other)
+    await _ticks(db, client)
+
+
+TODAY_NAME = clean_ad_name("BS - Timelapse - 100926 - Win", date.today())
+
+
+@pytest.mark.parametrize("status,age", [("PAUSED", timedelta(hours=3)), ("ACTIVE", timedelta(0)), ("ACTIVE", timedelta(hours=3))])
+async def test_a_persons_ad_with_the_same_name_is_never_adopted(status, age, mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db, max_live=9)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    meta.set("person1", status)
+    await _lost_reply_then_retry(mock_db, mock_mongo_client, poster, {
+        "id": "person1", "name": TODAY_NAME, "adset_id": "s1", "creative_id": "theirs",
+        "created_time": datetime.utcnow() - age})
+    line = await _line(mock_db)
+    assert line["state"] == "applied" and line["meta_ids"] == ["new2"]
+    assert "person1" not in [a for a, _ in poster.calls["status"]] and meta.ads["person1"]["status"] == status
+
+
+async def test_birdys_own_live_ad_with_the_same_clean_name_is_not_adopted(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db, max_live=9)
+    a = _add(1, video=False, key="img:h1", name="Static 1 - 100926")
+    b = _add(2, video=False, key="img:h2", name="Static 1 - 010226")
+    b["creative"]["image_hash"] = "h2"
+    await _card(mock_db, agent, a, b)
+    await _apply(mock_db, mock_mongo_client, line_ids=["l1"])
+    await _ticks(mock_db, mock_mongo_client)
+    first = await _line(mock_db, "l1")
+    assert first["meta_ids"] == ["new1"]
+    poster.made[0]["creative_id"] = "cr_of_a"
+    poster.err["create_ad"] = MetaWriteError("Meta request failed: ")
+    await _apply(mock_db, mock_mongo_client, line_ids=["l2"])
+    await _ticks(mock_db, mock_mongo_client)
+    await _apply(mock_db, mock_mongo_client, line_ids=["l2"])
+    await _ticks(mock_db, mock_mongo_client)
+    second = await _line(mock_db, "l2")
+    assert second["state"] == "applied" and second["meta_ids"] != ["new1"] and second["meta_ids"]
+
+
+async def test_a_paused_fresh_ad_with_the_name_is_adopted_after_a_rebuilt_creative(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    poster.lose_ad_reply = True
+    await _ticks(mock_db, mock_mongo_client)
+    poster.made[0]["creative_id"] = "an-earlier-creative"
+    await _apply(mock_db, mock_mongo_client, line_ids=["l1"])
+    await _ticks(mock_db, mock_mongo_client)
+    assert len(poster.ads) == 1 and (await _line(mock_db))["meta_ids"] == ["new1"]
+
+
+async def test_the_real_read_applies_the_name_rule(monkeypatch):
+    since = datetime(2026, 11, 4, 12, 0, 0)
+    rows = {"data": [
+        {"id": "old", "name": "N", "status": "PAUSED", "created_time": "2026-11-04T09:00:00+0000", "creative": {"id": "x"}},
+        {"id": "live", "name": "N", "status": "ACTIVE", "created_time": "2026-11-04T12:00:30+0000", "creative": {"id": "x"}},
+        {"id": "unparsable", "name": "N", "status": "PAUSED", "created_time": "soon", "creative": {"id": "x"}},
+        {"id": "other", "name": "M", "status": "PAUSED", "created_time": "2026-11-04T12:00:30+0000", "creative": {"id": "x"}}]}
+    seen = []
+
+    async def request(method, url, step, *, params=None, **kw):
+        seen.append(params)
+        return rows
+
+    monkeypatch.setattr(writer, "_request", request)
+    assert await writer.find_ad_in_adset("s", "t", name="N", creative_id="cr", since=since) is None
+    assert "status" in seen[0]["fields"] and "created_time" in seen[0]["fields"]
+    # A little clock difference is forgiven, and a creative match needs nothing else.
+    rows["data"].append({"id": "mine", "name": "N", "status": "PAUSED", "created_time": "2026-11-04T11:59:30+0000", "creative": {"id": "x"}})
+    assert await writer.find_ad_in_adset("s", "t", name="N", creative_id="cr", since=since) == "mine"
+    assert await writer.find_ad_in_adset("s", "t", name="zz", creative_id="x", since=since) == "old"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: saying "paused" only when it is
+# ---------------------------------------------------------------------------
+
+def _lands_then_lost(meta, poster, monkeypatch):
+    async def status(user_id, object_id, object_type, value, mongo_client):
+        poster.calls["status"].append((object_id, value))
+        meta.set(object_id, value)
+        raise MetaStatusError("timed out", 500)
+
+    monkeypatch.setattr(posting, "set_object_status", status)
+
+
+async def test_go_live_that_landed_is_applied_when_a_person_stops_the_agent(mock_db, mock_mongo_client, meta, poster, monkeypatch):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    _lands_then_lost(meta, poster, monkeypatch)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    assert (await _line(mock_db))["state"] == "applying"
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    line = await _line(mock_db)
+    assert line["state"] == "applied" and line["meta_ids"] == ["new1"] and line.get("paused_ad_id") is None
+    assert (await mock_db[TEST_ADS].find_one({}))["post_state"] == "active"
+    assert await mock_db[OUTCOMES].count_documents({}) == 1
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "undone"
+    assert meta.ads["new1"]["status"] == "PAUSED"
+
+
+async def test_go_live_that_landed_is_applied_when_the_tries_run_out(mock_db, mock_mongo_client, meta, poster, monkeypatch):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    await mock_db[CARDS].update_one({"_id": "c1"}, {"$set": {"lines.0.go_live_tries": add_mod.GO_LIVE_TRIES - 1}})
+    _lands_then_lost(meta, poster, monkeypatch)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    assert (await _line(mock_db))["state"] == "applied"
+
+
+async def test_go_live_that_didnt_land_says_paused_after_reading(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    poster.status_err = MetaStatusError("hiccup", 500)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    meta.reads.clear()
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    line = await _line(mock_db)
+    assert meta.reads == ["new1"] and line["state"] == "failed" and line["paused_ad_id"] == "new1" and "paused in Meta" in line["error"]
+
+
+async def test_no_attempt_means_nothing_to_read(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    assert meta.reads == [] and (await _line(mock_db))["paused_ad_id"] == "new1"
+
+
+async def test_unreadable_after_an_attempt_says_it_couldnt_confirm(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    poster.status_err = MetaStatusError("hiccup", 500)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    meta.read_error = RuntimeError("graph down")
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and line["reason_code"] == "unconfirmed" and line.get("paused_ad_id") is None
+    assert "confirm" in line["error"] and "paused" not in line["error"] and "Ads Manager" in line["error"]
+
+
+async def test_unconfirmed_on_a_replaced_card_doesnt_say_paused(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    poster.status_err = MetaStatusError("hiccup", 500)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    meta.read_error = RuntimeError("graph down")
+    await _card(mock_db, agent, _add(), _id="c2", run_id="r2", created=datetime.utcnow())
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    old = await _line(mock_db)
+    assert old["reason_code"] == "left_paused" and "paused in Meta" not in old["error"] and "confirm" in old["error"]
+    await apply_card(mock_db, mock_mongo_client, USER, "c2", by="s", source="d")
+    assert "paused" not in (await _line(mock_db, _id="c2"))["error"]
+
+
+async def test_an_ad_deleted_in_meta_says_so(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    poster.status_err = MetaStatusError("gone", 400)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    meta.ads["new1"] = None
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and "removed in Meta" in line["error"] and line.get("paused_ad_id") is None
+
+
+async def test_kill_switch_after_an_attempt_reads_too(mock_db, mock_mongo_client, meta, poster, monkeypatch):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    _lands_then_lost(meta, poster, monkeypatch)
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    monkeypatch.setenv("AGENT_ADD_WRITES_ENABLED", "false")
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    assert (await _line(mock_db))["state"] == "applied"
+
+
+# ---------------------------------------------------------------------------
+# Fix round 2: go-live wording
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("code", ["agent_off", "on_hold", "not_acting_agent", "now_flag", "not_auto", "superseded", "dismissed",
+                                  "max_ads_live", "no_destination", "live_check_failed", "protected_tag", "no_permission", "something_new"])
+async def test_each_go_live_stop_has_its_own_plain_words(code, mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    card, row = await _get(mock_db), await mock_db[TEST_ADS].find_one({})
+    await add_mod._leave_paused(mock_db, mock_mongo_client, card, card["lines"][0], row, {"code": code, "message": "Nothing was posted. Try again."})
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and line["reason_code"] == code and "paused in Meta" in line["error"]
+    low = line["error"].lower()
+    assert "nothing was" not in low and low.count("try again") <= 1 and ": " not in low and "\u2014" not in low
+
+
+async def test_stops_read_differently(mock_db, meta, poster):
+    codes = ["agent_off", "on_hold", "not_acting_agent", "now_flag", "not_auto", "superseded", "dismissed", "max_ads_live",
+             "no_destination", "live_check_failed"]
+    assert len({add_mod._stop_text({"code": c, "message": ""}) for c in codes}) == len(codes)
+
+
+@pytest.mark.parametrize("change", ["over_limit", "no_live_ads"])
+async def test_a_retry_refused_with_an_ad_uses_the_same_words(change, mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db, live=("d1", "d2"), max_live=3)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    await sync_add_lines(mock_db, _now(), mock_mongo_client)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "active"}})
+    if change == "over_limit":
+        await _live_ad(mock_db, "d3")
+    else:
+        meta.set("d1", "PAUSED")
+        meta.set("d2", "PAUSED")
+    await _apply(mock_db, mock_mongo_client, line_ids=["l1"])
+    line = await _line(mock_db)
+    low = line["error"].lower()
+    assert line["state"] == "blocked" and low.count("paused in meta") == 1 and "nothing was" not in low and low.count("try again") <= 1
+
+
+async def test_a_meta_error_that_says_try_again_isnt_said_twice(mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add())
+    await _apply(mock_db, mock_mongo_client)
+    await _to_created(mock_db, mock_mongo_client)
+    poster.status_err = MetaStatusError("Meta is busy. Try again in a few minutes.", 500)
+    await _ticks(mock_db, mock_mongo_client, add_mod.GO_LIVE_TRIES + 6)
+    line = await _line(mock_db)
+    assert line["state"] == "failed" and line["error"].lower().count("try again") == 1 and "paused in Meta" in line["error"]
+
+
+@pytest.mark.parametrize("line_", [
+    {"body": None, "title": "T"}, {"body": "B", "title": None}])
+async def test_no_words_says_what_to_do_next(line_, mock_db, mock_mongo_client, meta, poster):
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _worded(video=False, key="img:h1", **line_))
+    await _apply(mock_db, mock_mongo_client)
+    assert "Post it by hand in Ads Manager if you want it." in (await _line(mock_db))["error"]

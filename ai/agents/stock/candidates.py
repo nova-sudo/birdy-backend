@@ -67,6 +67,12 @@ def _copyable(ad: dict) -> bool:
     return bool(c.get("image_hash") or c.get("video_id"))
 
 
+def _has_words(ad: dict) -> bool:
+    """A blank ad is never posted, so one with no words we can read isn't offered, and takes no Auto slot. A
+    dynamic ad's `asset_feed_spec` isn't one text to copy, so it counts as none."""
+    return bool(str((ad.get("creative") or {}).get("body") or "").strip())
+
+
 async def _account_ads(db, gid: str) -> list[dict]:
     """The group's whole cached ad account, archived and rejected ads included."""
     return [d async for d in db["meta_ad_state"].find({"client_group_id": gid})]
@@ -97,7 +103,7 @@ async def _adds(db, agent, settings, group, window, user_id, already_run: set[st
             s, leads = sums.get(ad["ad_id"], (0.0, 0))
             c = cpl(s, leads)
             key = creative_key(ad)
-            if (c is None or leads < cfg["winner_min_leads"] or not _copyable(ad) or key in already_run
+            if (c is None or leads < cfg["winner_min_leads"] or not _copyable(ad) or not _has_words(ad) or key in already_run
                     or str(ad.get("effective_status") or "").upper() in _NOT_COPYABLE):
                 continue
             rec = await record_for(db, agent.get("_id"), key, sorted(shared))

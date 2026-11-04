@@ -11,6 +11,7 @@ Failures raise MetaWriteError tagged with the wizard `step` that failed.
 
 import base64
 import json
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 from typing import Optional, Union
 
@@ -71,6 +72,7 @@ IMAGE_TYPES = ("image/jpeg", "image/png")
 META_CDN_SUFFIX = ".fbcdn.net"
 VIDEO_PROCESS_FAILED = "Meta could not process the video"
 AD_READ_PAGES = 20
+ADOPT_CLOCK_MARGIN = timedelta(minutes=2)  # our clock against Meta's, for "made since we asked"
 
 
 def _check_blob_url(url: str, *, allow_meta_cdn: bool = False) -> None:
@@ -227,18 +229,29 @@ async def create_ad(act: str, token: str, *, name: str, adset_id: str, creative_
     return data["id"]
 
 
-async def find_ad_in_adset(adset_id: str, token: str, *, name: str, creative_id: str) -> Optional[str]:
-    """An ad already in this ad set that a lost `create_ad` reply left behind: the one on this creative, else
-    the one with exactly this name (a retry can have rebuilt the creative). None when there isn't one. Raises
-    MetaWriteError when the whole ad set couldn't be read, since then nobody can say there's none."""
-    params = {"access_token": token, "fields": "id,name,creative{id}", "limit": 200}
+def _made_since(ad: dict, since: datetime) -> bool:
+    try:
+        made = datetime.strptime(str(ad.get("created_time")), "%Y-%m-%dT%H:%M:%S%z")
+    except ValueError:
+        return False
+    since = since if since.tzinfo else since.replace(tzinfo=timezone.utc)
+    return made >= since - ADOPT_CLOCK_MARGIN
+
+
+async def find_ad_in_adset(adset_id: str, token: str, *, name: str, creative_id: str, since: datetime) -> Optional[str]:
+    """An ad already in this ad set that a lost `create_ad` reply left behind. The one on this creative, always.
+    Else, as a retry can have rebuilt the creative, one with exactly this name that is PAUSED, as every ad we
+    create starts, and was made since `since`, when we asked: names repeat, and a person's ad or an older live one
+    must never be taken for ours. None when there isn't one. Raises MetaWriteError when the whole ad set couldn't
+    be read, since then nobody can say there's none."""
+    params = {"access_token": token, "fields": "id,name,status,created_time,creative{id}", "limit": 200}
     by_name = None
     for _ in range(AD_READ_PAGES):
         data = await _request("GET", f"{GRAPH}/{adset_id}/ads", "read_adset_ads", params=params, timeout=30.0)
         for ad in data.get("data") or []:
             if str((ad.get("creative") or {}).get("id")) == str(creative_id):
                 return ad["id"]
-            if by_name is None and ad.get("name") == name:
+            if by_name is None and ad.get("name") == name and ad.get("status") == "PAUSED" and _made_since(ad, since):
                 by_name = ad["id"]
         paging = data.get("paging") or {}
         after = (paging.get("cursors") or {}).get("after")
