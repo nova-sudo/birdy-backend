@@ -29,8 +29,9 @@ Rules:
 - "add" holds candidate_id values from <candidates> add. "remove" and "revive" hold ad_id values
   from <candidates> remove and revive. Choose nothing else. Choose nothing at all if no change is
   warranted.
-- Live ads after your changes (ads_live minus removes plus adds plus revives) must not exceed
-  max_live.
+- max_live is per ad set. After your changes, no ad set you add to may have more than max_live live
+  ads. ads_live_by_adset has each ad set's count now. A remove or revive counts in its own adset_id,
+  and an add counts in main_adset_id.
 - Every money figure you write must be copied exactly from the facts or the candidates, in the
   currency it was given in, always with its currency symbol or code (for example £4.12 or 4.12 GBP),
   never as a bare number. Never calculate, convert or estimate a money figure. Percentages and
@@ -61,7 +62,7 @@ def _candidates_view(cands: dict) -> dict:
     """What the model needs to pick: ids, names, performance. No creative blobs."""
     add_keys = ("candidate_id", "ad_name", "source_name", "currency", "spend", "leads", "cpl",
                 "green_under", "record")
-    ad_keys = ("ad_id", "ad_name", "off_since", "spend", "leads", "cpl")
+    ad_keys = ("ad_id", "ad_name", "adset_id", "off_since", "spend", "leads", "cpl")
     return {
         "add": [{k: c.get(k) for k in add_keys} for c in cands.get("add") or []],
         "revive": [{k: c.get(k) for k in ad_keys} for c in cands.get("revive") or []],

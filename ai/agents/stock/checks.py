@@ -74,6 +74,19 @@ def totals(days: dict[str, list[AdDay]], start: date, end: date) -> dict[str, tu
     return out
 
 
+def _live_by_adset(live: dict, cur: dict) -> tuple[dict, str | None]:
+    """Live ads per ad set, since max_ads_live is per ad set, and the main one, where an Add goes: the
+    live ad set spending most in the window. A tie goes to the one with more live ads, then to the id."""
+    counts: dict[str, int] = {}
+    spend: dict[str, float] = {}
+    for ad_id, row in live.items():
+        adset = row.get("adset_id")
+        if adset:
+            counts[str(adset)] = counts.get(str(adset), 0) + 1
+            spend[str(adset)] = spend.get(str(adset), 0.0) + cur.get(ad_id, (0.0, 0))[0]
+    return counts, max(counts, key=lambda a: (spend[a], counts[a], a), default=None)
+
+
 async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
     """Everything a card needs about one client. `zones` is None when the client has no usable
     limits: zone and decision are then "no_zones" and nothing is judged, so the run can flag it.
@@ -101,6 +114,7 @@ async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
     state = {d["ad_id"]: d async for d in db["meta_ad_state"].find({"client_group_id": gid})}
     live = {a: s for a, s in state.items()
             if str(s.get("effective_status") or "").upper() == "ACTIVE" and in_scope(s.get("campaign_id"), group)}
+    by_adset, main_adset = _live_by_adset(live, cur)
     ads = []
     for ad_id, (s, l) in sorted(cur.items(), key=lambda kv: -kv[1][0]):
         ads.append({"ad_id": ad_id, "name": (state.get(ad_id) or {}).get("name") or days[ad_id][-1].ad_name,
@@ -112,7 +126,8 @@ async def client_facts(db, agent: dict, group: dict, window: Window) -> dict:
                         "prev_start": window.prev_start.isoformat(), "prev_end": window.prev_end.isoformat()},
              "spend": spend, "leads": leads, "cpl": cur_cpl,
              "prev_spend": prev_spend, "prev_leads": prev_leads, "prev_cpl": prev_cpl,
-             "ads_live": len(live), "ads": ads, "spend_stopped": spend_stopped, "history_state": history_state,
+             "ads_live": len(live), "ads_live_by_adset": by_adset, "main_adset_id": main_adset,
+             "ads": ads, "spend_stopped": spend_stopped, "history_state": history_state,
              "zones": None if zones is None else {"green_under": zones.green_under, "red_over": zones.red_over}}
     if zones is None:
         return {**facts, "zone": "no_zones", "decision": "no_zones"}

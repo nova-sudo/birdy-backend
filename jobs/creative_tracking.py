@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import date, datetime, timedelta, timezone
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 TICK_BUDGET_SECONDS = 45
 # Posting gets the first slice of the tick, then stock agent lines waiting to be applied; tracking
 # then runs against its own TICK_BUDGET_SECONDS deadline from the tick start (so always at least ~10 s).
+# The stock budget is hard, since one Graph call can take 30 s: a line cut off stays recoverable.
 POST_BUDGET_SECONDS = 25
 STOCK_LINES_BUDGET_SECONDS = 10
 MAX_TESTS_PER_TICK = 25
@@ -363,8 +365,12 @@ async def run_creatives_tick(now_utc: datetime | None = None) -> dict:
             logger.error(f"[creatives-post] tick failed: {e}", exc_info=True)
             result["posting"] = {"error": str(e)[:300]}
         try:
-            result["stock_lines"] = await process_queued_lines(
-                db, mongo_client, now_utc, deadline=time.monotonic() + STOCK_LINES_BUDGET_SECONDS)
+            budget = max(0.0, min(STOCK_LINES_BUDGET_SECONDS, deadline - time.monotonic()))
+            result["stock_lines"] = await asyncio.wait_for(
+                process_queued_lines(db, mongo_client, now_utc, deadline=time.monotonic() + budget), timeout=budget)
+        except asyncio.TimeoutError:
+            logger.info("[stock-lines] budget of %ss used, the next tick goes on", STOCK_LINES_BUDGET_SECONDS)
+            result["stock_lines"] = {"timed_out": True}
         except Exception as e:
             logger.error(f"[stock-lines] tick failed: {e}", exc_info=True)
             result["stock_lines"] = {"error": str(e)[:300]}

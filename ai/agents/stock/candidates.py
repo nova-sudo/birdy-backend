@@ -128,7 +128,8 @@ async def _revive_and_remove(db, settings, group, window, user_id, ads: list[dic
     for a in scoped:
         if str(a.get("effective_status") or "").upper() == "ACTIVE":
             s, leads = recent.get(a["ad_id"], (0.0, 0))
-            remove.append({"ad_id": a["ad_id"], "ad_name": a.get("name") or "", "spend": s, "leads": leads,
+            remove.append({"ad_id": a["ad_id"], "ad_name": a.get("name") or "", "adset_id": a.get("adset_id"),
+                           "spend": s, "leads": leads,
                            "cpl": cpl(s, leads)})
     remove.sort(key=lambda r: -r["spend"])
 
@@ -145,7 +146,8 @@ async def _revive_and_remove(db, settings, group, window, user_id, ads: list[dic
         if (off_since is None or off_since > cutoff or c is None or leads < cfg["winner_min_leads"]
                 or c >= zones.green_under or creative_key(a) in live_keys):
             continue
-        revive.append({"ad_id": a["ad_id"], "ad_name": a.get("name") or "", "off_since": off_since.isoformat(),
+        revive.append({"ad_id": a["ad_id"], "ad_name": a.get("name") or "", "adset_id": a.get("adset_id"),
+                       "off_since": off_since.isoformat(),
                        "spend": s, "leads": leads, "cpl": c, "ratio": c / zones.green_under})
     revive.sort(key=lambda r: r["ratio"])
     return revive, remove

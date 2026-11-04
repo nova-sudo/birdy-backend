@@ -18,18 +18,30 @@ check of the card's status and version. So a killed invocation leaves one of two
   no write_started_at   nothing was sent. Queued again, up to MAX_RECOVERIES, and every check reruns.
   write_started_at      it may have landed. Never sent again: the ad's status is read from Meta.
                         Landed: `applied`, counted as Birdy's write, logged once.
-                        Not landed: `failed`, saying so; a person can Retry.
+                        Not landed: `failed`, saying so; a person can Retry. The marker stays, so
+                        if it lands late, the Retry finds it done and it still counts as Birdy's.
                         Unreadable: stays `applying` and is read again each minute. After
                         CONFIRM_GIVE_UP it is `failed`, saying Birdy couldn't confirm it. A Retry reads
                         first, so that can't send twice either.
 
-Recovery only touches lines older than STUCK_AFTER, longer than an invocation can live. A write
-whose reply was an error is read back the same way, since a timeout can hide a write that landed.
+Recovery only touches lines older than STUCK_AFTER, longer than an invocation can live. A send that
+timed out stays `applying` for recovery, since it can land after any read made now. A reply where
+Meta said no is read back once and is `failed`.
 `undoing` works the same way, using `undo_write_started_at`.
 
 Refusals: statuses are an allow-list (`open`, plus `partly_applied`), `closing` and `superseded` are
 never applied, and a card with a newer card for its client is refused. If a card closes after the
 send has gone, the line still records what really happened, and its Undo still works.
+
+Before each write, one short lease per agent covers "check the guardrails, then send", so two
+invocations can't each see a spare ad and pause it. The lease expires by itself after a crash. A line
+that can't get it stays `queued` for the cron. Recovery only reads, so it doesn't take it. A write sent
+but not yet confirmed isn't in the day's pause count until recovery confirms it.
+
+The target's ad set is read from Meta before every write: last live ad, protected tags, taught
+exceptions and the live ad limit are judged on that list. A failed read, or an ad with no known ad set,
+refuses the line. The mode is resolved again at write time, for Remove and Bring back: now Flag means
+`flagged` and no write, and Auto only writes if it still resolves to Auto.
 
 Add lines are left as they are here. They reach Meta through the posting pipeline.
 """
@@ -37,17 +49,21 @@ Add lines are left as they are here. They reach Meta through the posting pipelin
 import asyncio
 import logging
 import time
+import uuid
 from datetime import datetime, timedelta
 
-from ai.agents.guardrails import _naive_utc, agent_tz, check_adset_contents_live, check_guardrails, local_today
+from pymongo.errors import DuplicateKeyError
+
+from ai.agents import claims
+from ai.agents.guardrails import (DEFAULT_GUARDRAILS, _naive_utc, agent_tz, check_adset_contents_live, check_guardrails,
+                                  local_today)
 from ai.agents.meta_state import AD_STATE, record_status_write
 from ai.agents.outcomes import UNDO_AUTO_WINDOW
 from ai.agents.stock.cards import (STATE_APPLIED, STATE_APPLYING, STATE_BLOCKED, STATE_FAILED, STATE_FLAGGED,
                                    STATE_NEEDS_FILE, STATE_PROPOSED, STATE_QUEUED, STATE_UNDOING, STATE_UNDONE,
                                    STATUS_APPLIED, STATUS_CLOSING, STATUS_DISMISSED, STATUS_FLAGGED, STATUS_OPEN,
                                    STATUS_PARTLY_APPLIED, STATUS_SUPERSEDED, guarded_update)
-from ai.agents.stock.checks import in_scope
-from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
+from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_mode
 from ai.agents.store import AGENTS, CARDS, RUNS, list_memory
 from ai.suggestions.actions import _is_desired, execute_action
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS
@@ -63,6 +79,12 @@ MAX_RECOVERIES = 2                     # kills before the send that a line survi
 QUEUE_BATCH = 200                      # cards looked at per cron pass; the rest wait a minute
 ERROR_MAX = 300
 _RACE_TRIES = 8
+
+LEASES = "agent_write_leases"          # one row per agent while it is checking and sending
+LEASE_TTL = timedelta(seconds=150)     # longer than the four Graph calls of one line, at 30 s each
+UNDO_LEASE_WAIT_S = 2.0                # Undo has a person waiting, so it waits this long, then says retry
+_LEASE_POLL_S = 0.2
+RECOVERY_READ_TIMEOUT_S = 3            # a hung read counts as unreadable, so one can't eat the tick
 
 WRITABLE_KINDS = ("remove", "revive")
 _ACTIONABLE = (STATUS_OPEN, STATUS_PARTLY_APPLIED)
@@ -87,6 +109,12 @@ ALREADY_DONE = "Already done in Meta. Nothing changed."
 UNDO_NOT_WRITTEN = "Birdy made no change here, so there was nothing to reverse."
 ALREADY_APPLIED = "Already applied. Undo it instead."
 BUSY = "Birdy is applying this right now. Try again in a moment."
+NOW_FLAG = "This change is now set to Flag, so Birdy didn't make it. Make it in Meta if you want it."
+OTHER_AGENT = "Another agent now handles this client, so Birdy can't undo this. Change it in Ads Manager if you need to."
+NO_ADSET = {"code": "no_adset", "message": "Birdy doesn't know which ad set this ad is in, so nothing was changed."}
+LAST_LIVE = {"code": "last_live_ad", "message": "Pausing this would leave its ad set with no live ads."}
+NO_AD = {"code": "no_ad", "message": "This line doesn't name an ad, so nothing was changed."}
+SEVERAL_ADS = {"code": "several_ads", "message": "This line names more than one ad, so nothing was changed."}
 
 
 def _action_type(kind: str, *, undo: bool = False) -> str:
@@ -134,6 +162,8 @@ def _status_after(status: str, lines: list[dict]) -> str:
     if status not in (STATUS_OPEN, STATUS_PARTLY_APPLIED, STATUS_APPLIED):
         return status
     states = [ln.get("state") for ln in lines]
+    if status == STATUS_OPEN and states and all(s == STATE_FLAGGED for s in states):
+        return STATUS_FLAGGED  # the mode changed: nothing here can be applied any more
     if not any(s in _TOUCHED for s in states):
         return status
     return STATUS_PARTLY_APPLIED if any(s in _WAITING for s in states) else STATUS_APPLIED
@@ -241,8 +271,8 @@ async def _refusal(db, agent: dict | None, card: dict) -> dict | None:
 
 
 def _target_doc(card: dict, line: dict, atype: str) -> dict:
-    """The shape check_guardrails and check_adset_contents_live read. They are given the stored
-    agent, so its `_id` turns on the not_acting_agent check."""
+    """The shape check_guardrails reads. Given a stored agent, its `_id` turns on the
+    not_acting_agent check."""
     return {"action": {"type": atype, "targets": [{"object_id": _ad_id(line), "object_type": "ad",
                                                    "name": line.get("ad_name")}]},
             "client_group_id": card.get("client_group_id"), "client_name": card.get("client_name"),
@@ -254,29 +284,84 @@ def _ad_id(line: dict) -> str | None:
     return str(ids[0]) if ids else None
 
 
-async def _over_live_limit(db, agent: dict, card: dict, ad_id: str) -> dict | None:
-    """Live ads never go over max_ads_live (spec section 6), however long ago the card was written."""
+def _over_live_limit(agent: dict, ad_id: str, live: set[str]) -> dict | None:
+    """Live ads per ad set never go over max_ads_live (spec section 6), however old the card is."""
     limit = _settings(agent)["creative"]["max_ads_live"]
-    gid = card.get("client_group_id")
-    group = await db["client_groups"].find_one({"id": gid, "user_id": card.get("user_id")}) or {}
-    rows = await db[AD_STATE].find({"client_group_id": gid, "effective_status": "ACTIVE"}).to_list(length=None)
-    live = {r["ad_id"] for r in rows if in_scope(r.get("campaign_id"), group)}
     if ad_id in live or len(live) < limit:
         return None
     return {"code": "max_ads_live",
-            "message": f"Turning this on would make {len(live) + 1} ads live, over the limit of {limit}."}
+            "message": f"Turning this on would make {len(live) + 1} ads live in its ad set, over the limit of {limit}."}
 
 
-async def _guardrail_block(db, mongo_client, agent: dict, card: dict, line: dict, atype: str,
-                           now: datetime) -> dict | None:
+async def _would_empty_adset(db, gid: str, adset_id: str, ad_id: str, live: set[str]) -> bool:
+    """Would pausing this leave nothing live? An ad Birdy has down as off doesn't count as a spare even
+    if Meta lists it live: a read just after a write can lag, so when the two disagree, refuse."""
+    rows = db[AD_STATE].find({"client_group_id": gid, "adset_id": adset_id, "effective_status": {"$ne": "ACTIVE"}})
+    known_off = {str(r["ad_id"]) async for r in rows}
+    return bool(live) and not (live - {ad_id} - known_off)
+
+
+async def _guardrail_block(db, mongo_client, agent: dict, card: dict, line: dict, atype: str, now: datetime, *,
+                           undo: bool = False) -> dict | None:
+    """Every check before a write. The stored rules run with the last live ad check off, because the
+    list from Meta decides that. An Undo restores what Birdy changed, so it skips the pause cap and the
+    live ad limit, and its acting agent check is done by the caller."""
+    rules = {**(agent.get("guardrails") or {}), "protect_last_live_ad": False}
+    guard = {**agent, "guardrails": rules}
+    if undo:
+        guard.pop("_id", None)
+        guard.update(guardrails={**rules, "max_pauses_per_client_day": None}, client_caps={})
     doc = _target_doc(card, line, atype)
-    g = await check_guardrails(db, agent, doc, now_utc=now)
-    if g.ok:
-        memories = await list_memory(db, agent["_id"], active_only=True)
-        g = await check_adset_contents_live(db, mongo_client, agent, doc, memories=memories, now_utc=now)
+    g = await check_guardrails(db, guard, doc, now_utc=now)
     if not g.ok:
         return {"code": g.reason, "message": g.message}
-    return await _over_live_limit(db, agent, card, _ad_id(line)) if atype == ACTION_ENABLE_ADS else None
+
+    gid, ad_id = card.get("client_group_id"), _ad_id(line)
+    row = await db[AD_STATE].find_one({"client_group_id": gid, "ad_id": ad_id})
+    adset_id = str(row["adset_id"]) if row and row.get("adset_id") else None
+    if adset_id is None:
+        return NO_ADSET
+    target = {"object_id": adset_id, "object_type": "adset", "name": line.get("ad_name"), "only_ad_id": ad_id}
+    read: dict = {}
+    g = await check_adset_contents_live(db, mongo_client, agent, {**doc, "action": {"type": atype, "targets": [target]}},
+                                        memories=await list_memory(db, agent["_id"], active_only=True), now_utc=now,
+                                        read_ads=read)
+    if not g.ok:
+        return {"code": g.reason, "message": g.message}
+    live = {str(a.get("id")) for a in read.get(adset_id) or [] if str(a.get("effective_status") or "").upper() == "ACTIVE"}
+    if atype == ACTION_PAUSE_ADS:
+        protect = {**DEFAULT_GUARDRAILS, **(agent.get("guardrails") or {})}.get("protect_last_live_ad")
+        return LAST_LIVE if protect and await _would_empty_adset(db, gid, adset_id, ad_id, live) else None
+    return None if undo else _over_live_limit(agent, ad_id, live)
+
+
+# ---------------------------------------------------------------------------
+# The lease
+# ---------------------------------------------------------------------------
+
+async def _take_lease(db, agent_id: str) -> str | None:
+    """A token, or None while another invocation holds this agent's lease. The real clock on purpose."""
+    token, now = uuid.uuid4().hex, datetime.utcnow()
+    try:
+        await db[LEASES].find_one_and_update({"_id": agent_id, "expires_at": {"$lte": now}},
+                                             {"$set": {"token": token, "expires_at": now + LEASE_TTL}}, upsert=True)
+    except DuplicateKeyError:
+        return None
+    return token
+
+
+async def _wait_for_lease(db, agent_id: str) -> str | None:
+    give_up = time.monotonic() + UNDO_LEASE_WAIT_S
+    while True:
+        token = await _take_lease(db, agent_id)
+        left = give_up - time.monotonic()
+        if token or left <= 0:
+            return token
+        await asyncio.sleep(min(_LEASE_POLL_S, left))
+
+
+async def _release_lease(db, agent_id: str, token: str) -> None:
+    await db[LEASES].delete_one({"_id": agent_id, "token": token})
 
 
 # ---------------------------------------------------------------------------
@@ -285,24 +370,28 @@ async def _guardrail_block(db, mongo_client, agent: dict, card: dict, line: dict
 
 async def _send_and_confirm(mongo_client, card: dict, line: dict, atype: str) -> tuple[bool | None, str | None]:
     """(landed, Meta's error). A reply that isn't a success doesn't prove the write failed, so it is
-    read back. landed is None when Meta can't say: only a later read can."""
+    read back. landed is False only when Meta said no. It is None when only a later read can say: Meta
+    can't be read, or the send was lost, since a timed-out write can land after this read."""
     user_id, ad_id = card["user_id"], _ad_id(line)
     target = {"object_id": ad_id, "object_type": "ad", "name": line.get("ad_name")}
-    error = None
+    error, lost = None, False
     try:
         res = await execute_action(mongo_client, user_id, {"type": atype, "targets": [target]})
         if res.get("succeeded"):
             return True, None
         error = ((res.get("failed") or [{}])[0]).get("error") or "Meta didn't accept this."
+        lost = error.startswith("Failed to reach Meta")
     except Exception as e:  # noqa: BLE001 - same as a lost reply: read what really happened
         logger.error("stock card %s: send for %s raised: %s", card["_id"], ad_id, e, exc_info=True)
-        error = "Meta didn't accept this."
+        error, lost = "Meta didn't accept this.", True
     try:
         state = await get_object_state(user_id, ad_id, "ad", mongo_client)
     except Exception as e:  # noqa: BLE001
         logger.warning("stock card %s: read-back of %s failed: %s", card["_id"], ad_id, e)
         return None, error
-    return _landed(atype, state), error
+    if _landed(atype, state):
+        return True, error
+    return (None if lost else False), error
 
 
 async def _log_once(db, card: dict, line: dict, kind: str, *, label: str, title: str, decision: dict,
@@ -326,7 +415,10 @@ async def _mirror(db, card: dict, agent: dict | None, line: dict, atype: str, no
 
 
 async def _finish_applied(db, card: dict, agent: dict | None, line: dict, atype: str, now: datetime, *,
-                          wrote: bool) -> None:
+                          wrote: bool, written_at: datetime | None = None) -> None:
+    """`written_at` is when the write really went, which recovery can only learn from the line. The Undo
+    window runs from there."""
+    applied_at = written_at or now
     decision = line.get("decision") or {}
     note = None if wrote else ALREADY_DONE
     await _mirror(db, card, agent, line, atype, now)
@@ -334,8 +426,8 @@ async def _finish_applied(db, card: dict, agent: dict | None, line: dict, atype:
     label = "Auto-run by Birdy" if decision.get("actor") == ACTOR_BIRDY else f"Approved by {_who(decision)}"
     await _log_once(db, card, line, KIND_ACTION_APPLIED, label=label, title=f"{verb} {line.get('ad_name') or 'an ad'}",
                     decision=decision, action_type=atype if wrote else None, note=note)
-    await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_APPLIED, applied_at=now,
-                    undo_until=now + UNDO_AUTO_WINDOW, wrote=wrote, note=note, error=None, reason_code=None)
+    await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_APPLIED, applied_at=applied_at,
+                    undo_until=applied_at + UNDO_AUTO_WINDOW, wrote=wrote, note=note, error=None, reason_code=None)
 
 
 async def _block(db, card: dict, line: dict, reason: dict) -> None:
@@ -351,8 +443,19 @@ async def _fail(db, card: dict, line: dict, error: str, **extra) -> None:
 async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime, sent: list) -> None:
     agent = await _load_agent(db, card)
     refusal = await _refusal(db, agent, card)
-    if refusal is None and not _ad_id(line):
-        refusal = {"code": "no_ad", "message": "This line doesn't name an ad, so nothing was changed."}
+    if refusal is None:
+        ids = line.get("meta_ids") or []
+        refusal = SEVERAL_ADS if len(ids) > 1 else None if ids else NO_AD
+    if refusal is None:
+        mode = resolve_mode(_settings(agent), card.get("client_group_id"), line["kind"])
+        if mode == "flag":
+            await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_FLAGGED, mode="flag",
+                            error=None, reason_code=None, note=NOW_FLAG)
+            return None
+        if mode != "auto" and (line.get("decision") or {}).get("actor") == ACTOR_BIRDY:
+            await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_PROPOSED, mode=mode,
+                            decision=None)
+            return None
     atype = _action_type(line["kind"])
     if refusal is None:
         refusal = await _guardrail_block(db, mongo_client, agent, card, line, atype, now)
@@ -369,7 +472,8 @@ async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime
         return await _fail(db, card, line, GONE)
     if _is_desired(atype, state):
         # Done already. If an earlier try sent it, that was Birdy's write and it counts.
-        return await _finish_applied(db, card, agent, line, atype, now, wrote=bool(line.get("write_started_at")))
+        return await _finish_applied(db, card, agent, line, atype, now, wrote=bool(line.get("write_started_at")),
+                                     written_at=line.get("write_started_at"))
 
     # The last check: this write is refused if the card closed or changed status, and nothing is
     # sent until it's stored that something may have been.
@@ -392,23 +496,34 @@ async def _apply_claimed(db, mongo_client, card: dict, line: dict, now: datetime
 
 
 async def _run_line(db, mongo_client, card_id: str, line_id: str, now: datetime) -> None:
-    """Take one queued line and see it through. A raise here stays with this line."""
-    card = await _set_line(db, card_id, line_id, expect=(STATE_QUEUED,), state=STATE_APPLYING, applying_at=now)
-    if card is None:
+    """Take one queued line and see it through. A raise here stays with this line. If the agent's lease
+    is taken, the line stays queued for the cron."""
+    row = await db[CARDS].find_one({"_id": card_id}, {"agent_id": 1})
+    if row is None:
         return
-    line = _find_line(card, line_id)
-    sent: list = []
+    agent_id = row.get("agent_id")
+    token = await _take_lease(db, agent_id)
+    if token is None:
+        return
     try:
-        await _apply_claimed(db, mongo_client, card, line, now, sent)
-    except asyncio.CancelledError:  # the request's budget ran out. Nothing sent, so it goes back
-        if not sent:
-            await _set_line(db, card_id, line_id, expect=(STATE_APPLYING,), state=STATE_QUEUED)
-        raise
-    except Exception as e:  # noqa: BLE001
-        logger.error("stock card %s line %s failed: %s", card_id, line_id, e, exc_info=True)
-        if not sent:
-            await _fail(db, card, line, NOTHING_CHANGED)
-        # Once sent, it stays `applying`: only a read of Meta can say what happened.
+        card = await _set_line(db, card_id, line_id, expect=(STATE_QUEUED,), state=STATE_APPLYING, applying_at=now)
+        if card is None:
+            return
+        line = _find_line(card, line_id)
+        sent: list = []
+        try:
+            await _apply_claimed(db, mongo_client, card, line, now, sent)
+        except asyncio.CancelledError:  # the budget ran out. Nothing sent, so it goes back
+            if not sent:
+                await _set_line(db, card_id, line_id, expect=(STATE_APPLYING,), state=STATE_QUEUED)
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error("stock card %s line %s failed: %s", card_id, line_id, e, exc_info=True)
+            if not sent:
+                await _fail(db, card, line, NOTHING_CHANGED)
+            # Once sent, it stays `applying`: only a read of Meta can say what happened.
+    finally:
+        await _release_lease(db, agent_id, token)
 
 
 async def _run_line_safely(db, mongo_client, card_id: str, line_id: str, now: datetime) -> None:
@@ -464,6 +579,8 @@ def _outcome(card: dict, line_ids: list[str]) -> dict:
     why = next((ln.get("error") for ln in lines if ln.get("error")), None)
     if any(s in _IN_PROGRESS for s in states):
         return _answer("queued", card)
+    if all(s == STATE_FLAGGED for s in states):
+        return _answer("flagged", card, reason=NOW_FLAG)
     if all(s == STATE_APPLIED for s in states):
         return _answer("applied", card)
     if STATE_APPLIED in states:
@@ -582,7 +699,8 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
     elif not pairs:
         outcome = "noop"
     else:
-        outcome = "applied" if counts["applied"] else "failed" if counts["failed"] else "blocked"
+        outcome = ("applied" if counts["applied"] else "failed" if counts["failed"]
+                   else "blocked" if counts["blocked"] else "noop")  # noop: they had all turned into Flag
     return {"ok": True, "outcome": outcome, "reason": None, **counts}
 
 
@@ -614,9 +732,11 @@ def _fallback(card: dict, client: dict, run: dict, line: dict, adds_so_far: int,
     return None
 
 
-async def _queue_auto(db, card: dict, client: dict, run: dict, add_limit: int, decision: dict) -> list[tuple[str, str]]:
+async def _queue_auto(db, card: dict, client: dict, run: dict, settings: dict, add_limit: int,
+                      decision: dict) -> list[tuple[str, str]]:
     """In one write: send fall-backs to Ask me, for good, and queue what may run. A fall-back stays
-    even when its reason passes, because a person may already be looking at an Apply button."""
+    even when its reason passes, because a person may already be looking at an Apply button. Remove and
+    Bring back follow the current settings: the mode may have changed since the card was written."""
     queued: list[dict] = []
 
     def change(fresh):
@@ -626,7 +746,11 @@ async def _queue_auto(db, card: dict, client: dict, run: dict, add_limit: int, d
             auto = ln.get("mode") == "auto"
             if auto and ln.get("kind") == "add":
                 adds += 1
-            if auto and ln.get("state") in (STATE_PROPOSED, STATE_NEEDS_FILE):
+            writable = ln.get("kind") in WRITABLE_KINDS
+            mode = resolve_mode(settings, fresh.get("client_group_id"), ln["kind"]) if writable else "auto"
+            if auto and ln.get("state") == STATE_PROPOSED and mode != "auto":
+                ln, changed = {**ln, "mode": mode, "state": STATE_FLAGGED if mode == "flag" else STATE_PROPOSED}, True
+            elif auto and ln.get("state") in (STATE_PROPOSED, STATE_NEEDS_FILE):
                 why = _fallback(fresh, client, run, ln, adds, add_limit)
                 if why:
                     ln, changed = {**ln, "mode": "ask", "auto_fallback": why}, True
@@ -636,7 +760,7 @@ async def _queue_auto(db, card: dict, client: dict, run: dict, add_limit: int, d
             lines.append(ln)
         if not changed:
             return None
-        fields = {"lines": lines}
+        fields = {"lines": lines, "status": _status_after(fresh["status"], lines)}
         if queued and not fresh.get("decided_by"):
             fields.update(decided_by=decision, decided_at=decision["at"])
         return fields
@@ -656,7 +780,8 @@ async def auto_apply_run(db, mongo_client, run: dict, agent: dict, *, deadline: 
     agent = await db[AGENTS].find_one({"_id": agent["_id"]})  # it may have been turned off this tick
     if not _is_on(agent):
         return
-    add_limit = _settings(agent)["creative"]["auto_max_adds"]
+    settings = _settings(agent)
+    add_limit = settings["creative"]["auto_max_adds"]
     now = datetime.utcnow()
     decision = _decision(ACTOR_BIRDY, "Birdy", "auto", now)
     cards = await db[CARDS].find({"run_id": run["_id"], "status": {"$in": list(_ACTIONABLE)},
@@ -666,13 +791,18 @@ async def auto_apply_run(db, mongo_client, run: dict, agent: dict, *, deadline: 
         client = (run.get("clients") or {}).get(card.get("client_group_id")) or {}
         if client.get("health_due") or await has_newer_card(db, card):
             continue
-        pairs += await _queue_auto(db, card, client, run, add_limit, decision)
+        pairs += await _queue_auto(db, card, client, run, settings, add_limit, decision)
     await _drain(db, mongo_client, pairs, deadline=deadline)
 
 
 # ---------------------------------------------------------------------------
 # The cron: finishing and recovering
 # ---------------------------------------------------------------------------
+
+async def _read_ad(card: dict, line: dict, mongo_client) -> dict | None:
+    return await asyncio.wait_for(get_object_state(card["user_id"], _ad_id(line), "ad", mongo_client),
+                                  timeout=RECOVERY_READ_TIMEOUT_S)
+
 
 async def _recover_applying(db, mongo_client, card: dict, line: dict, now: datetime) -> None:
     """See the module docstring. This never sends anything."""
@@ -684,15 +814,17 @@ async def _recover_applying(db, mongo_client, card: dict, line: dict, now: datet
         return None
     atype = _action_type(line["kind"])
     try:
-        state = await get_object_state(card["user_id"], _ad_id(line), "ad", mongo_client)
+        state = await _read_ad(card, line, mongo_client)
     except Exception as e:  # noqa: BLE001 - keep asking, and don't guess
         logger.warning("stock card %s line %s: can't confirm yet: %s", card["_id"], line["id"], e)
         if now - (line.get("write_started_at") or now) > CONFIRM_GIVE_UP:
             await _fail(db, card, line, COULD_NOT_CONFIRM)
         return None
     if _landed(atype, state):
-        return await _finish_applied(db, card, await _load_agent(db, card), line, atype, now, wrote=True)
-    return await _fail(db, card, line, _not_landed(state), write_started_at=None)
+        return await _finish_applied(db, card, await _load_agent(db, card), line, atype, now, wrote=True,
+                                     written_at=line["write_started_at"])
+    # write_started_at stays: if this lands late, a Retry finds it done and counts it as Birdy's write.
+    return await _fail(db, card, line, _not_landed(state))
 
 
 async def _undo_back(db, card: dict, line: dict, error: str) -> None:
@@ -716,7 +848,7 @@ async def _recover_undoing(db, mongo_client, card: dict, line: dict, now: dateti
         return await _undo_back(db, card, line, NOTHING_CHANGED)
     atype = _action_type(line["kind"], undo=True)
     try:
-        state = await get_object_state(card["user_id"], _ad_id(line), "ad", mongo_client)
+        state = await _read_ad(card, line, mongo_client)
     except Exception as e:  # noqa: BLE001
         logger.warning("stock card %s line %s: can't confirm the undo yet: %s", card["_id"], line["id"], e)
         if now - line["undo_write_started_at"] > CONFIRM_GIVE_UP:
@@ -728,8 +860,8 @@ async def _recover_undoing(db, mongo_client, card: dict, line: dict, now: dateti
 
 
 async def _recover_stuck(db, mongo_client, now: datetime, deadline: float | None) -> int:
-    cards = await db[CARDS].find({"lines.state": {"$in": [STATE_APPLYING, STATE_UNDOING]}}).limit(QUEUE_BATCH).to_list(
-        length=QUEUE_BATCH)
+    cards = await db[CARDS].find({"lines.state": {"$in": [STATE_APPLYING, STATE_UNDOING]}}).sort("updated_at", 1).limit(
+        QUEUE_BATCH).to_list(length=QUEUE_BATCH)
     recovered = 0
     for card in cards:
         for line in card.get("lines") or []:
@@ -760,10 +892,12 @@ async def _expand_apply_all(db, deadline: float | None) -> None:
 
 async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline: float) -> dict:
     """Every minute: finish Apply all presses, recover stuck lines, then run what's queued. A queued
-    line on a card closed meanwhile is refused by the same check every line goes through."""
+    line on a card closed meanwhile is refused by the same check every line goes through. Recovery gets
+    half the time left, so stuck lines can't starve the queue. `now_utc` only ages stuck lines: each line
+    run gets its own clock, so the pause cap counts rows logged earlier in this same pass."""
     now = _naive_utc(now_utc)
     await _expand_apply_all(db, deadline)
-    recovered = await _recover_stuck(db, mongo_client, now, deadline)
+    recovered = await _recover_stuck(db, mongo_client, now, time.monotonic() + max(0.0, deadline - time.monotonic()) / 2)
     processed = 0
     cards = await db[CARDS].find({"lines.state": STATE_QUEUED}).sort("updated_at", 1).limit(QUEUE_BATCH).to_list(
         length=QUEUE_BATCH)
@@ -773,7 +907,7 @@ async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline:
                 continue
             if _out_of_time(deadline):
                 return {"recovered": recovered, "processed": processed}
-            await _run_line_safely(db, mongo_client, card["_id"], line["id"], now)
+            await _run_line_safely(db, mongo_client, card["_id"], line["id"], datetime.utcnow())
             processed += 1
     return {"recovered": recovered, "processed": processed}
 
@@ -783,7 +917,7 @@ async def process_queued_lines(db, mongo_client, now_utc: datetime, *, deadline:
 # ---------------------------------------------------------------------------
 
 async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, atype: str, now: datetime, sent: list) -> dict:
-    block = await _guardrail_block(db, mongo_client, agent, card, line, atype, now)
+    block = await _guardrail_block(db, mongo_client, agent, card, line, atype, now, undo=True)
     if block is not None:
         await _undo_back(db, card, line, block["message"])
         return {"outcome": "blocked", "reason": block["message"]}
@@ -801,7 +935,9 @@ async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, a
     if state is None:
         await _undo_back(db, card, line, GONE)
         return {"outcome": "failed", "reason": GONE}
-    await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_write_started_at=now)
+    if await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_write_started_at=now) is None:
+        await _undo_back(db, card, line, NOTHING_CHANGED)  # the marker isn't stored, so nothing may be sent
+        return {"outcome": "failed", "reason": NOTHING_CHANGED}
     sent.append(True)
     landed, error = await _send_and_confirm(mongo_client, card, line, atype)
     if landed:
@@ -813,11 +949,49 @@ async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, a
     return {"outcome": "queued", "reason": None}  # recovery reads Meta
 
 
+async def _undo_refusal(db, agent: dict | None, card: dict) -> str | None:
+    """Undo stays open when the agent is off, so a person can reverse what it did after turning it off.
+    It is refused only when another agent now holds the client."""
+    if agent is None:
+        return AGENT_OFF["message"]
+    held_by = await claims.holder(db, card.get("user_id"), card.get("client_group_id"))
+    return OTHER_AGENT if held_by not in (None, agent["_id"]) else None
+
+
+async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | None, wrote: bool, decision: dict,
+                      now: datetime) -> dict:
+    card_id = card["_id"]
+    claimed = await _set_line(db, card_id, line_id, expect=(STATE_APPLIED,), state=STATE_UNDOING, undoing_at=now,
+                              undo_error=None, undo_write_started_at=None, undo_decision=decision)
+    if claimed is None:  # another press got it
+        fresh = await db[CARDS].find_one({"_id": card_id})
+        if (_find_line(fresh, line_id) or {}).get("state") == STATE_UNDONE:
+            return _answer("already", fresh)
+        return _answer("busy", fresh, ok=False, reason=BUSY)
+    line = _find_line(claimed, line_id)
+    if not wrote:
+        await _finish_undone(db, claimed, agent, line, None, now, note=UNDO_NOT_WRITTEN)
+        return _answer("undone", await db[CARDS].find_one({"_id": card_id}))
+    sent: list = []
+    try:
+        res = await _undo_claimed(db, mongo_client, claimed, line, agent, _action_type(line["kind"], undo=True), now, sent)
+    except Exception as e:  # noqa: BLE001
+        logger.error("stock card %s line %s: undo failed: %s", card_id, line_id, e, exc_info=True)
+        if sent:  # only a read of Meta can say what happened
+            res = {"outcome": "queued", "reason": None}
+        else:
+            await _undo_back(db, claimed, line, NOTHING_CHANGED)
+            res = {"outcome": "failed", "reason": NOTHING_CHANGED}
+    fresh = await db[CARDS].find_one({"_id": card_id})
+    return _answer(res["outcome"], fresh, ok=res["outcome"] in ("undone", "queued"), reason=res["reason"])
+
+
 async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, *, by: str | None,
                     source: str | None) -> dict:
-    """Reverse one applied line, within UNDO_AUTO_WINDOW of it applying. A write like any other, so
-    the guardrails run: Undo is refused once the client has moved or the agent is off. If Birdy
-    wrote nothing for this line, it sends nothing, since the ad was changed by someone else."""
+    """Reverse one applied line, within UNDO_AUTO_WINDOW of it applying. It only restores what Birdy
+    changed, so it skips the pause cap and the live ad limit and still works with the agent off. It
+    keeps the other checks. If Birdy wrote nothing for this line, it sends nothing, since the ad was
+    changed by someone else."""
     card = await _visible_card(db, user_id, card_id)
     line = _find_line(card, line_id) if card else None
     if card is None or line is None or card.get("preview"):
@@ -835,30 +1009,19 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
         return _answer("expired", card, ok=False, reason="This can only be undone for 24 hours.")
     wrote = bool(line.get("wrote"))
     agent = await _load_agent(db, card)
-    if wrote and not _is_on(agent):
-        return _answer("blocked", card, ok=False, reason=AGENT_OFF["message"])
-
-    claimed = await _set_line(db, card_id, line_id, expect=(STATE_APPLIED,), state=STATE_UNDOING, undoing_at=now,
-                              undo_error=None, undo_write_started_at=None,
-                              undo_decision=_decision(ACTOR_USER, by, source, now))
-    if claimed is None:  # another press got it
-        return _answer("busy", await db[CARDS].find_one({"_id": card_id}), ok=False, reason=BUSY)
-    line = _find_line(claimed, line_id)
+    decision = _decision(ACTOR_USER, by, source, now)
     if not wrote:
-        await _finish_undone(db, claimed, agent, line, None, now, note=UNDO_NOT_WRITTEN)
-        return _answer("undone", await db[CARDS].find_one({"_id": card_id}))
-    sent: list = []
+        return await _undo_write(db, mongo_client, card, line_id, agent, False, decision, now)
+    refusal = await _undo_refusal(db, agent, card)
+    if refusal:
+        return _answer("blocked", card, ok=False, reason=refusal)
+    token = await _wait_for_lease(db, card.get("agent_id"))
+    if token is None:
+        return _answer("busy", card, ok=False, reason=BUSY)
     try:
-        res = await _undo_claimed(db, mongo_client, claimed, line, agent, _action_type(line["kind"], undo=True), now, sent)
-    except Exception as e:  # noqa: BLE001
-        logger.error("stock card %s line %s: undo failed: %s", card_id, line_id, e, exc_info=True)
-        if sent:  # only a read of Meta can say what happened
-            res = {"outcome": "queued", "reason": None}
-        else:
-            await _undo_back(db, claimed, line, NOTHING_CHANGED)
-            res = {"outcome": "failed", "reason": NOTHING_CHANGED}
-    fresh = await db[CARDS].find_one({"_id": card_id})
-    return _answer(res["outcome"], fresh, ok=res["outcome"] in ("undone", "queued"), reason=res["reason"])
+        return await _undo_write(db, mongo_client, card, line_id, agent, True, decision, now)
+    finally:
+        await _release_lease(db, card.get("agent_id"), token)
 
 
 # ---------------------------------------------------------------------------

@@ -216,6 +216,28 @@ def _clean_flags(raw, chosen: set[str]) -> list[dict]:
     return out
 
 
+def _live_limit_errors(facts: dict, candidates: dict, add: list, remove: list, revive: list, max_live: int) -> list[str]:
+    """max_ads_live is per ad set. A remove or revive counts in its own ad set, an add in the main one.
+    Only an ad set this draft adds to can fail, so one already over the limit can still lose an ad.
+    With no ad set known, the client's live ads are treated as one ad set."""
+    by_adset = facts.get("ads_live_by_adset") or {}
+    counts = dict(by_adset) if by_adset else {None: facts.get("ads_live") or 0}
+    adset_of = {c["ad_id"]: c.get("adset_id") for kind in ("remove", "revive") for c in candidates.get(kind) or []}
+    main = facts.get("main_adset_id") if by_adset else None
+
+    def bucket(ad_id):
+        return adset_of.get(ad_id) if by_adset else None
+
+    after = dict(counts)
+    for ad_id in remove:
+        after[bucket(ad_id)] = after.get(bucket(ad_id), 0) - 1
+    for ad_id in revive:
+        after[bucket(ad_id)] = after.get(bucket(ad_id), 0) + 1
+    after[main] = after.get(main, 0) + len(add)
+    return [f"{n} ads would be live{f' in ad set {adset}' if adset else ''}, more than the limit of {max_live}"
+            for adset, n in after.items() if n > max_live and n > counts.get(adset, 0)]
+
+
 def validate_draft(raw: dict, facts: dict, candidates: dict, max_live: int) -> tuple[dict | None, list[str]]:
     """(clean draft, []) or (None, reasons). Ids must be allowed, live ads must stay within
     max_live, and every money figure in the text must come from the facts or candidates."""
@@ -227,9 +249,7 @@ def validate_draft(raw: dict, facts: dict, candidates: dict, max_live: int) -> t
     revive = _id_list(raw, "revive", {c["ad_id"] for c in candidates.get("revive") or []}, errs)
     if set(remove) & set(revive):
         errs.append("an ad cannot be both removed and revived")
-    live_after = (facts.get("ads_live") or 0) - len(remove) + len(add) + len(revive)
-    if live_after > max_live:
-        errs.append(f"{live_after} ads would be live, more than the limit of {max_live}")
+    errs += _live_limit_errors(facts, candidates, add, remove, revive, max_live)
     text: dict[str, str] = {}
     for f in TEXT_FIELDS:
         v = raw.get(f, "")

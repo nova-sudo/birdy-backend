@@ -201,9 +201,13 @@ LIVE_CHECK_FAILED_MESSAGE = ("Couldn't check the ads inside this ad set in Meta,
 
 
 async def check_adset_contents_live(db, mongo_client, agent: dict, doc: dict, *,
-                                    memories: list[dict], now_utc: datetime) -> GuardrailResult:
+                                    memories: list[dict], now_utc: datetime,
+                                    read_ads: dict | None = None) -> GuardrailResult:
     """For each ad set target, read its ads live from Meta and run the protected
-    tag and taught-exception checks over their names. Any read failure blocks."""
+    tag and taught-exception checks over their names. Any read failure blocks.
+
+    A target with `only_ad_id` changes one ad of that ad set, so only that ad's live name is checked.
+    `read_ads`, if given, receives each ad set's list, so the caller can judge it without reading twice."""
     targets = [t for t in ((doc.get("action") or {}).get("targets") or []) if t.get("object_type") == "adset"]
     if not targets:
         return GuardrailResult.passed()
@@ -218,7 +222,12 @@ async def check_adset_contents_live(db, mongo_client, agent: dict, doc: dict, *,
         except Exception as e:
             logger.warning("guardrails: live read of ad set %s failed: %s", t.get("object_id"), e)
             return GuardrailResult.blocked("live_check_failed", LIVE_CHECK_FAILED_MESSAGE)
+        if read_ads is not None:
+            read_ads[str(t.get("object_id"))] = ads
         names = [str(a.get("name") or "") for a in ads]
+        if t.get("only_ad_id"):
+            names = ([str(a.get("name") or "") for a in ads if str(a.get("id")) == str(t["only_ad_id"])]
+                     or [str(t.get("name") or "")])
         for name in names:
             low = name.lower()
             for tag in tags:

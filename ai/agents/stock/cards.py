@@ -24,7 +24,7 @@ STATE_UNDOING, STATE_UNDONE = "undoing", "undone"
 CHANGE_DECISION = "propose"
 _EDITABLE = ("lines", "additional_changes", "thought_process", "next_steps")
 CLIENT_NAME_FLAG = "client_name"
-MIN_CLIENT_NAME = 2  # a one letter name would match almost any ad
+MIN_CLIENT_NAME = 3  # "UK" or "Go" would match almost any ad
 
 
 def no_change_reason(facts: dict, decision: str) -> str:
@@ -142,7 +142,8 @@ def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, r
     usable = decision == CHANGE_DECISION and not failed
     lines = _lines(facts, draft, settings, candidates, flag_only) if usable else []
     for line in lines:
-        line["flags"] = line["flags"] + client_name_flags(_ad_text(line), client_names, facts.get("name"))
+        if line.get("kind") == "add":  # the only line that brings words in from another client
+            line["flags"] = line["flags"] + client_name_flags(_ad_text(line), client_names, facts.get("name"))
     additional = draft.get("additional_changes") or "" if usable else ""
 
     if lines or additional:
@@ -179,7 +180,8 @@ async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
         {"agent_id": agent_id, "client_group_id": gid, "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]},
          "run_id": {"$ne": run_id},
          "preview": {"$ne": True}},
-        {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow()}})
+        {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow()},
+         "$inc": {"version": 1}})  # so a line write that read the card before this has to read it again
     return res.modified_count
 
 

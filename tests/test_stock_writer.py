@@ -43,6 +43,39 @@ def test_unknown_id_is_rejected():
         assert d is None and errs and bad[0] in errs[0]
 
 
+def _two_sets(s1=3, s2=3):
+    facts = {**FACTS, "ads_live": s1 + s2, "ads_live_by_adset": {"s1": s1, "s2": s2}, "main_adset_id": "s1"}
+    cands = {**CANDS, "revive": [{"ad_id": "r1", "ad_name": "Old", "adset_id": "s2"}],
+             "remove": [{"ad_id": "x1", "ad_name": "One", "adset_id": "s1"}, {"ad_id": "x2", "ad_name": "Two", "adset_id": "s2"}]}
+    return facts, cands
+
+
+def test_two_ad_sets_with_three_each_take_one_add():
+    facts, cands = _two_sets()
+    assert validate_draft(draft(remove=[], add=["s:1"]), facts, cands, 4)[0] is not None
+
+
+def test_add_counts_against_the_main_ad_set():
+    facts, cands = _two_sets(s1=4, s2=1)
+    d, errs = validate_draft(draft(remove=[], add=["s:1"]), facts, cands, 4)
+    assert d is None and any("would be live" in e for e in errs)
+    assert validate_draft(draft(remove=["x1"], add=["s:1"]), facts, cands, 4)[0] is not None
+    # A remove elsewhere makes no room in the main ad set.
+    assert validate_draft(draft(remove=["x2"], add=["s:1"]), facts, cands, 4)[0] is None
+
+
+def test_revive_counts_against_its_own_ad_set():
+    facts, cands = _two_sets(s1=4, s2=4)
+    assert validate_draft(draft(remove=[], revive=["r1"]), facts, cands, 4)[0] is None
+    assert validate_draft(draft(remove=["x2"], revive=["r1"]), facts, cands, 4)[0] is not None
+    assert validate_draft(draft(remove=["x1"], revive=["r1"]), facts, cands, 4)[0] is None
+
+
+def test_an_ad_set_already_over_the_limit_can_still_lose_an_ad():
+    facts, cands = _two_sets(s1=6, s2=1)
+    assert validate_draft(draft(remove=["x1"]), facts, cands, 4)[0] is not None
+
+
 def test_over_max_live_is_rejected():
     d, errs = validate_draft(draft(remove=[], add=["s:1"]), FACTS, CANDS, 4)
     assert d is None and "4" in errs[0]
