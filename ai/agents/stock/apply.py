@@ -470,7 +470,8 @@ async def _finish_applied(db, card: dict, agent: dict | None, line: dict, atype:
     await _log_once(db, card, line, KIND_ACTION_APPLIED, label=label, title=f"{verb} {line.get('ad_name') or 'an ad'}",
                     decision=decision, action_type=atype if wrote else None, note=note)
     await _set_line(db, card["_id"], line["id"], expect=(STATE_APPLYING,), state=STATE_APPLIED, applied_at=applied_at,
-                    undo_until=applied_at + UNDO_AUTO_WINDOW, wrote=wrote, note=note, error=None, reason_code=None)
+                    undo_until=applied_at + UNDO_AUTO_WINDOW, wrote=wrote, note=note, error=None, reason_code=None,
+                    cut_at=None)
 
 
 async def _block(db, card: dict, line: dict, reason: dict) -> None:
@@ -719,7 +720,8 @@ async def _finish_apply_all(db, run_id: str) -> None:
 
 async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | None, source: str | None,
                     budget_s: float = 2.5) -> dict:
-    """Apply all. Called from Slack, so it answers inside `budget_s`. The press is stored first, so
+    """Apply all. It answers inside `budget_s`: the 2.5 s default is for Slack, where every line queues,
+    and the dashboard passes a longer budget so lines start at once. The press is stored first, so
     whatever doesn't fit, even queueing, is finished by the cron."""
     deadline = time.monotonic() + budget_s
     run = await db[RUNS].find_one({"_id": run_id, "user_id": user_id})
@@ -923,7 +925,7 @@ async def _recover_stuck(db, mongo_client, now: datetime, deadline: float | None
             state = line.get("state")
             since = line.get("applying_at") if state == STATE_APPLYING else line.get("undoing_at")
             if (state not in (STATE_APPLYING, STATE_UNDOING) or line.get("kind") not in WRITABLE_KINDS
-                    or (since and now - since < STUCK_AFTER and not line.get("cut_at"))):
+                    or (since and now - since < STUCK_AFTER and not (state == STATE_APPLYING and line.get("cut_at")))):
                 continue
             logger.warning("stock card %s line %s stuck in %s since %s", card["_id"], line["id"], state, since)
             recover = _recover_applying if state == STATE_APPLYING else _recover_undoing
@@ -1015,7 +1017,7 @@ async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | 
                       now: datetime) -> dict:
     card_id = card["_id"]
     claimed = await _set_line(db, card_id, line_id, expect=(STATE_APPLIED,), state=STATE_UNDOING, undoing_at=now,
-                              undo_error=None, undo_write_started_at=None, undo_decision=decision)
+                              undo_error=None, undo_write_started_at=None, undo_decision=decision, cut_at=None)
     if claimed is None:  # another press got it
         fresh = await db[CARDS].find_one({"_id": card_id})
         if (_find_line(fresh, line_id) or {}).get("state") == STATE_UNDONE:

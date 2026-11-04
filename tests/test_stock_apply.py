@@ -2160,6 +2160,83 @@ async def test_undo_is_not_trapped_by_a_lesson_taught_after_the_pause(mock_db, m
     assert meta.ads["ad1"]["status"] == "ACTIVE"
 
 
+async def _cut_then_confirmed(db, client, meta, monkeypatch):
+    real = meta.execute
+    monkeypatch.setattr(apply_mod, "execute_action", _inflight(meta))
+    agent = await _agent(db)
+    await _ads(db, "ad1", "spare")
+    await _card(db, agent, _ln())
+    await apply_card(db, client, USER, "c1", by="s", source="d", budget_s=0.05)
+    assert (await _line(db))["cut_at"]
+    await _tick(db, client)
+    line = await _line(db)
+    assert line["state"] == "applied" and not line.get("cut_at")
+    monkeypatch.setattr(apply_mod, "execute_action", real)
+    meta.writes.clear()
+    return agent
+
+
+async def test_a_tick_during_the_send_of_an_undo_after_a_cut_leaves_it_alone(mock_db, mock_mongo_client, meta, monkeypatch):
+    await _cut_then_confirmed(mock_db, mock_mongo_client, meta, monkeypatch)
+    seen = []
+
+    async def tick_during_send(mc, user, action):
+        ad = action["targets"][0]["object_id"]
+        meta.writes.append((ad, "ACTIVE"))
+        await _tick(mock_db, mock_mongo_client)
+        seen.append((await _line(mock_db))["state"])
+        meta.set(ad, "ACTIVE")
+        return {"succeeded": [ad], "failed": []}
+
+    monkeypatch.setattr(apply_mod, "execute_action", tick_during_send)
+    res = await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d")
+    assert seen == ["undoing"] and res["outcome"] == "undone" and (await _line(mock_db))["state"] == "undone"
+    assert meta.writes == [("ad1", "ACTIVE")]
+
+
+async def test_a_tick_before_the_send_of_an_undo_after_a_cut_leaves_it_alone(mock_db, mock_mongo_client, meta, monkeypatch):
+    await _cut_then_confirmed(mock_db, mock_mongo_client, meta, monkeypatch)
+    real = apply_mod._guardrail_block
+    seen = []
+
+    async def tick_first(*a, **k):
+        await _tick(mock_db, mock_mongo_client)
+        seen.append((await _line(mock_db))["state"])
+        return await real(*a, **k)
+
+    monkeypatch.setattr(apply_mod, "_guardrail_block", tick_first)
+    res = await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d")
+    assert seen == ["undoing"] and res["outcome"] == "undone" and (await _line(mock_db))["state"] == "undone"
+    assert meta.writes == [("ad1", "ACTIVE")]
+
+
+async def test_the_undo_claim_clears_a_cut_at_left_on_an_applied_line(mock_db, mock_mongo_client, meta, monkeypatch):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    now = datetime.utcnow()
+    meta.set("ad1", "PAUSED")
+    await _card(mock_db, agent, _ln(state="applied", wrote=True, applied_at=now, undo_until=now + UNDO_AUTO_WINDOW, cut_at=now))
+    claimed = {}
+    real = apply_mod._guardrail_block
+
+    async def look(*a, **k):
+        claimed.update(await _line(mock_db))
+        return await real(*a, **k)
+
+    monkeypatch.setattr(apply_mod, "_guardrail_block", look)
+    assert (await undo_line(mock_db, mock_mongo_client, USER, "c1", "l1", by="s", source="d"))["outcome"] == "undone"
+    assert claimed["state"] == "undoing" and claimed["cut_at"] is None
+
+
+async def test_cut_at_only_skips_the_wait_for_an_applying_line(mock_db, mock_mongo_client, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    now = datetime.utcnow()
+    await _card(mock_db, agent, _ln(state="undoing", undoing_at=now, undo_write_started_at=now, cut_at=now, wrote=True))
+    res = await _tick(mock_db, mock_mongo_client)
+    assert res["recovered"] == 0 and (await _line(mock_db))["state"] == "undoing" and meta.reads == []
+
+
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
