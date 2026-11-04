@@ -33,7 +33,6 @@ from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, c
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from routers import agents as agents_router
-from services import client_targets
 
 router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 logger = logging.getLogger(__name__)
@@ -146,15 +145,6 @@ async def patch_settings(agent_id: str, body: SettingsPatch,
                 if resp is not None:
                     return resp
                 await claims.release_clients(db, current_user, agent_id, set(before) - set(ids))
-            # First add: the green limit starts from the client's CPL target, if it has one.
-            added = [g for g in ids if g not in before]
-            groups = {g["id"]: g async for g in db["client_groups"].find(
-                {"id": {"$in": added}, "user_id": current_user})}
-            for gid in added:
-                cpl = client_targets.clean((groups.get(gid) or {}).get("targets")).get("cpl")
-                entry = merged["clients"].get(gid) or {}
-                if cpl is not None and (entry.get("zones") or {}).get("green_under") is None:
-                    merged["clients"][gid] = {**entry, "zones": {**(entry.get("zones") or {}), "green_under": cpl}}
 
         updated = await agent_store.update_agent(db, current_user, agent_id, update)
         return agents_router._agent_to_api(updated)

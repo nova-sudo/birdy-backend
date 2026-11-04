@@ -139,21 +139,20 @@ async def test_custom_agent_has_no_stock_settings(api, mock_db):
     assert api.patch(f"/api/agents/{c['_id']}/settings", json={"settings": {}}).status_code == 400
 
 
-async def test_patch_client_list_updates_scope_and_prefills_green(api, mock_db):
+async def test_patch_client_list_updates_scope_and_leaves_clients_on_your_zones(api, mock_db):
+    """A client's CPL target never becomes a zone limit: every client follows Your zones until it is given its own."""
     aid = await _stock(mock_db)
     await _group(mock_db, "g1", targets={"cpl": 2.5})
     await _group(mock_db, "g2")
     r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g1", "g2"]})
     assert r.status_code == 200
     assert r.json()["scope"]["client_group_ids"] == ["g1", "g2"]
-    clients = r.json()["settings"]["clients"]
-    assert clients["g1"]["zones"] == {"green_under": 2.5} and "g2" not in clients
-    assert "prepaid" not in clients["g1"]
-    # A green limit the agency already chose is not overwritten on re-add.
+    assert r.json()["settings"]["clients"] == {}
+    # Limits the agency chose are kept when the client leaves the list and comes back.
     api.patch(f"/api/agents/{aid}/settings", json={
-        "settings": {"clients": {"g1": {"zones": {"green_under": 4}}}}, "client_group_ids": ["g2"]})
+        "settings": {"clients": {"g1": {"zones": {"green_under": 4, "red_over": 6}}}}, "client_group_ids": ["g2"]})
     r = api.patch(f"/api/agents/{aid}/settings", json={"client_group_ids": ["g1", "g2"]})
-    assert r.json()["settings"]["clients"]["g1"]["zones"]["green_under"] == 4
+    assert r.json()["settings"]["clients"]["g1"]["zones"] == {"green_under": 4, "red_over": 6}
 
 
 async def test_unowned_client_is_rejected(api, mock_db):
