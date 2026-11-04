@@ -322,6 +322,18 @@ def test_open_card_has_apply_edit_dismiss_with_id_only_values():
     assert [e["value"] for e in buttons["elements"]] == ["c1", "c1", "c1"]
 
 
+@pytest.mark.parametrize("tag", ["green", "no_changes"])
+@pytest.mark.parametrize("status", ["open", "flagged"])
+def test_a_card_with_nothing_to_decide_has_no_buttons(tag, status):
+    """The same rule as the dashboard: only a `changes` card can be edited or dismissed."""
+    assert _buttons(_card(tag=tag, status=status, lines=[])) is None
+
+
+def test_flagged_changes_card_with_no_lines_can_still_be_edited_and_dismissed():
+    card = _card(status="flagged", lines=[], additional_changes="Raise the budget")
+    assert _ids(_buttons(card)) == ["agent_card_edit", "agent_card_dismiss"]
+
+
 def test_flag_line_card_has_no_apply_button():
     flagged = _card(status="flagged", lines=[_line("flagged", mode="flag")])
     assert _ids(_buttons(flagged)) == ["agent_card_edit", "agent_card_dismiss"]

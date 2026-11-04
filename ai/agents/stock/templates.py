@@ -426,7 +426,8 @@ def _undo_open(line: dict, now: datetime) -> bool:
 def card_buttons(card: dict, now: datetime | None = None, *, has_newer: bool) -> dict | None:
     """The card's actions block, from its state alone, or None. A superseded, closing or preview card
     gets none. Apply needs a proposed line (a Flag line is never one) on a card nobody has replaced;
-    Edit and Dismiss wait while any line is going out; Undo is per applied line, inside its window.
+    Edit and Dismiss are for a `changes` card only, as on the dashboard, and wait while any line is
+    going out; Undo is per applied line, inside its window.
     Values are the card id, and for Undo `card_id:line_id`: the handler checks everything else."""
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     status, cid = card.get("status"), card.get("_id") or card.get("id")
@@ -435,12 +436,13 @@ def card_buttons(card: dict, now: datetime | None = None, *, has_newer: bool) ->
     lines = card.get("lines") or []
     busy = any(ln.get("state") in BUSY_STATES for ln in lines)
     proposed = any(ln.get("state") == STATE_PROPOSED and ln.get("mode") != "flag" for ln in lines)
+    decidable = card.get("tag") == "changes" and not busy
     buttons = []
     if status in (STATUS_OPEN, STATUS_PARTLY_APPLIED) and proposed and not has_newer:
         buttons.append(_button("Apply", "agent_card_apply", cid, "primary"))
-    if status in (STATUS_OPEN, STATUS_FLAGGED) and not busy:
+    if status in (STATUS_OPEN, STATUS_FLAGGED) and decidable:
         buttons.append(_button("Edit", "agent_card_edit", cid))
-    if status in (STATUS_OPEN, STATUS_FLAGGED, STATUS_PARTLY_APPLIED) and not busy:
+    if status in (STATUS_OPEN, STATUS_FLAGGED, STATUS_PARTLY_APPLIED) and decidable:
         buttons.append(_button("Dismiss", "agent_card_dismiss", cid))
     if status in (STATUS_OPEN, STATUS_PARTLY_APPLIED, STATUS_APPLIED, STATUS_DISMISSED):
         for ln in lines:

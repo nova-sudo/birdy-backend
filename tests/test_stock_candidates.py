@@ -30,7 +30,7 @@ def _settings(**over):
     return s
 
 
-AGENT = {"_id": "ag1", "user_id": "u", "settings": _settings()}
+AGENT = {"_id": "ag1", "user_id": "u", "scope": {"client_group_ids": ["dest", "src"]}, "settings": _settings()}
 DEST = {"id": "dest", "user_id": "u", "name": "Dest", "ad_account_currency": "GBP", "meta_campaign_ids": ["dc1"]}
 SRC = {"id": "src", "user_id": "u", "name": "Src", "ad_account_currency": "GBP", "meta_campaign_ids": None}
 
@@ -59,6 +59,15 @@ async def _winner(db, ad_id="w1", leads=10, spend=80, **kw):
 
 def _ids(c, kind="add"):
     return [x["ad_id"] for x in c[kind]]
+
+
+async def test_a_client_out_of_scope_gives_no_adds_even_with_settings_left_behind(mock_db):
+    await _groups(mock_db, DEST, SRC)
+    await _winner(mock_db)
+    assert _ids(await build_candidates(mock_db, AGENT, DEST, WIN)) == ["w1"]
+    removed = {**AGENT, "scope": {"client_group_ids": ["dest"]}}  # src keeps its settings entry
+    assert _ids(await build_candidates(mock_db, removed, DEST, WIN)) == []
+    assert _ids(await build_candidates(mock_db, {**AGENT, "scope": None}, DEST, WIN)) == []
 
 
 async def test_basic_add(mock_db):
@@ -119,7 +128,7 @@ async def test_client_without_treatment_gives_and_gets_nothing(mock_db):
 
 async def test_rank_uses_cpl_over_source_green_limit_across_currencies(mock_db):
     usd = {"id": "usd", "user_id": "u", "name": "Usd", "ad_account_currency": "USD", "meta_campaign_ids": None}
-    agent = {**AGENT, "settings": _settings(clients={
+    agent = {**AGENT, "scope": {"client_group_ids": ["dest", "src", "usd"]}, "settings": _settings(clients={
         "dest": {"treatment_ids": ["t1"]}, "src": {"treatment_ids": ["t1"]}, "usd": {
             "treatment_ids": ["t1"], "zones": {"green_under": 40, "red_over": 60}}})}
     await _groups(mock_db, DEST, SRC, usd)

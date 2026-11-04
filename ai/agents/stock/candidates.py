@@ -89,8 +89,9 @@ async def _adds(db, agent, settings, group, window, user_id, already_run: set[st
         return []  # no treatment tag: gives nothing and gets nothing
     cfg, scoring = settings["creative"], settings["scoring"]
     start = window.end - timedelta(days=cfg["winner_days"] - 1)
+    scope_ids = (agent.get("scope") or {}).get("client_group_ids") or []  # a removed client keeps its settings entry
     others = [g for g in await db["client_groups"].find(
-        {"user_id": user_id, "id": {"$in": [k for k in (settings.get("clients") or {}) if k != gid]}}).to_list(None)]
+        {"user_id": user_id, "id": {"$in": [k for k in scope_ids if k != gid]}}).to_list(None)]
     best: dict[str, dict] = {}
     for src in others:
         shared = mine & _treatments(settings, src["id"])

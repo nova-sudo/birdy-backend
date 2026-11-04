@@ -150,18 +150,20 @@ class CreateAgentBody(BaseModel):
 
 
 @router.post("")
-async def create_agent(body: CreateAgentBody, current_user: str = Depends(get_current_user)):
-    if body.type not in (agent_store.TYPE_CUSTOM, agent_store.TYPE_STOCK):
-        raise HTTPException(status_code=400, detail="Unknown agent type")
-    name = None
-    if body.type == agent_store.TYPE_CUSTOM:
-        name = (body.name or "").strip()
-        if not name or len(name) > 60:
-            raise HTTPException(status_code=400, detail="Name must be 1 to 60 characters")
+async def create_agent(body: CreateAgentBody | None = None, current_user: str = Depends(get_current_user)):
+    agent_type, name = agent_store.TYPE_CUSTOM, None  # no body: the old frontend, during a deploy window
+    if body is not None:
+        agent_type = body.type
+        if agent_type not in (agent_store.TYPE_CUSTOM, agent_store.TYPE_STOCK):
+            raise HTTPException(status_code=400, detail="Unknown agent type")
+        if agent_type == agent_store.TYPE_CUSTOM:
+            name = (body.name or "").strip()
+            if not name or len(name) > 60:
+                raise HTTPException(status_code=400, detail="Name must be 1 to 60 characters")
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         try:
-            agent = await agent_store.create_agent(db, current_user, type=body.type, name=name)
+            agent = await agent_store.create_agent(db, current_user, type=agent_type, name=name)
         except agent_store.AgentExists:
             raise HTTPException(status_code=409, detail="You already have the Birdy Media Buying Agent")
         return _agent_to_api(agent)
@@ -224,6 +226,7 @@ async def _claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move:
             "detail": "Another agent already acts on " + ", ".join(
                 sorted({c["holder_name"] or "another agent" for c in conflicts})),
             "conflicts": conflicts})
+    await claims.mark_claimed(db, agent_id)  # it holds what it should, so the migration never touches it
     return None
 
 

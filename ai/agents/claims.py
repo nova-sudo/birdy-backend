@@ -17,6 +17,7 @@ from datetime import datetime
 logger = logging.getLogger(__name__)
 
 CLAIMS = "agent_client_claims"
+CLAIMS_MIGRATED = "claims_migrated_at"  # on the agent: it has its claims, migrate_claims skips it
 
 
 async def ensure_indexes(db) -> None:
@@ -95,11 +96,20 @@ async def release_clients(db, user_id: str, agent_id: str, gids=None) -> None:
     await db[CLAIMS].delete_many(q)
 
 
+async def mark_claimed(db, agent_id: str) -> None:
+    """Record that this agent has taken its claims, so `migrate_claims` leaves it alone for good."""
+    await db["agents"].update_one({"_id": agent_id}, {"$set": {CLAIMS_MIGRATED: datetime.utcnow()}})
+
+
 async def migrate_claims(db) -> None:
-    """Give every existing active agent a claim on its clients. Oldest agent first, so when
-    two already watch the same client the first by created_at keeps it and the other stays a
-    watcher (its changes are flagged). Safe to run on every start: never overwrites a claim."""
-    agents = await db["agents"].find({"status": "active"}).sort("created_at", 1).to_list(length=None)
+    """Give each active agent from before claims existed its claims, once. Oldest agent first, so
+    when two already watch the same client the first by created_at keeps it and the other stays a
+    watcher (its changes are flagged). This runs every night, so an agent is marked once done and
+    never looked at again: otherwise a client moved away and then released would drift back to its
+    old agent with nobody choosing that. An agent that fails part way stays unmarked and finishes
+    on the next pass, since a claim is never overwritten."""
+    agents = await db["agents"].find(
+        {"status": "active", CLAIMS_MIGRATED: {"$exists": False}}).sort("created_at", 1).to_list(length=None)
     for a in agents:
         scope = a.get("scope") or {}
         skip = set(scope.get("flag_only_client_group_ids") or [])  # chosen "only flag": never claim
@@ -110,3 +120,4 @@ async def migrate_claims(db) -> None:
             if conflicts:
                 logger.info("claims migration: %s keeps %s, %s only watches it",
                             conflicts[0]["holder_id"], gid, a["_id"])
+        await mark_claimed(db, a["_id"])

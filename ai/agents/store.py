@@ -23,6 +23,8 @@ import logging
 import uuid
 from datetime import datetime
 
+from pymongo.errors import OperationFailure
+
 from core.database import DB_NAME
 from ai.agents import claims
 from ai.agents.stock.scoreboard import OUTCOMES
@@ -275,7 +277,7 @@ async def create_agent_indexes(mongo_client):
     await migrate_agent_types(db)
     try:
         await db[AGENTS].drop_index("user_id_1_type_1")  # was unique over every type
-    except Exception:
+    except OperationFailure:
         pass  # already gone (or never created)
     await db[AGENTS].create_index(
         [("user_id", 1), ("type", 1)], unique=True, name="user_stock_agent",
