@@ -26,6 +26,7 @@ from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
+from ai.agents.stock import weekly as stock_weekly
 from ai.agents.stock.cards import (DROPPABLE_STATES, STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
                                    guarded_update)
 from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
@@ -69,7 +70,8 @@ OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids",
 def _run_to_api(run: dict) -> dict:
     """The run as the report needs it: no owner id, no Slack channel, and per client only its
     outcome, not the working data a resumed tick keeps."""
-    out = _with_id(run, drop=("user_id", "claimed_at", "claim_kind", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack"))
+    out = _with_id(run, drop=("user_id", "claimed_at", "claim_kind", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack",
+                                "weekly"))
     out["slack"] = {"ts": (run.get("slack") or {}).get("ts")}
     out["clients"] = {g: {k: c[k] for k in CLIENT_FIELDS if k in c} for g, c in (run.get("clients") or {}).items()}
     return out
@@ -260,10 +262,9 @@ async def get_run(agent_id: str, run_id: str, current_user: str = Depends(get_cu
         ).sort("created_at", 1).to_list(length=None)
         follow_ups = [{"client_group_id": c["client_group_id"], **f}
                       for c in cards for f in c.get("follow_ups") or []]
-        # weekly is filled in by the weekly message.
         return {"run": _run_to_api(run), "cards": [await _card_for_api(db, c) for c in cards], "follow_ups": follow_ups,
                 "scoreboard": await _scoreboard(db, agent_id), "learned": await _learned(db, agent_id, run),
-                "proposals": await _suggestions(db, agent_id), "weekly": None}
+                "proposals": await _suggestions(db, agent_id), "weekly": stock_weekly.weekly_view(run)}
 
 
 # ---------------------------------------------------------------------------
@@ -411,6 +412,33 @@ async def apply_all(agent_id: str, run_id: str, current_user: str = Depends(get_
         code = DECISION_STATUS.get(res["outcome"])
         if code:
             raise HTTPException(status_code=code, detail=res.get("reason") or "Run not found")
+        return res
+
+
+# ---------------------------------------------------------------------------
+# Weekly report
+# ---------------------------------------------------------------------------
+
+WEEKLY_REFUSED = {"preview": "A preview never posts to Slack."}
+
+
+@router.post("/{agent_id}/runs/{run_id}/weekly/post")
+async def post_weekly(agent_id: str, run_id: str, current_user: str = Depends(get_current_user)):
+    """Post the run's weekly message to Slack. Pressing again says it is already posted; it never posts twice."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        run = await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id})
+        if run is None or not run.get("weekly"):
+            raise HTTPException(status_code=404, detail="This run has no weekly report")
+        try:
+            res = await stock_weekly.post_weekly(db, run, agent, by=current_user)
+        except stock_slack.SlackPublishError as e:
+            raise HTTPException(status_code=502, detail=str(e))
+        if res["outcome"] == "preview":
+            raise HTTPException(status_code=409, detail=WEEKLY_REFUSED["preview"])
+        if res["outcome"] == "in_progress":
+            raise HTTPException(status_code=409, detail="The weekly report is being posted. Check Slack in a moment.")
         return res
 
 

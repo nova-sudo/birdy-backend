@@ -663,9 +663,24 @@ async def publish_run(db, run: dict, agent: dict, cards: list[dict]) -> None:
         except Exception as e:  # noqa: BLE001 - one card must not cost the others theirs
             logger.error("stock run %s: card %s didn't post: %s", run["_id"], card["_id"], e, exc_info=True)
             failure = SlackPublishError(f"A card couldn't be posted: {e}")
+    if not failure:
+        failure = await _weekly_step(db, run, agent, posted)
     if failure:
         failure.posted = posted
         raise failure
+
+
+async def _weekly_step(db, run: dict, agent: dict, posted: int) -> SlackPublishError | None:
+    """The weekly message, when the agent posts it on its own. The failure to report, or None."""
+    from ai.agents.stock import weekly  # weekly imports this module
+    try:
+        await weekly.post_if_automatic(db, run, agent)
+    except SlackPublishError as e:
+        return e
+    except Exception as e:  # noqa: BLE001 - the weekly must not cost the run its other messages
+        logger.error("stock run %s: weekly didn't post: %s", run["_id"], e, exc_info=True)
+        return SlackPublishError(f"The weekly report couldn't be posted: {e}")
+    return None
 
 
 # ---------------------------------------------------------------------------

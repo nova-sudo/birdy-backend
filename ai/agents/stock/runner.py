@@ -63,6 +63,7 @@ from ai.agents.stock.checks import client_facts, follow_ups
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.stock.slack import (SLACK_CLAIM, SLACK_POSTED, post_urgent_alerts, publish_run, slack_attempt_fields,
                                    slack_failed_fields)
+from ai.agents.stock.weekly import build_weekly, weekly_due
 from ai.agents.stock.windows import full_day_window, last_full_day
 from ai.agents.stock.writer import write_card
 from ai.agents.store import CARDS, RUNS
@@ -790,12 +791,24 @@ def _states(run: dict) -> dict:
     return {g: c["state"] for g, c in run["clients"].items()}
 
 
+async def _weekly_step(db, run: dict, agent: dict, now_utc: datetime | None = None) -> None:
+    """Build the weekly report on its weekday, before the run publishes so an automatic post goes out with it. It
+    never holds the run: a failure is logged and the next publish tries again. `kind` is left as it is."""
+    if not weekly_due(_settings(agent), run):
+        return
+    try:
+        await _save(db, run, weekly=await build_weekly(db, agent, now_utc or _run_now(run)))
+    except Exception as e:  # noqa: BLE001
+        logger.error("stock run %s: weekly report failed: %s", run["_id"], e, exc_info=True)
+
+
 async def _publishing_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
     await _save(db, run, in_flight=[])
     cards = await _run_cards(db, run)
     await _save(db, run, summary=_summary(run, cards), published_states=_states(run))
     if run["kind"] == PREVIEW:
         return True
+    await _weekly_step(db, run, agent)
     await _publish(db, run, agent, cards)
     if not run.get("reconnect"):  # with a dead token, no writes
         await auto_apply_run(db, mongo_client, run, agent, deadline=deadline)
@@ -833,6 +846,7 @@ async def _end_incomplete(db, run: dict, agent: dict) -> dict:
     logger.error("stock run %s ended after %s attempts, missing %s", run["_id"], attempts, missing)
     if run["kind"] != PREVIEW:
         await _call_urgent_hook(db, run, agent)
+        await _weekly_step(db, run, agent)
         await _publish(db, run, agent, cards)
         await _save(db, run, claimed_at=None)
     return run
