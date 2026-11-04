@@ -75,6 +75,7 @@ WAIT_HISTORY, WAIT_REFRESH = "history", "refresh"
 
 GRACE = timedelta(hours=2)           # how long one late client waits for its ad rows
 OVERDUE_AFTER = timedelta(hours=24)  # from the scheduled time, when the next day's run is due
+PREVIEW_MAX_AGE = timedelta(hours=3)  # a preview still open after this ends, so a new request starts fresh
 CLIENT_ATTEMPTS = 3
 MAX_RUN_ATTEMPTS = 3
 RETRY_AFTER = timedelta(minutes=10)  # so a retry lands on a later tick
@@ -181,6 +182,7 @@ async def get_or_create_run(db, agent: dict, now_utc: datetime, *, kind: str | N
     an unfinished preview is returned, and otherwise a new one starts."""
     fresh = _new_run(agent, now_utc, kind, scheduled_utc)
     if kind == PREVIEW:
+        await end_stale_previews(db, agent, now_utc)
         open_preview = await db[RUNS].find_one({"agent_id": agent["_id"], "kind": PREVIEW, "phase": {"$ne": DONE}})
         if open_preview:
             return open_preview
@@ -831,6 +833,18 @@ async def end_overdue_runs(db, agent: dict, now_utc: datetime) -> None:
     due. Measured from that time, not local midnight, so a late evening run keeps its full day."""
     cutoff = _naive(now_utc) - OVERDUE_AFTER
     q = {"agent_id": agent["_id"], "scheduled": True, "phase": {"$ne": DONE}, "scheduled_at": {"$lte": cutoff}}
+    for stale in await db[RUNS].find(q, {"_id": 1}).to_list(length=None):
+        run = await _claim(db, stale["_id"])
+        if run is not None:
+            run["tick_now"] = _naive(now_utc)
+            await _end_incomplete(db, run, agent)
+
+
+async def end_stale_previews(db, agent: dict, now_utc: datetime) -> None:
+    """A preview waiting longer than PREVIEW_MAX_AGE (a throttled account can keep it `waiting`
+    for good, and scheduled-run cleanup doesn't cover previews) ends here, saying what's missing."""
+    cutoff = _naive(now_utc) - PREVIEW_MAX_AGE
+    q = {"agent_id": agent["_id"], "kind": PREVIEW, "phase": {"$ne": DONE}, "as_of": {"$lte": cutoff}}
     for stale in await db[RUNS].find(q, {"_id": 1}).to_list(length=None):
         run = await _claim(db, stale["_id"])
         if run is not None:

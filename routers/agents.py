@@ -676,6 +676,21 @@ async def resolve_practice(agent_id: str, case_id: str, body: PracticeResolution
         return {"resolution": body.resolution}
 
 
+async def _stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list[dict]]:
+    """What stops the stock agent switching on: a client, zones that resolve for each, and a
+    finished preview. Also returns the settings errors behind any zone messages."""
+    ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
+    groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": user_id}).to_list(length=None)
+    errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
+    missing = [] if ids else ["Choose at least one client to watch"]
+    missing += [e["message"] for e in errors]
+    preview = await db[agent_store.RUNS].find_one({
+        "agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}}, {"_id": 1})
+    if preview is None:
+        missing.append("Preview the first report")
+    return missing, errors
+
+
 @router.post("/{agent_id}/activate")
 async def activate(agent_id: str, body: Optional[ActivateBody] = None,
                    current_user: str = Depends(get_current_user)):
@@ -686,16 +701,16 @@ async def activate(agent_id: str, body: Optional[ActivateBody] = None,
         if agent.get("status") == "active":
             return _agent_to_api(agent)  # idempotent: nothing changes
         if agent.get("type") == agent_store.TYPE_STOCK:
-            ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
-            groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": current_user}).to_list(length=None)
-            errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
-            if errors:
-                return JSONResponse(status_code=400, content={
-                    "detail": "Fix these settings before switching on", "errors": errors})
-        conf = await _confidence(db, agent)
-        if not conf["ready"]:
-            return JSONResponse(status_code=409, content={
-                "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
+            missing, errors = await _stock_missing(db, current_user, agent)
+            if missing:
+                return JSONResponse(status_code=409, content={
+                    "detail": "The agent isn't ready to switch on yet", "missing": missing, "errors": errors})
+            conf = {"score": None}
+        else:
+            conf = await _confidence(db, agent)
+            if not conf["ready"]:
+                return JSONResponse(status_code=409, content={
+                    "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
         scope = agent.get("scope") or {}
         ids = list(scope.get("client_group_ids") or [])
         flag_only = [g for g in (body.only_flag if body.only_flag is not None

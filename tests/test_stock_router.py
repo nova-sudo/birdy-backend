@@ -1,0 +1,243 @@
+"""The stock agent's API (spec section 12): preview, runs, cards, outcomes, lessons, activate."""
+
+import contextlib
+from datetime import datetime, timedelta, timezone
+
+import pytest
+from fastapi.testclient import TestClient
+
+import routers.agent_stock as stock_router
+import routers.agents as agents_router
+from ai.agents import claims
+from ai.agents.stock import runner
+from ai.agents.stock.runner import RUNS
+from ai.agents.stock.scoreboard import OUTCOMES
+from ai.agents.store import AGENTS, CARDS, MEMORY, TYPE_STOCK, create_agent
+from dependencies import get_current_user
+from jobs import agent_jobs
+from main import app
+from test_stock_runner import NOW, USER, ZONES, _client, _setup, fakes  # noqa: F401 - fakes is a fixture
+
+OTHER = "u2"
+
+
+@pytest.fixture
+def api(mock_mongo_client, monkeypatch, fakes):  # noqa: F811
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+
+    monkeypatch.setattr(agents_router, "get_mongo_client", fake_client)
+    monkeypatch.setattr(stock_router, "get_mongo_client", fake_client)
+    monkeypatch.setattr(stock_router, "_utcnow", lambda: NOW)
+    state = {"user": USER}
+    app.dependency_overrides[get_current_user] = lambda: state["user"]
+    client = TestClient(app)
+    client.state = state
+    client.fakes = fakes
+    yield client
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+def _routes(aid):
+    base = f"/api/agents/{aid}"
+    return [("post", f"{base}/preview"), ("get", f"{base}/runs"), ("get", f"{base}/runs/latest"),
+            ("get", f"{base}/runs/r1"), ("patch", f"{base}/cards/c1"), ("get", f"{base}/outcomes"),
+            ("get", f"{base}/lessons")]
+
+
+def _call(api, method, path):
+    return getattr(api, method)(path, **({"json": {}} if method == "patch" else {}))
+
+
+async def test_routes_404_for_another_users_agent_and_400_for_custom(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    api.state["user"] = OTHER
+    for method, path in _routes(agent["_id"]):
+        assert _call(api, method, path).status_code == 404, path
+    api.state["user"] = USER
+    custom = await create_agent(mock_db, USER, type="custom", name="Rules")
+    for method, path in _routes(custom["_id"]):
+        assert _call(api, method, path).status_code == 400, path
+
+
+# ---------------------------------------------------------------------------
+# Preview
+# ---------------------------------------------------------------------------
+
+async def test_preview_409_while_history_is_not_ready(api, mock_db):
+    agent = await _setup(mock_db, "g1", history_status="pending")
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 409 and r.json()["not_ready"] == ["g1"]
+    assert await mock_db[RUNS].count_documents({}) == 0
+
+
+async def test_preview_needs_a_client(api, mock_db):
+    agent = await create_agent(mock_db, USER, type=TYPE_STOCK)
+    assert api.post(f"/api/agents/{agent['_id']}/preview").status_code == 409
+
+
+async def test_preview_runs_and_writes_nothing_live(api, mock_db, monkeypatch):
+    agent = await _setup(mock_db, "g1", claim=False)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "draft"}})
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["kind"] == "preview" and body["phase"] == "done"
+    f = api.fakes
+    assert f.published == [] and f.autos == [] and f.urgent == []
+    [card] = await mock_db[CARDS].find({"run_id": body["run_id"]}).to_list(None)
+    assert card["preview"] is True
+    shown = api.get(f"/api/agents/{agent['_id']}/runs/{body['run_id']}").json()
+    assert [c["can_apply"] for c in shown["cards"]] == [False]
+
+
+async def test_a_stale_open_preview_is_ended_and_a_fresh_one_starts(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    old = await runner.get_or_create_run(mock_db, agent, NOW - timedelta(days=2), kind="preview")
+    r = api.post(f"/api/agents/{agent['_id']}/preview")
+    assert r.status_code == 200 and r.json()["run_id"] != old["_id"]
+    ended = await mock_db[RUNS].find_one({"_id": old["_id"]})
+    assert ended["phase"] == "done" and ended["ended_early"] is True
+
+
+async def test_the_tick_finishes_an_unfinished_preview(api, mock_db, mock_mongo_client):
+    agent = await _setup(mock_db, "g1", claim=False)
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"status": "draft"}})  # not ticked as a day's run
+    run = await runner.get_or_create_run(mock_db, agent, NOW, kind="preview")
+    await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW)
+    for n in range(1, 8):
+        if (await mock_db[RUNS].find_one({"_id": run["_id"]}))["phase"] == "done":
+            break
+        await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW + timedelta(minutes=15 * n))
+    assert (await mock_db[RUNS].find_one({"_id": run["_id"]}))["phase"] == "done"
+    assert api.fakes.urgent == [] and api.fakes.published == []
+
+
+# ---------------------------------------------------------------------------
+# Activate
+# ---------------------------------------------------------------------------
+
+async def test_activate_lists_what_is_missing_until_ready(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False, history_status="ready")
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft", "scope.client_group_ids": []}})
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 409 and len(r.json()["missing"]) >= 2
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"scope.client_group_ids": ["g1"]}})
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
+
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"settings.zones": {
+        "currency": None, "green_under": None, "red_over": None}, "settings.clients.g1.zones": None}})
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert any("zone" in m.lower() for m in r.json()["missing"])
+
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"settings.zones": ZONES}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 200 and r.json()["status"] == "active"
+    assert await claims.holder(mock_db, USER, "g1") == aid
+
+
+async def test_activate_claim_conflict_is_409_with_conflicts(api, mock_db):
+    agent = await _setup(mock_db, "g1", claim=False)
+    aid = agent["_id"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
+    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
+    await claims.claim_clients(mock_db, USER, "other-agent", ["g1"])
+    r = api.post(f"/api/agents/{aid}/activate")
+    assert r.status_code == 409 and r.json()["conflicts"][0]["client_group_id"] == "g1"
+
+
+# ---------------------------------------------------------------------------
+# Runs, cards, outcomes, lessons
+# ---------------------------------------------------------------------------
+
+async def _seed_run(db, agent, **kw):
+    run = {"_id": kw.pop("rid"), "agent_id": agent["_id"], "user_id": USER, "kind": "batch", "phase": "done",
+           "local_date": "2026-11-03", "as_of": datetime(2026, 11, 3, 7), "summary": {"cards": 1},
+           "clients": {"g1": {"state": "done", "facts": {"big": 1}, "draft": {"x": 1}}}, "alerts": [],
+           "scheduled": True, **kw}
+    await db[RUNS].insert_one(run)
+    return run
+
+
+async def _seed_card(db, agent, cid, rid, **kw):
+    card = {"_id": cid, "agent_id": agent["_id"], "user_id": USER, "run_id": rid, "client_group_id": "g1",
+            "status": "open", "lines": [{"id": "l1", "kind": "remove", "ad_name": "A", "meta_ids": ["a1"],
+                                         "mode": "ask", "state": "proposed"},
+                                        {"id": "l2", "kind": "remove", "ad_name": "B", "meta_ids": ["a2"],
+                                         "mode": "ask", "state": "proposed"}],
+            "additional_changes": "", "thought_process": "t", "next_steps": "n",
+            "original": {"lines": [], "additional_changes": "", "thought_process": "t", "next_steps": "n"},
+            "follow_ups": [{"line_id": "l1", "text": "A: off", "ok": True}],
+            "created_at": datetime(2026, 11, 3, 8), **kw}
+    await db[CARDS].insert_one(card)
+
+
+async def test_runs_list_latest_and_detail(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r1", as_of=datetime(2026, 11, 1, 7))
+    await _seed_run(mock_db, agent, rid="r2", as_of=datetime(2026, 11, 3, 7))
+    await _seed_run(mock_db, agent, rid="rp", kind="preview", as_of=datetime(2026, 11, 4, 7))
+    await _seed_card(mock_db, agent, "c1", "r2")
+    await _seed_card(mock_db, agent, "c2", "r2", client_group_id="g2", status="closing")
+    listed = api.get(f"/api/agents/{aid}/runs?limit=1").json()
+    assert [r["id"] for r in listed["runs"]] == ["r2"] and listed["next_before"]
+    older = api.get(f"/api/agents/{aid}/runs", params={"before": listed["next_before"]}).json()
+    assert [r["id"] for r in older["runs"]] == ["r1"] and older["next_before"] is None
+    assert api.get(f"/api/agents/{aid}/runs/latest").json()["run"]["id"] == "r2"
+    assert api.get(f"/api/agents/{aid}/runs/latest?kind=preview").json()["run"]["id"] == "rp"
+    d = api.get(f"/api/agents/{aid}/runs/r2").json()
+    assert set(d) == {"run", "cards", "follow_ups", "scoreboard", "learned", "proposals", "weekly"}
+    assert [c["id"] for c in d["cards"]] == ["c1"] and d["cards"][0]["can_apply"] is True
+    assert d["follow_ups"] == [{"client_group_id": "g1", "line_id": "l1", "text": "A: off", "ok": True}]
+    assert "facts" not in d["run"]["clients"]["g1"] and "_id" not in d["run"]
+    assert (d["learned"], d["proposals"], d["weekly"]) == ([], [], None)
+    assert d["scoreboard"] == {"won": 0, "lost": 0, "moves": 0, "rows": []}
+    assert api.get(f"/api/agents/{aid}/runs/nope").status_code == 404
+
+
+async def test_latest_with_no_runs_is_null(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    assert api.get(f"/api/agents/{agent['_id']}/runs/latest").json() == {"run": None}
+
+
+async def test_patch_card_keeps_original_and_refuses_a_settled_card(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2")
+    r = api.patch(f"/api/agents/{aid}/cards/c1", json={
+        "thought_process": "mine", "lines": [{"id": "l2", "kind": "add", "meta_ids": ["evil"]}]})
+    assert r.status_code == 200, r.text
+    card = await mock_db[CARDS].find_one({"_id": "c1"})
+    assert card["thought_process"] == "mine" and card["original"]["thought_process"] == "t"
+    assert [ln["id"] for ln in card["lines"]] == ["l2"]
+    assert card["lines"][0]["kind"] == "remove" and card["lines"][0]["meta_ids"] == ["a2"]
+    assert api.patch(f"/api/agents/{aid}/cards/c1", json={"lines": [{"id": "zz"}]}).status_code == 400
+    assert api.patch(f"/api/agents/{aid}/cards/c1", json={"status": "applied"}).status_code == 422
+    for status in ("applied", "partly_applied", "dismissed", "superseded"):
+        await _seed_card(mock_db, agent, f"s-{status}", "r2", client_group_id=status, status=status)
+        assert api.patch(f"/api/agents/{aid}/cards/s-{status}", json={"next_steps": "x"}).status_code == 409
+    await _seed_card(mock_db, agent, "cl", "r2", client_group_id="x", status="closing")
+    assert api.patch(f"/api/agents/{aid}/cards/cl", json={"next_steps": "x"}).status_code == 404
+
+
+async def test_outcomes_and_lessons(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    assert api.get(f"/api/agents/{aid}/outcomes").json() == {"won": 0, "lost": 0, "moves": 0, "rows": []}
+    await mock_db[OUTCOMES].insert_many([
+        {"_id": "o1", "agent_id": aid, "creative_key": "k", "result": "won", "created_at": datetime(2026, 11, 1)},
+        {"_id": "o2", "agent_id": aid, "creative_key": "k", "result": None, "created_at": datetime(2026, 11, 2)},
+        {"_id": "o3", "agent_id": "other", "creative_key": "k", "result": "lost"}])
+    out = api.get(f"/api/agents/{aid}/outcomes").json()
+    assert (out["won"], out["lost"], out["moves"]) == (1, 0, 2)
+    assert [r["id"] for r in out["rows"]] == ["o2", "o1"]
+    assert api.get(f"/api/agents/{aid}/lessons").json() == []
+    await mock_db[MEMORY].insert_one({"_id": "m1", "agent_id": aid, "text": "no blue", "active": True,
+                                      "created_at": datetime(2026, 11, 1)})
+    assert [m["id"] for m in api.get(f"/api/agents/{aid}/lessons").json()] == ["m1"]

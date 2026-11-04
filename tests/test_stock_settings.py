@@ -181,7 +181,8 @@ async def test_activate_reports_zone_errors(api, mock_db):
     api.patch(f"/api/agents/{aid}/settings", json={
         "settings": {"zones": GBP_ZONES}, "client_group_ids": ["g1"]})
     r = api.post(f"/api/agents/{aid}/activate")
-    assert r.status_code == 400 and r.json()["errors"][0]["client_group_id"] == "g1"
+    assert r.status_code == 409 and r.json()["errors"][0]["client_group_id"] == "g1"
+    assert any("needs its own zones" in m for m in r.json()["missing"])
 
 
 # ---------------------------------------------------------------------------

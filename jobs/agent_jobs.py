@@ -246,6 +246,26 @@ def _stock_last_run(run: dict, at: datetime) -> dict:
             "cards": summary.get("cards", 0), "stale": bool(summary.get("stale"))}
 
 
+async def _resume_previews(mongo_client, now_utc: datetime, deadline: float | None) -> None:
+    """Finish previews a request left unfinished (draft agents aren't ticked otherwise). Stale ones
+    end first. A preview never posts to Slack or Meta."""
+    db = mongo_client[DB_NAME]
+    for row in await db[stock_runner.RUNS].find(
+            {"kind": stock_runner.PREVIEW, "phase": {"$ne": stock_runner.DONE}}).to_list(length=None):
+        if deadline is not None and time.monotonic() > deadline:
+            return
+        try:
+            agent = await db[AGENTS].find_one({"_id": row["agent_id"], "type": TYPE_STOCK})
+            if agent is None:
+                continue
+            await stock_runner.end_stale_previews(db, agent, now_utc)
+            run = await db[stock_runner.RUNS].find_one({"_id": row["_id"]})
+            if run and run["phase"] != stock_runner.DONE:
+                await stock_runner.advance_run(db, mongo_client, run, agent, deadline=deadline, now_utc=now_utc)
+        except Exception as e:  # noqa: BLE001 - the preview records its own failures
+            logger.error("agents-tick: preview %s failed: %s", row.get("_id"), e, exc_info=True)
+
+
 async def run_due_stock_agents(mongo_client, *, now_utc: datetime, deadline: float | None = None) -> dict:
     """Start each active stock agent's run on time and resume unfinished ones, the agent advanced
     longest ago first, so one agency can't use the whole budget every tick. `deadline`
@@ -257,6 +277,7 @@ async def run_due_stock_agents(mongo_client, *, now_utc: datetime, deadline: flo
     def out_of_time() -> bool:
         return deadline is not None and time.monotonic() > deadline
 
+    await _resume_previews(mongo_client, now_utc, deadline)
     agents = await db[AGENTS].find({"status": "active", "type": TYPE_STOCK}).sort("stock_advanced_at", 1).to_list(length=None)
     for agent in agents:
         try:
