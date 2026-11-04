@@ -96,7 +96,7 @@ def fakes(monkeypatch):
     async def publish(db, run, agent, cards):
         f.published.append({"run": run, "cards": cards})
 
-    async def auto(db, mongo_client, run, agent):
+    async def auto(db, mongo_client, run, agent, *, deadline=None):
         f.autos.append(run["_id"])
 
     async def urgent(db, run, agent):

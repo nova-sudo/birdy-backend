@@ -843,7 +843,8 @@ async def agents_tick(authorization: str | None = Header(default=None)):
 
 @router.get("/creatives-tick")
 async def creatives_tick(authorization: str | None = Header(default=None)):
-    """Every minute: tracks due creative tests (nightly per user) and adopts hand-posted CT- ads."""
+    """Every minute: posts queued creatives, applies queued stock agent lines, tracks due creative
+    tests (nightly per user) and adopts hand-posted CT- ads."""
     _verify_cron_auth(authorization)
 
     from jobs.creative_tracking import run_creatives_tick

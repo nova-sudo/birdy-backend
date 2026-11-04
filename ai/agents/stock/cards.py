@@ -7,6 +7,7 @@ resolved here, once, per line.
 """
 
 import copy
+import re
 from datetime import datetime
 
 from ai.agents.stock.settings import resolve_mode
@@ -15,9 +16,15 @@ from ai.agents.store import CARDS
 
 STATUS_OPEN, STATUS_FLAGGED, STATUS_SUPERSEDED = "open", "flagged", "superseded"
 STATUS_CLOSING = "closing"  # stored, but older open cards aren't closed yet: can't be applied or shown
+STATUS_PARTLY_APPLIED, STATUS_APPLIED, STATUS_DISMISSED = "partly_applied", "applied", "dismissed"
 STATE_PROPOSED, STATE_FLAGGED = "proposed", "flagged"
+STATE_QUEUED, STATE_APPLYING, STATE_APPLIED, STATE_FAILED, STATE_BLOCKED, STATE_NEEDS_FILE = (
+    "queued", "applying", "applied", "failed", "blocked", "needs_file")
+STATE_UNDOING, STATE_UNDONE = "undoing", "undone"
 CHANGE_DECISION = "propose"
 _EDITABLE = ("lines", "additional_changes", "thought_process", "next_steps")
+CLIENT_NAME_FLAG = "client_name"
+MIN_CLIENT_NAME = 2  # a one letter name would match almost any ad
 
 
 def no_change_reason(facts: dict, decision: str) -> str:
@@ -50,6 +57,39 @@ def _next_if_it_stalls(candidates: dict | None) -> str:
     if best:
         return f"If it stalls, {best[0].get('ad_name') or 'the top allowed ad'} goes in next."
     return "If it stalls, Birdy will propose changes on the next batch day."
+
+
+def _name_pattern(name: str) -> re.Pattern:
+    """A client's name as whole words, any case, any spacing. Names are escaped: they are never a pattern."""
+    words = r"\s+".join(re.escape(w) for w in name.split())
+    return re.compile(rf"(?<!\w){words}(?!\w)", re.IGNORECASE)
+
+
+def client_name_flags(text: str, names, own_name: str | None) -> list[dict]:
+    """Spec section 6: other clients' names found in an ad's text. The client's own name isn't a match,
+    and neither is a shorter name inside it ("Acme" within "Acme London"), so its own name comes out
+    of the text first. An other client whose name contains this client's is looked for in the full text."""
+    text, own = text or "", (own_name or "").strip()
+    own_key = " ".join(own.split()).casefold()
+    own_re = _name_pattern(own) if own else None
+    without_own = own_re.sub(" ", text) if own_re else text
+    flags, seen = [], set()
+    for raw in names or []:
+        name = " ".join(str(raw or "").split())
+        key = name.casefold()
+        if len(name) < MIN_CLIENT_NAME or key == own_key or key in seen:
+            continue
+        seen.add(key)
+        haystack = text if own_re and own_re.search(name) else without_own
+        if _name_pattern(name).search(haystack):
+            flags.append({"kind": CLIENT_NAME_FLAG, "note": f"Mentions another client: {name}"})
+    return flags
+
+
+def _ad_text(line: dict) -> str:
+    """The ad's own words. Not `source`: an Add always comes from another client."""
+    creative = line.get("creative") or {}
+    return "\n".join(str(t) for t in (line.get("ad_name"), creative.get("title"), creative.get("body")) if t)
 
 
 def _line(n: int, kind: str, ad_id: str | None, name: str | None, mode: str, flags: list[dict], **extra) -> dict:
@@ -91,15 +131,18 @@ def _lines(facts: dict, draft: dict, settings: dict, candidates: dict | None, fl
 
 
 def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, run_id: str, *,
-               candidates: dict | None = None, flag_only: bool = False) -> dict:
+               candidates: dict | None = None, flag_only: bool = False, client_names=None) -> dict:
     """The card for one client, shaped as in spec section 7. `draft` is write_card's output, or
     None for a card that needs no AI. Only a "propose" decision with a draft that didn't fail
     makes lines, so a failed draft can never reach Auto. `candidates` names the chosen ads.
-    `flag_only` is for a client this agent watches without acting on: every line is a Flag."""
+    `flag_only` is for a client this agent watches without acting on: every line is a Flag.
+    `client_names` are the agency's clients, to flag an ad that mentions another one."""
     draft = draft or {}
     failed = bool(draft.get("failed"))
     usable = decision == CHANGE_DECISION and not failed
     lines = _lines(facts, draft, settings, candidates, flag_only) if usable else []
+    for line in lines:
+        line["flags"] = line["flags"] + client_name_flags(_ad_text(line), client_names, facts.get("name"))
     additional = draft.get("additional_changes") or "" if usable else ""
 
     if lines or additional:
@@ -140,14 +183,15 @@ async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
     return res.modified_count
 
 
-async def guarded_update(db, card: dict, fields: dict) -> bool:
+async def guarded_update(db, card: dict, fields: dict, *, statuses: tuple = (STATUS_OPEN, STATUS_FLAGGED)) -> bool:
     """Write `fields` to a card that is still open or flagged and hasn't changed since `card` was
     read: its `version` must match, and goes up by one. False when it lost a race (or the card
     was decided meanwhile), so the caller answers 409. Every write that changes a card's lines
-    (edit, apply, undo) goes through here."""
+    (edit, apply, undo) goes through here. Only apply paths widen `statuses`: a partly applied
+    card can't be edited."""
     version = card.get("version") or 0
     match = {"version": version} if version else {"$or": [{"version": 0}, {"version": {"$exists": False}}]}
     res = await db[CARDS].update_one(
-        {"_id": card["_id"], "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]}, **match},
+        {"_id": card["_id"], "status": {"$in": list(statuses)}, **match},
         {"$set": {**fields, "updated_at": datetime.utcnow()}, "$inc": {"version": 1}})
     return res.modified_count == 1

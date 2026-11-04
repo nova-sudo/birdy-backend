@@ -17,9 +17,11 @@ from pydantic import BaseModel, ConfigDict
 from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
+from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
-from ai.agents.stock.cards import STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, guarded_update
+from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
+                                   guarded_update)
 from ai.agents.stock.scoreboard import LOST, OUTCOMES, WON
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -31,6 +33,7 @@ router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
 OUTCOME_ROWS = 100
 CARD_EDITABLE = ("additional_changes", "thought_process", "next_steps")
+APPLY_BUDGET_SECONDS = 20      # a card's lines wait this long in the request; the cron finishes the rest
 
 
 def _utcnow() -> datetime:
@@ -64,11 +67,20 @@ def _run_to_api(run: dict) -> dict:
     return out
 
 
-def _card_to_api(card: dict) -> dict:
+def _card_to_api(card: dict, *, has_newer: bool = False) -> dict:
     out = _with_id(card, drop=("user_id",))
-    # Only a live card still waiting on a person can be applied. A preview card never can.
-    out["can_apply"] = card.get("status") == STATUS_OPEN and not card.get("preview")
+    # Only a live card still waiting on a person can be applied. A preview card never can, and a
+    # partly applied one can only while it has lines left and no newer card has replaced it.
+    status = card.get("status")
+    left = any(ln.get("state") == STATE_PROPOSED for ln in card.get("lines") or [])
+    out["can_apply"] = not card.get("preview") and (
+        status == STATUS_OPEN or (status == STATUS_PARTLY_APPLIED and left and not has_newer))
     return out
+
+
+async def _card_for_api(db, card: dict) -> dict:
+    has_newer = card.get("status") == STATUS_PARTLY_APPLIED and await stock_apply.has_newer_card(db, card)
+    return _card_to_api(card, has_newer=has_newer)
 
 
 class SettingsPatch(BaseModel):
@@ -209,7 +221,7 @@ async def get_run(agent_id: str, run_id: str, current_user: str = Depends(get_cu
         follow_ups = [{"client_group_id": c["client_group_id"], **f}
                       for c in cards for f in c.get("follow_ups") or []]
         # learned, proposals and weekly are filled in by the learning loop and the weekly message.
-        return {"run": _run_to_api(run), "cards": [_card_to_api(c) for c in cards], "follow_ups": follow_ups,
+        return {"run": _run_to_api(run), "cards": [await _card_for_api(db, c) for c in cards], "follow_ups": follow_ups,
                 "scoreboard": await _scoreboard(db, agent_id), "learned": [], "proposals": [], "weekly": None}
 
 
@@ -252,6 +264,89 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
         if patch and not await guarded_update(db, card, patch):
             raise HTTPException(status_code=409, detail="This card changed while you were editing it. Reload it")
         return _card_to_api(await db[stock_runner.CARDS].find_one({"_id": card_id}))
+
+
+class ApplyBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    line_ids: Optional[list[str]] = None   # naming a failed or blocked line retries it
+
+
+class DismissBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    reason: Optional[str] = None
+
+
+class UndoBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    line_id: str
+
+
+async def _require_card(db, agent_id: str, card_id: str, user_id: str) -> None:
+    """The card must be this agent's. A different agent's card is a 404, like another user's."""
+    if not await db[stock_runner.CARDS].find_one({"_id": card_id, "agent_id": agent_id, "user_id": user_id}, {"_id": 1}):
+        raise HTTPException(status_code=404, detail="Card not found")
+
+
+DECISION_STATUS = {"not_found": 404, "bad_lines": 400, "refused": 409, "expired": 410}
+
+
+async def _decision_response(db, res: dict, *, more: Optional[dict] = None) -> dict:
+    """A refusal is an HTTP error with the plain reason. Anything else that happened, a blocked or
+    failed line included, is a 200 carrying each line's result. `more` lists further HTTP errors."""
+    code = {**DECISION_STATUS, **(more or {})}.get(res["outcome"])
+    if code:
+        raise HTTPException(status_code=code, detail=res.get("reason") or "Card not found")
+    return {**res, "card": await _card_for_api(db, res["card"])}
+
+
+@router.post("/{agent_id}/cards/{card_id}/apply")
+async def apply_card(agent_id: str, card_id: str, body: ApplyBody = ApplyBody(), current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        await _require_card(db, agent_id, card_id, current_user)
+        res = await stock_apply.apply_card(db, mongo_client, current_user, card_id, by=current_user, source="dashboard",
+                                           line_ids=body.line_ids, budget_s=APPLY_BUDGET_SECONDS)
+        return await _decision_response(db, res)
+
+
+@router.post("/{agent_id}/cards/{card_id}/dismiss")
+async def dismiss_card(agent_id: str, card_id: str, body: DismissBody = DismissBody(), current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        await _require_card(db, agent_id, card_id, current_user)
+        res = await stock_apply.dismiss_card(db, current_user, card_id, by=current_user, source="dashboard",
+                                             reason=body.reason)
+        if res["outcome"] in ("busy", "already") and not res["ok"]:
+            raise HTTPException(status_code=409, detail=res["reason"])
+        return await _decision_response(db, res)
+
+
+@router.post("/{agent_id}/cards/{card_id}/undo")
+async def undo_line(agent_id: str, card_id: str, body: UndoBody, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        await _require_card(db, agent_id, card_id, current_user)
+        res = await stock_apply.undo_line(db, mongo_client, current_user, card_id, body.line_id, by=current_user,
+                                          source="dashboard")
+        return await _decision_response(db, res, more={"not_undoable": 409, "busy": 409, "blocked": 409, "failed": 502})
+
+
+@router.post("/{agent_id}/runs/{run_id}/apply-all")
+async def apply_all(agent_id: str, run_id: str, current_user: str = Depends(get_current_user)):
+    """Every open Ask me card in the run. What doesn't fit in the budget is finished by the cron."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        if not await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id}, {"_id": 1}):
+            raise HTTPException(status_code=404, detail="Run not found")
+        res = await stock_apply.apply_run(db, mongo_client, current_user, run_id, by=current_user, source="dashboard")
+        code = DECISION_STATUS.get(res["outcome"])
+        if code:
+            raise HTTPException(status_code=code, detail=res.get("reason") or "Run not found")
+        return res
 
 
 # ---------------------------------------------------------------------------

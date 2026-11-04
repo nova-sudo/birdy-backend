@@ -53,6 +53,7 @@ from ai.agents.meta_state import (SCOPE_ACCOUNT, MetaRateLimit, MetaTokenError, 
                                   store_meta_state)
 from ai.agents.snapshot import load_ad_days, load_state
 from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _alert, _history_state, run_alerts
+from ai.agents.stock.apply import auto_apply_run
 from ai.agents.stock.candidates import build_candidates
 from ai.agents.stock.cards import STATUS_CLOSING, build_card, supersede_open
 from ai.agents.stock.checks import client_facts, follow_ups
@@ -102,10 +103,6 @@ async def catch_up_run(db, mongo_client, run: dict, agent: dict) -> None:
 
 async def publish_run(db, run: dict, agent: dict, cards: list[dict]) -> None:
     """Post the summary and one reply per card to Slack. Called again when more cards arrive."""
-
-
-async def auto_apply_run(db, mongo_client, run: dict, agent: dict) -> None:
-    """Make the run's Auto changes. Called again when more cards arrive."""
 
 
 # ---------------------------------------------------------------------------
@@ -650,8 +647,9 @@ async def _close_with_card(db, run: dict, gid: str) -> None:
 async def _save_card(db, run: dict, agent: dict, facts: dict, last: dict | None, draft: dict | None,
                      candidates: dict | None, flag_only: bool) -> None:
     gid = facts["client_group_id"]
+    names = [g.get("name") async for g in db["client_groups"].find({"user_id": run["user_id"]}, {"name": 1})]
     card = build_card(facts, facts["decision"], draft, _settings(agent), run["_id"], candidates=candidates,
-                      flag_only=flag_only)
+                      flag_only=flag_only, client_names=names)
     card.update({"_id": str(uuid.uuid4()), "agent_id": agent["_id"], "user_id": run["user_id"],
                  "stale": bool(run["clients"][gid].get("stale")), "follow_ups": await _follow_ups(db, run, last, facts),
                  "final_status": card["status"], "status": STATUS_CLOSING, "created_at": datetime.utcnow(),
@@ -793,7 +791,7 @@ async def _publishing_phase(db, mongo_client, run: dict, agent: dict, deadline) 
         return True
     await _publish(db, run, agent, cards)
     if not run.get("reconnect"):  # with a dead token, no writes
-        await auto_apply_run(db, mongo_client, run, agent)
+        await auto_apply_run(db, mongo_client, run, agent, deadline=deadline)
     return True
 
 

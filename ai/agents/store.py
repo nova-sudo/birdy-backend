@@ -300,5 +300,7 @@ async def create_agent_indexes(mongo_client):
                                 partialFilterExpression={"open_preview": True})
     await db[CARDS].create_index([("run_id", 1), ("client_group_id", 1)], unique=True)
     await db[CARDS].create_index([("agent_id", 1), ("client_group_id", 1), ("created_at", -1)])
+    await db[CARDS].create_index("lines.state")  # the per-minute queue of lines to apply
+    await db[RUNS].create_index("apply_all.pending", sparse=True)
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)
