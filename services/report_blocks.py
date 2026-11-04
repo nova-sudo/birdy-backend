@@ -552,13 +552,14 @@ def _repair(b):
     return b
 
 
-def fit_to_slack(raw: dict) -> tuple[dict, list[str]]:
+def fit_to_slack(raw: dict, max_blocks: int = MAX_BLOCKS) -> tuple[dict, list[str]]:
     """
     Adjust a template that asks for more than Slack allows, instead of refusing it.
     Charts past Slack's two become a data table (when they compare clients) or
     are left out (day-by-day trends have no table form); blocks past 50 are cut.
     Returns the adjusted template and a note for each change, for the copilot to
-    pass on. Anything else wrong is left for `validate` to report.
+    pass on. Anything else wrong is left for `validate` to report. `max_blocks` leaves room for
+    blocks the caller adds after.
     """
     notes: list[str] = []
     blocks = raw.get("blocks")
@@ -592,16 +593,17 @@ def fit_to_slack(raw: dict) -> tuple[dict, list[str]]:
                     notes.append(f"Slack allows {MAX_CHARTS} charts per message, so “{title}” was left out.")
                 continue
         out.append(b)
-    if len(out) > MAX_BLOCKS:
-        notes.append(f"Slack allows {MAX_BLOCKS} blocks per message, so the last {len(out) - MAX_BLOCKS} were left out.")
-        out = out[:MAX_BLOCKS]
+    if len(out) > max_blocks:
+        notes.append(f"Slack allows {max_blocks} blocks here, so the last {len(out) - max_blocks} were left out.")
+        out = out[:max_blocks]
     return {**raw, "blocks": out}, notes
 
 
-def validate(raw: dict, clients: dict[str, str] | None = None) -> dict:
+def validate(raw: dict, clients: dict[str, str] | None = None, allowed_tokens: frozenset | set = frozenset()) -> dict:
     """
     A clean v4 template, or TemplateError listing everything wrong with it.
-    `clients` maps the user's client ids to names (None skips that check).
+    `clients` maps the user's client ids to names (None skips that check). `allowed_tokens` adds
+    agent placeholders (report_template.AGENT_TOKENS); a report passes none.
     """
     errors: list[str] = []
     if not isinstance(raw, dict):
@@ -647,7 +649,7 @@ def validate(raw: dict, clients: dict[str, str] | None = None) -> dict:
     blocks = _map_strings(blocks, lambda s, md: core.slackify(s) if md else s)
     tokens = all_tokens(blocks)
     for tok in tokens:
-        errors.extend(core._check_token(tok, clients))
+        errors.extend(core._check_token(tok, clients, allowed_tokens))
     if sum(1 for t in tokens if t["name"] == "birdy_take") > 1:
         errors.append("only one {{birdy_take}} per report")
     known = {t["raw"] for t in tokens}
@@ -866,7 +868,10 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
                 value = value[1:]  # a list already on its own line: no extra break, no stray indent
                 if out:
                     out[-1] = out[-1].rstrip(" \t")
-            out.append(core._escape(value) if md else value)
+            if tok["name"] in ctx.agent and tok["name"] not in core.TRUSTED_AGENT_TOKENS:
+                out.append(core._escape_all(value))  # an ad or client name must never ping or link
+            else:
+                out.append(core._escape(value) if md else value)
             last = tok["end"]
         out.append(core._escape(s[last:]) if md else s[last:])
         text = "".join(out)

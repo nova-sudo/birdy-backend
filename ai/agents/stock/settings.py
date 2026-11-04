@@ -10,6 +10,7 @@ import copy
 import os
 from dataclasses import dataclass
 
+TEMPLATE_KINDS = ("card", "summary", "weekly")   # the Slack templates an agent can edit
 MODE_KINDS = ("remove", "add", "revive")
 MODES = ("flag", "ask", "auto")
 SETTINGS_KEYS = ("batches", "weekly", "zones", "treatments", "clients", "creative", "scoring",
@@ -246,6 +247,12 @@ def shape_errors(patch: dict) -> list[dict]:
                            for k in ("channel_id", "channel_name", "also_tag_user_id")) \
                     or ("templates" in s and not isinstance(s["templates"], dict)):
                 out.append(_err(key, "invalid Slack settings"))
+            else:
+                for kind, t in (s.get("templates") or {}).items():
+                    if kind not in TEMPLATE_KINDS:
+                        out.append(_err(f"slack.templates.{kind}", "unknown template"))
+                    elif t is not None and not isinstance(t, dict):
+                        out.append(_err(f"slack.templates.{kind}", "must be a template or null to reset it"))
         elif key == "clients":
             if not isinstance(val, dict):
                 out.append(_err(key, "must be an object"))
@@ -266,6 +273,9 @@ def merge_settings(current: dict, patch: dict) -> dict:
         return out
 
     merged = merge(current, {k: v for k, v in patch.items() if k != "clients"})
+    templates = (merged.get("slack") or {}).get("templates")
+    if isinstance(templates, dict):   # a null template is a reset: remove it, don't store the null
+        merged["slack"] = {**merged["slack"], "templates": {k: v for k, v in templates.items() if v is not None}}
     clients = copy.deepcopy(current.get("clients") or {})
     for gid, c in (patch.get("clients") or {}).items():
         if c is None:

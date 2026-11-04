@@ -7,9 +7,10 @@ lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a c
 
 import copy
 import logging
+import os
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
@@ -23,6 +24,7 @@ from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
+from ai.agents.stock import templates as stock_templates
 from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
                                    guarded_update)
 from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
@@ -106,6 +108,15 @@ async def patch_settings(agent_id: str, body: SettingsPatch,
             raise HTTPException(status_code=400, detail="Only the Birdy Media Buying Agent has these settings")
         patch = body.settings or {}
         errors = stock_settings.shape_errors(patch)
+        if not errors and (patch.get("slack") or {}).get("templates"):
+            patch = copy.deepcopy(patch)
+            for kind, t in patch["slack"]["templates"].items():
+                if t is None:
+                    continue
+                try:
+                    patch["slack"]["templates"][kind] = stock_templates.validate_template(kind, t)
+                except stock_templates.TemplateError as e:
+                    errors += [{"field": f"slack.templates.{kind}", "message": m} for m in e.errors]
         if errors:
             return JSONResponse(status_code=400, content={"detail": "Some settings are invalid", "errors": errors})
         await agents_router._require_owned_groups(db, current_user, (patch.get("clients") or {}).keys())
@@ -401,6 +412,93 @@ async def apply_all(agent_id: str, run_id: str, current_user: str = Depends(get_
         if code:
             raise HTTPException(status_code=code, detail=res.get("reason") or "Run not found")
         return res
+
+
+# ---------------------------------------------------------------------------
+# Slack templates
+# ---------------------------------------------------------------------------
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")
+
+
+class TemplateBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    blocks: Optional[Any] = None
+
+
+def _kind_or_404(kind: str) -> str:
+    if kind not in stock_settings.TEMPLATE_KINDS:
+        raise HTTPException(status_code=404, detail=f"No template called {kind!r}")
+    return kind
+
+
+def _stored_templates(agent: dict) -> dict:
+    return ((agent.get("settings") or {}).get("slack") or {}).get("templates") or {}
+
+
+def _template_error(e: stock_templates.TemplateError) -> JSONResponse:
+    return JSONResponse(status_code=400, content={"detail": "This template can't be used", "errors": e.errors})
+
+
+def _template_view(kind: str, agent: dict) -> dict:
+    stored = _stored_templates(agent).get(kind)
+    return {"kind": kind, "customised": bool(stored), "template": stored or stock_templates.DEFAULT_TEMPLATES[kind],
+            "defaults": stock_templates.DEFAULT_TEMPLATES[kind], "placeholders": list(stock_templates.KIND_TOKENS[kind])}
+
+
+async def _save_template(db, agent: dict, user_id: str, kind: str, template: dict | None) -> dict:
+    """None resets it: merge_settings drops a null template, so it is really gone."""
+    current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
+    merged = stock_settings.merge_settings(current, {"slack": {"templates": {kind: template}}})
+    return await agent_store.update_agent(db, user_id, agent["_id"], {"settings": merged})
+
+
+@router.get("/{agent_id}/slack-templates/{kind}")
+async def get_slack_template(agent_id: str, kind: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        agent = await _stock_agent(mongo_client[DB_NAME], current_user, agent_id)
+        return _template_view(_kind_or_404(kind), agent)
+
+
+@router.put("/{agent_id}/slack-templates/{kind}")
+async def put_slack_template(agent_id: str, kind: str, body: TemplateBody, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        _kind_or_404(kind)
+        try:
+            clean = stock_templates.validate_template(kind, body.model_dump())
+        except stock_templates.TemplateError as e:
+            return _template_error(e)
+        return _template_view(kind, await _save_template(db, agent, current_user, kind, clean))
+
+
+@router.delete("/{agent_id}/slack-templates/{kind}")
+async def reset_slack_template(agent_id: str, kind: str, current_user: str = Depends(get_current_user)):
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        _kind_or_404(kind)
+        return _template_view(kind, await _save_template(db, agent, current_user, kind, None))
+
+
+@router.post("/{agent_id}/slack-templates/{kind}/preview")
+async def preview_slack_template(agent_id: str, kind: str, body: TemplateBody = TemplateBody(),
+                                 current_user: str = Depends(get_current_user)):
+    """The template (the unsaved draft in the body, else the saved one) rendered with sample values.
+    Nothing is read from Meta or sent to Slack."""
+    async with get_mongo_client() as mongo_client:
+        agent = await _stock_agent(mongo_client[DB_NAME], current_user, agent_id)
+        _kind_or_404(kind)
+        try:
+            template = (stock_templates.validate_template(kind, body.model_dump()) if body.blocks is not None
+                        else stock_templates.validate_template(kind, _template_view(kind, agent)["template"]))
+            currency = ((agent.get("settings") or {}).get("zones") or {}).get("currency") or "GBP"
+            blocks, text = stock_templates.sample_preview(kind, template, now=_utcnow(), currency=currency,
+                                                          frontend_url=FRONTEND_URL)
+        except stock_templates.TemplateError as e:
+            return _template_error(e)
+        return {"kind": kind, "blocks": blocks, "text": text, "sample": True}
 
 
 # ---------------------------------------------------------------------------

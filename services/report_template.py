@@ -136,6 +136,22 @@ SPECIAL_TOKENS = ("ranking", "breakdown", "alerts", "flagged_ads", "birdy_take",
 EVENT_TOKENS = {"event": "the event", "alert_name": "alert name", "alert_message": "alert message",
                 "account_name": "account name", "metric_name": "metric name"}
 
+# Placeholders only the Birdy Media Buying Agent's Slack templates (ai/agents/stock/templates.py)
+# may use. `validate` here never accepts them: a template says which it allows. They resolve from
+# `ctx.agent`, and are blank in an ordinary report.
+AGENT_TOKENS = {
+    "client": "client", "window": "window", "previous_cpl": "previous CPL", "current_cpl": "current CPL",
+    "zone": "zone", "changes": "changes", "additional_changes": "additional changes",
+    "thought_process": "thought process", "next_steps": "next steps", "follow_ups": "follow-ups",
+    "date": "date", "batch": "batch", "zone_counts": "zone counts", "alerts": "alerts",
+    "cards_waiting": "cards waiting", "tag": "tag",
+    "week": "week", "comparison": "comparison", "improved": "improved", "decreased": "decreased",
+    "status_check": "status check", "wins": "wins",
+}
+# Code-built values that stay mentions; every other agent value is escaped, so an ad or client name
+# like "<!channel>" can never ping anyone.
+TRUSTED_AGENT_TOKENS = ("tag",)
+
 _TOKEN_RE = re.compile(r"\{\{\s*([a-z_]+)((?:\s+[a-z_]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s}]+))*)\s*\}\}")
 _OPT_RE = re.compile(r"([a-z_]+)\s*=\s*(?:\"([^\"]*)\"|'([^']*)'|([^\s}]+))")
 _LOOSE_RE = re.compile(r"\{\{[^}]*\}\}")
@@ -181,7 +197,8 @@ def _resolve_client(ref: str | None, clients: dict[str, str]) -> str | None:
     return None
 
 
-def _check_token(tok: dict, clients: dict[str, str] | None) -> list[str]:
+def _check_token(tok: dict, clients: dict[str, str] | None, extra: frozenset | set = frozenset()) -> list[str]:
+    """`extra` names the agent placeholders this template may also use (see AGENT_TOKENS)."""
     name, opts = tok["name"], tok["opts"]
     where = tok["raw"]
     errs = []
@@ -228,7 +245,7 @@ def _check_token(tok: dict, clients: dict[str, str] | None) -> list[str]:
     elif name in ("alerts", "flagged_ads"):
         if opts.get("show", "summary") not in ("summary", "count", "list"):
             errs.append(f"{where}: show must be summary, count or list")
-    elif name in ("birdy_take", "period", "date", "client_count") or name in EVENT_TOKENS:
+    elif name in ("birdy_take", "period", "date", "client_count") or name in EVENT_TOKENS or name in extra:
         pass
     else:
         errs.append(f"{where}: unknown placeholder; metrics are {', '.join(CATALOG)}, "
@@ -247,6 +264,11 @@ def slackify(body: str) -> str:
     text = re.sub(r"\[([^\]\n]+)\]\((https?://[^)\s]+)\)", r"<\2|\1>", text)  # [t](u) → <u|t>
     text = re.sub(r"^(\s*)[-*] (?=\S)", r"\1• ", text, flags=re.M)        # - item → • item
     return text
+
+
+def _escape_all(text: str) -> str:
+    """Every &, < and > escaped, Slack's own syntax included. For values nobody vouched for."""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 def _escape(text: str) -> str:
@@ -610,6 +632,7 @@ class Context:
         self.preview = preview  # a preview, not a send: explain what can't be shown yet
         self.values: dict[str, float] = {}   # this send's figures, for the next send's show=change
         self.event: dict[str, str] = {}      # the event that sent it, if one did
+        self.agent: dict[str, str] = {}      # a stock agent template's values; they win over the report's own
         self._views: dict[str, dict] = {}
 
     def views(self, preset):
@@ -636,6 +659,9 @@ def _key(metric, client_id, preset):
 def _resolve(tok: dict, ctx: Context) -> str:
     name, opts = tok["name"], tok["opts"]
     cur = ctx.currency
+
+    if name in ctx.agent:
+        return ctx.agent[name] or (f"‹{AGENT_TOKENS[name]}›" if ctx.preview else "")
 
     if name in CATALOG:
         client_id = _resolve_client(opts.get("client"), ctx.names) if opts.get("client") else None
