@@ -20,7 +20,7 @@ and `render_kind` swaps it for a normal table of the run's own rows before the e
 import copy
 import json
 import re
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import services.report_blocks as rb
 import services.report_template as rt
@@ -325,7 +325,7 @@ def card_buttons(card: dict, now: datetime | None = None, *, has_newer: bool = F
     gets none. Apply needs a proposed line (a Flag line is never one) on a card nobody has replaced;
     Edit and Dismiss wait while any line is going out; Undo is per applied line, inside its window.
     Values are the card id, and for Undo `card_id:line_id`: the handler checks everything else."""
-    now = now or datetime.utcnow()
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     status, cid = card.get("status"), card.get("_id") or card.get("id")
     if card.get("preview") or status in (STATUS_CLOSING, "superseded") or not cid:
         return None
