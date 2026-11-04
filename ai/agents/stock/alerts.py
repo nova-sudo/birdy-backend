@@ -473,7 +473,8 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
         end = last_full_day(now_utc, health.get("timezone_name"))
 
         account_spend = None
-        if parts != "spend" and account in since_by_account and ((cfg["clients"].get(gid) or {}).get("prepaid") or {}).get("is_prepay_account") is not False:
+        wants_spend = account in since_by_account and _topups_of(cfg, gid)  # only a client with top-ups uses it
+        if parts != "spend" and wants_spend and ((cfg["clients"].get(gid) or {}).get("prepaid") or {}).get("is_prepay_account") is not False:
             if account not in spend_cache:
                 try:  # the health read above already stopped on a missing token
                     spend_cache[account] = await fetch_account_spend(account, token, since_by_account[account], end)

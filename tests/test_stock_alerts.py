@@ -657,3 +657,10 @@ async def test_app_wide_limit_on_the_health_read(monkeypatch):
     with pytest.raises(MetaRateLimit) as e:
         await fetch_account_health("act_1", "tok")
     assert e.value.scope == "app"
+
+
+async def test_failed_prepaid_read_only_touches_clients_with_top_ups(mock_db, graph, insights):
+    agent = await _seed(mock_db, settings=_topup_settings("g1"))
+    insights["error"] = "boom"
+    out = await run_alerts(mock_db, agent, _token, NOW, ["g1", "g2"], parts="health")
+    assert [a["client_group_id"] for a in out if a["code"] == "check_failed"] == ["g1"]

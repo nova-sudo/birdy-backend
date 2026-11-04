@@ -17,13 +17,19 @@ A client's `state` says what is left for it, so a resumed run never repeats fini
   needs_writing   needs its AI card
   done, alerts_only, on_hold, no_zones, no_data, data_late, failed    finished
 
-Alerts never wait on spend data. The token is checked first, then every client's health is read
-and `post_urgent_alerts` called. Only then does a late client wait, alone, for up to GRACE.
+Alerts never wait on spend data. The token is checked first, then every client's health and prepaid
+alerts are read. A late client then waits, alone, for up to GRACE, and the others get their spend
+alerts. `post_urgent_alerts` is called at the end of every alerts pass, however it stopped, and when
+a run ends incomplete, with the alerts so far. It's never called for a preview.
 
 Failures:
 - A client's error is retried on later ticks; `failed` only comes after CLIENT_ATTEMPTS.
 - A refresh that keeps failing doesn't fail the client: it carries on with `stale`.
-- A Meta rate limit stops the tick for this agent and costs nobody an attempt.
+- A health read that fails is retried on later ticks (`health_due`), up to CLIENT_ATTEMPTS, without
+  holding the client's card. Its `check_failed` only appears when the tries run out or the run ends,
+  and until then the summary lists the client in `health_unread`.
+- A Meta rate limit costs nobody an attempt. One on an ad account makes that account's clients wait
+  (`retry_after`) while other accounts carry on. One on the app or user stops this agent's tick.
 - A claim older than STALE_CLAIM belongs to a killed invocation. The kill counts against the
   clients named in `in_flight`, so one slow client fails alone. A kill with nobody in flight, or
   a phase that raises, counts in `run.attempts`, which progress resets; at MAX_RUN_ATTEMPTS the
@@ -366,7 +372,9 @@ async def _read_health(db, mongo_client, run: dict, agent: dict, gids: list[str]
             raise
         return e
     except Exception as e:  # noqa: BLE001 - run_alerts reports its own read failures; this is the rest
-        alerts = [{**_alert(g, "check_failed", "warning", "Couldn't check this client", _short(e), run["local_date"]),
+        logger.error("stock run %s: health pass failed for %s: %s", run["_id"], gids, e, exc_info=True)
+        alerts = [{**_alert(g, "check_failed", "warning", "Couldn't check this client",
+                            "Birdy couldn't read this account's health.", run["local_date"]),
                    "read_failed": True} for g in gids]
     failed = {a["client_group_id"]: a for a in alerts if a.get("read_failed")}
     await _add_alerts(db, run, [a for a in alerts if not a.get("read_failed")])
@@ -374,7 +382,7 @@ async def _read_health(db, mongo_client, run: dict, agent: dict, gids: list[str]
         if gid in failed:
             await _health_failed(db, run, gid, failed[gid])
         else:
-            await _save_client(db, run, gid, health_done=True, health_due=None, health_failure=None)
+            await _save_client(db, run, gid, health_done=True, health_due=None, health_failure=None, rate_limited=None)
     return None
 
 
@@ -542,6 +550,7 @@ async def _alerts_phase(db, mongo_client, run: dict, agent: dict, deadline) -> b
 async def _call_urgent_hook(db, run: dict, agent: dict) -> None:
     if run["kind"] == PREVIEW:
         return
+    await _save(db, run, in_flight=[])  # a kill in the hook isn't any client's fault
     try:
         await post_urgent_alerts(db, run, agent)
     except Exception as e:  # noqa: BLE001 - the alerts stay on the run, and the report shows them
@@ -734,10 +743,11 @@ def _summary(run: dict, cards: list[dict], missing: list[str] | None = None) -> 
                for g, c in run["clients"].items() if c["state"] in (NO_ZONES, NO_DATA, DATA_LATE)]
     waiting = [g for g, c in run["clients"].items() if c["state"] in UNFINISHED]
     stale = [g for g, c in run["clients"].items() if c.get("stale")]
+    health_unread = [g for g, c in run["clients"].items() if c.get("health_due")]
     tags = {t: sum(1 for c in cards if c.get("tag") == t) for t in ("changes", "no_changes", "green")}
     return {"clients": len(run["clients"]), "cards": len(cards), **tags, "alerts": len(run.get("alerts") or []),
             "could_not_check": could_not, "no_card": no_card, "waiting": waiting, "missing": missing or [],
-            "stale": bool(stale), "stale_clients": stale, "reconnect": bool(run.get("reconnect"))}
+            "health_unread": health_unread, "stale": bool(stale), "stale_clients": stale, "reconnect": bool(run.get("reconnect"))}
 
 
 async def _run_cards(db, run: dict) -> list[dict]:
