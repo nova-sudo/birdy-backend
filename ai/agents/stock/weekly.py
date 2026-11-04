@@ -191,20 +191,27 @@ def _listed(lines: list[str], limit: int = 10) -> list[str]:
     return [*lines[:limit], *([f"and {len(lines) - limit} more"] if len(lines) > limit else [])]
 
 
-async def _last_weeks_zones(db, agent: dict, prev_end: date) -> dict | None:
-    """{gid: {name, zone}} from the weekly stored for the week before, or None when there isn't one."""
-    row = await db[RUNS].find_one(
-        {"agent_id": agent["_id"], "kind": {"$ne": PREVIEW}, "weekly.week.end": prev_end.isoformat(),
-         "weekly.zones": {"$type": "object"}}, sort=[("as_of", -1)])
-    return row["weekly"]["zones"] if row else None
+async def _last_weeks_zones(db, agent: dict, week: tuple) -> tuple[dict | None, bool]:
+    """({gid: {name, zone}} from the weekly stored for the week before, or None, and whether this agent has any
+    earlier weekly at all)."""
+    base = {"agent_id": agent["_id"], "kind": {"$ne": PREVIEW}}
+    row = await db[RUNS].find_one({**base, "weekly.week.end": week[3].isoformat(), "weekly.zones": {"$type": "object"}},
+                                  sort=[("as_of", -1)])
+    if row:
+        return row["weekly"]["zones"], True
+    earlier = await db[RUNS].find_one({**base, "weekly.week.end": {"$lt": week[0].isoformat()}}, {"_id": 1})
+    return None, earlier is not None
 
 
-def _status_check(prior: dict | None, entries: list[dict]) -> tuple[dict, str]:
+def _status_check(prior: dict | None, had_earlier: bool, entries: list[dict]) -> tuple[dict, str]:
     """This week against last, for the accounts in last week's stored weekly. Names the ones that changed zone,
     stopped spending, or are no longer reported."""
     if prior is None:
-        return ({"first_week": True, "accounts": 0, "last_week": {}, "this_week": {}, "changed": [], "stopped": [],
-                 "left_out": []}, "This is the first weekly report, so there is nothing to compare yet.")
+        empty = {"accounts": 0, "last_week": {}, "this_week": {}, "changed": [], "stopped": [], "left_out": []}
+        if had_earlier:
+            return ({"first_week": False, **empty},
+                    "Last week's report isn't available to compare, so there is no status comparison this week.")
+        return {"first_week": True, **empty}, "This is the first weekly report, so there is nothing to compare yet."
     now_by = {e["client_group_id"]: e for e in entries}
     last = {z: 0 for z in JUDGED}
     this = {z: 0 for z in JUDGED}
@@ -242,12 +249,15 @@ def _account_day_over(now_utc: datetime, tz_name: str | None, end: date) -> bool
     return now_utc.astimezone(_tz(tz_name)).date() > end
 
 
-async def build_weekly(db, agent: dict, now_utc: datetime) -> dict:
-    """The week's report from the stored ad rows. Never calls Meta or an AI. Safe to build again."""
+async def build_weekly(db, agent: dict, now_utc: datetime, *, now: datetime | None = None) -> dict:
+    """The week's report from the stored ad rows. Never calls Meta or an AI. Safe to build again. `now_utc` (the run's
+    start) fixes the week; `now`, when given, is the real time of a rebuild, which decides whether an account's last
+    day is over."""
     settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
     week = last_full_week(now_utc, agency_tz(agent))
     window = Window(*week)
-    prior = await _last_weeks_zones(db, agent, week[3])
+    prior, had_earlier = await _last_weeks_zones(db, agent, week)
+    clock = now or now_utc
     entries, not_judged = [], []
     for gid in (agent.get("scope") or {}).get("client_group_ids") or []:
         if (settings["clients"].get(gid) or {}).get("on_hold"):
@@ -261,7 +271,7 @@ async def build_weekly(db, agent: dict, now_utc: datetime) -> dict:
         if decision == "data_late":
             # Judged on what it has only while the account's own last day is still going: the rest isn't missing, it
             # hasn't happened. Once that day is over, a gap means the data hasn't synced and can't be judged.
-            if _account_day_over(now_utc, group.get(ACCOUNT_TZ_FIELD), week[1]):
+            if _account_day_over(clock, group.get(ACCOUNT_TZ_FIELD), week[1]):
                 not_judged.append({"client_group_id": gid, "name": facts["name"], "reason": decision})
                 continue
             note = INCOMPLETE
@@ -278,7 +288,7 @@ async def build_weekly(db, agent: dict, now_utc: datetime) -> dict:
     decreased = [e for e in entries if e["zone"] == "red"]
     wins = _wins(entries)
     compare, comparison = _comparison(week, entries, not_judged)
-    check, status_text = _status_check(prior, entries)
+    check, status_text = _status_check(prior, had_earlier, entries)
     values = {"week": f"{_day(week[0])} to {_day(week[1])}", "comparison": comparison,
               "improved": "\n\n".join(_block(e, "🎯", False) for e in improved) or NOT_THERE,
               "decreased": "\n\n".join(_block(e, "⚠️", True) for e in decreased) or NOT_THERE,
@@ -360,7 +370,7 @@ async def _retry_one(db, run: dict, now: datetime) -> int:
         await db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"weekly_pending": False}})
         return 0
     if not run.get("weekly"):
-        await _store(db, run["_id"], await build_weekly(db, agent, _run_time(run)))
+        await _store(db, run["_id"], await build_weekly(db, agent, _run_time(run), now=datetime.now(timezone.utc)))
         run = await db[RUNS].find_one({"_id": run["_id"]})
     settings = merge_settings(DEFAULT_SETTINGS, agent.get("settings") or {})
     if (settings.get("weekly") or {}).get("auto_post") and not _is_posted(run["weekly"]):
@@ -412,7 +422,7 @@ async def post_weekly(db, run: dict, agent: dict, *, by: str) -> dict:
         return {"outcome": "already_posted", "ts": (again.get("slack") or {}).get("ts")} if _is_posted(again) else {"outcome": "in_progress"}
     try:
         try:
-            await _store(db, run["_id"], await build_weekly(db, agent, _run_time(run)))
+            await _store(db, run["_id"], await build_weekly(db, agent, _run_time(run), now=datetime.now(timezone.utc)))
         except Exception as e:  # noqa: BLE001 - the stored one still has the report
             logger.warning("stock run %s: weekly rebuild before posting failed, using the stored one: %s", run["_id"], e)
         values = ((await db[RUNS].find_one({"_id": run["_id"]}, {"weekly.values": 1})) or {})["weekly"]["values"]

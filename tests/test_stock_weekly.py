@@ -181,7 +181,8 @@ async def test_only_the_week_before_counts_as_last_week(mock_db):
     await _client(mock_db, "a", this=(60, 10), last=(60, 10))
     agent = await _weekly_agent(mock_db, ["a"])
     await _last_weeks_weekly(mock_db, agent, {"a": "green"}, end="2026-10-18")   # two weeks ago
-    assert (await build_weekly(mock_db, agent, MONDAY))["status_check"]["first_week"] is True
+    check = (await build_weekly(mock_db, agent, MONDAY))["status_check"]
+    assert check["first_week"] is False and check["accounts"] == 0
 
 
 async def test_the_stored_weekly_keeps_every_judged_account_zone(mock_db):
@@ -778,3 +779,63 @@ async def test_not_built_is_a_404_from_the_route(mock_db, slack, installed, api,
 
     monkeypatch.setattr(agent_stock.stock_weekly, "post_weekly", vanished)
     assert api.post(f"/api/agents/{agent['_id']}/runs/w1/weekly/post").status_code == 404
+
+
+async def test_a_skipped_week_says_last_weeks_report_is_not_available(mock_db):
+    await _client(mock_db, "a", this=(60, 10), last=(60, 10))
+    agent = await _weekly_agent(mock_db, ["a"])
+    await _last_weeks_weekly(mock_db, agent, {"a": "green"}, end="2026-10-18")
+    text = (await build_weekly(mock_db, agent, MONDAY))["values"]["status_check"]
+    assert "isn't available" in text and "first weekly report" not in text and "→" not in text
+
+
+async def test_earlier_weeklies_without_zones_also_count_as_not_the_first(mock_db):
+    await _client(mock_db, "a", this=(60, 10), last=(60, 10))
+    agent = await _weekly_agent(mock_db, ["a"])
+    await mock_db[RUNS].insert_one({"_id": "old", "agent_id": agent["_id"], "user_id": USER, "kind": "batch",
+                                    "as_of": datetime(2026, 10, 26, 7), "weekly": {"week": {"end": "2026-10-25"}}})
+    result = await build_weekly(mock_db, agent, MONDAY)
+    assert result["status_check"]["first_week"] is False and "isn't available" in result["values"]["status_check"]
+
+
+async def test_a_preview_or_the_same_weeks_own_weekly_does_not_make_it_a_later_week(mock_db):
+    await _client(mock_db, "a", this=(60, 10), last=(60, 10))
+    agent = await _weekly_agent(mock_db, ["a"])
+    await mock_db[RUNS].insert_one({"_id": "p", "agent_id": agent["_id"], "user_id": USER, "kind": "preview",
+                                    "as_of": datetime(2026, 10, 26, 7), "weekly": {"week": {"end": "2026-10-25"}}})
+    await mock_db[RUNS].insert_one({"_id": "same", "agent_id": agent["_id"], "user_id": USER, "kind": "batch",
+                                    "as_of": datetime(2026, 11, 2, 7), "weekly": {"week": {"end": "2026-11-01"}}})
+    assert (await build_weekly(mock_db, agent, MONDAY))["status_check"]["first_week"] is True
+
+
+async def test_a_rebuild_after_the_accounts_day_ended_uses_the_time_of_the_rebuild(mock_db):
+    await _client(mock_db, "la", this=(60, 10), last=(60, 10), ad_account_timezone="America/Los_Angeles",
+                  synced=datetime(2026, 11, 2, 3), name="LA")
+    agent = await _set_tz(mock_db, await _weekly_agent(mock_db, ["la"]), "Africa/Cairo")
+    first = await build_weekly(mock_db, agent, CAIRO_MONDAY)
+    assert _names(first["improved"]) == ["LA"] and first["improved"][0]["note"]
+    # Twelve hours on the week is the same, but the account's Sunday is over and still hasn't synced.
+    later = await build_weekly(mock_db, agent, CAIRO_MONDAY, now=CAIRO_MONDAY + timedelta(hours=12))
+    assert later["week"] == first["week"]
+    assert later["improved"] == [] and _names(later["not_judged"]) == ["LA"]
+
+
+async def test_the_runs_stored_start_fixes_the_week_but_not_the_clock_of_a_rebuild(mock_db, slack, installed):
+    await _client(mock_db, "la", this=(60, 10), last=(60, 10), ad_account_timezone="America/Los_Angeles",
+                  synced=datetime(2026, 11, 2, 3), name="LA")
+    agent = await _set_tz(mock_db, await _weekly_agent(mock_db, ["la"]), "Africa/Cairo")
+    run = _run(agent, run_id="w1")
+    run["local_date"], run["as_of"] = "2026-11-02", CAIRO_MONDAY.replace(tzinfo=None)
+    run["weekly"] = {"week": {"end": "2026-11-01"}, "values": {}}
+    await mock_db[RUNS].insert_one(run)
+    await post_weekly(mock_db, await mock_db[RUNS].find_one({"_id": "w1"}), agent, by="sam")     # real time: long after
+    stored = (await mock_db[RUNS].find_one({"_id": "w1"}))["weekly"]
+    assert stored["week"]["end"] == "2026-11-01" and stored["improved"] == [] and stored["not_judged"][0]["name"] == "LA"
+
+
+async def test_the_retry_query_has_a_partial_index(mock_db, mock_mongo_client):
+    from ai.agents.store import create_agent_indexes
+    await create_agent_indexes(mock_mongo_client)
+    infos = (await mock_db[RUNS].index_information()).values()
+    match = [i for i in infos if [k for k, _ in i["key"]] == ["weekly_pending", "weekly_retry_at"]]
+    assert match and match[0]["partialFilterExpression"] == {"weekly_pending": True}

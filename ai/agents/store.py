@@ -307,6 +307,8 @@ async def create_agent_indexes(mongo_client):
     await db[CARDS].create_index([("slack.needs_update", 1), ("slack.ts", 1)])  # the per-minute Slack message updates
     await db[SLACK_ACTIONS].create_index("created_at")
     await db[RUNS].create_index([("slack_pending", 1), ("slack_retry_at", 1)])  # the Slack messages still to post
+    await db[RUNS].create_index([("weekly_pending", 1), ("weekly_retry_at", 1)], name="weekly_pending_retry",
+                                partialFilterExpression={"weekly_pending": True})  # weekly reports still to build or post
     await db[RUNS].create_index("apply_all.pending", sparse=True)
     await db["meta_ad_state"].create_index([("client_group_id", 1), ("ad_id", 1)], unique=True)
     await db["meta_adset_state"].create_index([("client_group_id", 1), ("adset_id", 1)], unique=True)
