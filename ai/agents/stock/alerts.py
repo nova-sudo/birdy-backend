@@ -18,7 +18,7 @@ import httpx
 
 from ai.agents.history import HISTORY, is_ready
 from ai.agents.meta_state import (AD_STATE, ADSET_STATE, MetaRateLimit, MetaTokenError, _is_active, _parse_time,
-                                  is_rate_limit)
+                                  is_rate_limit, rate_limit_error)
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
 from ai.agents.stock.windows import _tz, last_full_day
 from ai.agents.store import AD_DAYS, AGENTS
@@ -51,7 +51,7 @@ async def fetch_account_health(ad_account_id: str, token: str) -> dict:
         if resp.status_code == 401 or err.get("code") in (190, 102):
             raise MetaTokenError(err.get("message") or "Meta token invalid")
         if is_rate_limit(err):
-            raise MetaRateLimit(f"Meta rate limit on {acct}: {err.get('message') or resp.status_code}")
+            raise rate_limit_error(err, resp, acct)
         raise RuntimeError(f"Meta Graph error on {acct}: {err.get('message') or resp.status_code}")
     return {"account_status": body.get("account_status"), "disable_reason": body.get("disable_reason"),
             "funding_source": body.get("funding_source"), "is_prepay_account": body.get("is_prepay_account"),
@@ -80,7 +80,7 @@ async def fetch_account_spend(ad_account_id: str, token: str, since: date, until
                 if resp.status_code == 401 or err.get("code") in (190, 102):
                     raise MetaTokenError(err.get("message") or "Meta token invalid")
                 if is_rate_limit(err):
-                    raise MetaRateLimit(f"Meta rate limit on {acct}/insights: {err.get('message') or resp.status_code}")
+                    raise rate_limit_error(err, resp, f"{acct}/insights")
                 raise RuntimeError(f"Meta Graph error on {acct}/insights: {err.get('message') or resp.status_code}")
             for row in body.get("data") or []:
                 day = str(row.get("date_start") or "")[:10]
@@ -189,9 +189,9 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
     spend alerts run only on "ready", and "late" gives one low-severity spend_data_late.
     `account_spend` is {iso_date: spend} for the whole ad account, from Meta, and feeds the
     prepaid estimate. `daily_budgets` are the active daily ad set budgets, used by that estimate
-    when fewer than 3 days of spend exist. `parts` picks "health" (account, payment and ad review:
-    no spend data needed), "spend" (spend and prepaid) or "all". `today` dates the alerts in the
-    agency's calendar; it defaults to the UTC date."""
+    when fewer than 3 days of spend exist. `parts` picks "health" (account, payment, ad review and
+    prepaid: no ad history needed), "spend" (spend from the daily ad rows) or "all". `today` dates
+    the alerts in the agency's calendar; it defaults to the UTC date."""
     if campaign_ids is not None:
         ads = [a for a in ads if a.get("campaign_id") in set(campaign_ids)]
     cfg = merge_settings(DEFAULT_SETTINGS, settings or {})
@@ -199,9 +199,9 @@ def health_alerts(health: dict, ads: list[dict], daily_spend: dict, settings: di
     out: list[dict] = []
     if parts != "spend":
         out += _health_part(health, ads, gid, today)
+        out += _prepaid_part(health, cfg, gid, now_utc, daily_budgets, account_spend, today)
     if parts != "health":
-        out += _spend_part(health, ads, daily_spend, cfg, gid, now_utc, daily_budgets, account_spend,
-                           history_state, today)
+        out += _spend_part(health, ads, daily_spend, cfg, gid, now_utc, history_state, today)
     return out
 
 
@@ -250,7 +250,7 @@ def _health_part(health: dict, ads: list[dict], gid: str, today: str) -> list[di
 
 
 def _spend_part(health: dict, ads: list[dict], daily_spend: dict, cfg: dict, gid: str, now_utc: datetime,
-                daily_budgets, account_spend, history_state: str, today: str) -> list[dict]:
+                history_state: str, today: str) -> list[dict]:
     out: list[dict] = []
     thresholds = cfg["alerts"]
     # -- spend, judged on full days in the account's own timezone
@@ -294,7 +294,14 @@ def _spend_part(health: dict, ads: list[dict], daily_spend: dict, cfg: dict, gid
                           f"{_plural(len(quiet), 'active ad has', 'active ads have')} not spent for "
                           f"{_NO_SPEND_DAYS}+ days", _ads_detail(quiet, lambda a: ""), prev.isoformat()))
 
-    # -- prepaid, an estimate from the agency's top-ups
+    return out
+
+
+def _prepaid_part(health: dict, cfg: dict, gid: str, now_utc: datetime, daily_budgets, account_spend,
+                  today: str) -> list[dict]:
+    """An estimate from the agency's top-ups and the account's own spend."""
+    out: list[dict] = []
+    y = last_full_day(now_utc, health.get("timezone_name"))
     prepaid = (((cfg.get("clients") or {}).get(gid)) or {}).get("prepaid") or {}
     entered = prepaid.get("topups") or []
     topups = usable_topups(entered)
@@ -313,7 +320,7 @@ def _spend_part(health: dict, ads: list[dict], daily_spend: dict, cfg: dict, gid
         last3 = [float(account_spend.get(d.isoformat(), 0.0)) for d in days_in_range] \
             if all(d.isoformat() >= latest for d in days_in_range) else []
         est = prepaid_estimate(topups, spend_since, last3, daily_budgets or [])
-        if est and est["days_left"] is not None and est["days_left"] <= thresholds["prepaid_days"]:
+        if est and est["days_left"] is not None and est["days_left"] <= cfg["alerts"]["prepaid_days"]:
             n = est["days_left"]
             out.append(_alert(
                 gid, "prepaid_low", "critical" if est["left"] <= 0 else "warning",
@@ -399,9 +406,11 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
     """Alerts for the given clients. `token_for(user_id)` is an async callable returning the Meta
     token. Each ad account's health, and its spend when a client on it has top-ups, is read once
     per call however many clients share it. A failed read becomes a `check_failed` alert for that
-    client, never an exception, unless it is one of the `reraise` types. `parts` is as in
-    `health_alerts`: "spend" reads no account health and takes the timezone an earlier "health"
-    call remembered. `today` is the agency's date for the alerts."""
+    client marked `read_failed`, so a caller can try again, and is never an exception unless it is
+    one of the `reraise` types. A rate limit on the spend read stays an alert either way, so it
+    can't lose the health alerts already read. `parts` is as in `health_alerts`: "spend" asks Meta
+    for nothing and takes the timezone an earlier "health" call remembered. `today` is the agency's
+    date for the alerts."""
     user_id = agent["user_id"]
     out: list[dict] = []
     today = today or now_utc.date().isoformat()
@@ -410,10 +419,11 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
         groups[gid] = await db["client_groups"].find_one({"id": gid, "user_id": user_id}) or {}
 
     token, token_error = None, None
-    try:
-        token = await token_for(user_id)
-    except Exception as e:  # noqa: BLE001 - reported as an alert
-        token_error = e
+    if parts != "spend":
+        try:
+            token = await token_for(user_id)
+        except Exception as e:  # noqa: BLE001 - reported as an alert
+            token_error = e
 
     health_cache: dict[str, dict | Exception] = {}
     spend_cache: dict[str, dict | Exception] = {}
@@ -449,8 +459,8 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
                 health_cache[account] = e
         health = health_cache[account]
         if isinstance(health, Exception):
-            out.append(_alert(gid, "check_failed", "warning", f"Couldn't check {name}",
-                              f"Meta could not be read: {health}", today))
+            out.append({**_alert(gid, "check_failed", "warning", f"Couldn't check {name}",
+                                 f"Meta could not be read: {health}", today), "read_failed": True})
             continue
 
         if parts != "spend":
@@ -463,21 +473,19 @@ async def run_alerts(db, agent: dict, token_for, now_utc: datetime, client_ids: 
         end = last_full_day(now_utc, health.get("timezone_name"))
 
         account_spend = None
-        if parts != "health" and account in since_by_account and ((cfg["clients"].get(gid) or {}).get("prepaid") or {}).get("is_prepay_account") is not False:
+        if parts != "spend" and account in since_by_account and ((cfg["clients"].get(gid) or {}).get("prepaid") or {}).get("is_prepay_account") is not False:
             if account not in spend_cache:
-                try:
-                    if token_error is not None or not token:
-                        raise token_error or MetaTokenError("No valid Facebook token found")
+                try:  # the health read above already stopped on a missing token
                     spend_cache[account] = await fetch_account_spend(account, token, since_by_account[account], end)
                 except Exception as e:  # noqa: BLE001 - reported as an alert
-                    if isinstance(e, reraise):
+                    if isinstance(e, reraise) and not isinstance(e, MetaRateLimit):
                         raise
                     logger.warning("account spend read failed for %s: %s", account, e)
                     spend_cache[account] = e
             got = spend_cache[account]
             if isinstance(got, Exception):
-                out.append(_alert(gid, "check_failed", "warning", f"Couldn't check prepaid for {name}",
-                                  f"Account spend could not be read from Meta: {got}", today))
+                out.append({**_alert(gid, "check_failed", "warning", f"Couldn't check prepaid for {name}",
+                                     f"Account spend could not be read from Meta: {got}", today), "read_failed": True})
             else:
                 account_spend = got
 

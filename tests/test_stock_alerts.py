@@ -1,3 +1,4 @@
+import json
 from datetime import date, datetime, timedelta, timezone
 
 import httpx
@@ -519,10 +520,9 @@ async def test_parts_split_health_from_spend(mock_db, graph):
     prepaid = {"clients": {"g1": {"prepaid": {"is_prepay_account": True, "topups": []}}}}
     agent = await _seed(mock_db, gids=("g1",), settings={**DEFAULT_SETTINGS, **prepaid})
     health = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health", today="2026-11-04")
-    assert [a["code"] for a in health] == ["ad_rejected"] and health[0]["since"] == "2026-11-04"
+    assert [a["code"] for a in health] == ["ad_rejected", "prepaid_no_topups"] and health[0]["since"] == "2026-11-04"
     reads = len(graph["calls"])
-    spend = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="spend")
-    assert [a["code"] for a in spend] == ["prepaid_no_topups"]
+    assert await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="spend") == []
     assert len(graph["calls"]) == reads  # no second account read
 
 
@@ -545,3 +545,115 @@ async def test_rate_limit_codes_are_named(mock_db, graph, monkeypatch):
         await fetch_account_health("act_1", "tok")
     with pytest.raises(MetaRateLimit):
         await fetch_account_spend("act_1", "tok", date(2026, 11, 1), date(2026, 11, 2))
+
+
+# ---------------------------------------------------------------------------
+# Prepaid belongs to the health pass; read failures can be retried
+# ---------------------------------------------------------------------------
+
+async def test_prepaid_alerts_come_from_the_health_part_only(mock_db, graph, insights):
+    agent = await _seed(mock_db, gids=("g1",), history=False, settings=_topup_settings("g1", amount=100))
+    await mock_db["meta_ad_state"].delete_many({})
+    health = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health")
+    assert "prepaid_low" in [a["code"] for a in health]  # no ad history needed
+    assert len(insights["calls"]) == 1
+    spend = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="spend")
+    assert "prepaid_low" not in [a["code"] for a in spend] and len(insights["calls"]) == 1
+
+
+async def test_unusable_top_ups_and_no_top_ups_come_from_the_health_part(mock_db, graph):
+    prepaid = {"clients": {"g1": {"prepaid": {"is_prepay_account": True, "topups": []}},
+                           "g2": {"prepaid": {"topups": [{"date": "nope", "amount": 1}]}}}}
+    agent = await _seed(mock_db, settings={**DEFAULT_SETTINGS, **prepaid})
+    await mock_db["meta_ad_state"].delete_many({})
+    health = await run_alerts(mock_db, agent, _token, NOW, ["g1", "g2"], parts="health")
+    assert sorted(a["code"] for a in health) == ["check_failed", "prepaid_no_topups"]
+    assert not any(a["code"].startswith("prepaid") or a["code"] == "check_failed"
+                   for a in await run_alerts(mock_db, agent, _token, NOW, ["g1", "g2"], parts="spend"))
+
+
+async def test_spend_part_asks_meta_for_nothing(mock_db, graph, insights):
+    agent = await _seed(mock_db, gids=("g1",), settings=_topup_settings("g1"))
+
+    asked = []
+
+    async def token_for(user_id):
+        asked.append(user_id)
+        return "tok"
+
+    await run_alerts(mock_db, agent, token_for, NOW, ["g1"], parts="spend")
+    assert asked == [] and graph["calls"] == [] and insights["calls"] == []
+
+
+async def test_no_spend_read_without_a_token(mock_db, graph, insights):
+    agent = await _seed(mock_db, gids=("g1",), settings=_topup_settings("g1"))
+
+    async def none(user_id):
+        return None
+
+    out = await run_alerts(mock_db, agent, none, NOW, ["g1"], parts="health")
+    assert insights["calls"] == [] and [a["code"] for a in out] == ["check_failed"]
+    with pytest.raises(MetaTokenError):
+        await run_alerts(mock_db, agent, none, NOW, ["g1"], parts="health", reraise=(MetaTokenError,))
+    assert insights["calls"] == []
+
+
+async def test_read_failures_are_marked_so_they_can_be_retried(mock_db, graph, insights):
+    agent = await _seed(mock_db, gids=("g1",), settings=_topup_settings("g1"))
+    insights["error"] = "boom"
+    out = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health")
+    assert [a["code"] for a in out if a.get("read_failed")] == ["check_failed"]
+    assert "ad_rejected" in [a["code"] for a in out]  # what was read is still reported
+
+    graph["fail"].add("act_1")
+    out = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health")
+    assert [(a["code"], a.get("read_failed")) for a in out] == [("check_failed", True)]
+
+
+async def test_no_account_is_not_marked_as_a_read_failure(mock_db, graph):
+    agent = await _seed(mock_db, gids=("g1",), account=None)
+    [a] = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health")
+    assert a["code"] == "check_failed" and not a.get("read_failed")
+
+
+async def test_throttled_prepaid_read_keeps_the_health_alerts(mock_db, graph, monkeypatch):
+    async def limited(*a, **k):
+        raise MetaRateLimit("slow down", scope="account")
+
+    monkeypatch.setattr(alerts_mod, "fetch_account_spend", limited)
+    agent = await _seed(mock_db, gids=("g1",), settings=_topup_settings("g1"))
+    out = await run_alerts(mock_db, agent, _token, NOW, ["g1"], parts="health", reraise=(MetaTokenError, MetaRateLimit))
+    assert "ad_rejected" in [a["code"] for a in out]
+    assert [a["code"] for a in out if a.get("read_failed")] == ["check_failed"]
+
+
+def _limited_get(monkeypatch, code, subcode=None, regain=19):
+    body = {"error": {"code": code, "message": "slow", **({"error_subcode": subcode} if subcode else {})}}
+    usage = {"123": [{"type": "ads_management", "estimated_time_to_regain_access": regain}]}
+
+    async def fake_get(self, url, params=None, **kw):
+        return httpx.Response(400, json=body, headers={"X-Business-Use-Case-Usage": json.dumps(usage)},
+                              request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+
+async def test_health_read_limit_carries_its_scope_and_time(monkeypatch):
+    _limited_get(monkeypatch, 80004, 2446079)
+    with pytest.raises(MetaRateLimit) as e:
+        await fetch_account_health("act_1", "tok")
+    assert e.value.scope == "account" and e.value.retry_after_s == 19 * 60
+
+
+async def test_spend_read_limit_carries_its_scope_and_time(monkeypatch):
+    _limited_get(monkeypatch, 80000, 2446079)
+    with pytest.raises(MetaRateLimit) as e:
+        await fetch_account_spend("act_1", "tok", date(2026, 11, 1), date(2026, 11, 2))
+    assert e.value.scope == "account" and e.value.retry_after_s == 19 * 60
+
+
+async def test_app_wide_limit_on_the_health_read(monkeypatch):
+    _limited_get(monkeypatch, 4)
+    with pytest.raises(MetaRateLimit) as e:
+        await fetch_account_health("act_1", "tok")
+    assert e.value.scope == "app"

@@ -43,7 +43,8 @@ from zoneinfo import ZoneInfo
 
 from ai.agents import claims
 from ai.agents import history as ad_history
-from ai.agents.meta_state import MetaRateLimit, MetaTokenError, backfill_paused_at, read_meta_state, store_meta_state
+from ai.agents.meta_state import (SCOPE_ACCOUNT, MetaRateLimit, MetaTokenError, backfill_paused_at, read_meta_state,
+                                  store_meta_state)
 from ai.agents.snapshot import load_ad_days, load_state
 from ai.agents.stock.alerts import ACCOUNT_TZ_FIELD, _alert, _history_state, run_alerts
 from ai.agents.stock.candidates import build_candidates
@@ -76,6 +77,7 @@ CLIENT_READ_TIMEOUT_S = 100          # started just before the 180 s budget, thi
 ERROR_MAX = 300
 RECONNECT = "Meta needs reconnecting. Reconnect to check this client."
 OUT_OF_TIME = "Birdy ran out of time before finishing this client."
+RATE_LIMITED = "Meta's rate limit stopped Birdy finishing this client today."
 
 
 # ---------------------------------------------------------------------------
@@ -245,12 +247,26 @@ def _clients_in(run: dict, *states) -> list[str]:
     return [g for g, c in run["clients"].items() if c["state"] in states and _due(c, run)]
 
 
+async def _give_up(db, run: dict, gid: str, error: str, *, attempts: int | None = None) -> bool:
+    """Every way a client stops short ends here. A stored card is paid for, so it gets one more try
+    at opening first: True when it did. Otherwise the client is failed, with the reason."""
+    try:
+        if await db[CARDS].find_one({"run_id": run["_id"], "client_group_id": gid}, {"_id": 1}):
+            await _close_with_card(db, run, gid)
+            return True
+    except Exception as e:  # noqa: BLE001 - the card stays closing: not applicable, older one still open
+        logger.error("stock run %s: could not open the card for %s: %s", run["_id"], gid, e, exc_info=True)
+    await _save_client(db, run, gid, state=FAILED, error=error, facts=None, draft=None,
+                       **({} if attempts is None else {"attempts": attempts}))
+    return False
+
+
 async def _retry_client(db, run: dict, gid: str, e: Exception) -> None:
     """A client's step failed: try again on a later tick, and only give up after CLIENT_ATTEMPTS."""
     logger.warning("stock run %s: client %s failed: %s", run["_id"], gid, e, exc_info=True)
     n = (run["clients"][gid].get("attempts") or 0) + 1
     if n >= CLIENT_ATTEMPTS:
-        await _save_client(db, run, gid, state=FAILED, error=_short(e), attempts=n, facts=None)
+        await _give_up(db, run, gid, _short(e), attempts=n)
     else:
         await _save_client(db, run, gid, error=_short(e), attempts=n, retry_after=_now(run) + RETRY_AFTER)
 
@@ -275,7 +291,9 @@ async def _needs_reconnect(db, run: dict, detail: str) -> None:
     """The token is dead for every client of this user: record it and stop reading."""
     for gid, c in run["clients"].items():
         if c["state"] in UNFINISHED:
-            await _save_client(db, run, gid, state=FAILED, error=RECONNECT, facts=None)
+            await _give_up(db, run, gid, RECONNECT)
+        if c.get("health_due"):
+            await _save_client(db, run, gid, health_due=None)
     await _add_alerts(db, run, [_alert(None, "meta_reconnect", "critical", "Meta needs reconnecting", detail,
                                        run["local_date"])])
     await _save(db, run, reconnect=True)
@@ -304,19 +322,99 @@ async def _refresh_failed(db, run: dict, gid: str, group: dict, e: Exception) ->
                                        run["local_date"])])
 
 
+def _health_unread(client: dict, run: dict) -> bool:
+    return not client.get("health_done") and (not client.get("health_due") or client["health_due"] <= _now(run))
+
+
+def _health_settled(client: dict) -> bool:
+    """Read, given up on, or with a retry booked: either way the client's card doesn't wait for it."""
+    return bool(client.get("health_done") or client.get("health_due"))
+
+
+def _health_due_now(run: dict) -> list[str]:
+    """Clients past the read stage with a health retry due. A pending client's comes with its read."""
+    return [g for g, c in run["clients"].items()
+            if c["state"] != PENDING and c.get("health_due") and c["health_due"] <= _now(run)]
+
+
+def _limit_wait(limit: MetaRateLimit) -> timedelta:
+    return timedelta(seconds=limit.retry_after_s) if limit.retry_after_s else RETRY_AFTER
+
+
+async def _health_failed(db, run: dict, gid: str, alert: dict) -> None:
+    """A read failed. Book a retry, with no hold on the client's card, and only report it when the
+    tries run out, so a blip leaves no false alert. A preview can't wait for later ticks."""
+    n = (run["clients"][gid].get("health_attempts") or 0) + 1
+    alert = {k: v for k, v in alert.items() if k != "read_failed"}
+    if run["kind"] != PREVIEW and n < CLIENT_ATTEMPTS:
+        await _save_client(db, run, gid, health_attempts=n, health_failure=alert, health_due=_now(run) + RETRY_AFTER)
+    else:
+        await _add_alerts(db, run, [alert])
+        await _save_client(db, run, gid, health_attempts=n, health_failure=None, health_due=None, health_done=True)
+
+
+async def _read_health(db, mongo_client, run: dict, agent: dict, gids: list[str]) -> MetaRateLimit | None:
+    """One account's health and prepaid alerts. Returns its rate limit, if it has one. A dead token
+    or an app-wide limit goes to the caller."""
+    try:
+        alerts = await run_alerts(db, agent, _token_for(mongo_client), _run_now(run), gids, parts="health",
+                                  today=run["local_date"], reraise=(MetaTokenError, MetaRateLimit))
+    except MetaTokenError:
+        raise
+    except MetaRateLimit as e:
+        if e.scope != SCOPE_ACCOUNT:
+            raise
+        return e
+    except Exception as e:  # noqa: BLE001 - run_alerts reports its own read failures; this is the rest
+        alerts = [{**_alert(g, "check_failed", "warning", "Couldn't check this client", _short(e), run["local_date"]),
+                   "read_failed": True} for g in gids]
+    failed = {a["client_group_id"]: a for a in alerts if a.get("read_failed")}
+    await _add_alerts(db, run, [a for a in alerts if not a.get("read_failed")])
+    for gid in gids:
+        if gid in failed:
+            await _health_failed(db, run, gid, failed[gid])
+        else:
+            await _save_client(db, run, gid, health_done=True, health_due=None, health_failure=None)
+    return None
+
+
+async def _retry_health(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
+    """Health reads booked for a later tick, whatever those clients have got to since. False when
+    the deadline stopped it."""
+    accounts: dict[str | None, list[str]] = {}
+    for gid in _health_due_now(run):
+        group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
+        accounts.setdefault(group.get("meta_ad_account_id"), []).append(gid)
+    for gids in accounts.values():
+        if _out_of_time(deadline):
+            return False
+        await _save(db, run, in_flight=gids)
+        limit = await _read_health(db, mongo_client, run, agent, gids)
+        for gid in gids if limit else []:
+            await _save_client(db, run, gid, health_due=_now(run) + _limit_wait(limit), rate_limited=_short(limit))
+    return True
+
+
 async def _read_account(db, mongo_client, run: dict, agent: dict, token: str, account: str | None,
                         entries: list[tuple[str, dict]], deadline) -> bool:
     """One read of the account, stored for each client on it, then its health, once. Saved after
-    each step. False when the deadline stopped it. Token and rate-limit errors go to the caller."""
+    each step. False when the deadline stopped it. A limit on this account makes its clients wait,
+    at no cost, and the reads are separate, so a throttled one doesn't skip the other. A dead token
+    or an app-wide limit goes to the caller."""
     gids = [g for g, _ in entries]
     await _save(db, run, in_flight=gids)
+    limit = None
     stale_ones = [(g, grp) for g, grp in entries if account and not run["clients"][g].get("refreshed")]
     if stale_ones:
         data = None
         try:
             data = await asyncio.wait_for(read_meta_state(account, token), CLIENT_READ_TIMEOUT_S)
-        except (MetaTokenError, MetaRateLimit):
+        except MetaTokenError:
             raise
+        except MetaRateLimit as e:
+            if e.scope != SCOPE_ACCOUNT:
+                raise
+            limit = e
         except Exception as e:  # noqa: BLE001 - a failed refresh must not skip the health read
             for gid, group in stale_ones:
                 await _refresh_failed(db, run, gid, group, e)
@@ -331,28 +429,23 @@ async def _read_account(db, mongo_client, run: dict, agent: dict, token: str, ac
     if _out_of_time(deadline):
         return False
 
-    unread = [g for g in gids if not run["clients"][g].get("health_done")]
+    unread = [g for g in gids if _health_unread(run["clients"][g], run)]
     if unread:
-        try:
-            alerts = await run_alerts(db, agent, _token_for(mongo_client), _run_now(run), unread, parts="health",
-                                      today=run["local_date"], reraise=(MetaTokenError, MetaRateLimit))
-        except (MetaTokenError, MetaRateLimit):
-            raise
-        except Exception as e:  # noqa: BLE001 - run_alerts reports its own read failures; this is the rest
-            for gid in unread:
-                await _retry_client(db, run, gid, e)
-            return True
-        await _add_alerts(db, run, alerts)
-        for gid in unread:
-            await _save_client(db, run, gid, health_done=True)
+        limit = await _read_health(db, mongo_client, run, agent, unread) or limit
+    if limit:
+        for gid in gids:
+            await _save_client(db, run, gid, rate_limited=_short(limit), retry_after=_now(run) + _limit_wait(limit))
+        return True
 
     for gid, group in entries:
         client = run["clients"][gid]
+        if client.get("rate_limited"):
+            await _save_client(db, run, gid, rate_limited=None)
         if not account:
             await _save_client(db, run, gid, state=FAILED, error="This client has no Meta ad account connected.")
-        elif client["state"] == PENDING and client.get("refreshed") and client.get("health_done"):
+        elif client["state"] == PENDING and client.get("refreshed") and _health_settled(client):
             await _save_client(db, run, gid, state=HEALTHY, wait_for=None, error=client.get("error"))
-        elif client["state"] == PENDING and client.get("wait_for") == WAIT_REFRESH and client.get("health_done"):
+        elif client["state"] == PENDING and client.get("wait_for") == WAIT_REFRESH and _health_settled(client):
             await _save_client(db, run, gid, state=WAITING, attempts=client.get("attempts") or 0)
     return True
 
@@ -364,17 +457,21 @@ async def _store(db, run: dict, gid: str, account: str, data: tuple) -> None:
 
 
 async def _should_wait(db, run: dict, gid: str, group: dict) -> bool:
-    """Only a batch client that will get a card waits, and only for rows that really are coming."""
-    if run["kind"] != BATCH or not run["clients"][gid]["carded"] or _now(run) >= run["as_of"] + GRACE:
+    """Only a batch client that will get a card waits, and only for rows that really are coming.
+    Past the grace period it stops waiting, but the top-up is still asked for, since a client held
+    up by a rate limit may get here for the first time then."""
+    if run["kind"] != BATCH or not run["clients"][gid]["carded"]:
         return False
     tz = group.get(ACCOUNT_TZ_FIELD)
     if await _history_state(db, gid, last_full_day(_run_now(run), tz), tz) != "late":
         return False
-    return bool(await ad_history.request_topups(db, [gid]))
+    requested = await ad_history.request_topups(db, [gid])
+    return bool(requested) and _now(run) < run["as_of"] + GRACE
 
 
 async def _spend_stage(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
-    """Late clients start waiting. Everyone else gets spend alerts, one account at a time."""
+    """Late clients start waiting. Everyone else gets spend alerts, one account at a time, from
+    stored rows: nothing here asks Meta."""
     accounts: dict[str, list[str]] = {}
     for gid in _clients_in(run, HEALTHY):
         group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
@@ -388,10 +485,7 @@ async def _spend_stage(db, mongo_client, run: dict, agent: dict, deadline) -> bo
         await _save(db, run, in_flight=gids)
         try:
             await _add_alerts(db, run, await run_alerts(db, agent, _token_for(mongo_client), _run_now(run), gids,
-                                                        parts="spend", today=run["local_date"],
-                                                        reraise=(MetaTokenError, MetaRateLimit)))
-        except (MetaTokenError, MetaRateLimit):
-            raise
+                                                        parts="spend", today=run["local_date"]))
         except Exception as e:  # noqa: BLE001 - this client's spend alerts come on a later tick
             for gid in gids:
                 await _retry_client(db, run, gid, e)
@@ -401,41 +495,53 @@ async def _spend_stage(db, mongo_client, run: dict, agent: dict, deadline) -> bo
     return True
 
 
-async def _alerts_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
-    """Token first, so a dead one is reported at once. Then each account's state and health, the
-    urgent hook, and the spend alerts."""
-    token = None
+async def _alerts_pass(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
+    """Booked retries, then the token, so a dead one is reported at once. Then each account's state
+    and health, and the spend alerts. False when the deadline stopped it."""
+    if not await _retry_health(db, mongo_client, run, agent, deadline):
+        return False
     pending = _clients_in(run, PENDING)
+    if pending:
+        token = await _token_for(mongo_client)(run["user_id"])
+        if not token:
+            await _needs_reconnect(db, run, "Birdy has no Meta connection for this agency, so nothing was checked.")
+            return True
+        accounts: dict[str | None, list[tuple[str, dict]]] = {}
+        for gid in pending:
+            group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
+            accounts.setdefault(group.get("meta_ad_account_id"), []).append((gid, group))
+        for account, entries in accounts.items():
+            if _out_of_time(deadline):
+                return False
+            if not await _read_account(db, mongo_client, run, agent, token, account, entries, deadline):
+                return False
+    return await _spend_stage(db, mongo_client, run, agent, deadline)
+
+
+async def _alerts_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
+    """One alerts pass. However it ends, what it found goes to the urgent hook: the hook keeps track
+    of what it has already posted, so being called each pass is safe."""
     try:
-        if pending:
-            token = await _token_for(mongo_client)(run["user_id"])
-            if not token:
-                await _needs_reconnect(db, run, "Birdy has no Meta connection for this agency, so nothing was checked.")
-                return True
-            accounts: dict[str | None, list[tuple[str, dict]]] = {}
-            for gid in pending:
-                group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
-                accounts.setdefault(group.get("meta_ad_account_id"), []).append((gid, group))
-            for account, entries in accounts.items():
-                if _out_of_time(deadline):
-                    return False
-                if not await _read_account(db, mongo_client, run, agent, token, account, entries, deadline):
-                    return False
-        if not run.get("urgent_posted") and not _clients_in(run, PENDING):
-            await _save(db, run, urgent_posted=True)
-            if run["kind"] != PREVIEW:
-                await _call_urgent_hook(db, run, agent)
-        return await _spend_stage(db, mongo_client, run, agent, deadline)
+        go_on = await _alerts_pass(db, mongo_client, run, agent, deadline)
+        if go_on and run.get("rate_limited"):
+            await _save(db, run, rate_limited=None)
     except MetaTokenError as e:
         await _needs_reconnect(db, run, f"Meta rejected the connection: {_short(e)}")
-        return True
+        go_on = True
     except MetaRateLimit as e:
         logger.warning("stock run %s: stopping this tick: %s", run["_id"], e)
         await _save(db, run, rate_limited=_short(e))
-        return False
+        go_on = False
+    except Exception:
+        await _call_urgent_hook(db, run, agent)
+        raise
+    await _call_urgent_hook(db, run, agent)
+    return go_on
 
 
 async def _call_urgent_hook(db, run: dict, agent: dict) -> None:
+    if run["kind"] == PREVIEW:
+        return
     try:
         await post_urgent_alerts(db, run, agent)
     except Exception as e:  # noqa: BLE001 - the alerts stay on the run, and the report shows them
@@ -510,7 +616,7 @@ async def _close_with_card(db, run: dict, gid: str) -> None:
     card = await db[CARDS].find_one(key)
     if card["status"] == STATUS_CLOSING:
         await db[CARDS].update_one(key, {"$set": {"status": card["final_status"]}})
-    await _save_client(db, run, gid, state=FINISHED, card_id=card["_id"], facts=None)
+    await _save_client(db, run, gid, state=FINISHED, card_id=card["_id"], facts=None, draft=None)
 
 
 async def _save_card(db, run: dict, agent: dict, facts: dict, last: dict | None, draft: dict | None,
@@ -584,8 +690,11 @@ async def _write_client(db, run: dict, agent: dict, gid: str) -> None:
     candidates = await build_candidates(db, agent, group, _window(run, agent, group))
     last = await _last_card(db, agent["_id"], gid, run["_id"])
     flag_only = not await _is_acting(db, run, agent, gid)  # it may have moved since the checks
-    draft = await write_card(db, agent, facts, candidates, await _lessons(db, agent["_id"], gid), last_card=last,
-                             open_questions=(last or {}).get("open_questions") or [])
+    draft = run["clients"][gid].get("draft")
+    if draft is None:  # saved straight away, so a failure from here on doesn't pay for a second call
+        draft = await write_card(db, agent, facts, candidates, await _lessons(db, agent["_id"], gid), last_card=last,
+                                 open_questions=(last or {}).get("open_questions") or [])
+        await _save_client(db, run, gid, draft=draft)
     await _save_card(db, run, agent, facts, last, draft, candidates, flag_only)
 
 
@@ -605,10 +714,15 @@ async def _writing_phase(db, mongo_client, run: dict, agent: dict, deadline) -> 
 # ---------------------------------------------------------------------------
 
 async def _catch_up_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
-    try:
-        await catch_up_run(db, mongo_client, run, agent)
-    except Exception as e:  # noqa: BLE001 - scoring old ads never holds up today's checks
-        logger.error("stock run %s: catch-up failed: %s", run["_id"], e, exc_info=True)
+    """Tried once. Nobody is in flight, so a kill here charges no client, and the next tick moves
+    on: scoring old ads never holds up today's checks."""
+    await _save(db, run, in_flight=[])
+    if not run.get("catch_up_started"):
+        await _save(db, run, catch_up_started=True)
+        try:
+            await catch_up_run(db, mongo_client, run, agent)
+        except Exception as e:  # noqa: BLE001
+            logger.error("stock run %s: catch-up failed: %s", run["_id"], e, exc_info=True)
     await _save(db, run, caught_up=True)
     return True
 
@@ -664,8 +778,8 @@ async def _waiting_phase(db, mongo_client, run: dict, agent: dict, deadline) -> 
         group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
         if not await _should_wait(db, run, gid, group):
             await _save_client(db, run, gid, state=HEALTHY, wait_for=None)
-    return bool(_clients_in(run, PENDING, HEALTHY, ALERTED, NEEDS_WRITING)) \
-        or not any(c["state"] in UNFINISHED for c in run["clients"].values())
+    return bool(_clients_in(run, PENDING, HEALTHY, ALERTED, NEEDS_WRITING) or _health_due_now(run)) \
+        or not any(c["state"] in UNFINISHED or c.get("health_due") for c in run["clients"].values())
 
 
 async def _end_incomplete(db, run: dict, agent: dict) -> dict:
@@ -674,22 +788,32 @@ async def _end_incomplete(db, run: dict, agent: dict) -> dict:
     again can't keep the run alive."""
     missing, attempts = [], run.get("attempts") or 0
     for gid in [g for g, c in run["clients"].items() if c["state"] in UNFINISHED]:
-        try:
-            if await db[CARDS].find_one({"run_id": run["_id"], "client_group_id": gid}, {"_id": 1}):
-                await _close_with_card(db, run, gid)
-                continue
-        except Exception as e:  # noqa: BLE001 - the card stays closing: not applicable, older one still open
-            logger.error("stock run %s: could not open the card for %s: %s", run["_id"], gid, e, exc_info=True)
-        missing.append(gid)
-        await _save_client(db, run, gid, state=FAILED, error=OUT_OF_TIME, facts=None)
+        limited = run["clients"][gid].get("rate_limited") or run.get("rate_limited")
+        if not await _give_up(db, run, gid, RATE_LIMITED if limited else OUT_OF_TIME):
+            missing.append(gid)
+    await _report_unread_health(db, run)
     cards = await _run_cards(db, run)
     await _save(db, run, phase=DONE, claimed_at=None, in_flight=[], finished_at=datetime.utcnow(), ended_early=True,
                 attempts=attempts, summary=_summary(run, cards, missing))
     logger.error("stock run %s ended after %s attempts, missing %s", run["_id"], attempts, missing)
     if run["kind"] != PREVIEW:
+        await _call_urgent_hook(db, run, agent)
         await _publish(db, run, agent, cards)
         await _save(db, run, claimed_at=None)
     return run
+
+
+async def _report_unread_health(db, run: dict) -> None:
+    """Health retries the run won't get to. Their failures weren't reported while a retry could
+    still clear them, so they are now."""
+    for gid, c in run["clients"].items():
+        if not c.get("health_due"):
+            continue
+        group = await db["client_groups"].find_one({"id": gid, "user_id": run["user_id"]}) or {}
+        await _add_alerts(db, run, [c.get("health_failure") or _alert(
+            gid, "check_failed", "warning", f"Couldn't check {group.get('name') or gid}",
+            c.get("rate_limited") or "Meta could not be read.", run["local_date"])])
+        await _save_client(db, run, gid, health_due=None, health_failure=None)
 
 
 async def end_overdue_runs(db, agent: dict, now_utc: datetime) -> None:
@@ -715,7 +839,7 @@ def _next_phase(run: dict) -> str:
             return PUBLISHING
         return CATCH_UP if run["kind"] == BATCH and not run.get("caught_up") else CHECKS
     if phase == WAITING_PHASE:
-        if _clients_in(run, PENDING, HEALTHY):
+        if _clients_in(run, PENDING, HEALTHY) or _health_due_now(run):
             return ALERTS
         if _clients_in(run, ALERTED, NEEDS_WRITING):
             return CHECKS
@@ -741,7 +865,7 @@ async def _count_takeover(db, run: dict) -> None:
     for gid in in_flight:
         n = (run["clients"][gid].get("attempts") or 0) + 1
         if n >= CLIENT_ATTEMPTS:
-            await _save_client(db, run, gid, state=FAILED, error=OUT_OF_TIME, attempts=n, facts=None)
+            await _give_up(db, run, gid, OUT_OF_TIME, attempts=n)
         else:
             await _save_client(db, run, gid, attempts=n)
     await _save(db, run, in_flight=[])

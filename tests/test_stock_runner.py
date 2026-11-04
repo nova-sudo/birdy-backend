@@ -1,5 +1,7 @@
 """The stock agent's cards and resumable run state machine (spec sections 6 and 7)."""
 
+import asyncio
+import time
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -42,7 +44,7 @@ class Fakes:
         self.order = []
         self.draft = None        # dict or callable(facts) -> dict
         self.read_error = {}     # account -> exception, or a list of them used up in turn
-        self.health_error = {}   # account -> exception
+        self.health_error = {}   # account -> exception, or a list of them used up in turn
         self.token = {"access_token": "t"}
         self.health = {"account_status": 1, "funding_source": "card", "is_prepay_account": False,
                        "timezone_name": "UTC", "currency": "GBP", "name": "x"}
@@ -75,8 +77,11 @@ def fakes(monkeypatch):
     async def health(account, tok):
         f.order.append(("health", account))
         f.health_reads.append(account)
-        if account in f.health_error:
-            raise f.health_error[account]
+        err = f.health_error.get(account)
+        if isinstance(err, list):
+            err = err.pop(0) if err else None
+        if err is not None:
+            raise err
         return dict(f.health)
 
     async def write(db, agent, facts, candidates, lessons, *, last_card=None, open_questions=None):
@@ -335,7 +340,7 @@ async def test_rate_limit_stops_the_tick_and_leaves_clients_pending(mock_db, moc
     assert fakes.reads == ["act_g1", "act_g2"]  # g3 wasn't tried
     assert run["clients"]["g2"]["state"] == "pending" and run["clients"]["g3"]["state"] == "pending"
     assert run["clients"]["g2"]["attempts"] == 0 and run["attempts"] == 0
-    assert fakes.urgent == []
+    assert fakes.urgent == [[]]  # the hook still runs, with what the pass has
     run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
     assert run["phase"] == "done" and len(await _cards(mock_db)) == 3
     assert fakes.reads.count("act_g1") == 1  # finished work isn't repeated
@@ -365,7 +370,7 @@ async def test_failed_refresh_still_reads_health_and_retries(mock_db, mock_mongo
     run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
     [card] = await _cards(mock_db)
     assert run["phase"] == "done" and card["stale"] is False
-    assert fakes.health_reads == ["act_g1"] and len(fakes.urgent) == 1
+    assert fakes.health_reads == ["act_g1"] and len(fakes.urgent) == 2 and "account_disabled" in fakes.urgent[-1]
 
 
 async def test_one_stale_client_leaves_the_others_not_stale(mock_db, mock_mongo_client, fakes):
@@ -487,7 +492,7 @@ async def test_kills_on_different_clients_with_progress_between_cost_nobody_else
     assert run["phase"] == "done" and run["clients"]["g1"]["state"] == run["clients"]["g2"]["state"] == "done"
 
 
-async def test_urgent_alerts_come_before_any_spend_work_on_a_batch_day_and_alert_only_day(mock_db, mock_mongo_client, fakes):
+async def test_urgent_hook_gets_alerts_on_a_batch_day_and_alert_only_day(mock_db, mock_mongo_client, fakes):
     fakes.health = {**fakes.health, "account_status": 2}
     await _setup(mock_db, "g1", synced=datetime(2026, 11, 2, 20))  # late on spend data
     await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW)
@@ -500,16 +505,8 @@ async def test_urgent_alerts_come_before_any_spend_work_on_a_batch_day_and_alert
     await mock_db[AGENTS].update_many({}, {"$set": {"last_run_at": None}})
     await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW + timedelta(days=1))
     run = await mock_db[RUNS].find_one({})
-    assert run["kind"] == "alert_only" and fakes.urgent == [["account_disabled"]]
+    assert run["kind"] == "alert_only" and fakes.urgent == [["account_disabled", "spend_data_late"]]
     assert run["phase"] == "done"  # never waits
-
-
-async def test_health_pass_has_no_spend_alerts(mock_db, mock_mongo_client, fakes):
-    fakes.health = {**fakes.health, "is_prepay_account": True}
-    agent = await _setup(mock_db, "g1", days=False)
-    await _run_all(mock_db, mock_mongo_client, agent)
-    assert fakes.urgent == [[]]  # prepaid_no_topups comes with the spend alerts
-    assert any(a["code"] == "prepaid_no_topups" for a in (await mock_db[RUNS].find_one({}))["alerts"])
 
 
 async def test_one_late_client_doesnt_hold_others(mock_db, mock_mongo_client, fakes):
@@ -1299,3 +1296,667 @@ async def test_windows_are_stable_across_ticks(mock_db, mock_mongo_client, fakes
     [card] = await _cards(mock_db)
     assert card["window"] == {"start": "2026-10-27", "end": "2026-11-02",
                               "prev_start": "2026-10-20", "prev_end": "2026-10-26"}
+
+
+# ---------------------------------------------------------------------------
+# Rate limits with a scope
+# ---------------------------------------------------------------------------
+
+def _limit(scope="account", retry_after_s=None):
+    return MetaRateLimit("slow down", scope=scope, retry_after_s=retry_after_s)
+
+
+async def _share_account(db, account, *gids):
+    await db.client_groups.update_many({"id": {"$in": list(gids)}}, {"$set": {"meta_ad_account_id": account}})
+
+
+def _naive(dt):
+    return dt.replace(tzinfo=None)
+
+
+async def test_one_throttled_account_leaves_the_other_accounts_running(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1", "g2", "g3", "g4", "g5")
+    await _share_account(mock_db, "act_g1", "g1", "g2", "g3")
+    fakes.read_error["act_g1"] = _limit()
+    fakes.health_error["act_g1"] = _limit()
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+
+    assert fakes.reads == ["act_g1", "act_g4", "act_g5"]
+    assert "act_g1" in fakes.health_reads  # tried even though its ads read was throttled
+    assert {a["client_group_id"] for a in run["alerts"] if a["code"] == "account_disabled"} == {"g4", "g5"}
+    assert {c["client_group_id"] for c in await _cards(mock_db)} == {"g4", "g5"}
+    for gid in ("g1", "g2", "g3"):
+        c = run["clients"][gid]
+        assert c["state"] == "pending" and c["attempts"] == 0 and c["rate_limited"]
+        assert c["retry_after"] == _naive(NOW) + runner.RETRY_AFTER
+    assert run["attempts"] == 0 and not run.get("rate_limited") and run["phase"] == "waiting"
+    assert sorted(run["summary"]["waiting"]) == ["g1", "g2", "g3"]
+
+
+async def test_throttled_account_waits_for_metas_time_then_carries_on(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    fakes.read_error["act_g1"] = _limit(retry_after_s=3600)
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["clients"]["g1"]["retry_after"] == _naive(NOW) + timedelta(hours=1)
+    assert run["clients"]["g2"]["state"] == "done"
+
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=30))
+    assert fakes.reads.count("act_g1") == 1 and run["clients"]["g1"]["state"] == "pending"
+
+    fakes.read_error.clear()
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=61))
+    assert run["phase"] == "done" and run["clients"]["g1"]["state"] == "done"
+    assert not run["clients"]["g1"]["rate_limited"] and len(await _cards(mock_db)) == 2
+
+
+async def test_throttled_ads_read_still_gets_the_health_alerts_once(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1")
+    fakes.read_error["act_g1"] = [_limit()]
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert [a["code"] for a in run["alerts"]] == ["account_disabled"] and fakes.urgent[-1] == ["account_disabled"]
+    assert run["clients"]["g1"]["state"] == "pending"
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert run["phase"] == "done" and fakes.health_reads == ["act_g1"] and len(await _cards(mock_db)) == 1
+
+
+async def test_throttled_health_read_alone_is_tried_again_at_no_cost(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1")
+    fakes.health_error["act_g1"] = [_limit()]
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["clients"]["g1"]["state"] == "pending" and run["clients"]["g1"]["attempts"] == 0
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert run["phase"] == "done" and "account_disabled" in [a["code"] for a in run["alerts"]]
+
+
+async def test_app_wide_limit_still_stops_the_agents_tick(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    fakes.read_error["act_g1"] = _limit(scope="app")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert fakes.reads == ["act_g1"] and fakes.health_reads == [] and run["rate_limited"]
+    assert run["phase"] == "alerts" and run["clients"]["g1"]["attempts"] == 0
+    assert not run["clients"]["g1"].get("retry_after") and await _cards(mock_db) == []
+
+
+async def test_app_wide_limit_on_the_health_read_stops_the_tick_too(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    fakes.health_error["act_g1"] = _limit(scope="app")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert fakes.reads == ["act_g1"] and run["rate_limited"] and run["phase"] == "alerts"
+    assert not run["clients"]["g1"].get("retry_after")
+
+
+async def test_urgent_hook_ends_every_alerts_pass_and_covers_spend_stopped(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")  # spent on the 1st, nothing on the 2nd
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert any(a["code"] == "spend_stopped" for a in run["alerts"])
+    assert fakes.urgent[0] == [a["code"] for a in run["alerts"]] and "spend_stopped" in fakes.urgent[0]
+    assert "urgent_posted" not in run
+
+
+async def test_urgent_hook_runs_each_pass_not_once_a_run(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1", "g2")
+    fakes.read_error["act_g2"] = _limit()
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert [c for c in fakes.urgent[-1] if c == "account_disabled"] == ["account_disabled"] * 2
+    calls = len(fakes.urgent)
+    fakes.read_error.clear()
+    await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert len(fakes.urgent) == calls + 1
+
+
+async def test_urgent_hook_runs_when_a_rate_limit_stops_the_pass(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1", "g2")
+    fakes.read_error["act_g2"] = _limit(scope="app")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["rate_limited"] and fakes.urgent == [["account_disabled"]]
+
+
+async def test_urgent_hook_runs_when_the_deadline_stops_the_pass(mock_db, mock_mongo_client, fakes, monkeypatch):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1", "g2")
+    fast = alerts_mod.fetch_account_health
+
+    async def slow(account, token):
+        await asyncio.sleep(0.08)
+        return await fast(account, token)
+
+    monkeypatch.setattr(alerts_mod, "fetch_account_health", slow)
+    run = await get_or_create_run(mock_db, agent, NOW)
+    run = await advance_run(mock_db, mock_mongo_client, run, agent, deadline=time.monotonic() + 0.04, now_utc=NOW)
+    assert fakes.health_reads == ["act_g1"] and run["phase"] == "alerts"
+    assert fakes.urgent == [["account_disabled"]]
+
+
+async def test_urgent_hook_runs_when_a_run_ends_incomplete(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"alerts": [
+        {"client_group_id": "g1", "code": "account_disabled", "detail": "x"}]}})
+    await runner.end_overdue_runs(mock_db, agent, NOW + timedelta(hours=24))
+    assert fakes.urgent == [["account_disabled"]] and (await mock_db[RUNS].find_one({}))["phase"] == "done"
+
+
+async def test_a_hook_error_never_stops_the_run(mock_db, mock_mongo_client, fakes, monkeypatch):
+    async def broken(db, run, agent):
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(runner, "post_urgent_alerts", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["phase"] == "done" and run["attempts"] == 0 and "slack down" in run["publish_error"]
+    assert len(await _cards(mock_db)) == 1 and len(fakes.published) == 1
+
+
+async def test_a_hook_error_doesnt_stop_an_incomplete_run_publishing(mock_db, mock_mongo_client, fakes, monkeypatch):
+    async def broken(db, run, agent):
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(runner, "post_urgent_alerts", broken)
+    agent = await _setup(mock_db, "g1")
+    await get_or_create_run(mock_db, agent, NOW)
+    await runner.end_overdue_runs(mock_db, agent, NOW + timedelta(hours=24))
+    assert (await mock_db[RUNS].find_one({}))["phase"] == "done" and len(fakes.published) == 1
+
+
+async def test_previews_never_call_the_hook(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    agent = await _setup(mock_db, "g1")
+    run = await _run_all(mock_db, mock_mongo_client, agent, kind="preview")
+    assert run["phase"] == "done" and any(a["code"] == "account_disabled" for a in run["alerts"])
+    assert fakes.urgent == []
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"phase": "alerts", "attempts": 3}})
+    await _tick(mock_db, mock_mongo_client, {**run, "phase": "alerts"}, agent)  # ends it incomplete
+    assert fakes.urgent == []
+
+
+async def test_urgent_hook_runs_when_the_pass_raises(mock_db, mock_mongo_client, fakes, monkeypatch):
+    fakes.health = {**fakes.health, "account_status": 2}
+
+    async def broken(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(runner, "_spend_stage", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert fakes.urgent == [["account_disabled"]] and run["attempts"] == 1 and "db down" in run["last_error"]
+
+
+async def test_transient_health_read_is_retried_without_holding_the_card(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    fakes.health_error["act_g1"] = [RuntimeError("500")]
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert not any(a["code"] == "check_failed" for a in run["alerts"])
+    assert run["clients"]["g1"]["state"] == "done" and len(await _cards(mock_db)) == 1
+    assert run["phase"] == "waiting" and len(fakes.published) == 1
+
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert "account_disabled" in [a["code"] for a in run["alerts"]]
+    assert not any(a["code"] == "check_failed" for a in run["alerts"])
+    assert "account_disabled" in fakes.urgent[-1]
+    assert run["phase"] == "done" and fakes.health_reads == ["act_g1", "act_g1"]
+    assert len(fakes.published) == 2 and run["summary"]["alerts"] == len(run["alerts"])
+    assert len(await _cards(mock_db)) == 1 and fakes.autos  # the card wasn't made again
+
+
+async def test_health_read_that_keeps_failing_says_so_after_three_tries(mock_db, mock_mongo_client, fakes):
+    fakes.health_error["act_g1"] = RuntimeError("500")
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    for n in range(3):
+        run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15 * n))
+    assert fakes.health_reads == ["act_g1"] * runner.CLIENT_ATTEMPTS and run["phase"] == "done"
+    assert [a["code"] for a in run["alerts"] if a["code"] == "check_failed"] == ["check_failed"]
+    assert all("read_failed" not in a for a in run["alerts"])
+    assert run["clients"]["g1"]["state"] == "done" and len(await _cards(mock_db)) == 1
+
+
+async def test_retry_waits_for_a_later_tick(mock_db, mock_mongo_client, fakes):
+    fakes.health_error["act_g1"] = [RuntimeError("500")]
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=5))
+    assert fakes.health_reads == ["act_g1"] and run["phase"] == "waiting"
+
+
+async def test_alert_only_day_retries_a_transient_health_read(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    fakes.health_error["act_g1"] = [RuntimeError("500")]
+    agent = await _setup(mock_db, "g1")
+    wed = NOW + timedelta(days=1)
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, wed), agent, wed)
+    assert run["kind"] == "alert_only" and run["phase"] == "waiting"
+    run = await _tick(mock_db, mock_mongo_client, run, agent, wed + timedelta(minutes=15))
+    assert run["phase"] == "done" and "account_disabled" in [a["code"] for a in run["alerts"]]
+
+
+async def test_preview_doesnt_wait_to_retry_a_health_read(mock_db, mock_mongo_client, fakes):
+    fakes.health_error["act_g1"] = RuntimeError("500")
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW, kind="preview"), agent)
+    assert run["phase"] == "done" and fakes.health_reads == ["act_g1"]
+    assert any(a["code"] == "check_failed" for a in run["alerts"])
+
+
+async def test_run_ending_with_a_retry_pending_reports_the_failed_check(mock_db, mock_mongo_client, fakes):
+    fakes.health_error["act_g1"] = RuntimeError("500")
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    await runner.end_overdue_runs(mock_db, agent, NOW + timedelta(hours=24))
+    run = await mock_db[RUNS].find_one({"_id": run["_id"]})
+    assert run["phase"] == "done" and any(a["code"] == "check_failed" for a in run["alerts"])
+    assert "check_failed" in fakes.urgent[-1] and run["clients"]["g1"]["state"] == "done"
+
+
+async def test_dead_token_during_a_health_retry_ends_the_retries(mock_db, mock_mongo_client, fakes):
+    fakes.health_error["act_g1"] = [RuntimeError("500")]
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    fakes.token = None
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert run["phase"] == "done" and run["reconnect"] and run["clients"]["g1"]["state"] == "done"
+    assert "meta_reconnect" in [a["code"] for a in run["alerts"]]
+
+
+async def test_throttled_health_retry_waits_at_no_cost(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "account_status": 2}
+    fakes.health_error["act_g1"] = [RuntimeError("500"), _limit(retry_after_s=3600)]
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert run["phase"] == "waiting" and run["clients"]["g1"]["health_attempts"] == 1
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=30))
+    assert len(fakes.health_reads) == 2
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=80))
+    assert run["phase"] == "done" and "account_disabled" in [a["code"] for a in run["alerts"]]
+
+
+async def test_health_retry_of_a_throttled_pending_client_waits_for_the_limit(mock_db, mock_mongo_client, fakes):
+    fakes.read_error["act_g1"] = _limit(retry_after_s=3600)
+    fakes.health_error["act_g1"] = [RuntimeError("500")]
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["clients"]["g1"]["state"] == "pending" and run["clients"]["g1"]["health_due"]
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert fakes.health_reads == ["act_g1"]  # due, but its account is still throttled
+
+
+async def test_health_retries_stop_at_the_deadline(mock_db, mock_mongo_client, fakes, monkeypatch):
+    fakes.health_error = {"act_g1": [RuntimeError("500")], "act_g2": [RuntimeError("500")]}
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert len(fakes.health_reads) == 2
+    fast = alerts_mod.fetch_account_health
+
+    async def slow(account, token):
+        await asyncio.sleep(0.08)
+        return await fast(account, token)
+
+    monkeypatch.setattr(alerts_mod, "fetch_account_health", slow)
+    await advance_run(mock_db, mock_mongo_client, run, agent, deadline=time.monotonic() + 0.04,
+                      now_utc=NOW + timedelta(minutes=15))
+    assert len(fakes.health_reads) == 3
+
+
+async def test_prepaid_alerts_come_with_the_health_pass(mock_db, mock_mongo_client, fakes):
+    fakes.health = {**fakes.health, "is_prepay_account": True}
+    await _setup(mock_db, "g1", synced=datetime(2026, 11, 2, 20))  # late on spend data, so it waits
+    await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW)
+    run = await mock_db[RUNS].find_one({})
+    assert run["clients"]["g1"]["state"] == "waiting"
+    assert "prepaid_no_topups" in [a["code"] for a in run["alerts"]] and "prepaid_no_topups" in fakes.urgent[0]
+
+
+async def test_prepaid_spend_read_failure_is_retried_like_a_health_read(mock_db, mock_mongo_client, fakes, monkeypatch):
+    calls = []
+
+    async def spend(account, token, since, until):
+        calls.append(account)
+        if len(calls) == 1:
+            raise RuntimeError("500")
+        return {"2026-11-02": 100.0, "2026-11-01": 100.0, "2026-10-31": 100.0}
+
+    monkeypatch.setattr(alerts_mod, "fetch_account_spend", spend)
+    fakes.health = {**fakes.health, "is_prepay_account": None}
+    clients = await _client(mock_db, "g1", prepaid={"topups": [{"date": "2026-10-28", "amount": 200}]})
+    agent = await _agent(mock_db, clients)
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert not any(a["code"] == "check_failed" for a in run["alerts"]) and run["phase"] == "waiting"
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert len(calls) == 2 and "prepaid_low" in [a["code"] for a in run["alerts"]] and run["phase"] == "done"
+
+
+def _closing_card(run, gid):
+    return {"_id": f"card_{gid}", "run_id": run["_id"], "client_group_id": gid, "agent_id": run["agent_id"],
+            "user_id": USER, "status": "closing", "final_status": "open", "created_at": datetime(2026, 11, 3)}
+
+
+async def test_giving_up_on_a_client_opens_its_stored_card_first(mock_db, mock_mongo_client, fakes, monkeypatch):
+    real, left = runner.supersede_open, [1, 1, 1]
+
+    async def flaky(*a, **k):
+        if left:
+            left.pop()
+            raise RuntimeError("db blip")
+        return await real(*a, **k)
+
+    monkeypatch.setattr(runner, "supersede_open", flaky)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    for n in range(3):
+        run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15 * n))
+    [card] = await _cards(mock_db)
+    assert run["clients"]["g1"]["state"] == "done" and card["status"] == "open" and len(fakes.ai_calls) == 1
+
+
+async def test_giving_up_stays_failed_when_the_card_cant_open(mock_db, mock_mongo_client, fakes, monkeypatch):
+    async def broken(*a, **k):
+        raise RuntimeError("db down")
+
+    monkeypatch.setattr(runner, "supersede_open", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    for n in range(3):
+        run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15 * n))
+    [card] = await _cards(mock_db)
+    assert run["clients"]["g1"]["state"] == "failed" and card["status"] == "closing" and run["phase"] != "alerts"
+
+
+async def test_takeover_giving_up_opens_the_stored_card(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[CARDS].insert_one(_closing_card(run, "g1"))
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {
+        "phase": "writing", "in_flight": ["g1"], "clients.g1.state": "needs_writing", "clients.g1.attempts": 2,
+        "claimed_at": datetime.utcnow() - timedelta(hours=1)}})
+    run = await _tick(mock_db, mock_mongo_client, run, agent)
+    [card] = await _cards(mock_db)
+    assert run["clients"]["g1"]["state"] == "done" and card["status"] == "open"
+
+
+async def test_reconnect_giving_up_opens_the_stored_card(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[CARDS].insert_one(_closing_card(run, "g1"))
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"clients.g1.state": "needs_writing"}})
+    fakes.token = None
+    run = await _tick(mock_db, mock_mongo_client, run, agent)
+    [card] = await _cards(mock_db)
+    assert run["clients"]["g1"]["state"] == "done" and card["status"] == "open"
+    assert run["clients"]["g2"]["state"] == "failed" and run["clients"]["g2"]["error"] == runner.RECONNECT
+
+
+async def test_catch_up_killed_once_moves_on_and_charges_nobody(mock_db, mock_mongo_client, fakes, monkeypatch):
+    calls, in_flight = [], []
+
+    async def killed(db, mongo_client, run, agent):
+        calls.append(run["_id"])
+        in_flight.append((await db[RUNS].find_one({"_id": run["_id"]}))["in_flight"])
+        raise Killed("function killed")
+
+    monkeypatch.setattr(runner, "catch_up_run", killed)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    with pytest.raises(Killed):
+        await _tick(mock_db, mock_mongo_client, run, agent)
+    assert in_flight == [[]]
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"claimed_at": datetime.utcnow() - timedelta(hours=1)}})
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert len(calls) == 1 and run["phase"] == "done" and not run.get("ended_early")
+    assert run["clients"]["g1"]["state"] == "done" and len(await _cards(mock_db)) == 1
+
+
+async def test_catch_up_error_still_moves_on_once(mock_db, mock_mongo_client, fakes, monkeypatch):
+    calls = []
+
+    async def broken(db, mongo_client, run, agent):
+        calls.append(1)
+        raise RuntimeError("scoring failed")
+
+    monkeypatch.setattr(runner, "catch_up_run", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["phase"] == "done" and calls == [1] and len(await _cards(mock_db)) == 1
+
+
+async def test_error_after_the_ai_call_doesnt_repeat_it(mock_db, mock_mongo_client, fakes, monkeypatch):
+    def broken(*a, **k):
+        raise RuntimeError("bad draft")
+
+    monkeypatch.setattr(runner, "build_card", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    for n in range(4):
+        run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15 * n))
+    assert len(fakes.ai_calls) == 1 and run["clients"]["g1"]["state"] == "failed"
+    assert not run["clients"]["g1"].get("draft")
+
+
+async def test_stored_draft_builds_the_card_on_the_retry(mock_db, mock_mongo_client, fakes, monkeypatch):
+    real, left = runner.build_card, [1]
+
+    def flaky(*a, **k):
+        if a[2] is not None and left:
+            left.pop()
+            raise RuntimeError("bad draft")
+        return real(*a, **k)
+
+    monkeypatch.setattr(runner, "build_card", flaky)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    for n in range(2):
+        run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15 * n))
+    [card] = await _cards(mock_db)
+    assert len(fakes.ai_calls) == 1 and card["thought_process"] == "Swap the worst ad."
+    assert run["clients"]["g1"]["state"] == "done" and not run["clients"]["g1"].get("draft")
+
+
+@pytest.mark.parametrize("scope", ["app", "account"])
+async def test_rate_limited_run_doesnt_say_it_ran_out_of_time(mock_db, mock_mongo_client, fakes, scope):
+    agent = await _setup(mock_db, "g1")
+    fakes.read_error["act_g1"] = _limit(scope=scope)
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    await runner.end_overdue_runs(mock_db, agent, NOW + timedelta(hours=24))
+    run = await mock_db[RUNS].find_one({"_id": run["_id"]})
+    error = run["clients"]["g1"]["error"]
+    assert run["clients"]["g1"]["state"] == "failed" and "ran out of time" not in error and "limit" in error
+    assert run["summary"]["could_not_check"] == [{"client_group_id": "g1", "reason": error}]
+
+
+async def test_rate_limit_is_cleared_when_it_passes(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    fakes.read_error["act_g1"] = [_limit(scope="app")]
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["rate_limited"]
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(minutes=15))
+    assert run["rate_limited"] is None and run["phase"] == "done"
+
+
+async def test_top_up_is_requested_even_when_grace_has_passed(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", synced=datetime(2026, 11, 2, 20))
+    fakes.read_error["act_g1"] = [_limit(retry_after_s=3 * 3600)]
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert not (await mock_db[history.HISTORY].find_one({"_id": "g1"})).get("topup_requested_at")
+    run = await _tick(mock_db, mock_mongo_client, run, agent, NOW + timedelta(hours=3, minutes=1))
+    assert run["clients"]["g1"]["state"] == "data_late"
+    assert (await mock_db[history.HISTORY].find_one({"_id": "g1"}))["topup_requested_at"]
+
+
+async def test_newer_card_closes_old_flagged_cards_too(mock_db):
+    rows = [{"_id": s, "agent_id": "ag", "client_group_id": "g1", "run_id": "old", "status": s}
+            for s in ("open", "flagged", "applied", "dismissed", "partly_applied")]
+    rows.append({"_id": "preview", "agent_id": "ag", "client_group_id": "g1", "run_id": "old", "status": "flagged",
+                 "preview": True})
+    rows.append({"_id": "mine", "agent_id": "ag", "client_group_id": "g1", "run_id": "new", "status": "flagged"})
+    await mock_db[CARDS].insert_many(rows)
+    assert await supersede_open(mock_db, "ag", "g1", "new") == 2
+    got = {c["_id"]: c["status"] for c in await _cards(mock_db)}
+    assert got == {"open": "superseded", "flagged": "superseded", "applied": "applied", "dismissed": "dismissed",
+                   "partly_applied": "partly_applied", "preview": "flagged", "mine": "flagged"}
+
+
+async def test_flagged_card_still_gets_its_follow_ups_from_the_next_run(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", claim=False)  # flag-only, so its card is flagged
+    await _run_all(mock_db, mock_mongo_client, agent)
+    [first] = await _cards(mock_db)
+    assert first["status"] == "flagged"
+    await seed_history(mock_db, "g1", last_topup_at=datetime(2026, 11, 10, 2))
+    await mock_db[AD_DAYS].insert_one({
+        "user_id": USER, "client_group_id": "g1", "ad_id": "ad_g1", "campaign_id": "c1", "ad_name": "Ad g1",
+        "date_start": "2026-11-08", "insight_data": {"spend": "120", "actions": [{"action_type": "lead", "value": "10"}]}})
+    await _run_all(mock_db, mock_mongo_client, agent, NOW + timedelta(days=7))
+    assert fakes.ai_calls[-1]["last_card"]["_id"] == first["_id"]
+    assert (await mock_db[CARDS].find_one({"_id": first["_id"]}))["status"] == "superseded"
+
+
+# ---------------------------------------------------------------------------
+# Behaviour the mutation run found untested
+# ---------------------------------------------------------------------------
+
+async def test_batch_client_without_a_card_doesnt_wait_for_late_rows(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", batch="a", synced=datetime(2026, 11, 2, 20))
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["kind"] == "batch" and run["clients"]["g1"]["state"] == "alerts_only"
+    assert "spend_data_late" in [a["code"] for a in run["alerts"]]
+
+
+async def test_last_card_ignores_a_card_left_closing(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    base = {"agent_id": agent["_id"], "client_group_id": "g1", "run_id": "old"}
+    await mock_db[CARDS].insert_one({**base, "_id": "real", "status": "applied", "created_at": datetime(2026, 10, 1)})
+    await mock_db[CARDS].insert_one({**base, "_id": "orphan", "run_id": "older", "status": "closing",
+                                     "created_at": datetime(2026, 10, 20)})
+    await _run_all(mock_db, mock_mongo_client, agent)
+    assert fakes.ai_calls[0]["last_card"]["_id"] == "real"
+
+
+async def test_moving_to_a_new_state_gives_the_client_fresh_attempts(mock_db, mock_mongo_client, fakes, monkeypatch):
+    real_check, real_write = runner._check_client, runner.write_card
+    check_fails, write_fails = [1], [1, 1]
+
+    async def check(*a, **k):
+        if check_fails:
+            check_fails.pop()
+            raise RuntimeError("blip")
+        return await real_check(*a, **k)
+
+    async def write(*a, **k):
+        if write_fails:
+            write_fails.pop()
+            raise RuntimeError("blip")
+        return await real_write(*a, **k)
+
+    monkeypatch.setattr(runner, "_check_client", check)
+    monkeypatch.setattr(runner, "write_card", write)
+    agent = await _setup(mock_db, "g1")
+    run = await _run_all(mock_db, mock_mongo_client, agent)
+    assert run["clients"]["g1"]["state"] == "done" and len(await _cards(mock_db)) == 1
+
+
+async def test_progress_on_one_client_resets_the_runs_attempts(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"attempts": 1}})
+    fakes.read_error["act_g2"] = Killed("function killed")
+    with pytest.raises(Killed):
+        await _tick(mock_db, mock_mongo_client, run, agent)
+    assert (await mock_db[RUNS].find_one({"_id": run["_id"]}))["attempts"] == 0
+
+
+async def test_hung_ads_read_is_cut_off_and_retried(mock_db, mock_mongo_client, fakes, monkeypatch):
+    fast = runner.read_meta_state
+
+    async def hung(account, token):
+        if account == "act_g1":
+            await asyncio.sleep(0.5)
+        return await fast(account, token)
+
+    monkeypatch.setattr(runner, "read_meta_state", hung)
+    monkeypatch.setattr(runner, "CLIENT_READ_TIMEOUT_S", 0.01)
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["clients"]["g1"]["state"] == "waiting" and run["clients"]["g1"]["attempts"] == 1
+    assert run["clients"]["g2"]["state"] == "done"
+
+
+async def test_deadline_after_the_ads_read_skips_the_health_read(mock_db, mock_mongo_client, fakes, monkeypatch):
+    async def slow(*a, **k):
+        await asyncio.sleep(0.05)
+
+    monkeypatch.setattr(runner, "store_meta_state", slow)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await advance_run(mock_db, mock_mongo_client, run, agent, deadline=time.monotonic() + 0.02, now_utc=NOW)
+    assert fakes.stored == [] and fakes.health_reads == []
+
+
+async def test_takeover_only_charges_clients_still_unfinished(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {
+        "in_flight": ["g1", "g2"], "clients.g1.state": "done", "clients.g1.attempts": 2,
+        "claimed_at": datetime.utcnow() - timedelta(hours=1)}})
+    run = await _tick(mock_db, mock_mongo_client, run, agent)
+    assert run["clients"]["g1"]["state"] == "done" and run["clients"]["g1"]["attempts"] == 2
+
+
+async def test_takeover_clears_in_flight_so_a_client_isnt_charged_twice(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await mock_db[RUNS].update_one({"_id": run["_id"]}, {"$set": {"in_flight": ["g1"]}})
+    run = await mock_db[RUNS].find_one({"_id": run["_id"]})
+    await runner._count_takeover(mock_db, run)
+    stored = await mock_db[RUNS].find_one({"_id": run["_id"]})
+    assert stored["in_flight"] == [] and stored["clients"]["g1"]["attempts"] == 1
+
+
+async def test_failed_store_is_retried_and_others_go_on(mock_db, mock_mongo_client, fakes, monkeypatch):
+    fast = runner.store_meta_state
+
+    async def store(db, user_id, gid, account, ads, adsets, *, today):
+        if gid == "g1":
+            raise RuntimeError("write failed")
+        return await fast(db, user_id, gid, account, ads, adsets, today=today)
+
+    monkeypatch.setattr(runner, "store_meta_state", store)
+    agent = await _setup(mock_db, "g1", "g2")
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
+    assert run["clients"]["g1"]["state"] == "waiting" and run["clients"]["g1"]["attempts"] == 1
+    assert run["clients"]["g2"]["state"] == "done" and run["attempts"] == 0
+
+
+async def test_client_without_an_account_fails_and_says_why(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", "g2")
+    await mock_db.client_groups.update_one({"id": "g1"}, {"$set": {"meta_ad_account_id": None}})
+    run = await _run_all(mock_db, mock_mongo_client, agent)
+    assert run["clients"]["g1"]["state"] == "failed" and "no Meta ad account" in run["clients"]["g1"]["error"]
+    assert run["clients"]["g2"]["state"] == "done" and fakes.reads == ["act_g2"]
+
+
+async def test_no_ai_card_is_flag_only_for_a_client_the_agent_doesnt_hold(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", spend=40, prev=(40, 10), claim=False)  # green: no AI call
+    await _run_all(mock_db, mock_mongo_client, agent)
+    [card] = await _cards(mock_db)
+    assert fakes.ai_calls == [] and card["status"] == "flagged"
+
+
+async def test_spend_alerts_are_dated_in_the_agencys_day(mock_db, mock_mongo_client, fakes):
+    at = datetime(2026, 11, 3, 23, tzinfo=UTC)  # already the 4th in Tokyo
+    agent = await _setup(mock_db, "g1", synced=datetime(2026, 11, 2, 20))
+    await mock_db[AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"scope.schedule.tz": "Asia/Tokyo"}})
+    agent = await mock_db[AGENTS].find_one({"_id": agent["_id"]})
+    run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, at), agent, at)
+    late = next(a for a in run["alerts"] if a["code"] == "spend_data_late")
+    assert run["local_date"] == "2026-11-04" and late["since"] == "2026-11-04"
+
+
+async def test_run_keeps_the_scheduled_time_when_its_tick_is_late(mock_db, mock_mongo_client, fakes):
+    await _setup(mock_db, "g1")
+    await agent_jobs.run_due_stock_agents(mock_mongo_client, now_utc=NOW + timedelta(minutes=40))
+    run = await mock_db[RUNS].find_one({})
+    assert run["scheduled_at"] == _naive(NOW) and run["as_of"] == _naive(NOW) + timedelta(minutes=40)

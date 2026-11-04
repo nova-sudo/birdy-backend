@@ -130,10 +130,11 @@ def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, r
 
 
 async def supersede_open(db, agent_id: str, gid: str, run_id: str) -> int:
-    """A newer card for a client closes its open cards, so an old card can't be applied. This
-    run's own card, and previews, are left alone."""
+    """A newer card for a client closes its open and flagged cards, so an old card can't be applied
+    or stay waiting forever. This run's own card, and previews, are left alone."""
     res = await db[CARDS].update_many(
-        {"agent_id": agent_id, "client_group_id": gid, "status": STATUS_OPEN, "run_id": {"$ne": run_id},
+        {"agent_id": agent_id, "client_group_id": gid, "status": {"$in": [STATUS_OPEN, STATUS_FLAGGED]},
+         "run_id": {"$ne": run_id},
          "preview": {"$ne": True}},
         {"$set": {"status": STATUS_SUPERSEDED, "superseded_by_run": run_id, "updated_at": datetime.utcnow()}})
     return res.modified_count

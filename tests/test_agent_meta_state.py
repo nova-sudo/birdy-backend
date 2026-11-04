@@ -209,3 +209,52 @@ async def test_fetch_all_gives_up_at_25(monkeypatch):
         with pytest.raises(RuntimeError):
             await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
     assert limits == [200, 100, 50, 25]
+
+
+def _limited(monkeypatch, code, subcode=None, headers=None):
+    async def fake_get(self, url, params=None, **kw):
+        err = {"code": code, "message": "slow", **({"error_subcode": subcode} if subcode else {})}
+        return httpx.Response(400, json={"error": err}, headers=headers or {}, request=httpx.Request("GET", str(url)))
+
+    monkeypatch.setattr(httpx.AsyncClient, "get", fake_get)
+
+
+async def _limit_from_fetch():
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(meta_state.MetaRateLimit) as e:
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    return e.value
+
+
+@pytest.mark.parametrize("code,subcode,scope", [
+    (80000, None, "account"), (80003, None, "account"), (80004, None, "account"), (80014, None, "account"),
+    (80000, 2446079, "account"), (17, 2446079, "account"),
+    (4, None, "app"), (17, None, "app"), (32, None, "app"), (613, None, "app")])
+async def test_fetch_all_gives_each_rate_limit_code_its_scope(monkeypatch, code, subcode, scope):
+    _limited(monkeypatch, code, subcode)
+    assert (await _limit_from_fetch()).scope == scope
+
+
+async def test_fetch_all_other_errors_are_not_rate_limits(monkeypatch):
+    _limited(monkeypatch, 100)
+    async with httpx.AsyncClient() as c:
+        with pytest.raises(RuntimeError) as e:
+            await meta_state._fetch_all(c, "act_1/ads", "id", "tok")
+    assert not isinstance(e.value, meta_state.MetaRateLimit)
+
+
+@pytest.mark.parametrize("header,seconds", [
+    (json.dumps({"1": [{"type": "ads_management", "estimated_time_to_regain_access": 19}]}), 19 * 60),
+    (json.dumps({"1": [{"estimated_time_to_regain_access": 2}], "2": [{"estimated_time_to_regain_access": 7},
+                                                                     {"estimated_time_to_regain_access": 0}]}), 7 * 60),
+    (json.dumps({"1": [{"estimated_time_to_regain_access": 0}]}), None),
+    (json.dumps({"1": [{"type": "ads_management"}]}), None),
+    (json.dumps(["odd"]), None), ("not json", None), (None, None)])
+async def test_fetch_all_reads_the_time_to_regain_access_in_minutes(monkeypatch, header, seconds):
+    _limited(monkeypatch, 80004, headers={"X-Business-Use-Case-Usage": header} if header else None)
+    assert (await _limit_from_fetch()).retry_after_s == seconds
+
+
+def test_rate_limit_defaults_to_the_wider_scope():
+    e = meta_state.MetaRateLimit("slow")
+    assert e.scope == "app" and e.retry_after_s is None

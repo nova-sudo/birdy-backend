@@ -33,15 +33,51 @@ class MetaTokenError(Exception):
     """The user's Meta token is missing, expired or rejected."""
 
 
+SCOPE_ACCOUNT, SCOPE_APP = "account", "app"
+
+
 class MetaRateLimit(RuntimeError):
-    """Meta is throttling this app or account. Trying again later should work."""
+    """Meta is throttling us. Trying again later should work. `scope` says who is affected:
+    SCOPE_ACCOUNT is one ad account, so others can still be read. SCOPE_APP is the app or the user,
+    so every read would fail. `retry_after_s` is Meta's own estimate, when it gave one."""
+
+    def __init__(self, message: str = "", *, scope: str = SCOPE_APP, retry_after_s: int | None = None):
+        super().__init__(message)
+        self.scope = scope
+        self.retry_after_s = retry_after_s
 
 
-_RATE_LIMIT_CODES = {4, 17, 32, 613, 80000, 80003, 80004, 80014}
+_APP_LIMIT_CODES = {4, 17, 32, 613}
+_ACCOUNT_LIMIT_CODES = {80000, 80003, 80004, 80014}
+_ACCOUNT_LIMIT_SUBCODE = 2446079  # with code 17, the limit is on the account
+_USAGE_HEADER = "X-Business-Use-Case-Usage"
 
 
 def is_rate_limit(err: dict) -> bool:
-    return (err or {}).get("code") in _RATE_LIMIT_CODES
+    return (err or {}).get("code") in _APP_LIMIT_CODES | _ACCOUNT_LIMIT_CODES
+
+
+def _limit_scope(err: dict) -> str:
+    code = err.get("code")
+    if code in _ACCOUNT_LIMIT_CODES or (code == 17 and err.get("error_subcode") == _ACCOUNT_LIMIT_SUBCODE):
+        return SCOPE_ACCOUNT
+    return SCOPE_APP
+
+
+def _regain_seconds(header: str | None) -> int | None:
+    """The longest estimated_time_to_regain_access in the usage header, which Meta gives in minutes
+    per business and use case. None when it's missing, unreadable or 0."""
+    try:
+        usage = json.loads(header or "{}")
+        minutes = [e.get("estimated_time_to_regain_access") or 0 for entries in usage.values() for e in entries]
+        return int(max(minutes, default=0) * 60) or None
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def rate_limit_error(err: dict, resp: httpx.Response, where: str) -> MetaRateLimit:
+    return MetaRateLimit(f"Meta rate limit on {where}: {err.get('message') or resp.status_code}",
+                         scope=_limit_scope(err), retry_after_s=_regain_seconds(resp.headers.get(_USAGE_HEADER)))
 
 
 def _is_active(status) -> bool:
@@ -120,7 +156,7 @@ async def _fetch_all(client: httpx.AsyncClient, path: str, fields: str, token: s
                     url = re.sub(r"([?&])limit=\d+", rf"\g<1>limit={limit}", url)
                 continue
             if is_rate_limit(err):
-                raise MetaRateLimit(f"Meta rate limit on {path}: {err.get('message') or resp.status_code}")
+                raise rate_limit_error(err, resp, path)
             raise RuntimeError(f"Meta Graph error on {path}: {err.get('message') or resp.status_code}")
         out.extend(body.get("data") or [])
         url, params = (body.get("paging") or {}).get("next"), None
