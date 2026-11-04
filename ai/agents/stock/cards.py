@@ -167,6 +167,7 @@ def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, r
     card = {"run_id": run_id, "client_group_id": facts["client_group_id"], "client_name": facts.get("name"),
             "tag": tag, "decision": decision, "zone": facts.get("zone"), "window": facts.get("window"),
             "previous_cpl": facts.get("prev_cpl"), "current_cpl": facts.get("cpl"), "currency": facts.get("currency"),
+            "leads": facts.get("leads"), "ads_live": facts.get("ads_live"),
             "lines": lines, "additional_changes": additional, "thought_process": thought, "next_steps": next_steps,
             "status": STATUS_FLAGGED if all_flagged else STATUS_OPEN, "ai_failed": failed,
             "slack": {"channel_id": None, "ts": None}, "decided_by": None, "decided_at": None}

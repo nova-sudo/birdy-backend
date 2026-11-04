@@ -2380,6 +2380,33 @@ async def test_routes_stop_another_users_agent_and_another_agents_card(api, mock
     assert meta.writes == [] and (await _line(mock_db))["state"] == "proposed"
 
 
+async def test_route_says_when_a_newer_card_replaced_one(api, mock_db, meta):
+    """Retry and Upload need this: can_apply can't tell a replaced card from one with only failed lines left."""
+    agent = await _agent(mock_db)
+    await _card(mock_db, agent, _ln(1, state="applied"), _ln(2, state="failed", error="x"), status="partly_applied")
+    await mock_db[RUNS].insert_one(_run(agent))
+    base = f"/api/agents/{agent['_id']}"
+    [shown] = api.get(f"{base}/runs/r1").json()["cards"]
+    assert shown["has_newer"] is False and shown["can_apply"] is False
+    await _card(mock_db, agent, _id="c2", run_id="r2", created=datetime.utcnow() + timedelta(hours=1))
+    [shown] = api.get(f"{base}/runs/r1").json()["cards"]
+    assert shown["has_newer"] is True and shown["can_apply"] is False
+
+
+async def test_route_an_open_card_with_a_newer_one_cant_be_applied(api, mock_db, meta):
+    """The window before the newer card closes the old one: the apply route refuses, so Apply isn't offered."""
+    agent = await _agent(mock_db)
+    await _card(mock_db, agent, _ln(1))
+    await mock_db[RUNS].insert_one(_run(agent))
+    base = f"/api/agents/{agent['_id']}"
+    [shown] = api.get(f"{base}/runs/r1").json()["cards"]
+    assert shown["has_newer"] is False and shown["can_apply"] is True
+    await _card(mock_db, agent, _id="c2", run_id="r2", created=datetime.utcnow() + timedelta(hours=1))
+    [shown] = api.get(f"{base}/runs/r1").json()["cards"]
+    assert shown["has_newer"] is True and shown["can_apply"] is False
+    assert api.post(f"{base}/cards/c1/apply").status_code == 409
+
+
 async def test_route_can_apply_on_a_partly_applied_card(api, mock_db, meta):
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "ad2", "spare")

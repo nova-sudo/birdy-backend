@@ -960,6 +960,14 @@ def _build(settings=None, draft=DRAFT, decision="propose", **kw):
     return build_card(FACTS, decision, draft, settings or DEFAULT_SETTINGS, "run1", candidates=CANDS, **kw)
 
 
+def test_build_card_stores_leads_and_ads_live_for_the_report_table():
+    card = build_card({**FACTS, "leads": 31, "ads_live": 4}, "none", None, DEFAULT_SETTINGS, "run1")
+    assert (card["leads"], card["ads_live"]) == (31, 4)
+    # Zero is a real count, so it stays zero.
+    card = build_card({**FACTS, "leads": 0, "ads_live": 0}, "none", None, DEFAULT_SETTINGS, "run1")
+    assert (card["leads"], card["ads_live"]) == (0, 0)
+
+
 def test_build_card_shape():
     card = _build()
     assert card["tag"] == "changes" and card["status"] == "open" and card["run_id"] == "run1"

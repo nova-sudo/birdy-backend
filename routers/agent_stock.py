@@ -79,17 +79,19 @@ def _run_to_api(run: dict) -> dict:
 
 def _card_to_api(card: dict, *, has_newer: bool = False) -> dict:
     out = _with_id(card, drop=("user_id",))
-    # Only a live card still waiting on a person can be applied. A preview card never can, and a
-    # partly applied one can only while it has lines left and no newer card has replaced it.
+    # Only a live card still waiting on a person can be applied. A preview card never can, a card a
+    # newer one has replaced never can, and a partly applied one can only while it has lines left.
+    # `has_newer` is sent too: a card with only failed lines left has can_apply false but can be retried.
     status = card.get("status")
     left = any(ln.get("state") == STATE_PROPOSED for ln in card.get("lines") or [])
-    out["can_apply"] = not card.get("preview") and (
-        status == STATUS_OPEN or (status == STATUS_PARTLY_APPLIED and left and not has_newer))
+    out["has_newer"] = has_newer
+    out["can_apply"] = not card.get("preview") and not has_newer and (
+        status == STATUS_OPEN or (status == STATUS_PARTLY_APPLIED and left))
     return out
 
 
 async def _card_for_api(db, card: dict) -> dict:
-    has_newer = card.get("status") == STATUS_PARTLY_APPLIED and await stock_apply.has_newer_card(db, card)
+    has_newer = card.get("status") in (STATUS_OPEN, STATUS_PARTLY_APPLIED) and await stock_apply.has_newer_card(db, card)
     return _card_to_api(card, has_newer=has_newer)
 
 
@@ -319,7 +321,7 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
                 await stock_lessons.lesson_from_edit(db, agent, saved, current_user)
             except Exception as e:  # noqa: BLE001 - a lesson is never worth failing a saved edit
                 logger.warning("stock card %s: could not record a lesson from the edit: %s", card_id, e)
-        return _card_to_api(saved)
+        return await _card_for_api(db, saved)
 
 
 class ApplyBody(BaseModel):
