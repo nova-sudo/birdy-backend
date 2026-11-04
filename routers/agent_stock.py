@@ -168,10 +168,17 @@ async def start_preview(agent_id: str, current_user: str = Depends(get_current_u
         watched = [g["id"] async for g in db["client_groups"].find(
             {"id": {"$in": gids}, "user_id": current_user, "meta_ad_account_id": {"$nin": [None, ""]}})]
         states = await ad_history.statuses(db, watched)
-        not_ready = [g for g in watched if not ad_history.is_ready(states.get(g))]
+        # Only a client still syncing holds the preview up. One Meta won't let Birdy read may stay that
+        # way for good, so it shows as having no data, unless no client at all can be read.
+        ready = [g for g in watched if ad_history.is_ready(states.get(g))]
+        not_ready = [g for g in watched if g not in ready and states[g]["status"] != ad_history.STATUS_ERROR]
         if not_ready:
             return JSONResponse(status_code=409, content={
                 "detail": "Ad history isn't ready yet", "not_ready": not_ready})
+        if watched and not ready:
+            return JSONResponse(status_code=409, content={
+                "detail": "Birdy can't read ad history from Meta for any of your clients, so there's nothing to preview yet.",
+                "unreadable": watched})
         now = _utcnow()
         run = await stock_runner.get_or_create_run(db, agent, now, kind=stock_runner.PREVIEW)
         if run["phase"] != stock_runner.DONE:
