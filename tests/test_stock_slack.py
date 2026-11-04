@@ -1380,6 +1380,122 @@ async def test_a_refusal_note_cut_off_is_still_sent_later(mock_db, mock_mongo_cl
     assert len(slack.ephemeral) == told + 1 and "24 hours" in slack.ephemeral[-1]["text"]
 
 
+async def test_a_failed_undo_cut_before_its_delete_doesnt_run_again(mock_db, mock_mongo_client, slack, installed, meta, monkeypatch):
+    """At the real cap. Meta's read fails at 4.6 s and the person is told nothing changed. Slack is slow to reply, so the
+    cap cuts before the row goes. Next tick Meta is fine, and the Undo mustn't go out."""
+    agent = await _slack_agent(mock_db)
+    row = await _undo_press(mock_db, mock_mongo_client, agent, meta)
+    good = apply_mod.get_object_state
+
+    async def slow_fail(*a, **k):
+        await asyncio.sleep(4.6)
+        raise RuntimeError("graph slow, then down")
+
+    monkeypatch.setattr(apply_mod, "get_object_state", slow_fail)
+    real_post = slack.chat_postEphemeral
+
+    async def post_then_hang(**kw):
+        await real_post(**kw)
+        await asyncio.sleep(0.8)
+
+    slack.chat_postEphemeral = post_then_hang
+    writes = len(meta.real_writes)
+    await stock_slack.finish_pending_actions(mock_db, mock_mongo_client, time.monotonic() + 10)
+    assert await mock_db[stock_slack.SLACK_ACTIONS].count_documents({"_id": row}) == 1
+
+    slack.chat_postEphemeral = real_post
+    monkeypatch.setattr(apply_mod, "get_object_state", good)
+    await stock_slack.finish_pending_actions(mock_db, mock_mongo_client, time.monotonic() + 10)
+
+    assert len(meta.real_writes) == writes and (await _line(mock_db))["state"] == "applied"
+    assert await mock_db[stock_slack.SLACK_ACTIONS].count_documents({}) == 0
+    told = [e["text"] for e in slack.ephemeral if "nothing was changed" in e["text"]]
+    assert 1 <= len(told) <= 2
+
+
+async def test_a_kill_after_the_answer_is_stored_only_tells_again(mock_db, mock_mongo_client, slack, installed, meta, monkeypatch):
+    agent = await _slack_agent(mock_db)
+    row = await _undo_press(mock_db, mock_mongo_client, agent, meta)
+    good = apply_mod.get_object_state
+
+    async def down(*a, **k):
+        raise RuntimeError("graph down")
+
+    monkeypatch.setattr(apply_mod, "get_object_state", down)
+    real_tell = stock_slack._tell_or_note
+
+    async def killed(*a, **k):
+        await real_tell(*a, **k)
+        raise Killed()
+
+    monkeypatch.setattr(stock_slack, "_tell_or_note", killed)
+    writes = len(meta.real_writes)
+    with pytest.raises(Killed):
+        await finish_action(mock_db, mock_mongo_client, row)
+
+    monkeypatch.setattr(stock_slack, "_tell_or_note", real_tell)
+    monkeypatch.setattr(apply_mod, "get_object_state", good)
+    await _age_claim(mock_db, row, 130)
+    await process_queued_lines(mock_db, mock_mongo_client, datetime.now(timezone.utc), deadline=time.monotonic() + 30)
+
+    assert len(meta.real_writes) == writes and (await _line(mock_db))["state"] == "applied"
+    assert await mock_db[stock_slack.SLACK_ACTIONS].count_documents({}) == 0
+    assert len([e for e in slack.ephemeral if "nothing was changed" in e["text"]]) == 2
+
+
+async def test_a_good_undo_cut_before_its_delete_isnt_run_again(mock_db, mock_mongo_client, slack, installed, meta, monkeypatch):
+    agent = await _slack_agent(mock_db)
+    row = await _undo_press(mock_db, mock_mongo_client, agent, meta)
+    real_update = stock_slack.update_card_message
+
+    async def hangs(*a, **k):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(stock_slack, "update_card_message", hangs)
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(finish_action(mock_db, mock_mongo_client, row), 0.2)
+    assert (await _line(mock_db))["state"] == "undone"
+
+    monkeypatch.setattr(stock_slack, "update_card_message", real_update)
+    calls = []
+    real_undo = stock_slack.undo_line
+
+    async def undo(*a, **k):
+        calls.append(1)
+        return await real_undo(*a, **k)
+
+    monkeypatch.setattr(stock_slack, "undo_line", undo)
+    await finish_action(mock_db, mock_mongo_client, row)
+    assert calls == [] and await mock_db[stock_slack.SLACK_ACTIONS].count_documents({}) == 0
+
+
+async def test_giving_up_is_an_answer_too(mock_db, mock_mongo_client, slack, installed, meta):
+    """Busy at the limit, told it didn't happen, then cut. With the try refunded, it must not run after all."""
+    agent = await _slack_agent(mock_db)
+    await _posted_card(mock_db, agent, _ln(state="applying"), _id="c1")
+    deferred = []
+    payload, action = _press("agent_card_dismiss", "c1")
+    await handle_card_action(payload, action, mock_db, mock_mongo_client, defer=deferred.append)
+    rows = mock_db[stock_slack.SLACK_ACTIONS]
+    await rows.update_one({"_id": deferred[0]}, {"$set": {"tries": stock_slack.ACTION_TRIES - 1}})
+    good = slack.chat_postEphemeral
+
+    async def hangs(**kw):
+        await asyncio.sleep(30)
+
+    slack.chat_postEphemeral = hangs
+    with pytest.raises(asyncio.TimeoutError):
+        await asyncio.wait_for(finish_action(mock_db, mock_mongo_client, deferred[0]), 0.1)
+
+    slack.chat_postEphemeral = good
+    lines = [{**(await _get(mock_db))["lines"][0], "state": "proposed"}]
+    await mock_db[CARDS].update_one({"_id": "c1"}, {"$set": {"lines": lines}})
+    await finish_action(mock_db, mock_mongo_client, deferred[0])
+
+    assert (await _get(mock_db))["status"] == "open" and await rows.count_documents({}) == 0
+    assert "didn't happen" in slack.ephemeral[-1]["text"]
+
+
 async def test_a_press_note_clears_when_the_dashboard_retry_works(mock_db, mock_mongo_client, slack, installed, meta):
     agent = await _slack_agent(mock_db)
     row = await _undo_press(mock_db, mock_mongo_client, agent, meta)
@@ -2075,6 +2191,42 @@ async def test_leave_acme_alone_refuses_nothing_on_apply_or_auto(mock_db, mock_m
     await _card(mock_db, agent, _ln(ad="ad2", mode="auto"), _id="c5", run_id="r5", slack={"channel_id": None, "ts": None})
     await runner.advance_run(mock_db, mock_mongo_client, run, agent, deadline=None, now_utc=NOW)
     assert ("ad2", "PAUSED") in meta.real_writes
+
+
+@pytest.mark.parametrize("client,name", [("Acme", "Acme"), ("Acme", "ACME"), ("Acme London", "Acme"), ("Acme London", "acme london"),
+                                         ("Acme", "Acme Summer"), ("  Acme   London ", "Acme  London")])
+async def test_a_name_filter_matching_the_clients_own_name_refuses_nothing(mock_db, mock_mongo_client, slack, installed, meta, monkeypatch, client, name):
+    reply = {"kind": "exception", "text": "Leave Acme alone", "filter": {"ad_name_contains": name}}
+    use_provider(monkeypatch, FakeProvider(reply=json.dumps(reply)))
+    agent = await _slack_agent(mock_db)
+    await mock_db.client_groups.update_one({"id": GID}, {"$set": {"name": client}})
+    await _ads(mock_db, "ad1", "spare")
+    await _posted_card(mock_db, agent, {**_ln(), "ad_name": "Acme Summer sale"}, _id="c1")
+    await handle_thread_mention(mock_db, TEAM, "C1", "100.1", "leave Acme alone", "<@U1>")
+
+    lesson = await mock_db[MEMORY].find_one({"source": "slack_mention"})
+    assert lesson["kind"] == "fact" and not lesson.get("filter") and "stays a note" in slack.posts[-1]["text"]
+    await apply_card(mock_db, mock_mongo_client, USER, "c1", by="sam", source="slack")
+    assert ("ad1", "PAUSED") in meta.real_writes
+
+
+async def test_a_name_filter_unlike_the_clients_name_stays_a_filter(mock_db, slack, installed, monkeypatch):
+    reply = {"kind": "exception", "text": "Leave Summer alone", "filter": {"ad_name_contains": "Summer"}}
+    use_provider(monkeypatch, FakeProvider(reply=json.dumps(reply)))
+    agent = await _slack_agent(mock_db)
+    await mock_db.client_groups.update_one({"id": GID}, {"$set": {"name": "Acme London"}})
+    await _posted_card(mock_db, agent, _ln(), _id="c1")
+    await handle_thread_mention(mock_db, TEAM, "C1", "100.1", "leave Summer alone", "<@U1>")
+    assert (await mock_db[MEMORY].find_one({"source": "slack_mention"}))["kind"] == "exception"
+
+
+async def test_a_dashboard_lesson_can_still_use_the_clients_name(mock_db, monkeypatch):
+    reply = {"kind": "exception", "text": "Leave Acme alone", "filter": {"ad_name_contains": "Acme"}}
+    use_provider(monkeypatch, FakeProvider(reply=json.dumps(reply)))
+    agent = await _slack_agent(mock_db)
+    await mock_db.client_groups.update_one({"id": GID}, {"$set": {"name": "Acme"}})
+    lesson = await lessons.lesson_from_text(mock_db, agent, "leave Acme", source="dismiss", author="x", client_group_id=GID)
+    assert lesson["filter"] == {"ad_name_contains": "Acme"}
 
 
 async def test_a_name_filter_with_this_clients_own_id_stays_a_filter(mock_db, slack, installed, monkeypatch):

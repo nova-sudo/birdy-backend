@@ -73,7 +73,7 @@ def no_current_user(monkeypatch):
 # thread, collection) are listed at the end of the session.
 
 BLOCKED: list[tuple[str | None, str]] = []  # (the test's id, what it tried)
-_current: dict = {"test": None, "live": False}
+_current: dict = {"test": None, "live": False, "leftovers": set()}
 _real_connect, _real_connect_ex = socket.socket.connect, socket.socket.connect_ex
 _real_sendto, _real_sendmsg, _real_getaddrinfo = socket.socket.sendto, socket.socket.sendmsg, socket.getaddrinfo
 _real_gethostbyname = socket.gethostbyname
@@ -117,7 +117,12 @@ ALLOWED_OUTBOUND: list[dict] = [
         "tests/test_meta_daily_spend.py::test_cache_reads_group_selection_and_stores_empty_for_empty_list")},
     # ai/suggestions/composer.py uses the provider factory, which since "Run chat on Birdy's own OpenAI account" finds the
     # key in .env. This file only pops ANTHROPIC_API_KEY, so it isn't hermetic as its docstring says.
-    {"name": "real OpenAI from the suggestion composer", "host": "api.openai.com", "tests": "tests/test_suggestion_flow.py"},
+    {"name": "real OpenAI from the suggestion composer", "host": "api.openai.com", "tests": (
+        "tests/test_suggestion_flow.py::test_undo_not_applied_is_noop",
+        "tests/test_suggestion_flow.py::test_cross_window_dedupe",
+        "tests/test_suggestion_flow.py::test_create_and_dedupe",
+        "tests/test_suggestion_flow.py::test_dismiss_cooldown",
+        "tests/test_suggestion_flow.py::test_reconcile_resolves_stale")},
 ]
 ALLOWED_USED: set[str] = set()
 
@@ -135,7 +140,7 @@ def _allowance(name: str) -> dict | None:
     for entry in entries:
         host, tests = entry["host"], entry["tests"]
         named = host and (name == host or (host.startswith(".") and name.endswith(host)))
-        if (named or name in _resolved) and (_current["test"] or "").startswith(tests):
+        if (named or name in _resolved) and (_current["test"] or "").split("[")[0] in tests:
             ALLOWED_USED.add(entry["name"])
             return entry
     return None
@@ -159,8 +164,10 @@ def _check(host, what: str) -> None:
     name = host.decode(errors="replace") if isinstance(host, (bytes, bytearray)) else str(host)
     if _allowance(name):
         return
-    # A monitor of a client being closed can land in the next test. It gets nowhere, and it isn't that test's doing.
-    if not threading.current_thread().name.startswith("pymongo_"):
+    # A monitor of an earlier test's closing client can land here. It gets nowhere, and it isn't this test's doing. One
+    # this test started is: threads alive when the test began tell the two apart.
+    thread = threading.current_thread()
+    if not (thread.name.startswith("pymongo_") and (thread in _current["leftovers"] or not _current["test"])):
         BLOCKED.append((_current["test"], f"{what} {name} from {_app_frame()}"))
     raise OutboundConnectionBlocked(f"{_current['test'] or 'outside any test'}: {what} {name}. Mark it `live` or use a fake.")
 
@@ -226,7 +233,8 @@ def _close_currency_client() -> None:
 @pytest.fixture(autouse=True)
 def _no_outbound_connections(request):
     start = len(BLOCKED)
-    _current.update(test=request.node.nodeid, live=request.node.get_closest_marker("live") is not None)
+    _current.update(test=request.node.nodeid, live=request.node.get_closest_marker("live") is not None,
+                    leftovers={t for t in threading.enumerate() if t.name.startswith("pymongo_")})
     yield
     _close_currency_client()
     _current.update(test=None, live=False)

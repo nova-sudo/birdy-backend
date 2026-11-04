@@ -899,18 +899,21 @@ async def _claim_action(db, row_id: str) -> dict | None:
         return_document=ReturnDocument.AFTER)
 
 
-async def _give_up_on_press(db, row: dict, *, settling: bool = False) -> None:
-    """The press is over. They're told, even if the note can't reach them. `settling`: an undo already under way, which
-    recovery finishes, and the card says how that went."""
-    logger.error("stock slack: gave up on %s after %s tries", row["_id"], row.get("tries"))
-    if settling:
-        await _bounded(_tell(db, row["user_id"], row.get("channel"), row.get("slack_user"), STILL_SETTLING, row.get("thread_ts")),
-                       ACTION_TELL_S)
+async def _deliver_answer(db, row: dict, answer: dict) -> None:
+    """What a stored press has to say, from `row.answered`, so it can be said again without doing the press again."""
+    card_id, text, how = row["card_id"], answer.get("text"), answer.get("how")
+    if how == "refused":
+        where = (row.get("channel"), row.get("slack_user"), row.get("thread_ts"))
+        await _tell_or_note(db, card_id, row["user_id"], where, text, ACTION_TELL_S)
+    elif text:
+        await _bounded(_tell(db, row["user_id"], row.get("channel"), row.get("slack_user"), text, row.get("thread_ts")), ACTION_TELL_S)
+    if how == "settling":  # an undo already under way: recovery finishes it, and the card says how that went
         return
-    await _bounded(_tell(db, row["user_id"], row.get("channel"), row.get("slack_user"), DIDNT_HAPPEN, row.get("thread_ts")),
-                   ACTION_TELL_S)
-    await _note_on_card(db, row["card_id"], DIDNT_HAPPEN)
-    await _bounded(update_card_message(db, {"_id": row["card_id"]}), ACTION_UPDATE_S)
+    if how == "gave_up":
+        await _note_on_card(db, card_id, text)
+    elif how == "done":
+        await db[CARDS].update_one({"_id": card_id, "press_note": {"$nin": [None]}}, {"$set": {"press_note": None}})
+    await _bounded(update_card_message(db, {"_id": card_id}), ACTION_UPDATE_S)
 
 
 async def _line_state(db, card_id: str, line_id: str | None) -> str | None:
@@ -924,7 +927,8 @@ async def finish_action(db, mongo_client, row_id: str) -> bool:
     after ACTION_RECLAIM: undo_line and dismiss_card are safe to repeat, and an undo frozen mid-line is settled first
     (apply.recover_stale_undo). Thawing later can't send: the row is checked last thing before the line is claimed, and
     the line's token and send window catch the rest. `busy` keeps the row for another try. Being cut off by a caller's
-    time limit costs no try. The person is told before the row goes, so a kill can repeat a note but not lose it."""
+    time limit costs no try. What came of the press is stored on the row before anyone is told, and a claim that finds it
+    only tells and deletes: a kill or cut can repeat a note, but it can't lose one or do the press after it was answered."""
     row = await _claim_action(db, row_id)
     if row is None:
         return False
@@ -936,38 +940,38 @@ async def finish_action(db, mongo_client, row_id: str) -> bool:
         now = _utcnow()
         return now if await actions.find_one_and_update(mine, {"$set": {"claimed_at": now}}) else None
 
-    async def give_up() -> None:
-        settling = row["kind"] == "undo" and await _line_state(db, card_id, line_id) == STATE_UNDOING
-        if await actions.find_one(mine, {"_id": 1}):
-            await _give_up_on_press(db, row, settling=settling)
-            await actions.delete_one(mine)
+    async def give_up_answer() -> dict:
+        logger.error("stock slack: gave up on %s after %s tries", row_id, row.get("tries"))
+        if row["kind"] == "undo" and await _line_state(db, card_id, line_id) == STATE_UNDOING:
+            return {"text": STILL_SETTLING, "how": "settling"}
+        return {"text": DIDNT_HAPPEN, "how": "gave_up"}
 
     who = {"by": row["by"], "by_id": row.get("by_id"), "source": "slack"}
     try:
-        if row["tries"] > ACTION_TRIES or _utcnow() - row["created_at"] > ACTION_MAX_AGE:
-            await give_up()
-            return True
-        if row["kind"] == "undo":
-            await recover_stale_undo(db, mongo_client, card_id, line_id, older_than=ACTION_RECLAIM)
-            res = await undo_line(db, mongo_client, user_id, card_id, line_id, press_gate=still_mine, **who)
-        else:
-            res = await dismiss_card(db, user_id, card_id, **who)
-        if res.get("outcome") == "taken_over":
-            return True
-        if res.get("outcome") == "busy":
-            if row["tries"] < ACTION_TRIES:
-                await actions.update_one(mine, {"$set": {"claimed_at": None}})
+        answer = row.get("answered")
+        if answer is None:
+            if row["tries"] > ACTION_TRIES or _utcnow() - row["created_at"] > ACTION_MAX_AGE:
+                answer = await give_up_answer()
             else:
-                await give_up()
-            return True
-        if not await actions.find_one(mine, {"_id": 1}):
-            return True  # a takeover has it, and answers for it
-        if res.get("ok"):
-            await db[CARDS].update_one({"_id": card_id, "press_note": {"$nin": [None]}}, {"$set": {"press_note": None}})
-        else:
-            where = (row.get("channel"), row.get("slack_user"), row.get("thread_ts"))
-            await _tell_or_note(db, card_id, user_id, where, _answer_text(res), ACTION_TELL_S)
-        await _bounded(update_card_message(db, {"_id": card_id}), ACTION_UPDATE_S)
+                if row["kind"] == "undo":
+                    await recover_stale_undo(db, mongo_client, card_id, line_id, older_than=ACTION_RECLAIM)
+                    res = await undo_line(db, mongo_client, user_id, card_id, line_id, press_gate=still_mine, **who)
+                else:
+                    res = await dismiss_card(db, user_id, card_id, **who)
+                if res.get("outcome") == "taken_over":
+                    return True
+                if res.get("outcome") == "busy" and row["tries"] < ACTION_TRIES:
+                    await actions.update_one(mine, {"$set": {"claimed_at": None}})
+                    return True
+                if res.get("outcome") == "busy":
+                    answer = await give_up_answer()
+                elif res.get("ok"):
+                    answer = {"text": None, "how": "done"}
+                else:
+                    answer = {"text": _answer_text(res), "how": "refused"}
+            if not (await actions.update_one(mine, {"$set": {"answered": answer}})).matched_count:
+                return True  # a takeover has it, and answers for it
+        await _deliver_answer(db, row, answer)
     except asyncio.CancelledError:
         await actions.update_one(mine, {"$set": {"claimed_at": None}, "$inc": {"tries": -1}})
         raise
@@ -1302,8 +1306,8 @@ def _lesson_reply(lesson: dict | None, client_name: str | None) -> tuple[str, li
     if not (lesson and lesson.get("_id")):
         return "Birdy couldn't record that, so it won't use it. Try again in a moment.", None
     scope = _esc(client_name or "this client")
-    extra = (" It stays a note, so it won't stop any change: from Slack, Birdy only makes rules about ads with a certain name "
-             "in this client. Set anything wider in Birdy." if lesson.get("filter_dropped") else "")
+    extra = (" It stays a note, so it won't stop any change: from Slack, Birdy only makes rules about particular ads by name, "
+             "not a whole client. Set anything wider in Birdy." if lesson.get("filter_dropped") else "")
     text = rb._cut(f"Noted for {scope}: {_esc(lesson.get('text'))}{extra}", MAX_TEXT)
     return text, [{"type": "section", "text": {"type": "mrkdwn", "text": text}},
                   {"type": "actions", "elements": [{"type": "button", "action_id": LESSON_UNDO, "value": lesson["_id"],

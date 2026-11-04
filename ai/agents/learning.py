@@ -362,6 +362,14 @@ async def _meter(db, user_id: str, provider, resp, feature: str = "agent_note_me
         logger.warning("learning: metering the note call failed for %s: %s", user_id, e)
 
 
+async def _names_the_client(db, agent: dict, client_group_id: str, ad_name: str) -> bool:
+    """Whether an ad-name match is really the client's name, in either direction: "Acme" and "Acme London" both are for a
+    client named "Acme London". Plain containment: a near miss costs a note, and the other way costs all their changes."""
+    group = await db["client_groups"].find_one({"id": client_group_id, "user_id": agent.get("user_id")}, {"name": 1}) or {}
+    client, match = " ".join(str(group.get("name") or "").split()).casefold(), " ".join(ad_name.split()).casefold()
+    return bool(client) and (match in client or client in match)
+
+
 async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str = "denial",
                            author: str | None = None, client_group_id: str | None = None,
                            feature: str = "agent_note_memory", status: str | None = None,
@@ -371,7 +379,8 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
     error, or output that can't be used, stores the note as a fact. Never raises.
     `filter_one_client`: for words where nobody chose the scope in a form. A filter has to name ads, and may only touch
     `client_group_id`'s. One naming a whole client or whole days could stop all of a client's changes on one sentence,
-    so anything else stays a fact, and the memory comes back with `filter_dropped`."""
+    and so could the client's own name, which ads often carry. Anything like that stays a fact, and the memory comes back
+    with `filter_dropped`."""
     note = (note or "").strip()[:NOTE_MAX]
     text, kind, flt, dropped = note, "fact", None, False
     try:
@@ -390,7 +399,8 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
                 flt = _clean_filter(parsed.get("filter"), allowed)
                 if flt and filter_one_client:
                     if (client_group_id and flt.get("ad_name_contains") and set(flt) <= {"ad_name_contains", "client_group_id"}
-                            and flt.get("client_group_id", client_group_id) == client_group_id):
+                            and flt.get("client_group_id", client_group_id) == client_group_id
+                            and not await _names_the_client(db, agent, client_group_id, flt["ad_name_contains"])):
                         flt = {**flt, "client_group_id": client_group_id}
                     else:
                         flt, dropped = None, True

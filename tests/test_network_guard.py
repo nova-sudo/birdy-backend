@@ -9,6 +9,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 
 import pytest
 
@@ -100,20 +101,20 @@ def test_what_counts_as_local(host, local):
 
 
 def test_an_allowed_host_only_counts_where_its_entry_says(monkeypatch, expect_blocked):
-    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": "api.example.test", "tests": "tests/somewhere_else.py"}])
+    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": "api.example.test", "tests": ("tests/somewhere_else.py::test_x",)}])
     with pytest.raises(conftest.OutboundConnectionBlocked):
         conftest._check("api.example.test", "look up")
 
 
 def test_an_allowed_suffix_covers_a_clusters_shards_and_no_other_host(monkeypatch, expect_blocked):
-    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": ".abc.mongodb.net", "tests": ("tests/test_network_guard.py",)}])
+    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": ".abc.mongodb.net", "tests": (conftest._current["test"],)}])
     conftest._check("ac-1-shard-00-00.abc.mongodb.net", "look up")
     with pytest.raises(conftest.OutboundConnectionBlocked):
         conftest._check("evil.mongodb.net", "look up")
 
 
 def test_a_dns_query_counts_by_the_name_it_asks_for(monkeypatch, expect_blocked):
-    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": ".abc.mongodb.net", "tests": ("tests/test_network_guard.py",)}])
+    monkeypatch.setattr(conftest, "ALLOWED_OUTBOUND", [{"name": "the guard's own test", "host": ".abc.mongodb.net", "tests": (conftest._current["test"],)}])
     query = bytes(12) + b"\x08_mongodb\x04_tcp\x04prod\x03abc\x07mongodb\x03net\x00\x00\x21\x00\x01"
     assert conftest._dns_question(query) == "_mongodb._tcp.prod.abc.mongodb.net"
     assert conftest._allowance(conftest._dns_question(query))
@@ -173,8 +174,7 @@ def test_a_new_test_that_reaches_the_dev_cluster_fails():
     assert done.returncode != 0 and "tried to leave this machine" in done.stdout
 
 
-def test_a_closing_mongo_monitor_is_refused_without_failing_the_test_it_lands_in():
-    import threading
+def _try_from_a_pymongo_thread() -> list:
     out = []
 
     def monitor():
@@ -183,8 +183,54 @@ def test_a_closing_mongo_monitor_is_refused_without_failing_the_test_it_lands_in
         except conftest.OutboundConnectionBlocked:
             out.append("refused")
 
+    return out, threading.Thread(target=monitor, name="pymongo_server_monitor_thread")
+
+
+def test_a_leftover_mongo_monitor_is_refused_without_failing_the_test_it_lands_in(monkeypatch):
+    out, thread = _try_from_a_pymongo_thread()
+    monkeypatch.setitem(conftest._current, "leftovers", {thread})   # alive when this test started
     before = len(conftest.BLOCKED)
-    thread = threading.Thread(target=monitor, name="pymongo_server_monitor_thread")
     thread.start()
     thread.join()
     assert out == ["refused"] and len(conftest.BLOCKED) == before
+
+
+def test_a_mongo_thread_this_test_started_is_recorded(expect_blocked):
+    out, thread = _try_from_a_pymongo_thread()
+    thread.start()
+    thread.join()
+    assert out == ["refused"]
+
+
+@pytest.mark.skipif(not os.environ.get("GUARD_SELF_TEST_PLAIN_URI"), reason="only run by the test below, which expects it to fail")
+async def test_inner_a_new_test_with_a_plain_uri():
+    from motor.motor_asyncio import AsyncIOMotorClient
+    client = AsyncIOMotorClient("mongodb://192.0.2.1:27017", serverSelectionTimeoutMS=500)
+    try:
+        await client.admin.command("ping")
+    except Exception:
+        pass
+    client.close()
+
+
+def test_a_plain_mongo_uri_with_no_lookup_still_fails_a_test_that_swallows_the_error():
+    """No SRV lookup to record here, as with a resolver on loopback: only pymongo's own threads try to connect."""
+    done = _inner_run("test_inner_a_new_test_with_a_plain_uri", GUARD_SELF_TEST_PLAIN_URI="1")
+    assert done.returncode != 0 and "tried to leave this machine" in done.stdout
+
+
+def test_a_test_id_extending_a_named_one_gets_nothing(monkeypatch):
+    entry = next(e for e in conftest.ALLOWED_OUTBOUND if "Mongo" in e["name"])
+    monkeypatch.setitem(entry, "host", ".abc.mongodb.net")
+    named = entry["tests"][0]
+    monkeypatch.setitem(conftest._current, "test", named + "_v2")
+    assert conftest._allowance("ac-1.abc.mongodb.net") is None
+    monkeypatch.setitem(conftest._current, "test", named)
+    assert conftest._allowance("ac-1.abc.mongodb.net") is entry
+    monkeypatch.setitem(conftest._current, "test", named + "[param]")
+    assert conftest._allowance("ac-1.abc.mongodb.net") is entry
+
+
+def test_every_allowlist_entry_names_whole_tests():
+    for entry in conftest.ALLOWED_OUTBOUND:
+        assert isinstance(entry["tests"], tuple) and all("::" in t for t in entry["tests"]), entry["name"]
