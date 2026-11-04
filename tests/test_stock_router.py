@@ -205,7 +205,7 @@ async def test_runs_list_latest_and_detail(api, mock_db):
 
 async def test_latest_with_no_runs_is_null(api, mock_db):
     agent = await _setup(mock_db, "g1")
-    assert api.get(f"/api/agents/{agent['_id']}/runs/latest").json() == {"run": None}
+    assert api.get(f"/api/agents/{agent['_id']}/runs/latest").json() == {"run": None, "open_cards": 0}
 
 
 async def test_patch_card_keeps_original_and_refuses_a_settled_card(api, mock_db):
@@ -407,3 +407,19 @@ async def test_a_claim_conflict_on_activate_changes_nothing(api, mock_db):
     assert await claims.holder(mock_db, USER, "g1") == "other-agent"
     doc = await mock_db[AGENTS].find_one({"_id": aid})
     assert doc["status"] == "draft"
+
+
+async def test_latest_counts_the_cards_a_person_can_still_apply(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2")
+    await _seed_card(mock_db, agent, "c2", "r2", client_group_id="g2", status="applied")
+    await _seed_card(mock_db, agent, "c3", "r2", client_group_id="g3", status="closing")
+    await _seed_run(mock_db, agent, rid="rp", kind="preview", as_of=datetime(2026, 11, 4, 7))
+    await _seed_card(mock_db, agent, "c4", "rp", client_group_id="g4")
+    latest = api.get(f"/api/agents/{aid}/runs/latest").json()
+    assert latest["open_cards"] == 1
+    shown = api.get(f"/api/agents/{aid}/runs/r2").json()["cards"]
+    assert latest["open_cards"] == sum(1 for c in shown if c["can_apply"])
+    assert api.get(f"/api/agents/{aid}/runs/latest?kind=preview").json()["open_cards"] == 0

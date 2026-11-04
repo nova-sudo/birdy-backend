@@ -239,14 +239,22 @@ async def list_runs(agent_id: str, limit: int = Query(20, ge=1, le=100), before:
 @router.get("/{agent_id}/runs/latest")
 async def latest_run(agent_id: str, kind: Optional[str] = Query(None, pattern="^preview$"),
                      current_user: str = Depends(get_current_user)):
-    """The newest report, or with kind=preview the newest preview."""
+    """The newest report, or with kind=preview the newest preview. `open_cards` is how many of its cards a person can
+    still apply (the cards' own `can_apply` rule), for the nav badge: no scoreboard or lessons are built here."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
         q = {"agent_id": agent_id, "kind": stock_runner.PREVIEW} if kind \
             else {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}}
         rows = await db[stock_runner.RUNS].find(q).sort("as_of", -1).limit(1).to_list(length=1)
-        return {"run": _run_to_api(rows[0]) if rows else None}
+        if not rows:
+            return {"run": None, "open_cards": 0}
+        open_cards = 0
+        if not kind:
+            waiting = db[stock_runner.CARDS].find(
+                {"run_id": rows[0]["_id"], "agent_id": agent_id, "status": {"$in": [STATUS_OPEN, STATUS_PARTLY_APPLIED]}})
+            open_cards = sum([1 async for c in waiting if (await _card_for_api(db, c))["can_apply"]])
+        return {"run": _run_to_api(rows[0]), "open_cards": open_cards}
 
 
 @router.get("/{agent_id}/runs/{run_id}")
