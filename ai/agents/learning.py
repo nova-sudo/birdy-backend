@@ -364,12 +364,15 @@ async def _meter(db, user_id: str, provider, resp, feature: str = "agent_note_me
 
 async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str = "denial",
                            author: str | None = None, client_group_id: str | None = None,
-                           feature: str = "agent_note_memory", status: str | None = None) -> dict:
+                           feature: str = "agent_note_memory", status: str | None = None,
+                           filter_one_client: bool = False) -> dict:
     """Store the note as a memory. One LLM call decides between a structured
     exception (a filter memory_filters can apply) and a free-text fact. Any
-    error, or output that can't be used, stores the note as a fact. Never raises."""
+    error, or output that can't be used, stores the note as a fact. Never raises.
+    `filter_one_client`: a filter may only ever touch `client_group_id`'s ads. One that can't be held to it stays a
+    fact, and the memory comes back with `filter_dropped`. For words where nobody chose the scope in a form."""
     note = (note or "").strip()[:NOTE_MAX]
-    text, kind, flt = note, "fact", None
+    text, kind, flt, dropped = note, "fact", None, False
     try:
         from ai import provider_factory
         ctx, allowed = await _context(db, agent, note, doc or {})
@@ -384,15 +387,21 @@ async def memory_from_note(db, agent: dict, note: str, doc: dict, *, source: str
                 text = parsed["text"].strip()[:MEMORY_TEXT_MAX]
             if parsed.get("kind") == "exception":
                 flt = _clean_filter(parsed.get("filter"), allowed)
+                if flt and filter_one_client:
+                    if client_group_id and flt.get("client_group_id", client_group_id) == client_group_id:
+                        flt = {**flt, "client_group_id": client_group_id}
+                    else:
+                        flt, dropped = None, True
                 kind = "exception" if flt else "fact"
     except Exception as e:
         logger.warning("learning: note -> memory fell back to a fact for agent %s: %s",
                        agent.get("_id"), e)
-        text, kind, flt = note, "fact", None
+        text, kind, flt, dropped = note, "fact", None, False
     try:
-        return await add_memory(db, agent["_id"], text=text, kind=kind, source=source,
-                                source_ref=(doc or {}).get("_id"), filter=flt,
-                                author=author, client_group_id=client_group_id, status=status)
+        memory = await add_memory(db, agent["_id"], text=text, kind=kind, source=source,
+                                  source_ref=(doc or {}).get("_id"), filter=flt,
+                                  author=author, client_group_id=client_group_id, status=status)
+        return {**memory, "filter_dropped": True} if dropped else memory
     except Exception as e:
         logger.error("learning: could not store memory for agent %s: %s", agent.get("_id"), e)
         return {"text": text, "kind": kind, "filter": flt, "source": source,

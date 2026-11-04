@@ -38,6 +38,7 @@ from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents.runner import run_agent
 from ai.agents.stock import runner as stock_runner
+from ai.agents.stock.slack import retry_unposted_runs
 from ai.agents.store import AGENTS, TYPE_STOCK
 from core.database import DB_NAME
 from dependencies import get_mongo_client
@@ -49,6 +50,7 @@ GRACE = timedelta(hours=2)
 FRESHNESS_FIELD = "last_meta_refresh"
 IN_FLIGHT = ("pending", "in_progress")
 TICK_BUDGET_SECONDS = 180          # of Vercel's 300s function timeout
+SLACK_RETRY_FLOOR_SECONDS = 30     # late Slack posts still get this after a tick that used its budget
 STALE_CLAIM = timedelta(minutes=30)
 MAX_RUN_ATTEMPTS = 3
 
@@ -326,7 +328,13 @@ async def run_agents_tick() -> dict:
         except Exception as e:
             logger.error("[agents-tick] stock agents raised: %s", e, exc_info=True)
             stock = {"error": str(e)}
-        return {**out, "stock": stock}
+        posted_late = 0
+        try:
+            posted_late = await retry_unposted_runs(mongo_client[DB_NAME], datetime.now(timezone.utc),
+                                                    max(deadline, time.monotonic() + SLACK_RETRY_FLOOR_SECONDS))
+        except Exception as e:
+            logger.error("[agents-tick] late Slack posts raised: %s", e, exc_info=True)
+        return {**out, "stock": stock, "slack_posted_late": posted_late}
 
 
 async def run_outcomes(mongo_client, now_utc: datetime) -> dict:

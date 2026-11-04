@@ -21,6 +21,7 @@ STATE_PROPOSED, STATE_FLAGGED = "proposed", "flagged"
 STATE_QUEUED, STATE_APPLYING, STATE_APPLIED, STATE_FAILED, STATE_BLOCKED, STATE_NEEDS_FILE = (
     "queued", "applying", "applied", "failed", "blocked", "needs_file")
 STATE_UNDOING, STATE_UNDONE = "undoing", "undone"
+DROPPABLE_STATES = (STATE_PROPOSED, STATE_FLAGGED, STATE_NEEDS_FILE)   # a person can take these off a card; the rest are in Meta's hands
 CHANGE_DECISION = "propose"
 _EDITABLE = ("lines", "additional_changes", "thought_process", "next_steps")
 CLIENT_NAME_FLAG = "client_name"

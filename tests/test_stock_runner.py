@@ -932,9 +932,8 @@ async def test_publishing_failure_is_recorded_and_auto_still_runs(mock_db, mock_
     monkeypatch.setattr(runner, "publish_run", bad)
     agent = await _setup(mock_db, "g1")
     run = await _run_all(mock_db, mock_mongo_client, agent)
-    # One try per tick, then the run ends with the error showing. Auto is safe to repeat and goes on regardless.
-    assert run["phase"] == "done" and "slack down" in run["publish_error"]
-    assert run["publish_tries"] == runner.PUBLISH_TRIES and len(fakes.autos) == runner.PUBLISH_TRIES
+    assert run["phase"] == "done" and "slack down" in run["publish_error"] and len(fakes.autos) == 1
+    assert run["attempts"] == 0 and run["slack_pending"] is True   # stock.slack.retry_unposted_runs takes it from here
 
 
 # ---------------------------------------------------------------------------
@@ -1080,6 +1079,35 @@ async def test_tick_dispatches_custom_and_stock_separately(mock_db, mock_mongo_c
     out = await agent_jobs.run_agents_tick()
     assert [c[0] for c in calls] == ["custom", "stock"] and calls[0][1] == calls[1][1] is not None
     assert out["ran"] == 1 and out["stock"] == {"ran": 2}
+
+
+async def test_the_tick_posts_what_slack_still_owes_even_when_stock_raises_or_ran_out_of_time(mock_db, mock_mongo_client, monkeypatch):
+    calls = []
+
+    async def custom(mongo_client, *, now_utc, deadline=None):
+        return {"ran": 1}
+
+    async def stock(mongo_client, *, now_utc, deadline=None):
+        raise RuntimeError("bad")
+
+    async def retry(db, now_utc, deadline):
+        calls.append(deadline - time.monotonic())
+        return 2
+
+    class Ctx:
+        async def __aenter__(self):
+            return mock_mongo_client
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(agent_jobs, "get_mongo_client", lambda: Ctx())
+    monkeypatch.setattr(agent_jobs, "run_due_agents", custom)
+    monkeypatch.setattr(agent_jobs, "run_due_stock_agents", stock)
+    monkeypatch.setattr(agent_jobs, "retry_unposted_runs", retry)
+    monkeypatch.setattr(agent_jobs, "TICK_BUDGET_SECONDS", 0)
+    out = await agent_jobs.run_agents_tick()
+    assert out["slack_posted_late"] == 2 and calls[0] > 20
 
 
 async def test_stock_failure_leaves_the_custom_result_alone(mock_db, mock_mongo_client, monkeypatch):
@@ -1451,8 +1479,21 @@ async def test_a_hook_error_never_stops_the_run(mock_db, mock_mongo_client, fake
     monkeypatch.setattr(runner, "post_urgent_alerts", broken)
     agent = await _setup(mock_db, "g1")
     run = await _tick(mock_db, mock_mongo_client, await get_or_create_run(mock_db, agent, NOW), agent)
-    assert run["phase"] == "done" and run["attempts"] == 0 and "slack down" in run["publish_error"]
+    assert run["phase"] == "done" and run["attempts"] == 0
+    # The publish after the hook got through, so the report's own error clears: the summary lists the alert.
+    assert not run["publish_error"]
     assert len(await _cards(mock_db)) == 1 and len(fakes.published) == 1
+
+
+async def test_a_hook_error_is_recorded_until_a_publish_gets_through(mock_db, mock_mongo_client, fakes, monkeypatch):
+    async def broken(db, run, agent):
+        raise RuntimeError("slack down")
+
+    monkeypatch.setattr(runner, "post_urgent_alerts", broken)
+    agent = await _setup(mock_db, "g1")
+    run = await get_or_create_run(mock_db, agent, NOW)
+    await runner._call_urgent_hook(mock_db, run, agent)
+    assert "slack down" in run["publish_error"] and run["attempts"] == 0
 
 
 async def test_a_hook_error_doesnt_stop_an_incomplete_run_publishing(mock_db, mock_mongo_client, fakes, monkeypatch):

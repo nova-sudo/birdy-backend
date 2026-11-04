@@ -30,6 +30,7 @@ from ai.suggestions.store import ACTIVITY, KIND_ACTION_APPLIED, KIND_ACTION_UNDO
 from dependencies import get_current_user
 from jobs import creative_tracking
 from main import app
+from test_agent_learning import FakeProvider, use_provider
 from test_stock_runner import _run_all, _setup, fakes  # noqa: F401 - fakes is a fixture
 from test_stock_runner import FACTS, USER, NOW
 
@@ -958,7 +959,8 @@ async def test_undo_contended_returns_a_retry_message(mock_db, mock_mongo_client
 # Dismiss
 # ---------------------------------------------------------------------------
 
-async def test_dismiss_closes_the_card_and_later_apply_is_refused(mock_db, mock_mongo_client, meta):
+async def test_dismiss_closes_the_card_and_later_apply_is_refused(mock_db, mock_mongo_client, meta, monkeypatch):
+    use_provider(monkeypatch, FakeProvider(reply='{"kind": "fact", "text": "Client said wait"}'))
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "spare")
     await _card(mock_db, agent, _ln())
@@ -1299,7 +1301,7 @@ async def _three_cards(db, agent):
     for n, gid in enumerate(("g1", "g2", "g3")):
         await claims.claim_clients(db, USER, agent["_id"], [gid])
         await _ads(db, f"ad{gid}", f"spare{gid}", gid=gid)
-        await _card(db, agent, _ln(1, ad=f"ad{gid}"), _id=f"c{n}", gid=gid)
+        await _card(db, agent, _ln(1, ad=f"ad{gid}"), _id=f"c{n}", gid=gid, slack={"channel_id": "C1", "ts": f"1.{n}"})
     await db[RUNS].insert_one(_run(agent, clients={g: {"state": "done"} for g in ("g1", "g2", "g3")}))
 
 
@@ -1974,7 +1976,7 @@ async def test_cron_starts_no_line_without_time_to_finish_it(mock_db, mock_mongo
 async def test_apply_all_at_its_real_budget_queues_every_line_and_cuts_none(mock_db, mock_mongo_client, meta):
     agent = await _agent(mock_db)
     await _ads(mock_db, "ad1", "ad2", "spare")
-    await _card(mock_db, agent, _ln(1), _ln(2))
+    await _card(mock_db, agent, _ln(1), _ln(2), slack={"channel_id": "C1", "ts": "1.1"})
     await mock_db[RUNS].insert_one(_run(agent))
     res = await apply_run(mock_db, mock_mongo_client, USER, "r1", by="s", source="slack")
     assert res["outcome"] == "queued" and res["queued"] == 2 and meta.writes == [] and meta.adset_reads == []
@@ -2300,7 +2302,8 @@ async def test_route_undo_expired_is_410(api, mock_db, meta):
     assert r.status_code == 410 and meta.writes == []
 
 
-async def test_route_dismiss(api, mock_db, meta):
+async def test_route_dismiss(api, mock_db, meta, monkeypatch):
+    use_provider(monkeypatch, FakeProvider(reply='{"kind": "fact", "text": "Not now"}'))
     agent = await _agent(mock_db)
     await _card(mock_db, agent, _ln())
     r = api.post(f"/api/agents/{agent['_id']}/cards/c1/dismiss", json={"reason": "Not now"})

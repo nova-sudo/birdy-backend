@@ -8,7 +8,8 @@ step and releases it.
 Phases: alerts, catch_up, checks, writing, publishing, waiting, done. From `waiting` a run loops
 back for any client that has become ready, and publishes again for what changed since, so
 `publish_run` and `auto_apply_run` must be safe to repeat and act only on what's new. A publish that
-failed also comes back here, on a later tick (`publish_retry`).
+failed doesn't hold the run: the report stays in Birdy with the error showing, and
+slack.retry_unposted_runs posts it late, outside this state machine.
 
 A client's `state` says what is left for it, so a resumed run never repeats finished work:
   pending    needs its ad state refreshed and its health read (markers `refreshed`, `health_done`)
@@ -60,7 +61,8 @@ from ai.agents.stock.cards import STATUS_CLOSING, build_card, supersede_open
 from ai.agents.stock import lessons, scoreboard
 from ai.agents.stock.checks import client_facts, follow_ups
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings
-from ai.agents.stock.slack import post_urgent_alerts, publish_run
+from ai.agents.stock.slack import (SLACK_CLAIM, SLACK_POSTED, post_urgent_alerts, publish_run, slack_attempt_fields,
+                                   slack_failed_fields)
 from ai.agents.stock.windows import full_day_window, last_full_day
 from ai.agents.stock.writer import write_card
 from ai.agents.store import CARDS, RUNS
@@ -90,8 +92,6 @@ ERROR_MAX = 300
 RECONNECT = "Meta needs reconnecting. Reconnect to check this client."
 OUT_OF_TIME = "Birdy ran out of time before finishing this client."
 RATE_LIMITED = "Meta's rate limit stopped Birdy finishing this client today."
-PUBLISH_TRIES = 3                    # a run's Slack messages, one try per tick
-PUBLISH_RETRY_AFTER = timedelta(minutes=1)  # so a retry lands on a later tick
 
 
 CATCH_UP_MAX_S = 60   # when the tick gave no deadline; the phase never holds a run up for longer
@@ -234,10 +234,12 @@ async def _claim(db, run_id: str) -> dict | None:
     before = await db[RUNS].find_one_and_update(
         {"_id": run_id, "phase": {"$ne": DONE},
          "$or": [{"claimed_at": None}, {"claimed_at": {"$lt": now - STALE_CLAIM}}]},
-        {"$set": {"claimed_at": now}})
+        {"$set": {"claimed_at": now, "claim_kind": None}})
     if before is None:
         return None
-    return {**before, "claimed_at": now, "taken_over": before.get("claimed_at") is not None}
+    # Slack's late posting uses the same claim, so the two never overlap, but its kills aren't this run's attempts.
+    taken_over = before.get("claimed_at") is not None and before.get("claim_kind") != SLACK_CLAIM
+    return {**before, "claimed_at": now, "claim_kind": None, "taken_over": taken_over}
 
 
 async def _save(db, run: dict, **fields) -> None:
@@ -770,24 +772,18 @@ async def _run_cards(db, run: dict) -> list[dict]:
 
 
 async def _publish(db, run: dict, agent: dict, cards: list[dict]) -> None:
-    """A failure keeps the report and is shown on the run. The next tick tries again, unless the error says that
-    can't help, and only what has no stored ts is posted. Getting further than last time doesn't use up a try."""
+    """A failure never holds the run. The error shows on the report, and slack.retry_unposted_runs posts what's missing
+    later. Marked due before the attempt, so a kill during it is retried too. There's one error on a run, and a publish
+    that gets through has said everything, so it clears it, an urgent alert's included."""
+    now = run.get("tick_now") or datetime.utcnow()
+    await _save(db, run, **slack_attempt_fields(run, now))
     try:
         await publish_run(db, run, agent, cards)
     except Exception as e:  # noqa: BLE001 - the report stays available without Slack
         logger.error("stock run %s: publish failed: %s", run["_id"], e, exc_info=True)
-        tries = 0 if getattr(e, "posted", 0) else (run.get("publish_tries") or 0) + 1
-        retry = getattr(e, "retry", True) and tries < PUBLISH_TRIES and run["phase"] != DONE
-        now = run.get("tick_now") or datetime.utcnow()
-        await _save(db, run, publish_error=_short(e), publish_tries=tries, publish_retry=retry,
-                    publish_retry_after=now + PUBLISH_RETRY_AFTER)
+        await _save(db, run, publish_error=_short(e), **slack_failed_fields(run, e, now))
         return
-    if run.get("publish_retry") or run.get("publish_tries"):
-        await _save(db, run, publish_error=None, publish_tries=0, publish_retry=False, publish_retry_after=None)
-
-
-def _publish_due(run: dict) -> bool:
-    return bool(run.get("publish_retry")) and (run.get("publish_retry_after") or datetime.min) <= _now(run)
+    await _save(db, run, **SLACK_POSTED)
 
 
 def _states(run: dict) -> dict:
@@ -818,8 +814,6 @@ async def _waiting_phase(db, mongo_client, run: dict, agent: dict, deadline) -> 
             await _save_client(db, run, gid, state=HEALTHY, wait_for=None)
     if _clients_in(run, PENDING, HEALTHY, ALERTED, NEEDS_WRITING) or _health_due_now(run):
         return True
-    if run.get("publish_retry"):  # the run stays open for its Slack messages, and tries on a later tick
-        return _publish_due(run)
     return not any(c["state"] in UNFINISHED or c.get("health_due") for c in run["clients"].values())
 
 
@@ -896,7 +890,7 @@ def _next_phase(run: dict) -> str:
             return ALERTS
         if _clients_in(run, ALERTED, NEEDS_WRITING):
             return CHECKS
-        return PUBLISHING if _states(run) != run.get("published_states") or _publish_due(run) else DONE
+        return PUBLISHING if _states(run) != run.get("published_states") else DONE
     return {CATCH_UP: CHECKS, CHECKS: WRITING, WRITING: PUBLISHING, PUBLISHING: WAITING_PHASE}[phase]
 
 

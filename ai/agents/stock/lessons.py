@@ -38,6 +38,7 @@ from ai.agents.store import MEMORY, PROPOSALS, add_memory
 logger = logging.getLogger(__name__)
 
 ACTIVE, OVERRULED = "active", "overruled"
+SLACK_MENTION = "slack_mention"    # anyone in a channel can say this, so it can't quietly become an agency-wide ad rule
 PROMOTE = "promote"
 LESSONS_FOR_PROMPT = 50
 FEATURE = "stock_lesson"           # the metering label for the AI call that turns text into a lesson
@@ -158,7 +159,7 @@ async def lesson_from_text(db, agent: dict, text: str, *, source: str, author: s
                                 source_ref=source_ref, author=author, client_group_id=client_group_id, status=ACTIVE)
     return await memory_from_note(db, agent, text, {"_id": source_ref, "client_group_id": client_group_id},
                                   source=source, author=author, client_group_id=client_group_id,
-                                  feature=FEATURE, status=ACTIVE)
+                                  feature=FEATURE, status=ACTIVE, filter_one_client=source == SLACK_MENTION)
 
 
 async def lessons_for_prompt(db, agent_id: str, gid: str) -> list[str]:

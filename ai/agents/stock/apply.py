@@ -91,6 +91,8 @@ from services.meta_status_service import get_object_state
 logger = logging.getLogger(__name__)
 
 STUCK_AFTER = timedelta(minutes=6)     # an invocation lives 300 s at most, so nothing alive is this old
+UNDO_SEND_WINDOW = timedelta(seconds=55)  # an undo older than this sends nothing. With Graph's 30 s, its write is over by
+                                          # the time a stored press's takeover reads Meta (slack.ACTION_RECLAIM, 90 s)
 CONFIRM_GIVE_UP = timedelta(hours=2)   # how long a sent write can wait for Meta to be readable
 MAX_RECOVERIES = 2                     # kills before the send that a line survives
 QUEUE_BATCH = 200                      # cards looked at per cron pass; the rest wait a minute
@@ -193,6 +195,9 @@ def _status_after(status: str, lines: list[dict]) -> str:
     return STATUS_PARTLY_APPLIED if any(s in _WAITING for s in states) else STATUS_APPLIED
 
 
+_ANY_TOKEN = object()
+
+
 async def _change(db, card_id: str, change, *, statuses=_LIVE) -> dict | None:
     """Apply `change(card) -> fields | None` through guarded_update, reading again when another
     writer got in first. The card as written, or None when it didn't happen."""
@@ -209,11 +214,15 @@ async def _change(db, card_id: str, change, *, statuses=_LIVE) -> dict | None:
     return None
 
 
-async def _set_line(db, card_id: str, line_id: str, *, expect: tuple, statuses=_LIVE, **changes) -> dict | None:
-    """Move one line that is still in an `expect` state. The card as written, or None."""
+async def _set_line(db, card_id: str, line_id: str, *, expect: tuple, statuses=_LIVE, undo_token_is=_ANY_TOKEN,
+                    **changes) -> dict | None:
+    """Move one line that is still in an `expect` state, and with `undo_token_is`, still that undo's. The card as
+    written, or None."""
     def change(card):
         line = _find_line(card, line_id)
         if line is None or line.get("state") not in expect:
+            return None
+        if undo_token_is is not _ANY_TOKEN and line.get("undo_token") != undo_token_is:
             return None
         lines = [{**ln, **changes} if ln.get("id") == line_id else ln for ln in card["lines"]]
         return {"lines": lines, "status": _status_after(card["status"], lines)}
@@ -221,8 +230,9 @@ async def _set_line(db, card_id: str, line_id: str, *, expect: tuple, statuses=_
     return await _change(db, card_id, change, statuses=statuses)
 
 
-def _decision(actor: str, by: str | None, source: str | None, now: datetime) -> dict:
-    return {"actor": actor, "by": by, "source": source, "at": now}
+def _decision(actor: str, by: str | None, source: str | None, now: datetime, by_id: str | None = None) -> dict:
+    """`by` is what's shown, `by_id` who it was when they have one (a Slack user id: a name can change)."""
+    return {"actor": actor, "by": by, "source": source, "at": now, **({"by_id": by_id} if by_id else {})}
 
 
 def _work_order(line: dict) -> int:
@@ -723,7 +733,7 @@ async def _visible_card(db, user_id: str, card_id: str) -> dict | None:
 
 
 async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | None, source: str | None,
-                     line_ids: list[str] | None = None, budget_s: float | None = None) -> dict:
+                     line_ids: list[str] | None = None, budget_s: float | None = None, by_id: str | None = None) -> dict:
     """Approve a card's lines. With no `line_ids`, every proposed line. Naming a line also retries
     it if it failed, was blocked or was waiting for a file. Never writes a Flag line. `budget_s` limits
     the wait, and what doesn't fit is finished by the cron."""
@@ -745,7 +755,7 @@ async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | 
         return ln.get("id") in line_ids and ln.get("state") in _RETRYABLE
 
     now = datetime.utcnow()
-    pairs = await _queue_lines(db, card_id, wanted, _decision(ACTOR_USER, by, source, now))
+    pairs = await _queue_lines(db, card_id, wanted, _decision(ACTOR_USER, by, source, now, by_id))
     if not pairs:
         fresh = await db[CARDS].find_one({"_id": card_id})
         refusal = await _card_refusal(db, fresh)  # lost to a dismissal or a supersede
@@ -758,21 +768,32 @@ async def apply_card(db, mongo_client, user_id: str, card_id: str, *, by: str | 
     return _outcome(await db[CARDS].find_one({"_id": card_id}), [p[1] for p in pairs])
 
 
-async def _queue_run(db, run: dict, decision: dict, *, deadline: float | None) -> tuple[list[tuple[str, str]], bool]:
+def _shown_in_slack(card: dict, decision: dict) -> bool:
+    """Whether someone pressing a button in Slack could have read this card."""
+    slack = card.get("slack") or {}
+    return bool(slack.get("ts")) and (slack.get("posted_at") is None or slack["posted_at"] <= decision["at"])
+
+
+async def _queue_run(db, run: dict, decision: dict, *, deadline: float | None) -> tuple[list[tuple[str, str]], bool, int]:
     """Queue the proposed lines of the cards that were showing when Apply all was pressed. A card
-    arriving later hasn't been seen by whoever pressed it. Returns (queued, finished)."""
+    arriving later hasn't been seen by whoever pressed it, and from Slack the same goes for a card not posted there:
+    it can have failed to post. Returns (queued, finished, cards left out for not being in Slack)."""
     def wanted(ln):
         return (ln.get("kind") in WRITABLE_KINDS and ln.get("mode") != "flag" and ln.get("state") == STATE_PROPOSED)
 
     cards = await db[CARDS].find({"run_id": run["_id"], "status": {"$in": list(_ACTIONABLE)}, "preview": {"$ne": True},
                                   "created_at": {"$lte": decision["at"]}}).to_list(length=None)
     pairs: list[tuple[str, str]] = []
+    left_out = 0
     for card in cards:
         if _out_of_time(deadline):
-            return pairs, False
+            return pairs, False, left_out
+        if decision.get("source") == "slack" and not _shown_in_slack(card, decision):
+            left_out += any(wanted(ln) for ln in card.get("lines") or [])
+            continue
         if not await has_newer_card(db, card):
             pairs += await _queue_lines(db, card["_id"], wanted, decision)
-    return pairs, True
+    return pairs, True, left_out
 
 
 async def _finish_apply_all(db, run_id: str) -> None:
@@ -780,7 +801,7 @@ async def _finish_apply_all(db, run_id: str) -> None:
 
 
 async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | None, source: str | None,
-                    budget_s: float = 2.5) -> dict:
+                    budget_s: float = 2.5, by_id: str | None = None) -> dict:
     """Apply all. It answers inside `budget_s`: the 2.5 s default is for Slack, where every line queues,
     and the dashboard passes a longer budget so lines start at once. The press is stored first, so
     whatever doesn't fit, even queueing, is finished by the cron."""
@@ -790,9 +811,9 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
         return {"ok": False, "outcome": "not_found", "reason": None}
     if run.get("kind") == "preview":
         return {"ok": False, "outcome": "refused", "reason": PREVIEW_CARD}
-    decision = _decision(ACTOR_USER, by, source, datetime.utcnow())
+    decision = _decision(ACTOR_USER, by, source, datetime.utcnow(), by_id)
     await db[RUNS].update_one({"_id": run_id}, {"$set": {"apply_all": {**decision, "pending": True}}})
-    pairs, finished = await _queue_run(db, run, decision, deadline=deadline)
+    pairs, finished, left_out = await _queue_run(db, run, decision, deadline=deadline)
     if finished:
         await _finish_apply_all(db, run_id)
     # Slack's default budget is under MIN_TIME_FOR_LINE_S, so no line starts there and the cron runs them.
@@ -818,7 +839,7 @@ async def apply_run(db, mongo_client, user_id: str, run_id: str, *, by: str | No
         outcome = ("applied" if counts["applied"] else "failed" if counts["failed"]
                    else "blocked" if counts["blocked"] or counts["needs_file"]
                    else "noop")  # noop: they had all turned into Flag
-    return {"ok": True, "outcome": outcome, "reason": None, **counts}
+    return {"ok": True, "outcome": outcome, "reason": None, "not_in_slack": left_out, **counts}
 
 
 # ---------------------------------------------------------------------------
@@ -947,8 +968,8 @@ async def _recover_applying(db, mongo_client, card: dict, line: dict, now: datet
 
 
 async def _undo_back(db, card: dict, line: dict, error: str) -> None:
-    await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), state=STATE_APPLIED, undo_error=_short(error),
-                    undo_write_started_at=None)
+    await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_token_is=line.get("undo_token"),
+                    state=STATE_APPLIED, undo_error=_short(error), undo_write_started_at=None, undo_token=None)
 
 
 async def _finish_undone(db, card: dict, agent: dict | None, line: dict, atype: str, now: datetime, *,
@@ -962,8 +983,8 @@ async def _finish_undone(db, card: dict, agent: dict | None, line: dict, atype: 
                                       {"$set": {"meta_status": "PAUSED", "paused_at": now, "updated_at": now}})
     await _log_once(db, card, line, KIND_ACTION_UNDONE, label=f"Undone by {_who(decision)}",
                     title=f"Undid: {line.get('ad_name') or 'an ad'}", decision=decision, note=note)
-    await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), state=STATE_UNDONE, undone_at=now,
-                    undo_error=None, note=note)
+    await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_token_is=line.get("undo_token"),
+                    state=STATE_UNDONE, undone_at=now, undo_error=None, note=note, undo_token=None)
 
 
 async def _recover_undoing(db, mongo_client, card: dict, line: dict, now: datetime) -> None:
@@ -980,6 +1001,16 @@ async def _recover_undoing(db, mongo_client, card: dict, line: dict, now: dateti
     if _landed(atype, state):
         return await _finish_undone(db, card, await _load_agent(db, card), line, atype, now)
     return await _undo_back(db, card, line, _not_landed(state))
+
+
+async def recover_stale_undo(db, mongo_client, card_id: str, line_id: str, *, older_than: timedelta) -> None:
+    """For a stored Slack press taken over: its frozen undo is settled now rather than at STUCK_AFTER, so the press can
+    go ahead. `older_than` has to outlast any send an alive invocation can have under way (UNDO_SEND_WINDOW)."""
+    card = await db[CARDS].find_one({"_id": card_id})
+    line = _find_line(card, line_id) if card else None
+    now = datetime.utcnow()
+    if line and line.get("state") == STATE_UNDOING and now - (line.get("undoing_at") or datetime.min) >= older_than:
+        await _recover_undoing(db, mongo_client, card, line, now)
 
 
 async def _recover_stuck(db, mongo_client, now: datetime, deadline: float | None) -> int:
@@ -1010,7 +1041,7 @@ async def _recover_stuck(db, mongo_client, now: datetime, deadline: float | None
 async def _expand_apply_all(db, deadline: float | None) -> None:
     """Apply all presses that ran out of budget before queueing every card."""
     for run in await db[RUNS].find({"apply_all.pending": True}).to_list(length=None):
-        _, finished = await _queue_run(db, run, run["apply_all"], deadline=deadline)
+        _, finished, _ = await _queue_run(db, run, run["apply_all"], deadline=deadline)
         if finished:
             await _finish_apply_all(db, run["_id"])
 
@@ -1061,6 +1092,14 @@ async def _run_queue(db, mongo_client, deadline: float) -> int:
 # Undo
 # ---------------------------------------------------------------------------
 
+async def _may_send_undo(db, card: dict, line: dict) -> bool:
+    fresh = await db[CARDS].find_one({"_id": card["_id"]})
+    stored = _find_line(fresh, line["id"]) if fresh else None
+    return bool(stored and stored.get("state") == STATE_UNDOING and stored.get("undo_token") == line.get("undo_token")
+                and stored.get("undo_write_started_at")
+                and datetime.utcnow() - (stored.get("undoing_at") or datetime.min) <= UNDO_SEND_WINDOW)
+
+
 async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, atype: str, now: datetime, sent: list) -> dict:
     block = await _guardrail_block(db, mongo_client, agent, card, line, atype, now, undo=True)
     if block is not None:
@@ -1080,9 +1119,16 @@ async def _undo_claimed(db, mongo_client, card: dict, line: dict, agent: dict, a
     if state is None:
         await _undo_back(db, card, line, GONE)
         return {"outcome": "failed", "reason": GONE}
-    if await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_write_started_at=now) is None:
+    if await _set_line(db, card["_id"], line["id"], expect=(STATE_UNDOING,), undo_token_is=line.get("undo_token"),
+                       undo_write_started_at=now) is None:
         await _undo_back(db, card, line, NOTHING_CHANGED)  # the marker isn't stored, so nothing may be sent
-        return {"outcome": "failed", "reason": NOTHING_CHANGED}
+        return {"outcome": "busy", "reason": BUSY}
+    # The fence. This may have been frozen for minutes, and recovery may already have read Meta and told the person it
+    # failed. The stored token and clock decide, read last thing before the send. What's left is the instant between
+    # this read and the socket, which a freeze of Vercel's function could still hit.
+    if not await _may_send_undo(db, card, line):
+        await _undo_back(db, card, line, NOTHING_CHANGED)
+        return {"outcome": "busy", "reason": BUSY}
     sent.append(True)
     landed, error = await _send_and_confirm(mongo_client, card, line, atype)
     if landed:
@@ -1107,7 +1153,8 @@ async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | 
                       now: datetime) -> dict:
     card_id = card["_id"]
     claimed = await _set_line(db, card_id, line_id, expect=(STATE_APPLIED,), state=STATE_UNDOING, undoing_at=now,
-                              undo_error=None, undo_write_started_at=None, undo_decision=decision, cut_at=None)
+                              undo_error=None, undo_write_started_at=None, undo_decision=decision, cut_at=None,
+                              undo_token=str(uuid.uuid4()))
     if claimed is None:  # another press got it
         fresh = await db[CARDS].find_one({"_id": card_id})
         if (_find_line(fresh, line_id) or {}).get("state") == STATE_UNDONE:
@@ -1120,6 +1167,10 @@ async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | 
     sent: list = []
     try:
         res = await _undo_claimed(db, mongo_client, claimed, line, agent, _action_type(line["kind"], undo=True), now, sent)
+    except asyncio.CancelledError:  # a caller's time limit, not a failure of this undo
+        if not sent:
+            await _undo_back(db, claimed, line, NOTHING_CHANGED)
+        raise
     except Exception as e:  # noqa: BLE001
         logger.error("stock card %s line %s: undo failed: %s", card_id, line_id, e, exc_info=True)
         if sent:  # only a read of Meta can say what happened
@@ -1132,7 +1183,7 @@ async def _undo_write(db, mongo_client, card: dict, line_id: str, agent: dict | 
 
 
 async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, *, by: str | None,
-                    source: str | None) -> dict:
+                    source: str | None, by_id: str | None = None) -> dict:
     """Reverse one applied line, within UNDO_AUTO_WINDOW of it applying. It only restores what Birdy
     changed, so it skips the pause cap, the live ad limit and taught exceptions, and still works with
     the agent off. It keeps the other checks. If Birdy wrote nothing for this line, it sends nothing, since the ad was
@@ -1156,7 +1207,7 @@ async def undo_line(db, mongo_client, user_id: str, card_id: str, line_id: str, 
         return _answer("expired", card, ok=False, reason="This can only be undone for 24 hours.")
     wrote = bool(line.get("wrote"))
     agent = await _load_agent(db, card)
-    decision = _decision(ACTOR_USER, by, source, now)
+    decision = _decision(ACTOR_USER, by, source, now, by_id)
     if not wrote:
         return await _undo_write(db, mongo_client, card, line_id, agent, False, decision, now)
     refusal = await _undo_refusal(db, agent, card)
@@ -1191,7 +1242,7 @@ async def _lesson_from_reason(db, card: dict, reason: str | None, by: str | None
 
 
 async def dismiss_card(db, user_id: str, card_id: str, *, by: str | None, source: str | None,
-                       reason: str | None = None) -> dict:
+                       reason: str | None = None, by_id: str | None = None) -> dict:
     """Decline what's left on a card. Lines already applied stay applied and keep their Undo. Refused
     while a line is being applied, or a dismissed card would hide a write still going out."""
     card = await _visible_card(db, user_id, card_id)
@@ -1200,7 +1251,7 @@ async def dismiss_card(db, user_id: str, card_id: str, *, by: str | None, source
     if card.get("preview"):
         return _answer("refused", card, ok=False, reason="A preview card can't be dismissed.")
     now = datetime.utcnow()
-    decision = _decision(ACTOR_USER, by, source, now)
+    decision = _decision(ACTOR_USER, by, source, now, by_id)
     busy = []
 
     def change(fresh):

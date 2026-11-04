@@ -26,7 +26,7 @@ from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
-from ai.agents.stock.cards import (STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
+from ai.agents.stock.cards import (DROPPABLE_STATES, STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
                                    guarded_update)
 from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
 from core.database import DB_NAME
@@ -69,7 +69,7 @@ OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids",
 def _run_to_api(run: dict) -> dict:
     """The run as the report needs it: no owner id, no Slack channel, and per client only its
     outcome, not the working data a resumed tick keeps."""
-    out = _with_id(run, drop=("user_id", "claimed_at", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack"))
+    out = _with_id(run, drop=("user_id", "claimed_at", "claim_kind", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack"))
     out["slack"] = {"ts": (run.get("slack") or {}).get("ts")}
     out["clients"] = {g: {k: c[k] for k in CLIENT_FIELDS if k in c} for g, c in (run.get("clients") or {}).items()}
     return out
@@ -299,8 +299,7 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
             ids = [ln.get("id") for ln in body.lines]
             if any(i not in stored for i in ids) or len(set(ids)) != len(ids):
                 raise HTTPException(status_code=400, detail="Lines must be existing lines of this card")
-            if any(ln.get("state") not in ("proposed", "flagged", "needs_file")
-                   for i, ln in stored.items() if i not in ids):
+            if any(ln.get("state") not in DROPPABLE_STATES for i, ln in stored.items() if i not in ids):
                 raise HTTPException(status_code=409, detail="A line that is being or has been applied can't be removed")
             patch["lines"] = [stored[i] for i in ids]
         if patch and not await guarded_update(db, card, patch):
