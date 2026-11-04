@@ -2418,3 +2418,41 @@ async def test_route_can_apply_on_a_partly_applied_card(api, mock_db, meta):
     assert api.get(f"{base}/runs/r1").json()["cards"][0]["can_apply"] is True
     await _card(mock_db, agent, _id="c2", run_id="r2", created=datetime.utcnow() + timedelta(hours=1))
     assert api.get(f"{base}/runs/r1").json()["cards"][0]["can_apply"] is False
+
+
+@pytest.mark.parametrize("replaced", ["superseded", "open_with_a_newer_card"])
+async def test_route_undo_works_on_a_replaced_card(replaced, api, mock_db, meta):
+    """A person must be able to reverse a live ad after a newer card replaced its card. Apply stays closed."""
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "ad2", "spare")
+    await _card(mock_db, agent, _ln(1), _ln(2))
+    await mock_db[RUNS].insert_one(_run(agent))
+    base = f"/api/agents/{agent['_id']}"
+    assert api.post(f"{base}/cards/c1/apply", json={"line_ids": ["l1"]}).status_code == 200
+    assert meta.writes == [("ad1", "PAUSED")]
+    await _card(mock_db, agent, _id="c2", run_id="r2", created=datetime.utcnow() + timedelta(hours=1))
+    if replaced == "superseded":
+        await mock_db[CARDS].update_one({"_id": "c1"}, {"$set": {"status": "superseded"}})
+    before = (await _get(mock_db))["status"]
+
+    r = api.post(f"{base}/cards/c1/undo", json={"line_id": "l1"})
+    assert r.status_code == 200, r.text
+    assert r.json()["outcome"] == "undone"
+    assert meta.writes == [("ad1", "PAUSED"), ("ad1", "ACTIVE")]
+    card = await _get(mock_db)
+    assert card["lines"][0]["state"] == "undone" and card["status"] == before
+    assert api.post(f"{base}/cards/c1/apply", json={"line_ids": ["l2"]}).status_code == 409
+
+
+async def test_apply_all_leaves_green_cards_alone_and_they_dont_wait_on_anyone(api, mock_db, meta):
+    agent = await _agent(mock_db)
+    await _ads(mock_db, "ad1", "spare")
+    await _card(mock_db, agent, _ln(1), tag="changes")
+    await _card(mock_db, agent, _id="c2", client_group_id="g2", tag="green")
+    await mock_db[RUNS].insert_one(_run(agent))
+    base = f"/api/agents/{agent['_id']}"
+    assert api.get(f"{base}/runs/latest").json()["open_cards"] == 1
+    assert api.post(f"{base}/runs/r1/apply-all").json()["applied"] == 1
+    green = await mock_db[CARDS].find_one({"_id": "c2"})
+    assert green["status"] == "open" and green["lines"] == []
+    assert api.get(f"{base}/runs/latest").json()["open_cards"] == 0

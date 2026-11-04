@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 import routers.agent_stock as stock_router
 import routers.agents as agents_router
 from ai.agents import claims
-from ai.agents.stock import runner
+from ai.agents.stock import runner, templates
 from ai.agents.stock.runner import RUNS
 from ai.agents.stock.scoreboard import OUTCOMES
 from ai.agents.store import (AGENTS, CARDS, MEMORY, TYPE_STOCK, create_agent, create_agent_indexes,
@@ -168,7 +168,7 @@ async def _seed_run(db, agent, **kw):
 
 async def _seed_card(db, agent, cid, rid, **kw):
     card = {"_id": cid, "agent_id": agent["_id"], "user_id": USER, "run_id": rid, "client_group_id": "g1",
-            "status": "open", "lines": [{"id": "l1", "kind": "remove", "ad_name": "A", "meta_ids": ["a1"],
+            "tag": "changes", "status": "open", "lines": [{"id": "l1", "kind": "remove", "ad_name": "A", "meta_ids": ["a1"],
                                          "mode": "ask", "state": "proposed"},
                                         {"id": "l2", "kind": "remove", "ad_name": "B", "meta_ids": ["a2"],
                                          "mode": "ask", "state": "proposed"}],
@@ -407,6 +407,39 @@ async def test_a_claim_conflict_on_activate_changes_nothing(api, mock_db):
     assert await claims.holder(mock_db, USER, "g1") == "other-agent"
     doc = await mock_db[AGENTS].find_one({"_id": aid})
     assert doc["status"] == "draft"
+
+
+async def test_latest_doesnt_count_green_or_no_changes_cards(api, mock_db):
+    """They are `open` and `can_apply` but have no lines, so nothing on them waits for a person."""
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2")
+    await _seed_card(mock_db, agent, "c2", "r2", client_group_id="g2", tag="green", lines=[])
+    await _seed_card(mock_db, agent, "c3", "r2", client_group_id="g3", tag="no_changes", lines=[])
+    await _seed_card(mock_db, agent, "c4", "r2", client_group_id="g4", lines=[], additional_changes="Raise the budget")
+    assert api.get(f"/api/agents/{aid}/runs/latest").json()["open_cards"] == 2
+    shown = {c["id"]: c for c in api.get(f"/api/agents/{aid}/runs/r2").json()["cards"]}
+    assert shown["c2"]["can_apply"] is True  # the route's own rule for the card itself doesn't change
+
+    # Slack counts proposed lines, so it agrees: the additional-changes card has none to apply.
+    cards = await mock_db[CARDS].find({"run_id": "r2"}).to_list(length=None)
+    run = await mock_db[RUNS].find_one({"_id": "r2"})
+    waiting = templates.summary_values(run, cards)["cards_waiting"]
+    assert waiting == "1"
+    assert "Apply all" in str(templates.summary_buttons(run, "https://x", waiting=int(waiting)))
+    assert "Apply all" not in str(templates.summary_buttons(run, "https://x", waiting=0))
+
+
+async def test_a_preview_card_is_never_replaced_by_a_later_live_card(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    aid = agent["_id"]
+    await _seed_run(mock_db, agent, rid="rp", kind="preview")
+    await _seed_card(mock_db, agent, "cp", "rp", preview=True)
+    await _seed_run(mock_db, agent, rid="r2")
+    await _seed_card(mock_db, agent, "c1", "r2", created_at=datetime(2026, 11, 4, 8))
+    [card] = api.get(f"/api/agents/{aid}/runs/rp").json()["cards"]
+    assert card["has_newer"] is False and card["can_apply"] is False
 
 
 async def test_latest_counts_the_cards_a_person_can_still_apply(api, mock_db):

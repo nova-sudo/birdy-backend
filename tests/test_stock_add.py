@@ -7,6 +7,7 @@ import asyncio
 import time
 from datetime import date, datetime, timedelta, timezone
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -811,6 +812,12 @@ def api(mock_mongo_client, monkeypatch):
     monkeypatch.setattr(agents_router, "get_mongo_client", lambda: Ctx())
     monkeypatch.setenv("BLOB_READ_WRITE_TOKEN", TOKEN)
     monkeypatch.setenv("CREATIVE_UPLOAD_SECRET", "s3cret")
+
+    # No real Blob store here. The real reader is tested in test_creative_upload_grant.
+    async def kind_by_name(url):
+        return "image" if url.endswith((".jpg", ".png")) else "video"
+
+    monkeypatch.setattr(upload_grant, "read_media_kind", kind_by_name)
     app.dependency_overrides[get_current_user] = lambda: USER
     yield TestClient(app)
     app.dependency_overrides.pop(get_current_user, None)
@@ -836,6 +843,51 @@ async def test_file_route_refuses_what_isnt_this_users_blob(url, mock_db, api, m
     bad = url.format(store=STORE, prefix=upload_grant.owner_prefix(USER), other=upload_grant.owner_prefix("someone-else"))
     r = api.post(f"/api/agents/{agent['_id']}/cards/c1/lines/l1/file", json={"blob_url": bad})
     assert r.status_code == 400
+    assert await mock_db[FILES].count_documents({}) == 0 and (await _line(mock_db))["state"] == "needs_file"
+
+
+@pytest.mark.parametrize("video,real,reason", [
+    (False, "video", "needs an image, not a video"),
+    (True, "image", "needs a video, not an image"),
+    (False, None, "isn't a JPEG or PNG"),
+    (True, None, "isn't an MP4 or MOV"),
+])
+async def test_file_route_refuses_the_wrong_kind_by_what_the_file_really_is(video, real, reason, mock_db, api, meta, poster, monkeypatch):
+    async def really(url):
+        return real
+
+    monkeypatch.setattr(upload_grant, "read_media_kind", really)
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add(video=video, state="needs_file"))
+    # The name says the opposite of what the bytes say.
+    named = _owned_url("clip.png" if real == "video" else "photo.mp4")
+    r = api.post(f"/api/agents/{agent['_id']}/cards/c1/lines/l1/file", json={"blob_url": named})
+    assert r.status_code == 400 and reason in r.text
+    assert await mock_db[FILES].count_documents({}) == 0 and (await _line(mock_db))["state"] == "needs_file"
+
+
+@pytest.mark.parametrize("video,real", [(True, "video"), (False, "image")])
+async def test_file_route_keeps_the_right_kind_whatever_its_name(video, real, mock_db, api, meta, poster, monkeypatch):
+    async def really(url):
+        return real
+
+    monkeypatch.setattr(upload_grant, "read_media_kind", really)
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add(video=video, state="needs_file"))
+    r = api.post(f"/api/agents/{agent['_id']}/cards/c1/lines/l1/file", json={"blob_url": _owned_url("no-extension")})
+    assert r.status_code == 200, r.text
+    assert await mock_db[FILES].count_documents({}) == 1 and (await _line(mock_db))["state"] == "proposed"
+
+
+async def test_file_route_keeps_nothing_when_the_file_cant_be_read(mock_db, api, meta, poster, monkeypatch):
+    async def down(url):
+        raise httpx.ConnectError("blob store down")
+
+    monkeypatch.setattr(upload_grant, "read_media_kind", down)
+    agent = await _world(mock_db)
+    await _card(mock_db, agent, _add(state="needs_file"))
+    r = api.post(f"/api/agents/{agent['_id']}/cards/c1/lines/l1/file", json={"blob_url": _owned_url("a.mp4")})
+    assert r.status_code == 409 and "couldn't read" in r.text
     assert await mock_db[FILES].count_documents({}) == 0 and (await _line(mock_db))["state"] == "needs_file"
 
 

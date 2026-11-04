@@ -91,7 +91,9 @@ def _card_to_api(card: dict, *, has_newer: bool = False) -> dict:
 
 
 async def _card_for_api(db, card: dict) -> dict:
-    has_newer = card.get("status") in (STATUS_OPEN, STATUS_PARTLY_APPLIED) and await stock_apply.has_newer_card(db, card)
+    # A preview is never replaced: it says what a run would do, and later live cards don't change that.
+    has_newer = (not card.get("preview") and card.get("status") in (STATUS_OPEN, STATUS_PARTLY_APPLIED)
+                 and await stock_apply.has_newer_card(db, card))
     return _card_to_api(card, has_newer=has_newer)
 
 
@@ -241,8 +243,9 @@ async def list_runs(agent_id: str, limit: int = Query(20, ge=1, le=100), before:
 @router.get("/{agent_id}/runs/latest")
 async def latest_run(agent_id: str, kind: Optional[str] = Query(None, pattern="^preview$"),
                      current_user: str = Depends(get_current_user)):
-    """The newest report, or with kind=preview the newest preview. `open_cards` is how many of its cards a person can
-    still apply (the cards' own `can_apply` rule), for the nav badge: no scoreboard or lessons are built here."""
+    """The newest report, or with kind=preview the newest preview. `open_cards` is how many of its cards wait on a
+    person, for the nav badge: a card proposing changes that passes its own `can_apply` rule. Green and no-changes cards
+    pass that rule too but have nothing to decide. No scoreboard or lessons are built here."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
@@ -254,7 +257,7 @@ async def latest_run(agent_id: str, kind: Optional[str] = Query(None, pattern="^
         open_cards = 0
         if not kind:
             waiting = db[stock_runner.CARDS].find(
-                {"run_id": rows[0]["_id"], "agent_id": agent_id, "status": {"$in": [STATUS_OPEN, STATUS_PARTLY_APPLIED]}})
+                {"run_id": rows[0]["_id"], "agent_id": agent_id, "tag": "changes", "status": {"$in": [STATUS_OPEN, STATUS_PARTLY_APPLIED]}})
             open_cards = sum([1 async for c in waiting if (await _card_for_api(db, c))["can_apply"]])
         return {"run": _run_to_api(rows[0]), "open_cards": open_cards}
 

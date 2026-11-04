@@ -50,6 +50,7 @@ import re
 from datetime import date, datetime, timedelta
 from urllib.parse import urlparse
 
+import httpx
 from pymongo.errors import DuplicateKeyError
 
 from ai.agents.guardrails import _naive_utc, agent_tz, check_adset_contents_live, check_guardrails, local_today
@@ -75,6 +76,7 @@ from integrations.facebook_utils.meta_creative_writer import (VIDEO_PROCESS_FAIL
 from services.creatives import posting
 from services.creatives.posting import DONE, FAILED, POST_JOBS, PostingError, _managed_job, _new_job, _norm_act, enqueue_post
 from services.creatives.store import DRAFT, POSTING, TEST_ADS, TESTING, TESTS, create_test, get_test, update_test
+from services.creatives import upload_grant
 from services.creatives.upload_grant import is_own_blob_url
 
 logger = logging.getLogger(__name__)
@@ -119,6 +121,14 @@ VIDEO_REJECTED = "Meta couldn't process this video. Upload the video file to pos
 READ_FAILED = "Birdy couldn't read this ad's media from Meta. Nothing was changed. Try again in a few minutes."
 NOT_THE_USERS = "That file isn't one of your uploads, so Birdy can't use it."
 CANT_TAKE_FILE = "This line can't take a file right now."
+FILE_UNREADABLE = "Birdy couldn't read that file. Upload it again."
+WRONG_FILE = {
+    # (what the line needs, what the file is): the reason it's refused
+    ("video", "image"): "This ad needs a video, not an image. Upload the video file.",
+    ("video", None): "That file isn't an MP4 or MOV video. Upload the video file.",
+    ("image", "video"): "This ad needs an image, not a video. Upload the image file.",
+    ("image", None): "That file isn't a JPEG or PNG image. Upload the image file.",
+}
 POST_FAILED = "Meta didn't accept this ad. Try again."
 STOPPED_WITH_AD = ("Posting new ads is switched off, so Birdy left this ad paused in Meta. "
                    "It needs turning on in Ads Manager, or trying again later.")
@@ -709,6 +719,15 @@ async def attach_file(db, user_id: str, card_id: str, line_id: str, blob_url: st
     ref = await _file_row(db, user_id, line)
     if ref is None:
         return _answer("refused", card, ok=False, reason=CANT_TAKE_FILE)
+    # This file is kept for every later Add of this creative, and the wrong kind would only fail once it reached Meta.
+    needed = "video" if _is_video(line) else "image"
+    try:
+        kind = await upload_grant.read_media_kind(blob_url)
+    except httpx.HTTPError as e:
+        logger.warning("stock add: couldn't read an upload for line %s: %s", line_id, e)
+        return _answer("refused", card, ok=False, reason=FILE_UNREADABLE)
+    if kind != needed:
+        return _answer("bad_file", card, ok=False, reason=WRONG_FILE[(needed, kind)])
     now = datetime.utcnow()
     file_id = ref.pop("_id")
     await db[FILES].update_one({"_id": file_id}, {"$set": {**ref, "blob_url": blob_url, "updated_at": now},
