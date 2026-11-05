@@ -98,6 +98,7 @@ def _activity_to_api(doc: dict) -> dict:
         "kind": doc.get("kind"),
         "title": doc.get("title"),
         "client": doc.get("client"),
+        "client_group_id": doc.get("client_group_id"),
         "label": doc.get("label"),
         "source": doc.get("source"),  # "dashboard" | "slack" | None
         "time": _relative_time(doc.get("created_at")),
