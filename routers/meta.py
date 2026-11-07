@@ -865,8 +865,8 @@ async def get_facebook_leads_filtered(
 
             # The response keeps the field names the Marketing Hub already
             # renders, so a landing-page client's Leads tab fills in without a
-            # frontend change. `match_keys` and `client_group_id` are internal to
-            # the resolver and are dropped here.
+            # frontend change. `match_keys` is internal to the resolver and is
+            # dropped here.
             leads = [
                 {
                     "lead_id": row["lead_id"],
@@ -881,6 +881,7 @@ async def get_facebook_leads_filtered(
                     "campaign_name": row["campaign_name"],
                     "platform": row["platform"],
                     "created_time": row["created_time"],
+                    "client_group_id": row["client_group_id"],
                     "group_name": row["group_name"],
                     "ad_account_id": row["ad_account_id"],
                     "field_data": row["field_data"],

@@ -19,7 +19,7 @@ from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, R
 
 from core.database import DB_NAME
 from core.constants import META_CACHE_PRESETS, PRESET_ALIAS, GHL_PRESET_DATE_RANGE, ghl_date_bounds
-from core.models import ClientGroupRequest, MetaCampaignsRequest
+from core.models import ClientGroupRequest, MetaCampaignsRequest, RenameClientRequest
 from core.utils import mongo_to_dict, get_result_value, iso_day_end, iso_day_range
 from dependencies import get_current_user, get_mongo_client
 from billing_middleware import check_client_limit
@@ -74,6 +74,7 @@ from services.ghl_service import (
     get_tag_metrics_from_cache,
 )
 from services.ad_leads import fetch_ad_leads, opp_rollup
+from services import client_rename as client_rename_svc
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
@@ -3129,6 +3130,38 @@ async def delete_client_group(
 # ---------------------------------------------------------------------------
 # PATCH /api/client-groups/{group_id}/client-status
 # ---------------------------------------------------------------------------
+
+@router.patch("/api/client-groups/{group_id}/name")
+async def rename_client_group(
+    group_id: str,
+    request: RenameClientRequest,
+    current_user: str = Depends(get_current_user),
+):
+    """Rename a client group and the copies of its name on other records."""
+    try:
+        name = client_rename_svc.clean_name(request.name)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        group = await db["client_groups"].find_one_and_update(
+            {"id": group_id, "user_id": current_user},
+            {"$set": {"name": name, "updated_at": datetime.now()}},
+            projection={"id": 1, "user_id": 1, "name": 1, "ghl_location_id": 1},
+        )
+        if not group:
+            raise HTTPException(status_code=404, detail="Client group not found")
+
+        # The name is already saved, and Meta and GHL syncs stamp it on their
+        # records again, so a failure here must not report the rename as failed.
+        try:
+            await client_rename_svc.update_name_copies(db, group, group.get("name") or "", name)
+        except Exception as e:
+            logger.error(f"Name copies not updated after renaming {group_id}: {e}", exc_info=True)
+
+    return {"message": "Client renamed", "name": name}
+
 
 @router.patch("/api/client-groups/{group_id}/client-status")
 async def update_client_status(

@@ -63,6 +63,11 @@ class MetaCampaignsRequest(BaseModel):
     campaign_ids: Optional[list[str]]
 
 
+class RenameClientRequest(BaseModel):
+    """PATCH body for renaming a client group."""
+    name: str
+
+
 class SaveViewRequest(BaseModel):
     page: str
     visible_columns: list
