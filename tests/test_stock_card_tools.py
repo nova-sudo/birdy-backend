@@ -94,9 +94,19 @@ async def test_apply_flag_line_reports_not_applied(mock_db):
     await _card(mock_db, lines=[{"id": "l1", "kind": "remove", "ad_name": "A", "meta_ids": ["a1"], "mode": "flag",
                                  "state": "flagged"}])
     out = await t.apply_card_lines(mock_db, USER)   # the real apply_card: it never writes a Flag line
-    assert out["ok"] is True and out["outcome"] == "noop" and "changed" not in out and out["count"] == 0
+    # ok is False: nothing went to Meta, so the result can't license "Done, I've applied it"
+    assert out["ok"] is False and out["error"] == "nothing_to_apply" and out["outcome"] == "noop"
+    assert "changed" not in out and out["count"] == 0
     assert out["lines"] == [{"id": "l1", "state": "flagged", "error": None, "reason_code": None, "note": None}]
     assert t.change_entry("apply_card_lines", out) is None   # nothing for the chat to show as applied
+
+
+async def test_apply_lines_already_decided_is_not_ok(mock_db):
+    await _card(mock_db, status="partly_applied", lines=[
+        {"id": "l1", "kind": "remove", "ad_name": "A", "meta_ids": ["a1"], "mode": "ask", "state": "applied"}])
+    out = await t.apply_card_lines(mock_db, USER, line_ids=["l1"])
+    assert out["ok"] is False and out["error"] == "nothing_to_apply" and out["count"] == 0
+    assert "changed" not in out
 
 
 async def test_dismiss_with_reason_makes_lesson(mock_db):

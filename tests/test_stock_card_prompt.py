@@ -29,3 +29,7 @@ def test_prompt_contains_lines_and_lessons():
 
 def test_prompt_without_card_says_so():
     assert "couldn't be loaded" in stock_card_chat.system_prompt({"card": None})
+
+
+def test_prompt_names_nothing_to_apply():
+    assert "nothing_to_apply" in stock_card_chat.system_prompt({"card": CARD})

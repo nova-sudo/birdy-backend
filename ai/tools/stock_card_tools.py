@@ -14,6 +14,7 @@ and never raise for a person's mistake:
   conflict     it changed while the chat was open, or a line is being applied right now
   expired      too late for that action
   not_found    no such card for this user
+  nothing_to_apply  apply found no line it could send (Flag lines, or lines already decided)
 """
 
 from contextvars import ContextVar
@@ -31,6 +32,7 @@ from ai.tools.registry import registry
 CHAT_BUDGET_S = 20      # how long "do it" waits for Meta; the cron finishes what doesn't fit
 SOURCE = "chat"
 CARD_CLOSED, CONFLICT, EXPIRED, NOT_FOUND = "card_closed", "conflict", "expired", "not_found"
+NOTHING_TO_APPLY = "nothing_to_apply"
 _ACTS_ON = (STATUS_OPEN, STATUS_FLAGGED)            # what a card chat can apply, edit or dismiss
 _STILL_DECIDING = _ACTS_ON + (STATUS_PARTLY_APPLIED,)   # a partly applied card can retry or dismiss what's left
 _GOING_OUT = (STATE_APPLIED, STATE_QUEUED, STATE_APPLYING)
@@ -103,7 +105,9 @@ async def get_card(db, user_id, mongo_client=None, **_):
 
 async def apply_card_lines(db, user_id, mongo_client=None, line_ids=None, **_):
     """Apply the card's proposed lines, or only the named ones. A Flag line is never applied: the
-    result's `lines` say so, and `ok` is what apply_card itself said."""
+    result's `lines` say so. `ok` is true only when apply_card said so and a line moved; when nothing
+    could go out (all Flag, or already decided) it is false with nothing_to_apply, so the result never
+    reads as something Birdy applied."""
     card = await _card(db, user_id)
     if card is None:
         return _fail(NOT_FOUND)
@@ -119,6 +123,8 @@ async def apply_card_lines(db, user_id, mongo_client=None, line_ids=None, **_):
            "count": sum(1 for ln in moved if ln.get("state") in _GOING_OUT)}
     if outcome in ("not_found", "refused", "bad_lines"):
         return {**out, "ok": False, "error": _decision_error(outcome)}
+    if outcome in ("noop", "already"):
+        return {**out, "ok": False, "error": NOTHING_TO_APPLY}
     if outcome in ("applied", "partial", "queued"):
         out["changed"] = "applied"
     elif outcome in ("failed", "blocked", "needs_file"):
