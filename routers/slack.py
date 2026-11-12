@@ -37,6 +37,7 @@ from services.slack_bot_service import (
     set_notify_channel,
     DEAD_TOKEN_ERRORS,
     mark_needs_reconnect,
+    list_bot_channels,
     SlackTeamAlreadyLinkedError,
 )
 
@@ -196,26 +197,8 @@ async def slack_channels(current_user: str = Depends(get_current_user)):
         if not bot_token:
             raise HTTPException(status_code=404, detail="Slack bot not connected")
 
-        from slack_sdk.web.async_client import AsyncWebClient
-        client = AsyncWebClient(token=bot_token)
-
-        channels: list[SlackChannel] = []
-        cursor = None
         try:
-            for _ in range(10):  # page cap — plenty for typical workspaces
-                resp = await client.conversations_list(
-                    types="public_channel,private_channel",
-                    exclude_archived=True,
-                    limit=200,
-                    cursor=cursor,
-                )
-                for c in resp.get("channels", []):
-                    channels.append(SlackChannel(
-                        id=c["id"], name=c.get("name", ""), is_private=c.get("is_private", False),
-                    ))
-                cursor = (resp.get("response_metadata") or {}).get("next_cursor")
-                if not cursor:
-                    break
+            channels = [SlackChannel(**c) for c in await list_bot_channels(bot_token)]
         except Exception as e:
             # Every failure used to come back as "reconnect Slack to grant
             # channel access", which named the one cause it usually was not.

@@ -236,6 +236,48 @@ async def get_notify_target(db, user_id: str) -> tuple[str | None, str | None]:
     return decrypt(token_enc), channel_id
 
 
+async def list_bot_channels(bot_token: str) -> list[dict]:
+    """Every channel the bot can see, as {id, name, is_private}. Slack errors are raised."""
+    from slack_sdk.web.async_client import AsyncWebClient
+    client = AsyncWebClient(token=bot_token)
+    channels: list[dict] = []
+    cursor = None
+    for _ in range(10):  # page cap — plenty for typical workspaces
+        resp = await client.conversations_list(
+            types="public_channel,private_channel", exclude_archived=True, limit=200, cursor=cursor)
+        for c in resp.get("channels", []):
+            channels.append({"id": c["id"], "name": c.get("name", ""), "is_private": c.get("is_private", False)})
+        cursor = (resp.get("response_metadata") or {}).get("next_cursor")
+        if not cursor:
+            break
+    return channels
+
+
+async def find_channel(db, user_id: str, ref: str) -> dict | None:
+    """The user's Slack channel with this id or name ("#ads" works), as {id, name, is_private}.
+    None when there is no such channel, no bot, or Slack is failing."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
+    bot_token = await get_decrypted_bot_token_for_user(db, user_id)
+    if not bot_token:
+        return None
+    try:
+        channels = await list_bot_channels(bot_token)
+    except Exception as e:
+        logger.warning("slack: channel lookup failed for %s: %s", user_id, e)
+        return None
+    name = ref.lstrip("#").lower()
+    return (next((c for c in channels if c["id"] == ref), None)
+            or next((c for c in channels if c["name"].lower() == name), None))
+
+
+async def user_has_channel(db, user_id: str, channel_id: str) -> bool:
+    """True when the user's Slack bot can see the channel with this id."""
+    found = await find_channel(db, user_id, channel_id)
+    return bool(found) and found["id"] == channel_id
+
+
 async def get_thread_session_id(db, team_id: str, channel: str, thread_key: str) -> str | None:
     doc = await db["slack_thread_sessions"].find_one({"_id": f"{team_id}:{channel}:{thread_key}"})
     return doc["session_id"] if doc else None

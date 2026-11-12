@@ -9,6 +9,9 @@ Replays an agent over past days without touching Meta or writing anything.
   sample_cases  practice cases for training, drawn from firing and near-miss
                 findings over the window.
 
+  next_practice_cases / start_dry_run_job  what GET /practice and POST /dry-run
+                do, shared with the setup chat's tools (ai/tools/agent_tools.py).
+
 Each client's data is loaded once (state + every ad_day row the window needs)
 and then sliced per replay day; evaluation goes through
 runner.evaluate_loaded, the same function the live run uses.
@@ -34,11 +37,14 @@ Simulated actions (dry_run only)
 """
 
 import hashlib
+import json
 import logging
 import random
 import time
+import uuid
 from dataclasses import asdict, dataclass, field, replace
 from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from ai.agents import history as ad_history
 from ai.agents.runner import HISTORY_DAYS, MISSING_TARGET_AGENT, evaluate_loaded
@@ -51,7 +57,7 @@ from ai.agents.snapshot import (
     load_client_ctx,
     load_state,
 )
-from ai.agents.store import list_memory, list_rules
+from ai.agents.store import JOBS, PRACTICE, list_memory, list_rules
 from ai.suggestions.contracts import ACTION_ENABLE_ADS, ACTION_PAUSE_ADS, Finding
 
 logger = logging.getLogger(__name__)
@@ -533,3 +539,114 @@ async def sample_cases(db, mongo_client, agent: dict, *, end: date, days: int = 
                 used |= keys
                 cases.append(_case(d, c, f))
     return cases
+
+
+# ---------------------------------------------------------------------------
+# Practice cases and dry-run jobs (GET /practice, POST /dry-run, the setup chat)
+# ---------------------------------------------------------------------------
+
+PRACTICE_DAYS = 60
+DRY_RUN_BUDGET_SECONDS = 240     # Vercel's function timeout is 300s (vercel.json sets none)
+JOB_TIMEOUT = timedelta(minutes=5)  # a queued/running job older than this was killed
+
+
+def local_today(agent: dict) -> date:
+    tz = ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or "UTC"
+    try:
+        return datetime.now(ZoneInfo(tz)).date()
+    except Exception:
+        return datetime.utcnow().date()
+
+
+async def next_practice_cases(db, mongo_client, agent: dict, *, k: int, end: date) -> list[dict]:
+    """Up to k practice cases (full, with the answer): unanswered ones already served come
+    first, then new ones from the PRACTICE_DAYS days to `end`, never repeating a served ad.
+    New cases are stored as served."""
+    agent_id = agent["_id"]
+    coll = db[PRACTICE]
+    # Only unanswered cases need their full body; the rest are counted / excluded.
+    served = await coll.find({"agent_id": agent_id}, {"case.snapshot.eval": 0}).sort(
+        "served_at", 1).to_list(length=None)
+    out = [d["case"] for d in served if d.get("resolution") == "unanswered"][:k]
+    if len(out) < k:
+        answered = sum(1 for d in served if d.get("resolution") != "unanswered")
+        seed = int(hashlib.sha1(f"{agent_id}:{answered}".encode()).hexdigest()[:12], 16)
+        exclude: set = set()
+        for d in served:
+            exclude |= set(d.get("ad_ids") or case_ad_keys(d.get("case") or {}))
+        cases = await sample_cases(db, mongo_client, agent, end=end, days=PRACTICE_DAYS,
+                                   k=k - len(out), seed=seed, exclude_ad_ids=exclude)
+        rule_ids = {r["kind"]: r["_id"] for r in await list_rules(db, agent_id)}
+        now = datetime.utcnow()
+        for case in cases:
+            # Keyed per agent: case ids are content hashes and two users can watch one account.
+            await coll.update_one({"_id": f"{agent_id}:{case['case_id']}"}, {"$setOnInsert": {
+                "agent_id": agent_id, "case_id": case["case_id"], "case": case,
+                "ad_ids": sorted(case_ad_keys(case)), "rule_id": rule_ids.get(case["rule_kind"]),
+                "rule_version_at_answer": None, "user_answer": None, "resolution": "unanswered",
+                "served_at": now,
+            }}, upsert=True)
+            out.append(case)
+    return out
+
+
+async def next_practice_case(db, mongo_client, agent: dict) -> dict | None:
+    """The next practice case to ask (full, with the answer), or None when there are none left."""
+    cases = await next_practice_cases(db, mongo_client, agent, k=1,
+                                      end=local_today(agent) - timedelta(days=1))
+    return cases[0] if cases else None
+
+
+def rules_sig(rules: list[dict]) -> str:
+    """Stable hash of everything in the rules that changes a dry run's answer."""
+    parts = sorted(
+        (
+            str(r.get("_id")), r.get("version"), r.get("mode"), r.get("enabled"),
+            r.get("params") or {}, r.get("client_overrides") or {},
+        )
+        for r in rules
+    )
+    blob = json.dumps(parts, sort_keys=True, default=str)
+    return hashlib.sha256(blob.encode()).hexdigest()[:32]
+
+
+async def _run_dry_run_job(db, mongo_client, job_id: str, agent: dict, *, end: date, deadline: float) -> None:
+    jobs = db[JOBS]
+    await jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
+    try:
+        result = await dry_run(db, mongo_client, agent, end=end, deadline=deadline)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
+    except DryRunTimeout as e:
+        logger.warning("dry run job %s ran out of time: %s", job_id, e)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "failed", "error": "timed_out", "finished_at": datetime.utcnow()}})
+    except Exception as e:
+        logger.error("dry run job %s failed: %s", job_id, e, exc_info=True)
+        await jobs.update_one({"_id": job_id}, {"$set": {
+            "status": "failed", "error": str(e) or type(e).__name__, "finished_at": datetime.utcnow()}})
+
+
+async def start_dry_run_job(db, mongo_client, user_id: str, agent: dict, *, end: date, deadline: float) -> str:
+    """Run a dry run as a job and return its id. The replay runs inside this call (nothing is
+    detached, which Vercel would freeze), so the first poll sees it done or failed. A job another
+    request is running for these exact rules is rejoined instead."""
+    agent_id = agent["_id"]
+    sig = rules_sig(await list_rules(db, agent_id))
+    # Rejoin a job another request is running only if it replays these exact
+    # rules; after an edit the old job's answer is stale, so start a new one.
+    active = await db[JOBS].find_one({
+        "agent_id": agent_id, "user_id": user_id, "kind": "dry_run",
+        "status": {"$in": ["queued", "running"]},
+        "created_at": {"$gt": datetime.utcnow() - JOB_TIMEOUT},
+        "rules_sig": sig,
+    })
+    if active is not None:
+        return active["_id"]  # one dry run at a time per rule set
+    job_id = uuid.uuid4().hex
+    await db[JOBS].insert_one({
+        "_id": job_id, "agent_id": agent_id, "user_id": user_id, "kind": "dry_run",
+        "status": "queued", "created_at": datetime.utcnow(), "rules_sig": sig,
+    })
+    await _run_dry_run_job(db, mongo_client, job_id, agent, end=end, deadline=deadline)
+    return job_id

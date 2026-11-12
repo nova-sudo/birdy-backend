@@ -207,11 +207,15 @@ async def post_suggestion(db, user_id: str, doc: dict, *,
     return ts
 
 
-async def post_new_suggestions(db, user_id: str, docs: list[dict]) -> int:
-    """Post a batch of suggestions (one message each). Returns count posted."""
+async def post_new_suggestions(db, user_id: str, docs: list[dict], *, channel_id: str | None = None) -> int:
+    """Post a batch of suggestions (one message each). Returns count posted.
+    `channel_id` is an agent's own channel; without one, the account's notify channel."""
     if not docs:
         return 0
-    bot_token, channel_id = await get_notify_target(db, user_id)
+    if channel_id:
+        bot_token = await get_decrypted_bot_token_for_user(db, user_id)
+    else:
+        bot_token, channel_id = await get_notify_target(db, user_id)
     if not bot_token or not channel_id:
         return 0  # Slack not configured for this user → silent no-op
 

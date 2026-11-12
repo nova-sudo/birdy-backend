@@ -247,7 +247,7 @@ async def test_runner_forces_flag_for_client_held_by_another_agent(mock_db, mock
     monkeypatch.setattr(runner, "refresh_meta_state", lambda *a, **k: _async({"ads": 0, "adsets": 0}))
     monkeypatch.setattr(runner, "backfill_paused_at", lambda *a, **k: _async(0))
 
-    async def quiet(db, user_id, docs):
+    async def quiet(db, user_id, docs, **kw):
         return 0
 
     monkeypatch.setattr("services.slack_suggestion_notifier.post_new_suggestions", quiet)
@@ -273,7 +273,7 @@ async def test_runner_forces_flag_for_flag_only_unheld_client(mock_db, mock_mong
     monkeypatch.setattr(runner, "refresh_meta_state", lambda *a, **k: _async({"ads": 0, "adsets": 0}))
     monkeypatch.setattr(runner, "backfill_paused_at", lambda *a, **k: _async(0))
 
-    async def quiet(db, user_id, docs):
+    async def quiet(db, user_id, docs, **kw):
         return 0
 
     monkeypatch.setattr("services.slack_suggestion_notifier.post_new_suggestions", quiet)

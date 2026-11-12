@@ -450,3 +450,72 @@ async def test_history_endpoint_counts_a_topup_error_as_ready(api, mock_db):
     body = api.get(f"/api/agents/{agent['id']}/history").json()
     assert body["ready"] == 1
     assert body["clients"] == [{"client_group_id": "g1", "name": "Acme", "status": "ready", "error": "rate_limited"}]
+
+
+# ---------------------------------------------------------------------------
+# Setup steps and the per-agent Slack channel
+# ---------------------------------------------------------------------------
+
+def test_agent_api_has_all_steps(api):
+    from ai.agents.store import STEP_KEYS
+    a = make_agent(api)
+    assert a["training"]["steps"] == {k: False for k in STEP_KEYS}
+    assert a["description"] == "" and a["scope"]["slack_channel_id"] is None
+    assert a["training"]["topics"]["pause"] is False  # the topics stay as they were
+
+
+async def test_mark_step_rejects_unknown_key(mock_db):
+    from ai.agents.store import mark_step
+    agent = await create_agent(mock_db, U)
+    await mark_step(mock_db, agent["_id"], "clients")
+    saved = await mock_db.agents.find_one({"_id": agent["_id"]})
+    assert saved["training"]["steps"] == {"clients": True}
+    with pytest.raises(ValueError):
+        await mark_step(mock_db, agent["_id"], "bogus")
+
+
+async def test_patch_marks_steps(api, mock_db):
+    await group(mock_db, "g1")
+    a = make_agent(api)
+    url = f"/api/agents/{a['id']}"
+    r = api.patch(url, json={"scope": {"client_group_ids": []}})
+    assert r.json()["training"]["steps"]["clients"] is False  # an empty scope isn't a choice yet
+    r = api.patch(url, json={"scope": {"client_group_ids": ["g1"]}})
+    assert r.json()["training"]["steps"]["clients"] is True
+    assert r.json()["training"]["steps"]["permissions"] is False
+    r = api.patch(url, json={"guardrails": {"max_pauses_per_client_day": 3}})
+    assert r.json()["training"]["steps"]["permissions"] is True
+    r = api.patch(url, json={"scope": {"schedule": {"time": "08:00"}}})
+    steps = r.json()["training"]["steps"]
+    assert steps["schedule"] is True and steps["slack"] is False and steps["purpose"] is False
+    r = api.patch(url, json={"description": "Pauses ads over target"})
+    assert r.status_code == 200 and r.json()["description"] == "Pauses ads over target"
+    assert api.patch(url, json={"description": "x" * 281}).status_code == 400
+
+
+async def test_patch_permissions_marks_permissions(api):
+    a = make_agent(api)
+    r = api.patch(f"/api/agents/{a['id']}", json={"permissions": {"campaigns": True}})
+    assert r.json()["training"]["steps"]["permissions"] is True
+
+
+async def test_patch_slack_channel(api, mock_db, monkeypatch):
+    import services.slack_bot_service as sbs
+
+    async def fake_has(db, user_id, channel_id):
+        return user_id == U and channel_id == "C1"
+
+    monkeypatch.setattr(sbs, "user_has_channel", fake_has)
+    a = make_agent(api)
+    url = f"/api/agents/{a['id']}"
+    r = api.patch(url, json={"scope": {"slack_channel_id": "CX"}})
+    assert r.status_code == 400
+    assert api.get(url).json()["training"]["steps"]["slack"] is False
+    r = api.patch(url, json={"scope": {"slack_channel_id": "C1"}})
+    assert r.status_code == 200, r.text
+    assert r.json()["scope"]["slack_channel_id"] == "C1"
+    assert r.json()["training"]["steps"]["slack"] is True
+    assert r.json()["scope"]["schedule"]["time"] == "07:00"  # the rest of the scope is kept
+    r = api.patch(url, json={"scope": {"slack_channel_id": None}})  # back to the account's channel
+    assert r.status_code == 200 and r.json()["scope"]["slack_channel_id"] is None
+    assert api.patch(url, json={"scope": {"slack_channel_id": 5}}).status_code == 400

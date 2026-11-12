@@ -60,7 +60,12 @@ MIGRATED_NAME = "Pause and revive rules"
 DEFAULT_CUSTOM_NAME = "Custom agent"
 
 AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status", "training",
-                    "name", "settings", "turned_off_at"}
+                    "name", "description", "settings", "turned_off_at"}
+
+# The setup chat's steps, in the order Birdy asks them (training.steps.<key> is True once done).
+STEP_KEYS = ("purpose", "playbook", "clients", "permissions", "schedule", "slack")
+NAME_MAX = 60
+DESCRIPTION_MAX = 280
 
 
 class AgentExists(Exception):
@@ -177,6 +182,13 @@ async def update_agent(db, user_id: str, agent_id: str, patch: dict) -> dict:
         if "status" in patch and patch["status"] != "active":
             await claims.release_clients(db, user_id, agent_id)  # turned off: stops acting
     return await get_agent(db, user_id, agent_id)
+
+
+async def mark_step(db, agent_id: str, key: str) -> None:
+    """Tick one setup step. The caller has already checked the agent is the user's."""
+    if key not in STEP_KEYS:
+        raise ValueError(f"unknown setup step: {key}")
+    await db[AGENTS].update_one({"_id": agent_id}, {"$set": {f"training.steps.{key}": True}})
 
 
 # ---------------------------------------------------------------------------

@@ -9,11 +9,12 @@ from ai.tools.registry import ToolRegistry
 from ai.prompts.birdy import get_system_prompt
 from ai.prompts.media_buying import get_media_buying_module
 from ai.prompts import agent_training as agent_training_prompt
+from ai.prompts import agent_setup as agent_setup_prompt
 from ai.prompts import dashboards as dashboards_prompt
 from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
-from ai.tools.agent_tools import AGENT_TOOL_NAMES
+from ai.tools.agent_tools import AGENT_TOOL_NAMES, SETUP_PAGE_TOOLS
 from ai.tools import stock_card_tools, stock_lesson_tools
 from ai.tools.stock_card_tools import STOCK_CARD_TOOL_NAMES
 from ai.tools.stock_lesson_tools import STOCK_LESSON_TOOL_NAMES
@@ -161,6 +162,9 @@ for _page in ("dashboard", "campaigns", "leads", "opportunities", "client_detail
 for _page in ("dashboard", "campaigns"):
     _PAGE_TOOLS[_page].extend(CREATIVE_READ_TOOLS)
 _PAGE_TOOLS["campaigns"].extend(CREATIVE_WRITE_TOOLS)
+
+# New agent setup: one chat, the setup tools plus the training tools (ai/tools/agent_tools.py).
+_PAGE_TOOLS["agent_setup"] = list(SETUP_PAGE_TOOLS)
 
 # Output budget per page. The default suits answers; the report copilot writes
 # whole Block Kit payloads as tool arguments, and at 2,048 tokens those were
@@ -474,6 +478,31 @@ _PAGE_SYSTEM_PROMPTS = {
     "dashboards": dashboards_prompt.system_prompt,
     "agent_training": agent_training_prompt.system_prompt,
 }
+
+_PAGE_SYSTEM_PROMPTS["agent_setup"] = agent_setup_prompt.system_prompt
+
+# A tool result's inline block (e.g. the setup chat's playbook, practice case or preview)
+# and the fields it renders from. Copied into that call's agent_changes entry.
+UI_BLOCK_PAYLOAD_KEYS = ("playbook", "case", "job_id")
+
+
+def _add_ui_block(agent_changes: list, appended: bool, tool: str, result: str) -> None:
+    """Any tool that returns {ok: true, ui_block, ...} gets its block into agent_changes, on
+    the entry this call already added (`appended`) or a new one."""
+    if '"ui_block"' not in (result or ""):
+        return
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return
+    if not (isinstance(parsed, dict) and parsed.get("ok") and parsed.get("ui_block")):
+        return
+    block = {"ui_block": parsed["ui_block"], **{k: parsed[k] for k in UI_BLOCK_PAYLOAD_KEYS if k in parsed}}
+    if appended:
+        agent_changes[-1].update(block)
+    else:
+        agent_changes.append({"tool": tool, **block})
+
 
 # Surfaces where the optional "media_buying" capability (Settings -> Capabilities)
 # may inject the senior-media-buyer analysis module. Deliberately excludes the
@@ -956,6 +985,7 @@ async def run_chat(
 
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
 
+                changes_before = len(agent_changes)
                 if tc.name in AGENT_TOOL_NAMES and not bad_args:
                     try:
                         parsed = json.loads(result)
@@ -963,7 +993,6 @@ async def run_chat(
                         parsed = None
                     if isinstance(parsed, dict) and parsed.get("ok") and parsed.get("changed"):
                         agent_changes.append({"tool": tc.name, "changed": parsed["changed"]})
-
                 if tc.name in _STOCK_CHAT_TOOL_NAMES and not bad_args:
                     try:
                         entry = stock_card_tools.change_entry(tc.name, json.loads(result))
@@ -971,6 +1000,9 @@ async def run_chat(
                         entry = None
                     if entry:
                         agent_changes.append(entry)
+
+                if not bad_args:
+                    _add_ui_block(agent_changes, len(agent_changes) > changes_before, tc.name, result)
 
                 history.append({
                     "role": "tool",

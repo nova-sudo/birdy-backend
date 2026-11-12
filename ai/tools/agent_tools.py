@@ -2,17 +2,22 @@
 ai/tools/agent_tools.py
 -----------------------
 Chat tools that let a user train one custom agent by talking to Birdy
-(page "agent_training"). Each tool resolves the agent from current_training_agent (set per request by routers/chat.py) and returns
+(page "agent_training"), and set a new one up step by step (page "agent_setup",
+the tools under "Setup tools"). Each tool resolves the agent from current_training_agent (set per request by routers/chat.py) and returns
 {ok, changed: {...}} so the chat can echo the change, or {ok: false, error}
 instead of raising. Rule validation is shared with the PATCH route
 (ai/agents/validation.py).
 """
 
 import copy
+import re
+from time import monotonic
 from contextvars import ContextVar
+from datetime import timedelta
 from typing import Optional
+from zoneinfo import ZoneInfo
 
-from ai.agents import store, validation
+from ai.agents import confidence, replay, store, validation
 from ai.agents.defaults import DEFAULT_PARAMS, RULE_KINDS
 from ai.suggestions.agents.useless_ad_purger import _symbol
 from ai.tools.registry import registry
@@ -22,7 +27,7 @@ TOPICS = ("targets", "pause", "revive", "flags")
 NO_AGENT = "Set up this agent first"
 
 # The agent the training chat is acting on. routers/chat.py sets it for the
-# duration of one request on page "agent_training" and resets it afterwards;
+# duration of one request on page "agent_training" or "agent_setup" and resets it afterwards;
 # the default None means "no agent", never "the user's first agent".
 current_training_agent: ContextVar[str | None] = ContextVar("current_training_agent", default=None)
 
@@ -100,6 +105,7 @@ async def get_playbook(db, user_id, **_):
         "targets": {g.get("name"): (g.get("targets") or {}).get("cpl") for g in groups},
         "currencies": {g.get("name"): _symbol(g.get("ad_account_currency")) for g in groups},
         "topics": dict((agent.get("training") or {}).get("topics") or {}),
+        "steps": _steps(agent),
     }
 
 
@@ -217,6 +223,181 @@ async def answer_topic(db, user_id, topic=None, **_):
 
 
 # ---------------------------------------------------------------------------
+# Setup tools (page "agent_setup"): one step at a time, each ticks training.steps
+# ---------------------------------------------------------------------------
+
+NOT_FOUND = "not_found"
+SETUP_BLOCKS = ("clients", "permissions", "schedule", "slack")
+PUBLIC_PRACTICE_KEYS = ("case_id", "rule_kind", "client_name", "title", "facts", "options")
+# The preview runs inside the chat turn, which also waits on the model, so it gets less
+# than POST /dry-run. One that runs out fails as timed_out and the preview block can retry.
+PREVIEW_BUDGET_SECONDS = 120
+_TIME_RE = re.compile(r"^\s*(\d{1,2})(?:\s*[:.]\s*(\d{2}))?\s*(?:([ap])\.?\s*m\.?)?\s*$", re.IGNORECASE)
+
+
+def _steps(agent: dict) -> dict:
+    done = (agent.get("training") or {}).get("steps") or {}
+    return {k: bool(done.get(k)) for k in store.STEP_KEYS}
+
+
+def _playbook(rules: list[dict]) -> list[dict]:
+    order = {k: i for i, k in enumerate(RULE_KINDS)}
+    return [{"kind": r["kind"], "enabled": bool(r.get("enabled", True)), "mode": r.get("mode"),
+             "params": r.get("params") or {}}
+            for r in sorted(rules, key=lambda r: order.get(r["kind"], len(order)))]
+
+
+def parse_time(raw) -> Optional[str]:
+    """ "7am", "07:00", "7:30 pm" -> "HH:MM" (24h), or None when it isn't a time of day."""
+    m = _TIME_RE.match(str(raw or ""))
+    if not m:
+        return None
+    hour, minute, half = int(m.group(1)), int(m.group(2) or 0), (m.group(3) or "").lower()
+    if minute > 59:
+        return None
+    if half:
+        if not 1 <= hour <= 12:
+            return None
+        hour = hour % 12 + (12 if half == "p" else 0)
+    elif hour > 23:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+async def set_purpose(db, user_id, name=None, description=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    name = name.strip() if isinstance(name, str) else ""
+    description = description.strip() if isinstance(description, str) else ""
+    if not 1 <= len(name) <= store.NAME_MAX:
+        return _fail("bad_name", detail=f"The name must be 1 to {store.NAME_MAX} characters")
+    if len(description) > store.DESCRIPTION_MAX:
+        return _fail("bad_description", detail=f"The description must be at most {store.DESCRIPTION_MAX} characters")
+    await store.update_agent(db, user_id, agent["_id"], {"name": name, "description": description})
+    await store.mark_step(db, agent["_id"], "purpose")
+    return {"ok": True, "changed": "purpose", "name": name, "description": description}
+
+
+async def draft_playbook(db, user_id, rules=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    if not isinstance(rules, list) or not rules:
+        return _fail("rules must be a non-empty list of {kind, enabled, params}")
+    seen: set = set()
+    for item in rules:  # check every rule before writing any
+        if not isinstance(item, dict) or item.get("kind") not in RULE_KINDS:
+            return _fail(f"Unknown rule kind. This agent can only run {list(RULE_KINDS)}")
+        if item["kind"] in seen:
+            return _fail(f"{item['kind']} is listed twice")
+        seen.add(item["kind"])
+        if not isinstance(item.get("enabled", True), bool):
+            return _fail("enabled must be true or false")
+        err = validation.params_error(item["kind"], item.get("params") or {})
+        if err:
+            return _fail(err)
+    for item in rules:
+        rule = await _rule(db, agent["_id"], item["kind"])
+        if rule is None:
+            return _fail(f"Rule {item['kind']} not found")
+        params = item.get("params") or None
+        await store.update_rule(db, agent["_id"], rule["_id"],
+                                params={**(rule.get("params") or {}), **params} if params else None,
+                                enabled=item.get("enabled", True))
+    return {"ok": True, "changed": "playbook", "ui_block": "playbook",
+            "playbook": _playbook(await store.list_rules(db, agent["_id"]))}
+
+
+async def confirm_playbook(db, user_id, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    await store.mark_step(db, agent["_id"], "playbook")
+    topics = ["pause", "revive", "flags"]
+    watched = (agent.get("scope") or {}).get("client_group_ids") or []
+    if watched:
+        groups = await db["client_groups"].find({"user_id": user_id, "id": {"$in": watched}}).to_list(length=None)
+        if len(groups) == len(set(watched)) and all(
+                _number((g.get("targets") or {}).get("cpl")) for g in groups):
+            topics.insert(0, "targets")
+    for topic in topics:
+        await answer_topic(db, user_id, topic=topic)
+    return {"ok": True, "changed": "playbook", "topics": topics}
+
+
+async def show_block(db, user_id, block=None, **_):
+    if await _agent(db, user_id) is None:
+        return _fail(NOT_FOUND)
+    if block not in SETUP_BLOCKS:
+        return _fail(f"block must be one of {list(SETUP_BLOCKS)}")
+    return {"ok": True, "ui_block": block}
+
+
+async def set_schedule(db, user_id, time=None, tz=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    hhmm = parse_time(time)
+    if hhmm is None:
+        return _fail("bad_time")
+    scope = agent.get("scope") or {}
+    if not tz:
+        tz = (scope.get("schedule") or {}).get("tz")
+    if not tz:
+        user = await db["users"].find_one({"user_id": user_id}, {"timezone": 1}) or {}
+        tz = user.get("timezone") or "UTC"
+    try:
+        ZoneInfo(str(tz))
+    except Exception:
+        return _fail("bad_tz")
+    schedule = {"time": hhmm, "tz": str(tz)}
+    await store.update_agent(db, user_id, agent["_id"], {"scope": {**scope, "schedule": schedule}})
+    await store.mark_step(db, agent["_id"], "schedule")
+    return {"ok": True, "changed": "schedule", "schedule": schedule}
+
+
+async def set_slack(db, user_id, channel_id=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    from services import slack_bot_service
+    channel = await slack_bot_service.find_channel(db, user_id, channel_id)
+    if channel is None:
+        return _fail("unknown_channel")
+    scope = agent.get("scope") or {}
+    await store.update_agent(db, user_id, agent["_id"], {"scope": {**scope, "slack_channel_id": channel["id"]}})
+    await store.mark_step(db, agent["_id"], "slack")
+    return {"ok": True, "changed": "slack", "channel": {"id": channel["id"], "name": channel["name"]}}
+
+
+async def ask_practice_case(db, user_id, mongo_client=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    conf = await confidence.compute_confidence(db, agent)
+    score = {"score": conf["score"], "ready": conf["ready"], "missing": conf["missing"]}
+    if conf["ready"]:
+        return _fail("ready", confidence=score)  # practice is done: on to the preview
+    case = await replay.next_practice_case(db, mongo_client, agent)
+    if case is None:
+        return _fail("no_cases", confidence=score)
+    return {"ok": True, "ui_block": "practice", "case": {k: case.get(k) for k in PUBLIC_PRACTICE_KEYS},
+            "confidence": score}
+
+
+async def run_preview(db, user_id, mongo_client=None, **_):
+    agent = await _agent(db, user_id)
+    if agent is None:
+        return _fail(NOT_FOUND)
+    job_id = await replay.start_dry_run_job(
+        db, mongo_client, user_id, agent, end=replay.local_today(agent) - timedelta(days=1),
+        deadline=monotonic() + PREVIEW_BUDGET_SECONDS)
+    job = await db[store.JOBS].find_one({"_id": job_id}, {"status": 1}) or {}
+    return {"ok": True, "ui_block": "preview", "job_id": job_id, "status": job.get("status")}
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -278,7 +459,73 @@ _TOOL_DEFS = {
     ),
 }
 
-AGENT_TOOL_NAMES = tuple(_TOOL_DEFS)
+TRAINING_TOOL_NAMES = tuple(_TOOL_DEFS)
+
+_SETUP_TOOL_DEFS = {
+    "set_purpose": (
+        set_purpose,
+        "Step 1, what it does: save the agent's short name and a one-sentence description of its job.",
+        {"type": "object", "properties": {
+            "name": {"type": "string", "description": f"1 to {store.NAME_MAX} characters."},
+            "description": {"type": "string", "description": f"At most {store.DESCRIPTION_MAX} characters."}},
+         "required": ["name", "description"]},
+    ),
+    "draft_playbook": (
+        draft_playbook,
+        "Step 2, its playbook: write the drafted rules and show them to the user to confirm. Only the four "
+        "rule kinds exist. Leave params out to keep the defaults; params names come from get_playbook.",
+        {"type": "object", "properties": {"rules": {"type": "array", "items": {
+            "type": "object", "properties": {
+                "kind": _KIND,
+                "enabled": {"type": "boolean"},
+                "params": {"type": "object", "additionalProperties": {"type": "number"}}},
+            "required": ["kind", "enabled"]}}},
+         "required": ["rules"]},
+    ),
+    "confirm_playbook": (
+        confirm_playbook,
+        "Step 2 done: call only after the user said the drafted playbook is right.",
+        {"type": "object", "properties": {}, "required": []},
+    ),
+    "show_block": (
+        show_block,
+        "Show the user an inline picker for one step (clients, permissions, schedule or slack). Saves nothing: "
+        "the user saves in the picker and the app tells you.",
+        {"type": "object", "properties": {"block": {"type": "string", "enum": list(SETUP_BLOCKS)}},
+         "required": ["block"]},
+    ),
+    "set_schedule": (
+        set_schedule,
+        "Step 5, report time: save the daily time the agent runs and reports, from what the user said "
+        "(\"7am\", \"07:00\", \"7:30 pm\"). tz is an IANA zone; leave it out to keep the agent's.",
+        {"type": "object", "properties": {
+            "time": {"type": "string"}, "tz": {"type": "string", "description": "e.g. Europe/London"}},
+         "required": ["time"]},
+    ),
+    "set_slack": (
+        set_slack,
+        "Step 6, Slack: save the channel this agent posts to, by channel id or name.",
+        {"type": "object", "properties": {"channel_id": {"type": "string"}}, "required": ["channel_id"]},
+    ),
+    "ask_practice_case": (
+        ask_practice_case,
+        "After the six steps: show the user the next practice case to answer. Returns no_cases when none are left.",
+        {"type": "object", "properties": {}, "required": []},
+    ),
+    "run_preview": (
+        run_preview,
+        "Last: run the preview of what the agent would have done over the last 30 days, and show it.",
+        {"type": "object", "properties": {}, "required": []},
+    ),
+}
+
+_TOOL_DEFS.update(_SETUP_TOOL_DEFS)
+
+SETUP_TOOL_NAMES = tuple(_SETUP_TOOL_DEFS)
+AGENT_TOOL_NAMES = TRAINING_TOOL_NAMES + SETUP_TOOL_NAMES
+# The agent_setup page: the setup tools, then the training tools it also needs.
+SETUP_PAGE_TOOLS = SETUP_TOOL_NAMES + ("get_playbook", "set_rule_param", "set_client_target",
+                                       "set_client_override", "add_memory", "add_exception")
 
 
 def register_agent_tools(tool_registry=None):

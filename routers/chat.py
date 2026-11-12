@@ -37,6 +37,9 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
+# Pages whose chat acts on one custom agent (request.agent_id): training it, or setting it up.
+AGENT_CHAT_PAGES = ("agent_training", "agent_setup")
+
 # Register all tools once at module load
 register_meta_tools()
 register_ghl_tools()
@@ -112,7 +115,7 @@ async def chat(
                 await check_credits(current_user, mongo_client)
             provider = await get_provider_for_user(current_user, db)
             agent_token = current_training_agent.set(
-                request.agent_id if request.page == "agent_training" else None)
+                request.agent_id if request.page in AGENT_CHAT_PAGES else None)
             card_token = current_stock_card.set(stock_card_id)
             lessons_token = current_lessons_agent.set(lessons_agent_id)
             try:
