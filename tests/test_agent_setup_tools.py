@@ -312,6 +312,14 @@ def test_setup_page_tools_and_prompt():
         assert needle.lower() in p.lower(), needle
 
 
+def test_setup_prompt_drafts_purpose_and_playbook_without_asking_for_a_name():
+    # Spec §5.1 mock 7: the first answer is enough. Birdy names the agent itself and shows the playbook
+    # draft in the same turn, rather than asking for a name and description.
+    p = agent_setup.system_prompt().lower()
+    assert "never ask them for a name" in p
+    assert "same turn" in p
+
+
 def test_setup_tools_registered():
     reg = ToolRegistry()
     t.register_agent_tools(reg)
