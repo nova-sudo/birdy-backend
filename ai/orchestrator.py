@@ -14,8 +14,9 @@ from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
-from ai.tools import stock_card_tools
+from ai.tools import stock_card_tools, stock_lesson_tools
 from ai.tools.stock_card_tools import STOCK_CARD_TOOL_NAMES
+from ai.tools.stock_lesson_tools import STOCK_LESSON_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
 from ai.tools.attribution_tools import TOOL_NAME as CLOSES_BY_AD_TOOL
 from datetime import date
@@ -179,10 +180,12 @@ _PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES) | set(AGENT_TOOL_NAMES)
 # Page-only tools with prompts built from the card or agent when a session starts.
 # Their results become `agent_changes` through stock_card_tools.change_entry.
 _PAGE_TOOLS["stock_card"] = list(STOCK_CARD_TOOL_NAMES)
-_STOCK_CHAT_TOOL_NAMES = frozenset(STOCK_CARD_TOOL_NAMES)
+_PAGE_TOOLS["stock_lessons"] = list(STOCK_LESSON_TOOL_NAMES)
+_STOCK_CHAT_TOOL_NAMES = frozenset(STOCK_CARD_TOOL_NAMES) | frozenset(STOCK_LESSON_TOOL_NAMES)
 _PAGE_ONLY_TOOLS |= _STOCK_CHAT_TOOL_NAMES
 # page -> async (db, user_id) -> str
-_ASYNC_PAGE_PROMPTS = {"stock_card": stock_card_tools.build_system_prompt}
+_ASYNC_PAGE_PROMPTS = {"stock_card": stock_card_tools.build_system_prompt,
+                       "stock_lessons": stock_lesson_tools.build_system_prompt}
 
 # Client-scoped pages hard-pin these tools to the page's client server-side:
 # whatever group_id the model passes (or omits) is overwritten with the page's

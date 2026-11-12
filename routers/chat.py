@@ -31,6 +31,7 @@ from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
 from ai.tools.agent_tools import current_training_agent
 from ai.tools.stock_card_tools import current_stock_card, load_chat_card, register_stock_card_tools
+from ai.tools.stock_lesson_tools import current_lessons_agent, load_lessons_agent, register_stock_lesson_tools
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +54,7 @@ register_report_designer_tools()
 register_dashboard_tools()
 register_agent_tools()
 register_stock_card_tools()
+register_stock_lesson_tools()
 register_creative_tools()
 register_render_ui_tools()
 register_page_view_tools()
@@ -76,6 +78,16 @@ async def _stock_card_id(db, user_id: str, request: ChatRequest) -> str | None:
     return card["_id"]
 
 
+async def _lessons_agent_id(db, user_id: str, request: ChatRequest) -> str | None:
+    """Page "stock_lessons": the user's own stock agent Teach Birdy works on (404 agent_not_found)."""
+    if request.page != "stock_lessons":
+        return None
+    agent = await load_lessons_agent(db, user_id, request.agent_id)
+    if agent is None:
+        raise HTTPException(status_code=404, detail="agent_not_found")
+    return agent["_id"]
+
+
 async def _onboarding_complete(db, user_id: str) -> bool:
     user = await db["users"].find_one({"user_id": user_id}, {"onboarding.completed": 1}) or {}
     return bool((user.get("onboarding") or {}).get("completed"))
@@ -90,6 +102,7 @@ async def chat(
         try:
             db = get_db(mongo_client)
             stock_card_id = await _stock_card_id(db, current_user, request)
+            lessons_agent_id = await _lessons_agent_id(db, current_user, request)
             # Stopper: block when the user is out of Birdy Credits (raises 402
             # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
             # Except the report copilot during onboarding: it runs before
@@ -101,6 +114,7 @@ async def chat(
             agent_token = current_training_agent.set(
                 request.agent_id if request.page == "agent_training" else None)
             card_token = current_stock_card.set(stock_card_id)
+            lessons_token = current_lessons_agent.set(lessons_agent_id)
             try:
                 result = await run_chat(
                     provider=provider,
@@ -120,6 +134,7 @@ async def chat(
                     **_archive_ids(request),
                 )
             finally:
+                current_lessons_agent.reset(lessons_token)
                 current_stock_card.reset(card_token)
                 current_training_agent.reset(agent_token)
             return ChatResponse(**result)
