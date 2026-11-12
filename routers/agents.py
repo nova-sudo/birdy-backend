@@ -184,6 +184,16 @@ async def get_agent(agent_id: str, current_user: str = Depends(get_current_user)
         return _agent_to_api(await _agent_or_404(db, current_user, agent_id))
 
 
+@router.get("/{agent_id}/setup/chat")
+async def get_setup_chat(agent_id: str, current_user: str = Depends(get_current_user)):
+    """The latest setup chat for this agent, so a draft reopened later resumes its transcript and blocks."""
+    from ai import conversation_log
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _agent_or_404(db, current_user, agent_id)
+        return await conversation_log.setup_transcript(db, current_user, agent_id)
+
+
 @router.delete("/{agent_id}")
 async def delete_agent(agent_id: str, current_user: str = Depends(get_current_user)):
     """Start setup over: deletes a draft agent and its rules, practice and memory."""

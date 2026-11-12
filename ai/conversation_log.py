@@ -108,19 +108,16 @@ async def tag_latest_user_turn(
         logger.warning(f"conversation_log tag failed (non-fatal): {e}")
 
 
-async def card_transcript(db, user_id: str, card_id: str) -> dict:
-    """The latest chat about one stock card, oldest first, for seeding the
-    card's chat after a reload. Only this user's turns; form answers
+async def _transcript(db, user_id: str, match: dict) -> dict:
+    """The latest session among this user's turns matching `match`, oldest first. Form answers
     ([UI_RESPONSE]) are protocol, not conversation, and are left out."""
-    latest = await db[_COLLECTION].find_one(
-        {"user_id": user_id, "card_id": card_id}, {"session_id": 1},
-        sort=[("created_at", -1)],
-    )
+    q = {"user_id": user_id, **match}
+    latest = await db[_COLLECTION].find_one(q, {"session_id": 1}, sort=[("created_at", -1)])
     if latest is None:
         return {"session_id": None, "messages": []}
     session_id = latest["session_id"]
     rows = await db[_COLLECTION].find(
-        {"user_id": user_id, "card_id": card_id, "session_id": session_id},
+        {**q, "session_id": session_id},
         {"role": 1, "content": 1, "agent_changes": 1, "created_at": 1, "_id": 0},
     ).sort("created_at", 1).to_list(length=None)
     messages = []
@@ -136,6 +133,17 @@ async def card_transcript(db, user_id: str, card_id: str) -> dict:
             "created_at": at.isoformat() if hasattr(at, "isoformat") else at,
         })
     return {"session_id": session_id, "messages": messages}
+
+
+async def card_transcript(db, user_id: str, card_id: str) -> dict:
+    """The latest chat about one stock card, for seeding the card's chat after a reload."""
+    return await _transcript(db, user_id, {"card_id": card_id})
+
+
+async def setup_transcript(db, user_id: str, agent_id: str) -> dict:
+    """The latest setup chat for one custom agent, so a draft opened later (another tab, another
+    day) shows where the setup got to, with its inline blocks (`agent_changes`)."""
+    return await _transcript(db, user_id, {"agent_id": agent_id, "page": "agent_setup"})
 
 
 async def create_conversation_log_indexes(mongo_client) -> None:
@@ -161,6 +169,10 @@ async def create_conversation_log_indexes(mongo_client) -> None:
     await db[_COLLECTION].create_index(
         [("user_id", 1), ("card_id", 1), ("created_at", 1)],
         name="idx_convlog_user_card_created", background=True,
+    )
+    await db[_COLLECTION].create_index(
+        [("user_id", 1), ("agent_id", 1), ("created_at", 1)],
+        name="idx_convlog_user_agent_created", background=True,
     )
     await db[_COLLECTION].create_index(
         [("category", 1), ("created_at", -1)],

@@ -519,3 +519,35 @@ async def test_patch_slack_channel(api, mock_db, monkeypatch):
     r = api.patch(url, json={"scope": {"slack_channel_id": None}})  # back to the account's channel
     assert r.status_code == 200 and r.json()["scope"]["slack_channel_id"] is None
     assert api.patch(url, json={"scope": {"slack_channel_id": 5}}).status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# Setup chat transcript (BirdyHub redesign, spec sections 3.3 and 5.1)
+# ---------------------------------------------------------------------------
+
+async def test_setup_chat_route_returns_latest_session(api, mock_mongo_client):
+    from core.database import DB_NAME
+    db = mock_mongo_client[DB_NAME]
+    a = make_agent(api)
+    base = datetime(2026, 11, 3, 9)
+    rows = [("s-old", "user", "earlier", 0, "agent_setup"), ("s-new", "user", "Pause ads that cost too much", 5, "agent_setup"),
+            ("s-new", "assistant", "Here's the playbook.", 6, "agent_setup"),
+            ("s-train", "user", "training chat", 9, "agent_training")]
+    for sid, role, content, minute, page in rows:
+        await db["ai_conversation_log"].insert_one({
+            "user_id": U, "session_id": sid, "source": "birdy", "role": role, "content": content, "page": page,
+            "agent_id": a["id"], "created_at": base + timedelta(minutes=minute),
+            **({"agent_changes": [{"tool": "draft_playbook", "ui_block": "playbook"}]} if role == "assistant" else {})})
+    r = api.get(f"/api/agents/{a['id']}/setup/chat")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["session_id"] == "s-new"
+    assert [m["content"] for m in body["messages"]] == ["Pause ads that cost too much", "Here's the playbook."]
+    assert body["messages"][1]["agent_changes"] == [{"tool": "draft_playbook", "ui_block": "playbook"}]
+
+
+def test_setup_chat_route_empty_and_owner_checked(api):
+    a = make_agent(api)
+    assert api.get(f"/api/agents/{a['id']}/setup/chat").json() == {"session_id": None, "messages": []}
+    api.state["user"] = OTHER
+    assert api.get(f"/api/agents/{a['id']}/setup/chat").status_code == 404
