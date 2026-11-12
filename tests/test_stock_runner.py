@@ -2125,3 +2125,32 @@ async def test_a_run_finishes_with_a_dot_in_the_client_id(mock_db, mock_mongo_cl
     assert set(stored["clients"]) == {DOTTED}
     assert stored["clients"][DOTTED]["state"] == "done"
     assert (await _cards(mock_db, run_id=run["_id"]))[0]["client_group_id"] == DOTTED
+
+
+# ---------------------------------------------------------------------------
+# BirdyHub redesign: card spend and lesson uses
+# ---------------------------------------------------------------------------
+
+async def test_card_has_spend(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1", spend=10.5, leads=1)
+    await mock_db["meta_ad_state"].insert_one({"client_group_id": "g1", "ad_id": "ad_b", "name": "Ad b",
+                                               "campaign_id": "c1", "effective_status": "ACTIVE", "creative": {}})
+    await mock_db[AD_DAYS].insert_one({
+        "user_id": USER, "client_group_id": "g1", "ad_id": "ad_b", "campaign_id": "c1", "ad_name": "Ad b",
+        "date_start": "2026-11-01", "insight_data": {"spend": "4.5", "actions": [{"action_type": "lead", "value": "0"}]}})
+    run = await _run_all(mock_db, mock_mongo_client, agent)
+    card = await mock_db[CARDS].find_one({"run_id": run["_id"]})
+    assert card["spend"] == 15.0
+
+
+async def test_write_client_records_uses_not_for_preview(mock_db, mock_mongo_client, fakes):
+    agent = await _setup(mock_db, "g1")
+    await mock_db[MEMORY].insert_one({"_id": "m1", "agent_id": agent["_id"], "text": "for all", "kind": "fact",
+                                      "active": True, "client_group_id": None, "created_at": datetime(2026, 10, 1)})
+    await _run_all(mock_db, mock_mongo_client, agent, kind="preview")
+    assert "uses" not in await mock_db[MEMORY].find_one({"_id": "m1"})
+    run = await _run_all(mock_db, mock_mongo_client, agent)
+    card = await mock_db[CARDS].find_one({"run_id": run["_id"]})
+    m = await mock_db[MEMORY].find_one({"_id": "m1"})
+    assert m["uses"] == 1 and m["last_used"][-1]["card_id"] == card["_id"]
+    assert m["last_used"][-1]["run_id"] == run["_id"] and m["last_used"][-1]["client_group_id"] == "g1"

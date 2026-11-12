@@ -561,7 +561,8 @@ async def get_lessons(agent_id: str, current_user: str = Depends(get_current_use
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        return [agents_router._memory_to_api(m) for m in await agent_store.list_memory(db, agent_id, active_only=False)]
+        return [{"uses": 0, "last_used": [], **agents_router._memory_to_api(m)}
+                for m in await agent_store.list_memory(db, agent_id, active_only=False)]
 
 
 @router.post("/{agent_id}/lessons/{lesson_id}/keep")

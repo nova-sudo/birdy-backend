@@ -447,3 +447,31 @@ async def test_learned_starts_where_the_previous_report_finished(api, mock_db):
     assert [x["text"] for x in body["learned"]] == ["after r1"]
     r1 = api.get(f"/api/agents/{aid}/runs/r1").json()
     assert "during r1" in [x["text"] for x in r1["learned"]]
+
+
+# ---------------------------------------------------------------------------
+# Lesson usage (BirdyHub redesign, spec section 4.1)
+# ---------------------------------------------------------------------------
+
+async def test_record_lesson_uses_increments_and_caps(mock_db):
+    m = await add_memory(mock_db, "ag1", text="no blue", kind="fact", source="edit")
+    for n in range(6):
+        await lessons.record_lesson_uses(mock_db, [m["_id"]], run_id="r1", card_id=f"c{n}", client_group_id="g1")
+    doc = await mock_db[MEMORY].find_one({"_id": m["_id"]})
+    assert doc["uses"] == 6 and len(doc["last_used"]) == 5
+    assert doc["last_used"][-1]["card_id"] == "c5" and doc["last_used"][0]["card_id"] == "c1"
+    assert doc["last_used"][-1]["run_id"] == "r1" and doc["last_used"][-1]["client_group_id"] == "g1"
+    await lessons.record_lesson_uses(mock_db, [], run_id="r1", card_id="cx", client_group_id="g1")  # no-op
+
+
+async def test_lessons_for_prompt_with_ids(mock_db):
+    m = await add_memory(mock_db, "ag1", text="keep me", kind="fact", source="edit")
+    assert await lessons.lessons_for_prompt(mock_db, "ag1", "g1", with_ids=True) == [(m["_id"], "keep me")]
+
+
+async def test_lessons_route_returns_uses(api, mock_db):
+    agent = await _stock(mock_db)
+    aid = agent["_id"]
+    await add_memory(mock_db, aid, text="no blue", kind="fact", source="edit")
+    [row] = api.get(f"/api/agents/{aid}/lessons").json()
+    assert row["uses"] == 0 and row["last_used"] == []

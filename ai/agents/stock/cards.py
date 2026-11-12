@@ -131,6 +131,12 @@ def _lines(facts: dict, draft: dict, settings: dict, candidates: dict | None, fl
     return out
 
 
+def _spend(facts: dict) -> float | None:
+    """The client's ad spend in the card's window, from the same facts that give `leads` and the CPL."""
+    spend = facts.get("spend")
+    return None if spend is None else round(float(spend), 2)
+
+
 def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, run_id: str, *,
                candidates: dict | None = None, flag_only: bool = False, client_names=None) -> dict:
     """The card for one client, shaped as in spec section 7. `draft` is write_card's output, or
@@ -167,7 +173,7 @@ def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, r
     card = {"run_id": run_id, "client_group_id": facts["client_group_id"], "client_name": facts.get("name"),
             "tag": tag, "decision": decision, "zone": facts.get("zone"), "window": facts.get("window"),
             "previous_cpl": facts.get("prev_cpl"), "current_cpl": facts.get("cpl"), "currency": facts.get("currency"),
-            "leads": facts.get("leads"), "ads_live": facts.get("ads_live"),
+            "leads": facts.get("leads"), "spend": _spend(facts), "ads_live": facts.get("ads_live"),
             "lines": lines, "additional_changes": additional, "thought_process": thought, "next_steps": next_steps,
             "status": STATUS_FLAGGED if all_flagged else STATUS_OPEN, "ai_failed": failed,
             "slack": {"channel_id": None, "ts": None}, "decided_by": None, "decided_at": None}

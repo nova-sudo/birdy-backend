@@ -9,6 +9,7 @@ agents. The scoreboard is scored here too, and patterns in it become "Make it a 
   lesson_from_edit    a code-written lesson from a meaningful card edit (no AI call)
   lesson_from_text    text a person wrote (dismiss reason, Slack mention) -> lesson, via memory_from_note
   lessons_for_prompt  the active lessons the writer sees: this client's and the agency's, newest 50
+  record_lesson_uses  counts the lessons a card was written with (not for previews)
   keep / overrule     a person's verdict on a lesson; an overruled one no longer reaches the AI
   score_result        won / lost / no_clear_change / never_went_live from fixed numbers
   score_due           scores the scoreboard rows whose scoring window has passed
@@ -41,6 +42,7 @@ ACTIVE, OVERRULED = "active", "overruled"
 SLACK_MENTION = "slack_mention"    # anyone in a channel can say this, so it can't quietly become an agency-wide ad rule
 PROMOTE = "promote"
 LESSONS_FOR_PROMPT = 50
+LAST_USED_KEPT = 5                 # uses kept on a lesson, for "where it was used"
 FEATURE = "stock_lesson"           # the metering label for the AI call that turns text into a lesson
 MAX_SCORE_ROWS = 200               # rows scored in one catch-up; the rest wait for the next batch day
 UNSCORED_AFTER_DAYS = 14           # a row that still can't be judged this long after its window ends `unscored`
@@ -162,14 +164,28 @@ async def lesson_from_text(db, agent: dict, text: str, *, source: str, author: s
                                   feature=FEATURE, status=ACTIVE, filter_one_client=source == SLACK_MENTION)
 
 
-async def lessons_for_prompt(db, agent_id: str, gid: str) -> list[str]:
+async def lessons_for_prompt(db, agent_id: str, gid: str, *, with_ids: bool = False) -> list:
     """What the writer is told: active lessons for this client or the whole agency, newest first, 50 at most.
-    Overruled and removed lessons are left out, and so is every other agent's."""
+    Overruled and removed lessons are left out, and so is every other agent's. With `with_ids` it gives
+    `(id, text)` pairs, so the run can record which lessons each card was given."""
     rows = await (db[MEMORY].find({
         "agent_id": agent_id, "active": True, "status": {"$ne": OVERRULED},
         "$or": [{"client_group_id": None}, {"client_group_id": gid}]})
         .sort("created_at", -1).limit(LESSONS_FOR_PROMPT).to_list(length=LESSONS_FOR_PROMPT))
+    if with_ids:
+        return [(m["_id"], m["text"]) for m in rows if m.get("text")]
     return [m["text"] for m in rows if m.get("text")]
+
+
+async def record_lesson_uses(db, ids: list[str], *, run_id, card_id, client_group_id) -> None:
+    """These lessons were given to Birdy for this card: count it, and keep the last LAST_USED_KEPT uses
+    (newest last). One write for all of them. "Used" means given to the writer, nothing more."""
+    if not ids:
+        return
+    entry = {"run_id": run_id, "card_id": card_id, "client_group_id": client_group_id, "at": _utcnow()}
+    await db[MEMORY].update_many({"_id": {"$in": list(ids)}},
+                                 {"$inc": {"uses": 1},
+                                  "$push": {"last_used": {"$each": [entry], "$slice": -LAST_USED_KEPT}}})
 
 
 async def keep_lesson(db, agent_id: str, memory_id: str) -> dict | None:

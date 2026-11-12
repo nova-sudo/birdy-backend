@@ -719,10 +719,26 @@ async def _write_client(db, run: dict, agent: dict, gid: str) -> None:
     flag_only = not await _is_acting(db, run, agent, gid)  # it may have moved since the checks
     draft = run["clients"][gid].get("draft")
     if draft is None:  # saved straight away, so a failure from here on doesn't pay for a second call
-        draft = await write_card(db, agent, facts, candidates, await lessons.lessons_for_prompt(db, agent["_id"], gid), last_card=last,
+        given = await lessons.lessons_for_prompt(db, agent["_id"], gid, with_ids=True)
+        draft = await write_card(db, agent, facts, candidates, [text for _, text in given], last_card=last,
                                  open_questions=(last or {}).get("open_questions") or [])
-        await _save_client(db, run, gid, draft=draft)
+        await _save_client(db, run, gid, draft=draft, lesson_ids=[lid for lid, _ in given])
     await _save_card(db, run, agent, facts, last, draft, candidates, flag_only)
+    await _record_lesson_uses(db, run, gid)
+
+
+async def _record_lesson_uses(db, run: dict, gid: str) -> None:
+    """After the card is saved: the lessons its draft was written with count one use. Previews never count.
+    The client is finished by now, so this runs once; a failure only loses the count."""
+    ids = run["clients"][gid].get("lesson_ids") or []
+    if run.get("kind") == PREVIEW or not ids:
+        return
+    try:
+        card = await db[CARDS].find_one({"run_id": run["_id"], "client_group_id": gid}, {"_id": 1})
+        if card is not None:
+            await lessons.record_lesson_uses(db, ids, run_id=run["_id"], card_id=card["_id"], client_group_id=gid)
+    except Exception as e:  # noqa: BLE001 - a usage count never costs the card
+        logger.warning("stock run %s: lesson uses not recorded for %s: %s", run["_id"], gid, e)
 
 
 async def _writing_phase(db, mongo_client, run: dict, agent: dict, deadline) -> bool:
