@@ -411,6 +411,95 @@ async def run_preview(db, user_id, mongo_client=None, **_):
 
 
 # ---------------------------------------------------------------------------
+# Setup turn guard
+# ---------------------------------------------------------------------------
+# The model sometimes says it is showing a picker, a practice case or the preview without
+# calling the tool. After each agent_setup turn the server checks the step it should be on and
+# adds that step's block itself, so the chat never stalls on a promise.
+
+SKIP_SLACK_MESSAGE = "Skip Slack for now"  # SlackBlock's skip button
+PRACTICE_ANSWER_PREFIX = "Practice case "  # PracticeBlock's "…: we agreed. Next one."
+# "I want to change {label}" from the setup rail (frontend steps.js labels) -> that step's block.
+CHANGE_STEP_BLOCKS = {"its playbook": "playbook", "clients": "clients", "what it can change": "permissions",
+                      "report time": "schedule", "slack": "slack"}
+_GUARD_TOOL = "setup_guard"
+
+
+async def setup_steps(db, user_id) -> Optional[dict]:
+    """The setup chat's agent's steps (None outside a draft custom agent)."""
+    agent = await _agent(db, user_id)
+    if agent is None or agent.get("status") == "active":
+        return None
+    return _steps(agent)
+
+
+def _shown(agent_changes: list) -> set:
+    return {c.get("ui_block") for c in agent_changes if c.get("ui_block")}
+
+
+def _add_block(agent_changes: list, result: dict) -> None:
+    block = {"ui_block": result["ui_block"],
+             **{k: result[k] for k in ("playbook", "case", "job_id") if k in result}}
+    agent_changes.append({"tool": _GUARD_TOOL, **block})
+
+
+async def _practice_or_preview(db, user_id, agent_changes: list, mongo_client) -> None:
+    out = await ask_practice_case(db, user_id, mongo_client=mongo_client)
+    if out.get("ok"):
+        _add_block(agent_changes, out)
+    elif out.get("error") in ("ready", "no_cases"):
+        preview = await run_preview(db, user_id, mongo_client=mongo_client)
+        if preview.get("ok"):
+            _add_block(agent_changes, preview)
+
+
+async def ensure_setup_blocks(db, user_id, agent_changes: list, *, message: str = "",
+                              steps_before: Optional[dict] = None, mongo_client=None) -> None:
+    """Add the block this setup turn should have shown when the model didn't show it."""
+    agent = await _agent(db, user_id)
+    if agent is None or agent.get("status") == "active":
+        return
+    message = (message or "").strip()
+    if message == SKIP_SLACK_MESSAGE:
+        # Skipping is an answer: tick the step so Turn on isn't held back by it.
+        await store.mark_step(db, agent["_id"], "slack")
+        agent = await _agent(db, user_id)
+    steps = _steps(agent)
+    shown = _shown(agent_changes)
+
+    if message.lower().startswith("i want to change "):
+        block = CHANGE_STEP_BLOCKS.get(message[len("i want to change "):].strip().lower())
+        if block and block not in shown:
+            if block == "playbook":
+                _add_block(agent_changes, {"ui_block": "playbook",
+                                                 "playbook": _playbook(await store.list_rules(db, agent["_id"]))})
+            else:
+                _add_block(agent_changes, {"ui_block": block})
+        return
+
+    if not steps["purpose"]:
+        return  # naming needs the model; draft_playbook refuses until it's done
+    if not steps["playbook"]:
+        if "playbook" not in shown:
+            _add_block(agent_changes, {"ui_block": "playbook",
+                                             "playbook": _playbook(await store.list_rules(db, agent["_id"]))})
+        return
+    for key in SETUP_BLOCKS:  # clients, permissions, schedule, slack, in rail order
+        if not steps[key]:
+            if key not in shown:
+                _add_block(agent_changes, {"ui_block": key})
+            return
+
+    # Every step is done: practice, then the preview. Only on the turn that finished setup or
+    # answered a practice case, so ordinary questions afterwards don't start another dry run.
+    if shown & {"practice", "preview"}:
+        return
+    finished_now = steps_before is not None and not all(steps_before.values())
+    if finished_now or message.startswith(PRACTICE_ANSWER_PREFIX):
+        await _practice_or_preview(db, user_id, agent_changes, mongo_client)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 

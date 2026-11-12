@@ -440,3 +440,147 @@ def test_chat_router_points_setup_chat_at_its_agent(mock_mongo_client, monkeypat
     assert r.status_code == 200, r.text
     assert seen["agent"] == expected
     assert t.current_training_agent.get() is None  # reset after the request
+
+
+# ---------------------------------------------------------------------------
+# Setup turn guard: the block a step needs shows even when the model only talks about it
+# ---------------------------------------------------------------------------
+
+async def _named(mock_db):
+    agent = await create_agent(mock_db)
+    await t.set_purpose(mock_db, U, name="Cutter", description="Pauses costly ads")
+    return agent
+
+
+async def test_guard_waits_for_the_name(mock_db):
+    await create_agent(mock_db)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="pause ads that cost too much")
+    assert changes == []
+
+
+async def test_guard_shows_the_playbook_until_confirmed(mock_db):
+    await _named(mock_db)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="pause ads that cost too much")
+    assert [c["ui_block"] for c in changes] == ["playbook"] and changes[0]["playbook"]
+    assert changes[0]["tool"] == "setup_guard"
+
+    # Already shown by the model this turn: nothing added.
+    shown = [{"tool": "draft_playbook", "ui_block": "playbook", "playbook": []}]
+    await t.ensure_setup_blocks(mock_db, U, shown, message="x")
+    assert len(shown) == 1
+
+
+@pytest.mark.parametrize("done,block", [
+    ({"playbook"}, "clients"),
+    ({"playbook", "clients"}, "permissions"),
+    ({"playbook", "clients", "permissions"}, "schedule"),
+    ({"playbook", "clients", "permissions", "schedule"}, "slack"),
+])
+async def test_guard_shows_the_next_steps_picker(mock_db, done, block):
+    agent = await _named(mock_db)
+    for key in done:
+        await store.mark_step(mock_db, agent["_id"], key)
+    changes = [{"tool": "confirm_playbook", "changed": "playbook"}]
+    await t.ensure_setup_blocks(mock_db, U, changes, message="yes")
+    assert changes[-1] == {"tool": "setup_guard", "ui_block": block}
+
+
+async def test_guard_skip_slack_ticks_the_step(mock_db):
+    agent = await _named(mock_db)
+    for key in ("playbook", "clients", "permissions", "schedule"):
+        await store.mark_step(mock_db, agent["_id"], key)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message=t.SKIP_SLACK_MESSAGE, steps_before={})
+    assert (await steps(mock_db, agent))["slack"] is True
+    assert all(c.get("ui_block") != "slack" for c in changes)
+
+
+async def test_guard_change_step_shows_that_steps_block(mock_db):
+    agent = await _named(mock_db)
+    for key in store.STEP_KEYS:
+        await store.mark_step(mock_db, agent["_id"], key)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="I want to change report time")
+    assert changes == [{"tool": "setup_guard", "ui_block": "schedule"}]
+
+
+async def _all_done(mock_db):
+    agent = await _named(mock_db)
+    for key in store.STEP_KEYS:
+        await store.mark_step(mock_db, agent["_id"], key)
+    return agent
+
+
+async def test_guard_runs_practice_when_setup_finishes(mock_db, mock_mongo_client, monkeypatch):
+    async def fake_sample(db, mongo_client, agent, *, end, days, k, seed, exclude_ad_ids):
+        return [_case()]
+
+    monkeypatch.setattr(replay, "sample_cases", fake_sample)
+    await _all_done(mock_db)
+    changes = []
+    before = {k: k != "slack" for k in store.STEP_KEYS}
+    await t.ensure_setup_blocks(mock_db, U, changes, message="#birdy", steps_before=before,
+                                mongo_client=mock_mongo_client)
+    assert changes[-1]["ui_block"] == "practice" and changes[-1]["case"]["case_id"] == "c1"
+
+
+async def test_guard_runs_preview_when_nothing_to_practise(mock_db, mock_mongo_client, monkeypatch):
+    async def no_cases(db, mongo_client, agent, *, end, days, k, seed, exclude_ad_ids):
+        return []
+
+    async def fake_job(*a, **kw):
+        return "job1"
+
+    monkeypatch.setattr(replay, "sample_cases", no_cases)
+    monkeypatch.setattr(replay, "start_dry_run_job", fake_job)
+    await _all_done(mock_db)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="Practice case c0: we agreed. Next one.",
+                                steps_before={k: True for k in store.STEP_KEYS},
+                                mongo_client=mock_mongo_client)
+    assert changes[-1]["ui_block"] == "preview" and changes[-1]["job_id"] == "job1"
+
+
+async def test_guard_leaves_later_questions_alone(mock_db, mock_mongo_client, monkeypatch):
+    async def boom(*a, **kw):
+        raise AssertionError("no dry run for an ordinary question")
+
+    monkeypatch.setattr(replay, "sample_cases", boom)
+    monkeypatch.setattr(replay, "start_dry_run_job", boom)
+    await _all_done(mock_db)
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="what does rule 2 do?",
+                                steps_before={k: True for k in store.STEP_KEYS},
+                                mongo_client=mock_mongo_client)
+    assert changes == []
+
+
+async def test_guard_ignores_active_agents(mock_db):
+    agent = await _named(mock_db)
+    await mock_db.agents.update_one({"_id": agent["_id"]}, {"$set": {"status": "active"}})
+    changes = []
+    await t.ensure_setup_blocks(mock_db, U, changes, message="hi")
+    assert changes == []
+
+
+async def test_run_chat_adds_the_missing_picker(mock_db, monkeypatch):
+    from ai.orchestrator import run_chat
+    from ai.providers.base import BaseLLMProvider, ProviderResponse
+
+    class SaysOnly(BaseLLMProvider):
+        model = "stub-model"
+
+        async def chat_completion(self, messages, tools=None, tool_choice="auto", temperature=0.3, max_tokens=2048):
+            return ProviderResponse(content="Please choose the permissions for this agent.")
+
+    monkeypatch.setattr("ai.orchestrator.mcp_client.needs_mcp", lambda allowed: False)
+    reg = ToolRegistry()
+    t.register_agent_tools(reg)
+    agent = await _named(mock_db)
+    for key in ("playbook", "clients"):
+        await store.mark_step(mock_db, agent["_id"], key)
+    out = await run_chat(provider=SaysOnly(), tool_registry=reg, db=mock_db, user_id=U,
+                         message="Picked 1 client", page="agent_setup")
+    assert out["agent_changes"] == [{"tool": "setup_guard", "ui_block": "permissions"}]

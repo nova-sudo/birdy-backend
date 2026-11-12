@@ -15,7 +15,7 @@ from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
 from ai.tools.agent_tools import AGENT_TOOL_NAMES, SETUP_PAGE_TOOLS
-from ai.tools import stock_card_tools, stock_lesson_tools
+from ai.tools import agent_tools, stock_card_tools, stock_lesson_tools
 from ai.tools.stock_card_tools import STOCK_CARD_TOOL_NAMES
 from ai.tools.stock_lesson_tools import STOCK_LESSON_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
@@ -739,6 +739,19 @@ async def run_chat(
     # {tool, changed} from every successful agent training tool this turn, so
     # the training UI can show what Birdy changed in the playbook.
     agent_changes: list = []
+    # Setup chat: the steps before this turn, so the guard knows if this turn finished setup.
+    setup_steps_before = await agent_tools.setup_steps(db, user_id) if page == "agent_setup" else None
+
+    async def _guard_setup() -> None:
+        """Add the block the setup step needs if the model only talked about it."""
+        if page != "agent_setup":
+            return
+        try:
+            await agent_tools.ensure_setup_blocks(
+                db, user_id, agent_changes, message=message,
+                steps_before=setup_steps_before, mongo_client=mongo_client)
+        except Exception:
+            logger.exception("setup guard failed")
 
     # ── Birdy Credits metering ──────────────────────────────────────────────
     # A single question can make up to MAX_TOOL_ITERATIONS+1 model calls; sum the
@@ -876,6 +889,7 @@ async def run_chat(
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 history.append({"role": "assistant", "content": reply})
                 await session_store.save_messages(db, session_id, history)
+                await _guard_setup()
                 await conversation_log.log_message(
                     db,
                     user_id=user_id,
@@ -1018,6 +1032,7 @@ async def run_chat(
         reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
         history.append({"role": "assistant", "content": reply})
         await session_store.save_messages(db, session_id, history)
+        await _guard_setup()
         await conversation_log.log_message(
             db,
             user_id=user_id,
