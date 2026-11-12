@@ -14,6 +14,8 @@ from ai.tools.dashboard_tools import DASHBOARD_TOOL_NAMES
 from ai.prompts.creatives import CREATIVE_TESTS_GUIDE
 from ai.tools.creative_tools import CREATIVE_READ_TOOLS, CREATIVE_SESSION_TOOLS, CREATIVE_WRITE_TOOLS
 from ai.tools.agent_tools import AGENT_TOOL_NAMES
+from ai.tools import stock_card_tools
+from ai.tools.stock_card_tools import STOCK_CARD_TOOL_NAMES
 from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
 from ai.tools.attribution_tools import TOOL_NAME as CLOSES_BY_AD_TOOL
 from datetime import date
@@ -172,6 +174,15 @@ DEFAULT_MAX_TOKENS = 4096
 # ~13k characters of catalog-laden schemas there, and their ops have no editor
 # to land in.
 _PAGE_ONLY_TOOLS = set(DASHBOARD_TOOL_NAMES) | set(AGENT_TOOL_NAMES)
+
+# ── Stock agent chats (BirdyHub redesign): one card, and Teach Birdy ─────────
+# Page-only tools with prompts built from the card or agent when a session starts.
+# Their results become `agent_changes` through stock_card_tools.change_entry.
+_PAGE_TOOLS["stock_card"] = list(STOCK_CARD_TOOL_NAMES)
+_STOCK_CHAT_TOOL_NAMES = frozenset(STOCK_CARD_TOOL_NAMES)
+_PAGE_ONLY_TOOLS |= _STOCK_CHAT_TOOL_NAMES
+# page -> async (db, user_id) -> str
+_ASYNC_PAGE_PROMPTS = {"stock_card": stock_card_tools.build_system_prompt}
 
 # Client-scoped pages hard-pin these tools to the page's client server-side:
 # whatever group_id the model passes (or omits) is overwritten with the page's
@@ -633,6 +644,8 @@ async def run_chat(
     if not history:
         if page == "client_detail" and client_group_id and client_name:
             system_content = _build_client_detail_prompt(client_name, client_group_id)
+        elif page in _ASYNC_PAGE_PROMPTS:
+            system_content = await _ASYNC_PAGE_PROMPTS[page](db, user_id)
         elif page:
             system_content = _PAGE_SYSTEM_PROMPTS.get(page, get_system_prompt())
             if callable(system_content):
@@ -947,6 +960,14 @@ async def run_chat(
                         parsed = None
                     if isinstance(parsed, dict) and parsed.get("ok") and parsed.get("changed"):
                         agent_changes.append({"tool": tc.name, "changed": parsed["changed"]})
+
+                if tc.name in _STOCK_CHAT_TOOL_NAMES and not bad_args:
+                    try:
+                        entry = stock_card_tools.change_entry(tc.name, json.loads(result))
+                    except (json.JSONDecodeError, TypeError):
+                        entry = None
+                    if entry:
+                        agent_changes.append(entry)
 
                 history.append({
                     "role": "tool",

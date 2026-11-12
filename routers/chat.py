@@ -30,6 +30,7 @@ from ai.tools.page_view_tools import register_page_view_tools
 from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
 from ai.tools.agent_tools import current_training_agent
+from ai.tools.stock_card_tools import current_stock_card, load_chat_card, register_stock_card_tools
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +52,7 @@ register_call_analysis_tools()
 register_report_designer_tools()
 register_dashboard_tools()
 register_agent_tools()
+register_stock_card_tools()
 register_creative_tools()
 register_render_ui_tools()
 register_page_view_tools()
@@ -62,6 +64,16 @@ def _archive_ids(request: ChatRequest) -> dict:
     if request.page not in HIDDEN_HISTORY_PAGES:
         return {}
     return {"agent_id": request.agent_id, "card_id": request.card_id if request.page == "stock_card" else None}
+
+
+async def _stock_card_id(db, user_id: str, request: ChatRequest) -> str | None:
+    """Page "stock_card": the card the chat acts on, after an owner check (404 card_not_found)."""
+    if request.page != "stock_card":
+        return None
+    card = await load_chat_card(db, user_id, request.card_id, request.agent_id)
+    if card is None:
+        raise HTTPException(status_code=404, detail="card_not_found")
+    return card["_id"]
 
 
 async def _onboarding_complete(db, user_id: str) -> bool:
@@ -77,6 +89,7 @@ async def chat(
     async with get_mongo_client() as mongo_client:
         try:
             db = get_db(mongo_client)
+            stock_card_id = await _stock_card_id(db, current_user, request)
             # Stopper: block when the user is out of Birdy Credits (raises 402
             # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
             # Except the report copilot during onboarding: it runs before
@@ -87,6 +100,7 @@ async def chat(
             provider = await get_provider_for_user(current_user, db)
             agent_token = current_training_agent.set(
                 request.agent_id if request.page == "agent_training" else None)
+            card_token = current_stock_card.set(stock_card_id)
             try:
                 result = await run_chat(
                     provider=provider,
@@ -106,6 +120,7 @@ async def chat(
                     **_archive_ids(request),
                 )
             finally:
+                current_stock_card.reset(card_token)
                 current_training_agent.reset(agent_token)
             return ChatResponse(**result)
         except HTTPException:
