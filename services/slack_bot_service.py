@@ -253,16 +253,29 @@ async def list_bot_channels(bot_token: str) -> list[dict]:
     return channels
 
 
-async def user_has_channel(db, user_id: str, channel_id: str) -> bool:
-    """True when the user's Slack bot can see this channel. No bot, or Slack failing, is False."""
+async def find_channel(db, user_id: str, ref: str) -> dict | None:
+    """The user's Slack channel with this id or name ("#ads" works), as {id, name, is_private}.
+    None when there is no such channel, no bot, or Slack is failing."""
+    ref = str(ref or "").strip()
+    if not ref:
+        return None
     bot_token = await get_decrypted_bot_token_for_user(db, user_id)
     if not bot_token:
-        return False
+        return None
     try:
-        return any(c["id"] == channel_id for c in await list_bot_channels(bot_token))
+        channels = await list_bot_channels(bot_token)
     except Exception as e:
-        logger.warning("slack: channel check failed for %s: %s", user_id, e)
-        return False
+        logger.warning("slack: channel lookup failed for %s: %s", user_id, e)
+        return None
+    name = ref.lstrip("#").lower()
+    return (next((c for c in channels if c["id"] == ref), None)
+            or next((c for c in channels if c["name"].lower() == name), None))
+
+
+async def user_has_channel(db, user_id: str, channel_id: str) -> bool:
+    """True when the user's Slack bot can see the channel with this id."""
+    found = await find_channel(db, user_id, channel_id)
+    return bool(found) and found["id"] == channel_id
 
 
 async def get_thread_session_id(db, team_id: str, channel: str, thread_key: str) -> str | None:

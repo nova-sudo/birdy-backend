@@ -190,7 +190,7 @@ def test_page_tools_scoped():
 def test_tools_registered_with_page_names():
     reg = ToolRegistry()
     t.register_agent_tools(reg)
-    assert set(reg.get_tool_names()) == set(_PAGE_TOOLS["agent_training"]) - {"get_client_groups"}
+    assert set(reg.get_tool_names()) == (set(_PAGE_TOOLS["agent_training"]) - {"get_client_groups"}) | set(t.SETUP_TOOL_NAMES)
 
 
 def test_prompt_content():

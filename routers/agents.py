@@ -8,12 +8,9 @@ Every route is owner-scoped: another user's agent is a 404, never a 403.
 Budgets are never writable: `permissions.budgets` is forced to false.
 """
 
-import hashlib
-import json
 import logging
 import re
 import time
-import uuid
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Literal, Optional
@@ -123,7 +120,7 @@ def _validate_params(kind: str, params: dict) -> None:
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 SCOPE_KEYS = {"client_group_ids", "schedule", "slack_channel_id"}
-DESCRIPTION_MAX = 280
+DESCRIPTION_MAX = agent_store.DESCRIPTION_MAX
 
 
 def _validate_schedule(sched) -> dict:
@@ -532,52 +529,12 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
 # "timed_out" failure. The job record keeps the POST → job id, GET → status
 # contract, so the frontend polls exactly as before (the first poll sees done).
 
-DRY_RUN_BUDGET_SECONDS = 240     # Vercel's function timeout is 300s (vercel.json sets none)
-JOB_TIMEOUT = timedelta(minutes=5)  # a queued/running job older than this was killed
-
-
-def _rules_sig(rules: list[dict]) -> str:
-    """Stable hash of everything in the rules that changes a dry run's answer."""
-    parts = sorted(
-        (
-            str(r.get("_id")), r.get("version"), r.get("mode"), r.get("enabled"),
-            r.get("params") or {}, r.get("client_overrides") or {},
-        )
-        for r in rules
-    )
-    blob = json.dumps(parts, sort_keys=True, default=str)
-    return hashlib.sha256(blob.encode()).hexdigest()[:32]
+DRY_RUN_BUDGET_SECONDS = replay.DRY_RUN_BUDGET_SECONDS
+JOB_TIMEOUT = replay.JOB_TIMEOUT
 
 
 def _local_today(agent: dict) -> date:
-    tz = ((agent.get("scope") or {}).get("schedule") or {}).get("tz") or "UTC"
-    try:
-        return datetime.now(ZoneInfo(tz)).date()
-    except Exception:
-        return datetime.utcnow().date()
-
-
-async def _run_dry_run_job(db, mongo_client, job_id: str, user_id: str, agent_id: str,
-                           *, deadline: float) -> None:
-    jobs = db[agent_store.JOBS]
-    await jobs.update_one({"_id": job_id}, {"$set": {"status": "running", "started_at": datetime.utcnow()}})
-    try:
-        agent = await agent_store.get_agent(db, user_id, agent_id)
-        if agent is None:
-            raise RuntimeError("agent not found")
-        # Local yesterday: every replayed day is complete.
-        result = await replay.dry_run(db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1),
-                                      deadline=deadline)
-        await jobs.update_one({"_id": job_id}, {"$set": {
-            "status": "done", "result": result.to_dict(), "finished_at": datetime.utcnow()}})
-    except replay.DryRunTimeout as e:
-        logger.warning("dry run job %s ran out of time: %s", job_id, e)
-        await jobs.update_one({"_id": job_id}, {"$set": {
-            "status": "failed", "error": "timed_out", "finished_at": datetime.utcnow()}})
-    except Exception as e:
-        logger.error("dry run job %s failed: %s", job_id, e, exc_info=True)
-        await jobs.update_one({"_id": job_id}, {"$set": {
-            "status": "failed", "error": str(e) or type(e).__name__, "finished_at": datetime.utcnow()}})
+    return replay.local_today(agent)
 
 
 @router.post("/{agent_id}/dry-run")
@@ -585,24 +542,10 @@ async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_u
     deadline = time.monotonic() + DRY_RUN_BUDGET_SECONDS
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        await _agent_or_404(db, current_user, agent_id)
-        sig = _rules_sig(await agent_store.list_rules(db, agent_id))
-        # Rejoin a job another request is running only if it replays these exact
-        # rules; after an edit the old job's answer is stale, so start a new one.
-        active = await db[agent_store.JOBS].find_one({
-            "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
-            "status": {"$in": ["queued", "running"]},
-            "created_at": {"$gt": datetime.utcnow() - JOB_TIMEOUT},
-            "rules_sig": sig,
-        })
-        if active is not None:
-            return {"job_id": active["_id"]}  # one dry run at a time per rule set
-        job_id = uuid.uuid4().hex
-        await db[agent_store.JOBS].insert_one({
-            "_id": job_id, "agent_id": agent_id, "user_id": current_user, "kind": "dry_run",
-            "status": "queued", "created_at": datetime.utcnow(), "rules_sig": sig,
-        })
-        await _run_dry_run_job(db, mongo_client, job_id, current_user, agent_id, deadline=deadline)
+        agent = await _agent_or_404(db, current_user, agent_id)
+        # Local yesterday: every replayed day is complete.
+        job_id = await replay.start_dry_run_job(db, mongo_client, current_user, agent,
+                                                end=_local_today(agent) - timedelta(days=1), deadline=deadline)
     return {"job_id": job_id}
 
 
@@ -635,7 +578,6 @@ async def get_job(agent_id: str, job_id: str, current_user: str = Depends(get_cu
 # Confidence, practice cases and activation
 # ---------------------------------------------------------------------------
 
-PRACTICE_DAYS = 60
 PUBLIC_CASE_KEYS = ("case_id", "rule_kind", "client_name", "title", "facts", "options", "birdy_answer", "why")
 
 
@@ -677,31 +619,8 @@ async def get_practice(agent_id: str, k: int = Query(3, ge=1, le=20),
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        coll = db[agent_store.PRACTICE]
-        # Only unanswered cases need their full body; the rest are counted / excluded.
-        served = await coll.find({"agent_id": agent_id}, {"case.snapshot.eval": 0}).sort(
-            "served_at", 1).to_list(length=None)
-        out = [d["case"] for d in served if d.get("resolution") == "unanswered"][:k]
-        if len(out) < k:
-            answered = sum(1 for d in served if d.get("resolution") != "unanswered")
-            seed = int(hashlib.sha1(f"{agent_id}:{answered}".encode()).hexdigest()[:12], 16)
-            exclude: set = set()
-            for d in served:
-                exclude |= set(d.get("ad_ids") or replay.case_ad_keys(d.get("case") or {}))
-            cases = await replay.sample_cases(
-                db, mongo_client, agent, end=_local_today(agent) - timedelta(days=1), days=PRACTICE_DAYS,
-                k=k - len(out), seed=seed, exclude_ad_ids=exclude)
-            rule_ids = {r["kind"]: r["_id"] for r in await agent_store.list_rules(db, agent_id)}
-            now = datetime.utcnow()
-            for case in cases:
-                # Keyed per agent: case ids are content hashes and two users can watch one account.
-                await coll.update_one({"_id": f"{agent_id}:{case['case_id']}"}, {"$setOnInsert": {
-                    "agent_id": agent_id, "case_id": case["case_id"], "case": case,
-                    "ad_ids": sorted(replay.case_ad_keys(case)), "rule_id": rule_ids.get(case["rule_kind"]),
-                    "rule_version_at_answer": None, "user_answer": None, "resolution": "unanswered",
-                    "served_at": now,
-                }}, upsert=True)
-                out.append(case)
+        out = await replay.next_practice_cases(db, mongo_client, agent, k=k,
+                                               end=_local_today(agent) - timedelta(days=1))
         return [_case_to_api(c) for c in out]
 
 

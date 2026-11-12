@@ -64,6 +64,8 @@ AGENT_PATCH_KEYS = {"scope", "permissions", "guardrails", "client_caps", "status
 
 # The setup chat's steps, in the order Birdy asks them (training.steps.<key> is True once done).
 STEP_KEYS = ("purpose", "playbook", "clients", "permissions", "schedule", "slack")
+NAME_MAX = 60
+DESCRIPTION_MAX = 280
 
 
 class AgentExists(Exception):
