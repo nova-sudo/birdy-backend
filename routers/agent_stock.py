@@ -17,6 +17,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from ai import conversation_log
 from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
@@ -555,6 +556,17 @@ async def get_outcomes(agent_id: str, current_user: str = Depends(get_current_us
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
         return await _scoreboard(db, agent_id)
+
+
+@router.get("/{agent_id}/cards/{card_id}/chat")
+async def get_card_chat(agent_id: str, card_id: str, current_user: str = Depends(get_current_user)):
+    """The latest Birdy chat about this card, so the card's chat shows its history after a reload."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        if await db[agent_store.CARDS].find_one({"_id": card_id, "agent_id": agent_id}, {"_id": 1}) is None:
+            raise HTTPException(status_code=404, detail="Card not found")
+        return await conversation_log.card_transcript(db, current_user, card_id)
 
 
 _MONTH_RE = re.compile(r"^\d{4}-\d{2}$")

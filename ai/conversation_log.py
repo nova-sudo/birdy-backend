@@ -43,8 +43,18 @@ async def log_message(
     tools_used: list | None = None,
     category: str | None = None,
     client_group_id: str | None = None,
+    agent_id: str | None = None,
+    card_id: str | None = None,
+    agent_changes: list | None = None,
 ) -> None:
-    """Append a single conversation message. Best-effort; never raises."""
+    """Append a single conversation message. Best-effort; never raises.
+
+    `agent_id` / `card_id` tie a turn to the agent chat it came from (the
+    stock card, Teach Birdy and agent setup chats) and `agent_changes` keeps
+    what that turn changed, so the chat can be shown again after a reload.
+    Each is stored only when set."""
+    extra = {k: v for k, v in (("agent_id", agent_id), ("card_id", card_id),
+                               ("agent_changes", agent_changes)) if v}
     try:
         await db[_COLLECTION].insert_one({
             "user_id": user_id,
@@ -61,6 +71,7 @@ async def log_message(
             "tools_used": tools_used or [],
             "category": category,        # only set on user turns
             "created_at": datetime.utcnow(),
+            **extra,
         })
     except Exception as e:
         # A durable-log failure is never worth failing a user's live chat over.
@@ -97,6 +108,36 @@ async def tag_latest_user_turn(
         logger.warning(f"conversation_log tag failed (non-fatal): {e}")
 
 
+async def card_transcript(db, user_id: str, card_id: str) -> dict:
+    """The latest chat about one stock card, oldest first, for seeding the
+    card's chat after a reload. Only this user's turns; form answers
+    ([UI_RESPONSE]) are protocol, not conversation, and are left out."""
+    latest = await db[_COLLECTION].find_one(
+        {"user_id": user_id, "card_id": card_id}, {"session_id": 1},
+        sort=[("created_at", -1)],
+    )
+    if latest is None:
+        return {"session_id": None, "messages": []}
+    session_id = latest["session_id"]
+    rows = await db[_COLLECTION].find(
+        {"user_id": user_id, "card_id": card_id, "session_id": session_id},
+        {"role": 1, "content": 1, "agent_changes": 1, "created_at": 1, "_id": 0},
+    ).sort("created_at", 1).to_list(length=None)
+    messages = []
+    for r in rows:
+        content = r.get("content") or ""
+        if content.lstrip().startswith("[UI_RESPONSE]"):
+            continue
+        at = r.get("created_at")
+        messages.append({
+            "role": r.get("role"),
+            "content": content,
+            "agent_changes": r.get("agent_changes") or [],
+            "created_at": at.isoformat() if hasattr(at, "isoformat") else at,
+        })
+    return {"session_id": session_id, "messages": messages}
+
+
 async def create_conversation_log_indexes(mongo_client) -> None:
     """Register indexes. NOTE: intentionally no TTL index — this is an archive."""
     from core.database import DB_NAME
@@ -116,6 +157,10 @@ async def create_conversation_log_indexes(mongo_client) -> None:
     await db[_COLLECTION].create_index(
         [("user_id", 1), ("client_group_id", 1), ("created_at", -1)],
         name="idx_convlog_user_client_created", background=True,
+    )
+    await db[_COLLECTION].create_index(
+        [("user_id", 1), ("card_id", 1), ("created_at", 1)],
+        name="idx_convlog_user_card_created", background=True,
     )
     await db[_COLLECTION].create_index(
         [("category", 1), ("created_at", -1)],

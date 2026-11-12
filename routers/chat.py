@@ -57,6 +57,13 @@ register_page_view_tools()
 register_attribution_tools()
 
 
+def _archive_ids(request: ChatRequest) -> dict:
+    """The agent and card an agent chat is archived under; nothing for any other page."""
+    if request.page not in HIDDEN_HISTORY_PAGES:
+        return {}
+    return {"agent_id": request.agent_id, "card_id": request.card_id if request.page == "stock_card" else None}
+
+
 async def _onboarding_complete(db, user_id: str) -> bool:
     user = await db["users"].find_one({"user_id": user_id}, {"onboarding.completed": 1}) or {}
     return bool((user.get("onboarding") or {}).get("completed"))
@@ -96,6 +103,7 @@ async def chat(
                     dashboard_summary=request.summary,
                     view_catalogues=request.view_catalogues,
                     attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
+                    **_archive_ids(request),
                 )
             finally:
                 current_training_agent.reset(agent_token)
@@ -127,6 +135,9 @@ async def chat(
 
 MAX_CONVERSATIONS = 100
 TITLE_LENGTH = 60
+# Agent chats (a stock card, Teach Birdy, agent setup) are archived with their
+# agent/card and reopened from that agent's page, never from the history list.
+HIDDEN_HISTORY_PAGES = {"stock_card", "stock_lessons", "agent_setup"}
 
 
 @router.get("/api/chat/conversations")
@@ -151,6 +162,7 @@ async def list_conversations(
                 {"$match": {
                     "user_id": current_user,
                     "source": "birdy",
+                    "page": {"$nin": sorted(HIDDEN_HISTORY_PAGES)},
                     **({"client_group_id": client_group_id} if client_group_id else {}),
                 }},
                 {"$sort": {"created_at": 1}},

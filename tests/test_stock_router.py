@@ -596,3 +596,31 @@ async def test_a_preview_where_every_client_failed_does_not_count(api, mock_db):
         "clients.g1": {"state": "failed", "error": "Meta needs reconnecting. Reconnect to check this client."}}})
     r = api.post(f"/api/agents/{aid}/activate")
     assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
+
+
+# ---------------------------------------------------------------------------
+# Card chat transcript (BirdyHub redesign, spec section 3.3)
+# ---------------------------------------------------------------------------
+
+async def test_card_chat_route_returns_latest_session(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    await _seed_run(mock_db, agent, rid="r1")
+    await _seed_card(mock_db, agent, "c1", "r1")
+    for sid, content, minute in (("s-old", "earlier", 0), ("s-new", "later", 5)):
+        await mock_db["ai_conversation_log"].insert_one({
+            "user_id": USER, "session_id": sid, "source": "birdy", "role": "user", "content": content,
+            "page": "stock_card", "agent_id": agent["_id"], "card_id": "c1",
+            "created_at": datetime(2026, 11, 3, 9, minute)})
+    r = api.get(f"/api/agents/{agent['_id']}/cards/c1/chat")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["session_id"] == "s-new" and [m["content"] for m in body["messages"]] == ["later"]
+    assert api.get(f"/api/agents/{agent['_id']}/cards/missing/chat").status_code == 404
+
+
+async def test_card_chat_route_other_user_404(api, mock_db):
+    agent = await _setup(mock_db, "g1")
+    await _seed_run(mock_db, agent, rid="r1")
+    await _seed_card(mock_db, agent, "c1", "r1")
+    api.state["user"] = OTHER
+    assert api.get(f"/api/agents/{agent['_id']}/cards/c1/chat").status_code == 404

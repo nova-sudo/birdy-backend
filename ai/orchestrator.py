@@ -602,7 +602,11 @@ async def run_chat(
     dashboard_summary: Optional[str] = None,
     view_catalogues: Optional[dict] = None,
     attachments: Optional[list[dict]] = None,
+    agent_id: Optional[str] = None,
+    card_id: Optional[str] = None,
 ) -> dict:
+    # Agent chats are archived with their agent/card (see conversation_log).
+    archive_ids = {"agent_id": agent_id, "card_id": card_id}
     # Restore or create session (get_or_create only resumes sessions this user owns)
     session_id, history = await session_store.get_or_create(db, session_id, user_id)
 
@@ -668,6 +672,7 @@ async def run_chat(
             page=page,
             client_group_id=client_group_id,
             category=classify_query(message),
+            **archive_ids,
         )
 
     tools_used = []
@@ -836,6 +841,8 @@ async def run_chat(
                     page=page,
                     client_group_id=client_group_id,
                     tools_used=tools_used,
+                    agent_changes=agent_changes,
+                    **archive_ids,
                 )
                 await _debit_credits()
                 return {
@@ -965,6 +972,8 @@ async def run_chat(
             page=page,
             client_group_id=client_group_id,
             tools_used=tools_used,
+            agent_changes=agent_changes,
+            **archive_ids,
         )
         await _debit_credits()
         return {

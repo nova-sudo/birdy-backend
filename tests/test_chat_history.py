@@ -411,3 +411,79 @@ async def test_a_thread_never_borrows_another_users_client_name(chat_api, mock_d
     convo = (await chat_router.list_conversations(current_user=USER))["conversations"][0]
     assert convo["scope"] == "global"
     assert convo["client_name"] is None
+
+
+# ---------------------------------------------------------------------------
+# Agent and card chats (BirdyHub redesign, spec section 3.3)
+# ---------------------------------------------------------------------------
+
+async def test_log_message_stores_card_fields(mock_db):
+    await log_message(mock_db, user_id=USER, session_id="s1", source="birdy", role="user", content="hi",
+                      page="stock_card", agent_id="ag1", card_id="c1")
+    await log_message(mock_db, user_id=USER, session_id="s1", source="birdy", role="assistant", content="ok",
+                      page="stock_card", agent_id="ag1", card_id="c1",
+                      agent_changes=[{"tool": "dismiss_card", "changed": "dismissed"}])
+    await log_message(mock_db, user_id=USER, session_id="s2", source="birdy", role="user", content="plain")
+    rows = await mock_db["ai_conversation_log"].find({}, {"_id": 0}).sort("created_at", 1).to_list(None)
+    assert rows[0]["agent_id"] == "ag1" and rows[0]["card_id"] == "c1" and "agent_changes" not in rows[0]
+    assert rows[1]["agent_changes"] == [{"tool": "dismiss_card", "changed": "dismissed"}]
+    assert not {"agent_id", "card_id", "agent_changes"} & set(rows[2])
+
+
+async def test_history_hides_agent_pages(chat_api, mock_db):
+    await a_conversation(mock_db, "ask", ["What's my CPL?", "£10"])
+    for page in ("stock_card", "stock_lessons", "agent_setup"):
+        await log_message(mock_db, user_id=USER, session_id=f"s-{page}", source="birdy", role="user",
+                          content="hidden", page=page, agent_id="ag1")
+    out = await chat_router.list_conversations(current_user=USER)
+    assert [c["session_id"] for c in out["conversations"]] == ["ask"]
+    assert chat_router.HIDDEN_HISTORY_PAGES == {"stock_card", "stock_lessons", "agent_setup"}
+
+
+async def test_card_transcript_latest_session_in_order(mock_db):
+    from ai.conversation_log import card_transcript
+    base = datetime(2026, 11, 3, 9)
+    rows = [("old", "user", "first try", 0), ("old", "assistant", "first answer", 1),
+            ("new", "user", "why this?", 10), ("new", "user", "[UI_RESPONSE] {}", 11),
+            ("new", "assistant", "because", 12)]
+    for sid, role, content, minute in rows:
+        await mock_db["ai_conversation_log"].insert_one({
+            "user_id": USER, "session_id": sid, "source": "birdy", "role": role, "content": content,
+            "page": "stock_card", "card_id": "c1", "agent_id": "ag1", "created_at": base + timedelta(minutes=minute),
+            **({"agent_changes": [{"tool": "get_card", "changed": "x"}]} if content == "because" else {})})
+    await mock_db["ai_conversation_log"].insert_one({
+        "user_id": OTHER, "session_id": "theirs", "source": "birdy", "role": "user", "content": "x",
+        "card_id": "c1", "created_at": base + timedelta(hours=1)})
+    out = await card_transcript(mock_db, USER, "c1")
+    assert out["session_id"] == "new"
+    assert [m["content"] for m in out["messages"]] == ["why this?", "because"]
+    assert out["messages"][1]["agent_changes"] == [{"tool": "get_card", "changed": "x"}]
+    assert out["messages"][0]["agent_changes"] == [] and out["messages"][0]["role"] == "user"
+    assert await card_transcript(mock_db, USER, "nope") == {"session_id": None, "messages": []}
+
+
+async def test_run_chat_archives_agent_chat_fields(mock_db, monkeypatch):
+    from ai.orchestrator import run_chat
+    from ai.providers.base import BaseLLMProvider, ProviderResponse
+    from ai.tools.registry import ToolRegistry
+
+    class Scripted(BaseLLMProvider):
+        model = "stub-model"
+
+        async def chat_completion(self, messages, tools=None, tool_choice="auto", temperature=0.3, max_tokens=2048):
+            return ProviderResponse(content="Sure.")
+
+    monkeypatch.setattr("ai.orchestrator.mcp_client.needs_mcp", lambda allowed: False)
+    await run_chat(provider=Scripted(), tool_registry=ToolRegistry(), db=mock_db, user_id=USER,
+                   message="why?", page="stock_card", agent_id="ag1", card_id="c1")
+    rows = await mock_db["ai_conversation_log"].find({}).sort("created_at", 1).to_list(None)
+    assert [(r["role"], r["agent_id"], r["card_id"]) for r in rows] == [("user", "ag1", "c1"), ("assistant", "ag1", "c1")]
+
+
+def test_chat_router_archives_ids_only_for_agent_pages():
+    from core.models import ChatRequest
+    ids = chat_router._archive_ids
+    assert ids(ChatRequest(message="x", page="stock_card", agent_id="a", card_id="c")) == {"agent_id": "a", "card_id": "c"}
+    assert ids(ChatRequest(message="x", page="stock_lessons", agent_id="a", card_id="c")) == {"agent_id": "a", "card_id": None}
+    assert ids(ChatRequest(message="x", page="agent_training", agent_id="a")) == {}
+    assert ids(ChatRequest(message="x")) == {}
