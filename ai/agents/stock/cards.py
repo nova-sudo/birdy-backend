@@ -7,12 +7,15 @@ resolved here, once, per line.
 """
 
 import copy
+import logging
 import re
 from datetime import datetime
 
 from ai.agents.stock.settings import resolve_mode
 from ai.agents.stock.writer import _fmt_money
 from ai.agents.store import CARDS
+
+logger = logging.getLogger(__name__)
 
 STATUS_OPEN, STATUS_FLAGGED, STATUS_SUPERSEDED = "open", "flagged", "superseded"
 STATUS_CLOSING = "closing"  # stored, but older open cards aren't closed yet: can't be applied or shown
@@ -131,6 +134,12 @@ def _lines(facts: dict, draft: dict, settings: dict, candidates: dict | None, fl
     return out
 
 
+def _spend(facts: dict) -> float | None:
+    """The client's ad spend in the card's window, from the same facts that give `leads` and the CPL."""
+    spend = facts.get("spend")
+    return None if spend is None else round(float(spend), 2)
+
+
 def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, run_id: str, *,
                candidates: dict | None = None, flag_only: bool = False, client_names=None) -> dict:
     """The card for one client, shaped as in spec section 7. `draft` is write_card's output, or
@@ -167,7 +176,7 @@ def build_card(facts: dict, decision: str, draft: dict | None, settings: dict, r
     card = {"run_id": run_id, "client_group_id": facts["client_group_id"], "client_name": facts.get("name"),
             "tag": tag, "decision": decision, "zone": facts.get("zone"), "window": facts.get("window"),
             "previous_cpl": facts.get("prev_cpl"), "current_cpl": facts.get("cpl"), "currency": facts.get("currency"),
-            "leads": facts.get("leads"), "ads_live": facts.get("ads_live"),
+            "leads": facts.get("leads"), "spend": _spend(facts), "ads_live": facts.get("ads_live"),
             "lines": lines, "additional_changes": additional, "thought_process": thought, "next_steps": next_steps,
             "status": STATUS_FLAGGED if all_flagged else STATUS_OPEN, "ai_failed": failed,
             "slack": {"channel_id": None, "ts": None}, "decided_by": None, "decided_at": None}
@@ -202,3 +211,60 @@ async def guarded_update(db, card: dict, fields: dict, *, statuses: tuple = (STA
         {"_id": card["_id"], "status": {"$in": list(statuses)}, **match},
         {"$set": {**fields, **moved, "updated_at": datetime.utcnow(), "slack.needs_update": True}, "$inc": {"version": 1}})
     return res.modified_count == 1
+
+
+TEXT_EDITABLE = ("additional_changes", "thought_process", "next_steps")
+EDIT_NOT_FOUND, EDIT_CLOSED, EDIT_BAD_LINES, EDIT_LINE_BUSY, EDIT_CONFLICT = (
+    "not_found", "card_closed", "bad_lines", "line_busy", "conflict")
+EDIT_REASONS = {
+    EDIT_NOT_FOUND: "Card not found",
+    EDIT_BAD_LINES: "Lines must be existing lines of this card",
+    EDIT_LINE_BUSY: "A line that is being or has been applied can't be removed",
+    EDIT_CONFLICT: "This card changed while you were editing it. Reload it",
+}
+PREVIEW_NOT_EDITABLE = "A preview card can't be edited"
+ALREADY_DECIDED = "This card has already been decided"
+
+
+async def edit_card(db, user_id: str, card_id: str, *, lines: list[str] | None = None,
+                    additional_changes: str | None = None, thought_process: str | None = None,
+                    next_steps: str | None = None, by: str | None = None, agent_id: str | None = None) -> dict:
+    """Edit a card still waiting on a person (PATCH /cards/{id} and the card chat share this). `original`
+    stays as Birdy wrote it. `lines` lists the line ids to keep, in order: a line can be dropped or
+    reordered, nothing else about it changes. A meaningful edit becomes a lesson. Returns
+    {"ok": True, "card": saved} or {"ok": False, "error": code, "reason": text}; never raises for a person's mistake."""
+    def fail(code: str, reason: str | None = None) -> dict:
+        return {"ok": False, "error": code, "reason": reason or EDIT_REASONS.get(code)}
+
+    q = {"_id": card_id, "user_id": user_id, "status": {"$ne": STATUS_CLOSING}}
+    if agent_id is not None:
+        q["agent_id"] = agent_id
+    card = await db[CARDS].find_one(q)
+    if card is None:
+        return fail(EDIT_NOT_FOUND)
+    if card.get("preview"):
+        return fail(EDIT_CLOSED, PREVIEW_NOT_EDITABLE)
+    if card.get("status") not in (STATUS_OPEN, STATUS_FLAGGED):
+        return fail(EDIT_CLOSED, ALREADY_DECIDED)
+    texts = {"additional_changes": additional_changes, "thought_process": thought_process, "next_steps": next_steps}
+    patch = {k: v for k, v in texts.items() if v is not None}
+    if lines is not None:
+        stored = {ln["id"]: ln for ln in card.get("lines") or []}
+        if any(i not in stored for i in lines) or len(set(lines)) != len(lines):
+            return fail(EDIT_BAD_LINES)
+        if any(ln.get("state") not in DROPPABLE_STATES for i, ln in stored.items() if i not in lines):
+            return fail(EDIT_LINE_BUSY)
+        patch["lines"] = [stored[i] for i in lines]
+    if patch and not await guarded_update(db, card, patch):
+        return fail(EDIT_CONFLICT)
+    saved = await db[CARDS].find_one({"_id": card_id})
+    if patch:
+        from ai.agents.stock.lessons import lesson_from_edit
+        from ai.agents.store import AGENTS
+        try:
+            agent = await db[AGENTS].find_one({"_id": card.get("agent_id"), "user_id": user_id})
+            if agent is not None:
+                await lesson_from_edit(db, agent, saved, by)
+        except Exception as e:  # noqa: BLE001 - a lesson is never worth failing a saved edit
+            logger.warning("stock card %s: could not record a lesson from the edit: %s", card_id, e)
+    return {"ok": True, "card": saved}

@@ -9,7 +9,10 @@ agents. The scoreboard is scored here too, and patterns in it become "Make it a 
   lesson_from_edit    a code-written lesson from a meaningful card edit (no AI call)
   lesson_from_text    text a person wrote (dismiss reason, Slack mention) -> lesson, via memory_from_note
   lessons_for_prompt  the active lessons the writer sees: this client's and the agency's, newest 50
+  record_lesson_uses  counts the lessons a card was written with (not for previews)
   keep / overrule     a person's verdict on a lesson; an overruled one no longer reaches the AI
+  edit_lesson_text    a person rewrote a lesson in chat; the old words are kept
+  remove_lesson       a lesson is taken away (the DELETE /memory route uses it too)
   score_result        won / lost / no_clear_change / never_went_live from fixed numbers
   score_due           scores the scoreboard rows whose scoring window has passed
   scan_patterns       a pattern reaching `scoring.rule_after` opens one `promote` proposal
@@ -33,7 +36,7 @@ from ai.agents.learning import (MEMORY_TEXT_MAX, NOTE_MAX, ProposalClosed, Propo
 from ai.agents.snapshot import load_ad_days
 from ai.agents.stock.scoreboard import (LOST, NEVER_WENT_LIVE, NO_CLEAR_CHANGE, OUTCOMES, UNSCORED, WON)
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_lost_spend, resolve_zones
-from ai.agents.store import MEMORY, PROPOSALS, add_memory
+from ai.agents.store import MEMORY, PROPOSALS, add_memory, deactivate_memory
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +44,7 @@ ACTIVE, OVERRULED = "active", "overruled"
 SLACK_MENTION = "slack_mention"    # anyone in a channel can say this, so it can't quietly become an agency-wide ad rule
 PROMOTE = "promote"
 LESSONS_FOR_PROMPT = 50
+LAST_USED_KEPT = 5                 # uses kept on a lesson, for "where it was used"
 FEATURE = "stock_lesson"           # the metering label for the AI call that turns text into a lesson
 MAX_SCORE_ROWS = 200               # rows scored in one catch-up; the rest wait for the next batch day
 UNSCORED_AFTER_DAYS = 14           # a row that still can't be judged this long after its window ends `unscored`
@@ -162,14 +166,28 @@ async def lesson_from_text(db, agent: dict, text: str, *, source: str, author: s
                                   feature=FEATURE, status=ACTIVE, filter_one_client=source == SLACK_MENTION)
 
 
-async def lessons_for_prompt(db, agent_id: str, gid: str) -> list[str]:
+async def lessons_for_prompt(db, agent_id: str, gid: str, *, with_ids: bool = False) -> list:
     """What the writer is told: active lessons for this client or the whole agency, newest first, 50 at most.
-    Overruled and removed lessons are left out, and so is every other agent's."""
+    Overruled and removed lessons are left out, and so is every other agent's. With `with_ids` it gives
+    `(id, text)` pairs, so the run can record which lessons each card was given."""
     rows = await (db[MEMORY].find({
         "agent_id": agent_id, "active": True, "status": {"$ne": OVERRULED},
         "$or": [{"client_group_id": None}, {"client_group_id": gid}]})
         .sort("created_at", -1).limit(LESSONS_FOR_PROMPT).to_list(length=LESSONS_FOR_PROMPT))
+    if with_ids:
+        return [(m["_id"], m["text"]) for m in rows if m.get("text")]
     return [m["text"] for m in rows if m.get("text")]
+
+
+async def record_lesson_uses(db, ids: list[str], *, run_id, card_id, client_group_id) -> None:
+    """These lessons were given to Birdy for this card: count it, and keep the last LAST_USED_KEPT uses
+    (newest last). One write for all of them. "Used" means given to the writer, nothing more."""
+    if not ids:
+        return
+    entry = {"run_id": run_id, "card_id": card_id, "client_group_id": client_group_id, "at": _utcnow()}
+    await db[MEMORY].update_many({"_id": {"$in": list(ids)}},
+                                 {"$inc": {"uses": 1},
+                                  "$push": {"last_used": {"$each": [entry], "$slice": -LAST_USED_KEPT}}})
 
 
 async def keep_lesson(db, agent_id: str, memory_id: str) -> dict | None:
@@ -185,6 +203,33 @@ async def overrule_lesson(db, agent_id: str, memory_id: str) -> dict | None:
         {"_id": memory_id, "agent_id": agent_id},
         {"$set": {"status": OVERRULED, "active": False, "overruled_at": _utcnow()}},
         return_document=ReturnDocument.AFTER)
+
+
+CHAT_EDIT = "chat_edit"            # a lesson a person rewrote through Teach Birdy
+
+
+async def edit_lesson_text(db, agent_id: str, lesson_id: str, text: str, *, author: str | None) -> dict | None:
+    """A person rewrote a lesson in chat. The old words go onto `previous_texts`, so nothing is lost.
+    None when this agent has no such lesson, or the new text is empty."""
+    text = " ".join(str(text or "").split())[:MEMORY_TEXT_MAX]
+    if not text:
+        return None
+    current = await db[MEMORY].find_one({"_id": lesson_id, "agent_id": agent_id})
+    if current is None:
+        return None
+    now = _utcnow()
+    old = {"text": current.get("text"), "source": current.get("source"), "replaced_at": now}
+    return await db[MEMORY].find_one_and_update(
+        {"_id": lesson_id, "agent_id": agent_id},
+        {"$set": {"text": text, "source": CHAT_EDIT, "edited_at": now, "author": author},
+         "$push": {"previous_texts": old}},
+        return_document=ReturnDocument.AFTER)
+
+
+async def remove_lesson(db, agent_id: str, lesson_id: str) -> bool:
+    """Remove: the lesson is no longer active. The same path as DELETE /memory/{id}. False when this
+    agent has no such active lesson."""
+    return await deactivate_memory(db, agent_id, lesson_id)
 
 
 # ---------------------------------------------------------------------------

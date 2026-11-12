@@ -8,6 +8,7 @@ lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a c
 import copy
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -16,19 +17,21 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
+from ai import conversation_log
 from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
 from ai.agents.stock import add as stock_add
 from ai.agents.stock import apply as stock_apply
+from ai.agents.stock import cards as stock_cards
 from ai.agents.stock import lessons as stock_lessons
+from ai.agents.stock import months as stock_months
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
 from ai.agents.stock import weekly as stock_weekly
-from ai.agents.stock.cards import (DROPPABLE_STATES, STATE_PROPOSED, STATUS_CLOSING, STATUS_FLAGGED, STATUS_OPEN, STATUS_PARTLY_APPLIED,
-                                   guarded_update)
+from ai.agents.stock.cards import STATE_PROPOSED, STATUS_CLOSING, STATUS_OPEN, STATUS_PARTLY_APPLIED
 from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -39,7 +42,6 @@ logger = logging.getLogger(__name__)
 
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
 OUTCOME_ROWS = 100
-CARD_EDITABLE = ("additional_changes", "thought_process", "next_steps")
 APPLY_BUDGET_SECONDS = 20      # the dashboard waits this long for lines in the request; the cron finishes the rest
 
 
@@ -295,32 +297,15 @@ async def patch_card(agent_id: str, card_id: str, body: CardPatch, current_user:
     dropped or reordered, nothing else about it changes: what it does comes from the stored line."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        agent = await _stock_agent(db, current_user, agent_id)
-        card = await db[stock_runner.CARDS].find_one(
-            {"_id": card_id, "agent_id": agent_id, "status": {"$ne": STATUS_CLOSING}})
-        if card is None:
-            raise HTTPException(status_code=404, detail="Card not found")
-        if card.get("preview"):
-            raise HTTPException(status_code=409, detail="A preview card can't be edited")
-        if card.get("status") not in (STATUS_OPEN, STATUS_FLAGGED):
-            raise HTTPException(status_code=409, detail="This card has already been decided")
-        patch = {k: getattr(body, k) for k in CARD_EDITABLE if getattr(body, k) is not None}
-        if body.lines is not None:
-            stored = {ln["id"]: ln for ln in card.get("lines") or []}
-            ids = [ln.get("id") for ln in body.lines]
-            if any(i not in stored for i in ids) or len(set(ids)) != len(ids):
-                raise HTTPException(status_code=400, detail="Lines must be existing lines of this card")
-            if any(ln.get("state") not in DROPPABLE_STATES for i, ln in stored.items() if i not in ids):
-                raise HTTPException(status_code=409, detail="A line that is being or has been applied can't be removed")
-            patch["lines"] = [stored[i] for i in ids]
-        if patch and not await guarded_update(db, card, patch):
-            raise HTTPException(status_code=409, detail="This card changed while you were editing it. Reload it")
-        saved = await db[stock_runner.CARDS].find_one({"_id": card_id})
-        if patch:
-            try:
-                await stock_lessons.lesson_from_edit(db, agent, saved, current_user)
-            except Exception as e:  # noqa: BLE001 - a lesson is never worth failing a saved edit
-                logger.warning("stock card %s: could not record a lesson from the edit: %s", card_id, e)
+        await _stock_agent(db, current_user, agent_id)
+        res = await stock_cards.edit_card(
+            db, current_user, card_id, lines=None if body.lines is None else [ln.get("id") for ln in body.lines],
+            additional_changes=body.additional_changes, thought_process=body.thought_process,
+            next_steps=body.next_steps, by=current_user, agent_id=agent_id)
+        if not res["ok"]:
+            status = {stock_cards.EDIT_NOT_FOUND: 404, stock_cards.EDIT_BAD_LINES: 400}.get(res["error"], 409)
+            raise HTTPException(status_code=status, detail=res["reason"])
+        saved = res["card"]
         return await _card_for_api(db, saved)
 
 
@@ -555,13 +540,45 @@ async def get_outcomes(agent_id: str, current_user: str = Depends(get_current_us
         return await _scoreboard(db, agent_id)
 
 
+@router.get("/{agent_id}/cards/{card_id}/chat")
+async def get_card_chat(agent_id: str, card_id: str, current_user: str = Depends(get_current_user)):
+    """The latest Birdy chat about this card, so the card's chat shows its history after a reload."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        await _stock_agent(db, current_user, agent_id)
+        if await db[agent_store.CARDS].find_one({"_id": card_id, "agent_id": agent_id}, {"_id": 1}) is None:
+            raise HTTPException(status_code=404, detail="Card not found")
+        return await conversation_log.card_transcript(db, current_user, card_id)
+
+
+_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+@router.get("/{agent_id}/months/{month}")
+async def get_month(agent_id: str, month: str, current_user: str = Depends(get_current_user)):
+    """The whole-month report: per client, the month's leads, spend, CPL and zone, and how many cards were decided."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        try:
+            if not _MONTH_RE.match(month):
+                raise ValueError(month)
+            stock_months.parse_month(month)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad_month")
+        if month > stock_months.current_month(agent, _utcnow()):
+            raise HTTPException(status_code=400, detail="future_month")
+        return await stock_months.month_rows(db, agent, month)
+
+
 @router.get("/{agent_id}/lessons")
 async def get_lessons(agent_id: str, current_user: str = Depends(get_current_user)):
     """Every lesson, overruled ones included, oldest first."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        return [agents_router._memory_to_api(m) for m in await agent_store.list_memory(db, agent_id, active_only=False)]
+        return [{"uses": 0, "last_used": [], **agents_router._memory_to_api(m)}
+                for m in await agent_store.list_memory(db, agent_id, active_only=False)]
 
 
 @router.post("/{agent_id}/lessons/{lesson_id}/keep")
