@@ -8,6 +8,7 @@ lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a c
 import copy
 import logging
 import os
+import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -22,6 +23,7 @@ from ai.agents import history as ad_history
 from ai.agents.stock import add as stock_add
 from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import lessons as stock_lessons
+from ai.agents.stock import months as stock_months
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock import slack as stock_slack
@@ -553,6 +555,26 @@ async def get_outcomes(agent_id: str, current_user: str = Depends(get_current_us
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
         return await _scoreboard(db, agent_id)
+
+
+_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
+
+
+@router.get("/{agent_id}/months/{month}")
+async def get_month(agent_id: str, month: str, current_user: str = Depends(get_current_user)):
+    """The whole-month report: per client, the month's leads, spend, CPL and zone, and how many cards were decided."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        try:
+            if not _MONTH_RE.match(month):
+                raise ValueError(month)
+            stock_months.parse_month(month)
+        except ValueError:
+            raise HTTPException(status_code=400, detail="bad_month")
+        if month > stock_months.current_month(agent, _utcnow()):
+            raise HTTPException(status_code=400, detail="future_month")
+        return await stock_months.month_rows(db, agent, month)
 
 
 @router.get("/{agent_id}/lessons")
