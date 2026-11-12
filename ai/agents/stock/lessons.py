@@ -11,6 +11,8 @@ agents. The scoreboard is scored here too, and patterns in it become "Make it a 
   lessons_for_prompt  the active lessons the writer sees: this client's and the agency's, newest 50
   record_lesson_uses  counts the lessons a card was written with (not for previews)
   keep / overrule     a person's verdict on a lesson; an overruled one no longer reaches the AI
+  edit_lesson_text    a person rewrote a lesson in chat; the old words are kept
+  remove_lesson       a lesson is taken away (the DELETE /memory route uses it too)
   score_result        won / lost / no_clear_change / never_went_live from fixed numbers
   score_due           scores the scoreboard rows whose scoring window has passed
   scan_patterns       a pattern reaching `scoring.rule_after` opens one `promote` proposal
@@ -34,7 +36,7 @@ from ai.agents.learning import (MEMORY_TEXT_MAX, NOTE_MAX, ProposalClosed, Propo
 from ai.agents.snapshot import load_ad_days
 from ai.agents.stock.scoreboard import (LOST, NEVER_WENT_LIVE, NO_CLEAR_CHANGE, OUTCOMES, UNSCORED, WON)
 from ai.agents.stock.settings import DEFAULT_SETTINGS, merge_settings, resolve_lost_spend, resolve_zones
-from ai.agents.store import MEMORY, PROPOSALS, add_memory
+from ai.agents.store import MEMORY, PROPOSALS, add_memory, deactivate_memory
 
 logger = logging.getLogger(__name__)
 
@@ -201,6 +203,33 @@ async def overrule_lesson(db, agent_id: str, memory_id: str) -> dict | None:
         {"_id": memory_id, "agent_id": agent_id},
         {"$set": {"status": OVERRULED, "active": False, "overruled_at": _utcnow()}},
         return_document=ReturnDocument.AFTER)
+
+
+CHAT_EDIT = "chat_edit"            # a lesson a person rewrote through Teach Birdy
+
+
+async def edit_lesson_text(db, agent_id: str, lesson_id: str, text: str, *, author: str | None) -> dict | None:
+    """A person rewrote a lesson in chat. The old words go onto `previous_texts`, so nothing is lost.
+    None when this agent has no such lesson, or the new text is empty."""
+    text = " ".join(str(text or "").split())[:MEMORY_TEXT_MAX]
+    if not text:
+        return None
+    current = await db[MEMORY].find_one({"_id": lesson_id, "agent_id": agent_id})
+    if current is None:
+        return None
+    now = _utcnow()
+    old = {"text": current.get("text"), "source": current.get("source"), "replaced_at": now}
+    return await db[MEMORY].find_one_and_update(
+        {"_id": lesson_id, "agent_id": agent_id},
+        {"$set": {"text": text, "source": CHAT_EDIT, "edited_at": now, "author": author},
+         "$push": {"previous_texts": old}},
+        return_document=ReturnDocument.AFTER)
+
+
+async def remove_lesson(db, agent_id: str, lesson_id: str) -> bool:
+    """Remove: the lesson is no longer active. The same path as DELETE /memory/{id}. False when this
+    agent has no such active lesson."""
+    return await deactivate_memory(db, agent_id, lesson_id)
 
 
 # ---------------------------------------------------------------------------

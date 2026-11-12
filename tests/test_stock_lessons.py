@@ -475,3 +475,28 @@ async def test_lessons_route_returns_uses(api, mock_db):
     await add_memory(mock_db, aid, text="no blue", kind="fact", source="edit")
     [row] = api.get(f"/api/agents/{aid}/lessons").json()
     assert row["uses"] == 0 and row["last_used"] == []
+
+
+async def test_edit_lesson_keeps_history(mock_db):
+    m = await add_memory(mock_db, "ag1", text="no blue", kind="fact", source="edit")
+    got = await lessons.edit_lesson_text(mock_db, "ag1", m["_id"], "  no blue ads on Fridays ", author="u1")
+    assert got["text"] == "no blue ads on Fridays" and got["source"] == "chat_edit" and got["edited_at"]
+    assert got["previous_texts"][-1]["text"] == "no blue" and got["author"] == "u1"
+    again = await lessons.edit_lesson_text(mock_db, "ag1", m["_id"], "no blue at all", author="u1")
+    assert [p["text"] for p in again["previous_texts"]] == ["no blue", "no blue ads on Fridays"]
+    assert await lessons.edit_lesson_text(mock_db, "ag1", m["_id"], "   ", author="u1") is None
+
+
+async def test_edit_lesson_other_agent_returns_none(mock_db):
+    m = await add_memory(mock_db, "ag1", text="no blue", kind="fact", source="edit")
+    assert await lessons.edit_lesson_text(mock_db, "ag2", m["_id"], "hijack", author="u2") is None
+    assert (await mock_db[MEMORY].find_one({"_id": m["_id"]}))["text"] == "no blue"
+
+
+async def test_remove_lesson_deactivates(mock_db):
+    m = await add_memory(mock_db, "ag1", text="no blue", kind="fact", source="edit")
+    assert await lessons.remove_lesson(mock_db, "ag2", m["_id"]) is False
+    assert await lessons.remove_lesson(mock_db, "ag1", m["_id"]) is True
+    assert (await mock_db[MEMORY].find_one({"_id": m["_id"]}))["active"] is False
+    assert await lessons.lessons_for_prompt(mock_db, "ag1", "g1") == []
+    assert await lessons.remove_lesson(mock_db, "ag1", m["_id"]) is False

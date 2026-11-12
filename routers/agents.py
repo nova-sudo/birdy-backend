@@ -472,7 +472,7 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        if not await agent_store.deactivate_memory(db, agent_id, memory_id):
+        if not await stock_lessons.remove_lesson(db, agent_id, memory_id):
             raise HTTPException(status_code=404, detail="Memory not found")
         return {"ok": True}
 
