@@ -74,6 +74,7 @@ async def test_set_purpose_marks_step(mock_db):
 
 async def test_draft_playbook_rejects_unknown_kind(mock_db):
     agent = await create_agent(mock_db)
+    await t.set_purpose(mock_db, U, name="Cutter", description="Pauses costly ads")
     before = await rule(mock_db, agent, "pause_over_target")
     for rules in ([{"kind": "scale_budget", "enabled": True, "params": {}}],
                   [{"kind": "pause_over_target", "enabled": True, "params": {"bogus": 1}}],
@@ -88,11 +89,20 @@ async def test_draft_playbook_rejects_unknown_kind(mock_db):
         {"kind": "nope", "enabled": True}])
     assert out["ok"] is False
     assert (await rule(mock_db, agent, "pause_over_target"))["version"] == before["version"]
-    assert await steps(mock_db, agent) == {}
+    assert await steps(mock_db, agent) == {"purpose": True}
+
+
+async def test_draft_playbook_needs_purpose_first(mock_db):
+    agent = await create_agent(mock_db)
+    before = await rule(mock_db, agent, "pause_over_target")
+    out = await t.draft_playbook(mock_db, U, rules=[{"kind": "pause_over_target", "enabled": True}])
+    assert out["ok"] is False and out["error"] == "purpose_first" and "set_purpose" in out["detail"]
+    assert (await rule(mock_db, agent, "pause_over_target"))["version"] == before["version"]
 
 
 async def test_draft_playbook_writes_rules(mock_db):
     agent = await create_agent(mock_db)
+    await t.set_purpose(mock_db, U, name="Cutter", description="Pauses costly ads")
     out = await t.draft_playbook(mock_db, U, rules=[
         {"kind": "pause_over_target", "enabled": True, "params": {"cpl_multiple": 2}},
         {"kind": "revive_winner", "enabled": False},
@@ -106,7 +116,7 @@ async def test_draft_playbook_writes_rules(mock_db):
     assert by_kind["pause_over_target"]["params"]["cpl_multiple"] == 2
     assert by_kind["revive_winner"]["enabled"] is False and by_kind["flag_no_spend"]["enabled"] is True
     # A draft is not a confirmation.
-    assert await steps(mock_db, agent) == {}
+    assert await steps(mock_db, agent) == {"purpose": True}
 
 
 async def test_set_rule_param_shows_playbook_again_until_confirmed(mock_db):
@@ -379,22 +389,22 @@ async def test_ui_block_reaches_agent_changes(mock_db, monkeypatch):
     t.register_agent_tools(reg)
     await create_agent(mock_db)
     provider = Scripted([
+        call("set_purpose", {"name": "Cutter", "description": "Pauses costly ads"}, "d"),
         call("draft_playbook", {"rules": [{"kind": "pause_over_target", "enabled": True,
                                            "params": {"cpl_multiple": 2}}]}, "a"),
         call("show_block", {"block": "clients"}, "b"),
         call("show_block", {"block": "nope"}, "c"),
-        call("set_purpose", {"name": "Cutter", "description": "Pauses costly ads"}, "d"),
         ProviderResponse(content="Here's the playbook."),
     ])
     out = await run_chat(provider=provider, tool_registry=reg, db=mock_db, user_id=U,
                          message="pause ads that cost too much", page="agent_setup")
     changes = out["agent_changes"]
-    assert [c["tool"] for c in changes] == ["draft_playbook", "show_block", "set_purpose"]
-    playbook = changes[0]
+    assert [c["tool"] for c in changes] == ["set_purpose", "draft_playbook", "show_block"]
+    playbook = changes[1]
     assert playbook["changed"] == "playbook" and playbook["ui_block"] == "playbook"
     assert {r["kind"]: r for r in playbook["playbook"]}["pause_over_target"]["params"]["cpl_multiple"] == 2
-    assert changes[1] == {"tool": "show_block", "ui_block": "clients"}
-    assert changes[2]["changed"] == "purpose" and "ui_block" not in changes[2]
+    assert changes[2] == {"tool": "show_block", "ui_block": "clients"}
+    assert changes[0]["changed"] == "purpose" and "ui_block" not in changes[0]
 
 
 @pytest.mark.parametrize("page,expected", [("agent_setup", "a1"), ("agent_training", "a1"), ("dashboard", None)])

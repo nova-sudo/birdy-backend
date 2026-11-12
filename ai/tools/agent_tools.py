@@ -287,6 +287,11 @@ async def draft_playbook(db, user_id, rules=None, **_):
     agent = await _agent(db, user_id)
     if agent is None:
         return _fail(NOT_FOUND)
+    if not _steps(agent)["purpose"]:
+        # Without this the model sometimes drafted (or only described) a playbook and never named the
+        # agent, leaving "What it does" open so Turn on could never unlock.
+        return _fail("purpose_first", detail="Save the agent's name and description with set_purpose first, "
+                                             "then call draft_playbook again.")
     if not isinstance(rules, list) or not rules:
         return _fail("rules must be a non-empty list of {kind, enabled, params}")
     seen: set = set()
