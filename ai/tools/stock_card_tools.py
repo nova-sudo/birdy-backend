@@ -40,6 +40,9 @@ _GOING_OUT = (STATE_APPLIED, STATE_QUEUED, STATE_APPLYING)
 # The card the chat is about. routers/chat.py sets it for one request on page "stock_card" and
 # resets it afterwards; None means "no card", never a guess.
 current_stock_card: ContextVar[str | None] = ContextVar("current_stock_card", default=None)
+# True when the person opened the card read-only (a past run, a month, a client outside today's batch).
+# routers/chat.py sets it with current_stock_card; every action tool then refuses with card_closed.
+current_card_read_only: ContextVar[bool] = ContextVar("current_card_read_only", default=False)
 
 
 def _fail(error: str, **extra) -> dict:
@@ -67,7 +70,12 @@ async def _agent(db, user_id, card: dict) -> dict | None:
 
 
 def _closed(card: dict, statuses=_ACTS_ON) -> bool:
-    return bool(card.get("preview")) or card.get("status") not in statuses
+    return current_card_read_only.get() or bool(card.get("preview")) or card.get("status") not in statuses
+
+
+def _refuse_closed(card: dict) -> dict:
+    extra = {"read_only": True} if current_card_read_only.get() else {}
+    return _fail(CARD_CLOSED, status=card.get("status"), preview=bool(card.get("preview")), **extra)
 
 
 _LINE_KEYS = ("id", "kind", "ad_name", "mode", "state", "error", "spend", "leads", "cpl", "currency", "source", "flags")
@@ -78,6 +86,7 @@ def card_view(card: dict) -> dict:
     return {
         "id": card["_id"], "client_name": card.get("client_name"), "client_group_id": card.get("client_group_id"),
         "status": card.get("status"), "preview": bool(card.get("preview")), "can_act": not _closed(card),
+        "read_only": current_card_read_only.get(),
         "tag": card.get("tag"), "zone": card.get("zone"), "window": card.get("window"),
         "currency": card.get("currency"), "previous_cpl": card.get("previous_cpl"), "current_cpl": card.get("current_cpl"),
         "leads": card.get("leads"), "spend": card.get("spend"), "ads_live": card.get("ads_live"),
@@ -112,7 +121,7 @@ async def apply_card_lines(db, user_id, mongo_client=None, line_ids=None, **_):
     if card is None:
         return _fail(NOT_FOUND)
     if _closed(card, _STILL_DECIDING):
-        return _fail(CARD_CLOSED, status=card.get("status"), preview=bool(card.get("preview")))
+        return _refuse_closed(card)
     ids = [str(i) for i in line_ids] if isinstance(line_ids, list) and line_ids else None
     res = await stock_apply.apply_card(db, mongo_client, user_id, card["_id"], by=user_id, source=SOURCE,
                                        line_ids=ids, budget_s=CHAT_BUDGET_S)
@@ -140,7 +149,7 @@ async def dismiss_card(db, user_id, mongo_client=None, reason=None, **_):
     if card is None:
         return _fail(NOT_FOUND)
     if _closed(card, _STILL_DECIDING):
-        return _fail(CARD_CLOSED, status=card.get("status"), preview=bool(card.get("preview")))
+        return _refuse_closed(card)
     reason = str(reason).strip() if reason else None
     res = await stock_apply.dismiss_card(db, user_id, card["_id"], by=user_id, source=SOURCE, reason=reason or None)
     outcome = res.get("outcome")
@@ -159,7 +168,7 @@ async def edit_card(db, user_id, mongo_client=None, keep_line_ids=None, addition
     if card is None:
         return _fail(NOT_FOUND)
     if _closed(card):
-        return _fail(CARD_CLOSED, status=card.get("status"), preview=bool(card.get("preview")))
+        return _refuse_closed(card)
     keep = [str(i) for i in keep_line_ids] if isinstance(keep_line_ids, list) else None
     res = await stock_cards.edit_card(db, user_id, card["_id"], lines=keep, additional_changes=additional_changes,
                                       thought_process=thought_process, next_steps=next_steps, by=user_id,

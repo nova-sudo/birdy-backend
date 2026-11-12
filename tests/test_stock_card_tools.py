@@ -33,7 +33,9 @@ def calm_ai(monkeypatch):
 @pytest.fixture(autouse=True)
 def _reset_card():
     token = t.current_stock_card.set(None)
+    ro_token = t.current_card_read_only.set(False)
     yield
+    t.current_card_read_only.reset(ro_token)
     t.current_stock_card.reset(token)
 
 
@@ -107,6 +109,27 @@ async def test_apply_lines_already_decided_is_not_ok(mock_db):
     out = await t.apply_card_lines(mock_db, USER, line_ids=["l1"])
     assert out["ok"] is False and out["error"] == "nothing_to_apply" and out["count"] == 0
     assert "changed" not in out
+
+
+@pytest.mark.parametrize("status", ["open", "flagged", "partly_applied"])
+async def test_read_only_chat_refuses_every_card_action(mock_db, monkeypatch, status):
+    """A past run, a month, or a client outside today's batch: the dialog says nothing changes, so the
+    tools refuse even when the card itself is still open."""
+    await _card(mock_db, status=status)
+    t.current_card_read_only.set(True)
+
+    async def never(*a, **k):
+        raise AssertionError("a read-only chat must not change the card")
+
+    monkeypatch.setattr(stock_apply, "apply_card", never)
+    monkeypatch.setattr(stock_apply, "dismiss_card", never)
+    monkeypatch.setattr(stock_cards, "edit_card", never)
+    for tool, kw in ((t.apply_card_lines, {}), (t.dismiss_card, {"reason": "x"}), (t.edit_card, {"next_steps": "x"})):
+        out = await tool(mock_db, USER, **kw)
+        assert out["ok"] is False and out["error"] == "card_closed" and out["read_only"] is True, tool.__name__
+    got = await t.get_card(mock_db, USER)
+    assert got["card"]["can_act"] is False and got["card"]["read_only"] is True
+    assert (await t.prompt_context(mock_db, USER))["card"]["can_act"] is False
 
 
 async def test_dismiss_with_reason_makes_lesson(mock_db):
@@ -242,6 +265,42 @@ async def test_chat_route_sets_the_card_for_the_tools(mock_db, mock_mongo_client
         app.dependency_overrides.pop(get_current_user, None)
     assert seen == {"card": "c1", "card_id": "c1", "agent_id": agent["_id"]}
     assert t.current_stock_card.get() is None
+
+
+async def test_chat_route_passes_read_only_to_the_tools(mock_db, mock_mongo_client, monkeypatch):
+    agent = await _card(mock_db)
+    t.current_stock_card.set(None)
+    seen = []
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+
+    async def ok(*a, **k):
+        return None
+
+    async def provider(user, db):
+        return object()
+
+    async def run_chat(**kw):
+        seen.append(t.current_card_read_only.get())
+        return {"reply": "hi", "tools_used": [], "session_id": "s1"}
+
+    monkeypatch.setattr(chat_router, "get_mongo_client", fake_client)
+    monkeypatch.setattr(chat_router, "check_credits", ok)
+    monkeypatch.setattr(chat_router, "get_provider_for_user", provider)
+    monkeypatch.setattr(chat_router, "run_chat", run_chat)
+    app.dependency_overrides[get_current_user] = lambda: USER
+    try:
+        body = {"message": "do it", "page": "stock_card", "card_id": "c1", "agent_id": agent["_id"]}
+        assert TestClient(app).post("/api/chat", json={**body, "card_read_only": True}).status_code == 200
+        assert TestClient(app).post("/api/chat", json=body).status_code == 200
+        # only the stock_card page reads it
+        assert TestClient(app).post("/api/chat", json={"message": "hi", "card_read_only": True}).status_code == 200
+    finally:
+        app.dependency_overrides.pop(get_current_user, None)
+    assert seen == [True, False, False]
+    assert t.current_card_read_only.get() is False
 
 
 async def test_run_chat_records_card_changes(mock_db, monkeypatch):

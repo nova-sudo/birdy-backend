@@ -30,7 +30,8 @@ from ai.tools.page_view_tools import register_page_view_tools
 from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
 from ai.tools.agent_tools import current_training_agent
-from ai.tools.stock_card_tools import current_stock_card, load_chat_card, register_stock_card_tools
+from ai.tools.stock_card_tools import (current_card_read_only, current_stock_card, load_chat_card,
+                                      register_stock_card_tools)
 from ai.tools.stock_lesson_tools import current_lessons_agent, load_lessons_agent, register_stock_lesson_tools
 
 logger = logging.getLogger(__name__)
@@ -117,6 +118,7 @@ async def chat(
             agent_token = current_training_agent.set(
                 request.agent_id if request.page in AGENT_CHAT_PAGES else None)
             card_token = current_stock_card.set(stock_card_id)
+            read_only_token = current_card_read_only.set(bool(stock_card_id and request.card_read_only))
             lessons_token = current_lessons_agent.set(lessons_agent_id)
             try:
                 result = await run_chat(
@@ -138,6 +140,7 @@ async def chat(
                 )
             finally:
                 current_lessons_agent.reset(lessons_token)
+                current_card_read_only.reset(read_only_token)
                 current_stock_card.reset(card_token)
                 current_training_agent.reset(agent_token)
             return ChatResponse(**result)

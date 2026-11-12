@@ -33,3 +33,9 @@ def test_prompt_without_card_says_so():
 
 def test_prompt_names_nothing_to_apply():
     assert "nothing_to_apply" in stock_card_chat.system_prompt({"card": CARD})
+
+
+def test_prompt_read_only_card_is_for_questions():
+    p = stock_card_chat.system_prompt({"card": {**CARD, "can_act": False, "read_only": True}})
+    assert "read-only" in p and "Only answer questions" in p
+    assert "read-only" not in stock_card_chat.system_prompt({"card": CARD})

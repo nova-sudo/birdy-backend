@@ -40,6 +40,12 @@ How to answer:
 - Questions about why: answer from the reasoning, the lines' figures and flags, and the lessons."""
 
 
+READ_ONLY = """This card is read-only: the person opened it from a past report, a month, or as a client outside
+today's batch, and the dialog tells them nothing here changes anything. Only answer questions about it. Don't
+offer to apply, skip or edit anything; the card tools refuse (card_closed). If they ask you to act, say this
+report is read-only and that today's report is where changes are made."""
+
+
 def _lessons(lessons) -> list[str]:
     out = []
     for x in (lessons or [])[:LESSONS_MAX]:
@@ -62,5 +68,5 @@ def system_prompt(context: dict) -> str:
     facts["targets"] = (context or {}).get("zones")
     facts["alerts"] = (context or {}).get("alerts") or []
     facts["lines"] = card.get("lines") or []
-    parts = [RULES, TRUST_BOUNDARY, _block("facts", facts), _block("lessons", _lessons((context or {}).get("lessons")))]
+    parts = [RULES, *([READ_ONLY] if card.get("read_only") else []), TRUST_BOUNDARY, _block("facts", facts), _block("lessons", _lessons((context or {}).get("lessons")))]
     return "\n\n".join(parts)
