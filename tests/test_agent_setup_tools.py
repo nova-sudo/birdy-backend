@@ -320,6 +320,11 @@ def test_setup_prompt_drafts_purpose_and_playbook_without_asking_for_a_name():
     assert "same turn" in p
 
 
+def test_setup_prompt_runs_preview_even_with_no_practice_cases():
+    p = agent_setup.system_prompt().lower()
+    assert "no_cases, still call run_preview" in p
+
+
 def test_setup_tools_registered():
     reg = ToolRegistry()
     t.register_agent_tools(reg)
