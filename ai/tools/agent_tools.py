@@ -124,7 +124,11 @@ async def set_rule_param(db, user_id, rule_kind=None, param=None, value=None, **
     params = rule.get("params") or {}
     before = params.get(param, DEFAULT_PARAMS[rule_kind].get(param))
     await store.update_rule(db, agent["_id"], rule["_id"], params={**params, param: value})
-    return {"ok": True, "changed": {"rule_kind": rule_kind, "param": param, "before": before, "after": value}}
+    result = {"ok": True, "changed": {"rule_kind": rule_kind, "param": param, "before": before, "after": value}}
+    if not _steps(agent)["playbook"]:
+        # Still being drafted in setup: show the updated playbook again so they can say yes to it.
+        result.update(ui_block="playbook", playbook=_playbook(await store.list_rules(db, agent["_id"])))
+    return result
 
 
 async def set_client_target(db, user_id, client_name=None, cpl=None, **_):
@@ -381,7 +385,11 @@ async def ask_practice_case(db, user_id, mongo_client=None, **_):
         return _fail("ready", confidence=score)  # practice is done: on to the preview
     case = await replay.next_practice_case(db, mongo_client, agent)
     if case is None:
-        return _fail("no_cases", confidence=score)
+        # Practice cases come from the watched clients' ads over the last PRACTICE_DAYS days. With
+        # none to ask, the score can't reach READY_SCORE, so say why and how to unblock it.
+        return _fail("no_cases", confidence=score, days=replay.PRACTICE_DAYS,
+                     detail="The watched clients have no ads to practise on from the last "
+                            f"{replay.PRACTICE_DAYS} days. Watch more clients, ones with ads running recently.")
     return {"ok": True, "ui_block": "practice", "case": {k: case.get(k) for k in PUBLIC_PRACTICE_KEYS},
             "confidence": score}
 

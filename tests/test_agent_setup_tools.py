@@ -109,6 +109,19 @@ async def test_draft_playbook_writes_rules(mock_db):
     assert await steps(mock_db, agent) == {}
 
 
+async def test_set_rule_param_shows_playbook_again_until_confirmed(mock_db):
+    agent = await create_agent(mock_db)
+    out = await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="zero_lead_spend", value=40)
+    assert out["ok"] is True and out["ui_block"] == "playbook"
+    by_kind = {r["kind"]: r for r in out["playbook"]}
+    assert by_kind["pause_over_target"]["params"]["zero_lead_spend"] == 40
+
+    # Once the playbook is confirmed, a later edit (training, settings) shows no setup block.
+    await t.confirm_playbook(mock_db, U)
+    out = await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="zero_lead_spend", value=50)
+    assert out["ok"] is True and "ui_block" not in out and "playbook" not in out
+
+
 async def test_confirm_playbook_sets_topics(mock_db):
     agent = await create_agent(mock_db)
     await group(mock_db, "g1", "Acme", cpl=20)
@@ -232,6 +245,8 @@ async def test_ask_practice_case_hides_answer(mock_db, mock_mongo_client, monkey
     await mock_db[store.PRACTICE].update_one({"_id": stored["_id"]}, {"$set": {"resolution": "agreed"}})
     out = await t.ask_practice_case(mock_db, U, mongo_client=mock_mongo_client)
     assert out["ok"] is False and out["error"] == "no_cases" and out["confidence"]["ready"] is False
+    # Says why there's nothing to practise on, so Birdy can explain the locked Turn on.
+    assert out["days"] == replay.PRACTICE_DAYS and "Watch more clients" in out["detail"]
 
 
 async def test_ask_practice_case_stops_when_ready(mock_db, mock_mongo_client, monkeypatch):
@@ -323,6 +338,12 @@ def test_setup_prompt_drafts_purpose_and_playbook_without_asking_for_a_name():
 def test_setup_prompt_runs_preview_even_with_no_practice_cases():
     p = agent_setup.system_prompt().lower()
     assert "no_cases, still call run_preview" in p
+    assert "why turn on is locked" in p and "change next to clients" in p
+
+
+def test_setup_prompt_reconfirms_a_changed_playbook():
+    p = agent_setup.system_prompt()
+    assert 'end with "Does this look right?" again' in p and "never move on to the next step" in p
 
 
 def test_setup_tools_registered():

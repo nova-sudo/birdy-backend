@@ -42,8 +42,8 @@ async def rule(db, agent, kind):
 async def test_set_rule_param_validates_and_versions(mock_db):
     agent = await create_agent(mock_db, U)
     out = await t.set_rule_param(mock_db, U, rule_kind="pause_over_target", param="cpl_multiple", value=2)
-    assert out == {"ok": True, "changed": {"rule_kind": "pause_over_target", "param": "cpl_multiple",
-                                           "before": 1.5, "after": 2}}
+    assert out["ok"] is True and out["changed"] == {"rule_kind": "pause_over_target", "param": "cpl_multiple",
+                                                    "before": 1.5, "after": 2}
     r = await rule(mock_db, agent, "pause_over_target")
     assert r["params"]["cpl_multiple"] == 2 and r["version"] == 2
     assert r["params"]["patience_days"] == DEFAULT_PARAMS["pause_over_target"]["patience_days"]
@@ -237,7 +237,8 @@ async def test_run_chat_returns_agent_changes(mock_db, monkeypatch):
     ])
     out = await run_chat(provider=provider, tool_registry=reg, db=mock_db, user_id=U,
                          message="pause at 2x", page="agent_training")
-    assert out["agent_changes"] == [
+    # A draft's playbook isn't confirmed, so set_rule_param also carries it (setup's playbook block).
+    assert [{k: c[k] for k in ("tool", "changed")} for c in out["agent_changes"]] == [
         {"tool": "set_rule_param", "changed": {"rule_kind": "pause_over_target", "param": "cpl_multiple",
                                                "before": 1.5, "after": 2}},
         {"tool": "answer_topic", "changed": {"topic": "pause", "answered": True}},
