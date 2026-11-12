@@ -43,6 +43,7 @@ from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from routers.dashboard import _suggestion_to_api
 from services import client_targets
+from services import slack_bot_service
 
 logger = logging.getLogger(__name__)
 
@@ -62,11 +63,12 @@ def _agent_to_api(doc: dict) -> dict:
         "name": doc.get("name"),
         "settings": doc.get("settings") or {},
         "status": doc.get("status"),
-        "scope": doc.get("scope") or {},
+        "scope": {"slack_channel_id": None, **(doc.get("scope") or {})},
         "permissions": doc.get("permissions") or {},
         "guardrails": doc.get("guardrails") or {},
         "client_caps": doc.get("client_caps") or {},
-        "training": doc.get("training") or {},
+        "description": doc.get("description") or "",
+        "training": _training_to_api(doc.get("training")),
         "confidence": doc.get("confidence") or {},
         "last_run": doc.get("last_run"),
         "last_run_at": doc.get("last_run_at"),
@@ -76,6 +78,12 @@ def _agent_to_api(doc: dict) -> dict:
     if doc.get("type") == agent_store.TYPE_STOCK:
         out["add_writes_enabled"] = stock_settings.add_writes_enabled()  # setup shows Add as Flag only while off
     return out
+
+
+def _training_to_api(training: dict | None) -> dict:
+    """Every setup step is present (False until done), whatever the stored doc has."""
+    training = training or {}
+    return {**training, "steps": {k: bool((training.get("steps") or {}).get(k)) for k in agent_store.STEP_KEYS}}
 
 
 def _rule_to_api(doc: dict) -> dict:
@@ -114,7 +122,8 @@ def _validate_params(kind: str, params: dict) -> None:
 
 
 _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
-SCOPE_KEYS = {"client_group_ids", "schedule"}
+SCOPE_KEYS = {"client_group_ids", "schedule", "slack_channel_id"}
+DESCRIPTION_MAX = 280
 
 
 def _validate_schedule(sched) -> dict:
@@ -202,6 +211,7 @@ class AgentPatch(BaseModel):
     permissions: Optional[dict] = None
     guardrails: Optional[dict] = None
     client_caps: Optional[dict] = None
+    description: Optional[str] = None
     move_claims: bool = False          # take over clients another agent acts on
     only_flag: Optional[list[str]] = None  # stay watching these clients without claiming them
 
@@ -257,6 +267,14 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
             flag_only = [g for g in (body.only_flag if body.only_flag is not None
                                      else current.get(FLAG_ONLY_KEY) or []) if g in eff_ids]
             merged_scope[FLAG_ONLY_KEY] = flag_only
+            if "slack_channel_id" in body.scope:
+                channel = body.scope["slack_channel_id"]
+                if channel is not None and not isinstance(channel, str):
+                    raise HTTPException(status_code=400, detail="slack_channel_id must be a channel id or null")
+                channel = (channel or "").strip() or None
+                if channel and not await slack_bot_service.user_has_channel(db, current_user, channel):
+                    raise HTTPException(status_code=400, detail="Pick a channel from your Slack workspace")
+                merged_scope["slack_channel_id"] = channel
             patch["scope"] = merged_scope
             if agent.get("status") == "active":
                 resp = await _claim_scope(db, current_user, agent_id, eff_ids,
@@ -296,8 +314,34 @@ async def patch_agent(agent_id: str, body: AgentPatch, current_user: str = Depen
                     raise HTTPException(status_code=400, detail="client_caps values must be numbers >= 0")
             patch["client_caps"] = body.client_caps
 
+        if body.description is not None:
+            description = body.description.strip()
+            if len(description) > DESCRIPTION_MAX:
+                raise HTTPException(status_code=400, detail=f"Description must be at most {DESCRIPTION_MAX} characters")
+            patch["description"] = description
+
         updated = await agent_store.update_agent(db, current_user, agent_id, patch)
+        steps = _patch_steps(body, updated)
+        for key in steps:
+            await agent_store.mark_step(db, agent_id, key)
+        if steps:
+            updated = await agent_store.get_agent(db, current_user, agent_id)
         return _agent_to_api(updated)
+
+
+def _patch_steps(body: "AgentPatch", agent: dict) -> list[str]:
+    """The setup steps a saved PATCH completes."""
+    steps = []
+    scope = body.scope or {}
+    if scope.get("client_group_ids"):
+        steps.append("clients")
+    if body.permissions is not None or body.guardrails is not None:
+        steps.append("permissions")
+    if "schedule" in scope:
+        steps.append("schedule")
+    if (agent.get("scope") or {}).get("slack_channel_id") and "slack_channel_id" in scope:
+        steps.append("slack")
+    return steps
 
 
 @router.get("/{agent_id}/claims")

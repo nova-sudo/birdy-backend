@@ -275,7 +275,8 @@ async def run_agent(db, mongo_client, agent: dict, *, as_of: date,
             # Slack (it still shows in the work list's auto-run section).
             docs = [d for d in docs if not _silent_auto_run(d, rules_by_id)]
             if docs:
-                await post_new_suggestions(db, user_id, docs)
+                await post_new_suggestions(db, user_id, docs,
+                                           channel_id=(agent.get("scope") or {}).get("slack_channel_id"))
         except Exception as e:
             logger.warning("agent runner: Slack notify failed for %s: %s", user_id, e)
     if updated_docs:

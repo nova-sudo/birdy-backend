@@ -100,7 +100,7 @@ def meta_calls(monkeypatch):
 def no_slack(monkeypatch):
     posted = []
 
-    async def fake_post(db, user_id, docs):
+    async def fake_post(db, user_id, docs, **kw):
         posted.extend(docs)
         return len(docs)
 
@@ -519,3 +519,50 @@ async def test_reupsert_keeps_undone_at_and_refreshes_rule_version(mock_db):
     saved = await mock_db[sstore.SUGGESTIONS].find_one({"_id": doc["_id"]})
     assert saved["undone_at"] and doc2["undone_at"] == saved["undone_at"]
     assert saved["rule_version"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Slack: the agent's own channel, else the account's notify channel
+# ---------------------------------------------------------------------------
+
+async def test_runner_posts_to_agent_channel(mock_db, mock_mongo_client, meta_calls, monkeypatch):
+    seen = []
+
+    async def fake_post(db, user_id, docs, *, channel_id=None):
+        seen.append(channel_id)
+        return len(docs)
+
+    monkeypatch.setattr("services.slack_suggestion_notifier.post_new_suggestions", fake_post)
+    await _seed_client(mock_db, "cg1")
+    agent = await _agent(mock_db, ["cg1"])
+    agent = await update_agent(mock_db, USER, agent["_id"], {
+        "scope": {**agent["scope"], "slack_channel_id": "C_AGENT"}})
+    await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+    assert seen == ["C_AGENT"]
+
+
+async def test_runner_falls_back_to_notify_target(mock_db, mock_mongo_client, meta_calls, monkeypatch):
+    import services.slack_suggestion_notifier as n
+    posted = []
+
+    async def target(db, user_id):
+        return "tok", "C_ACCOUNT"
+
+    async def token(db, user_id):
+        return "tok"
+
+    async def fake_post_one(db, user_id, doc, *, bot_token=None, channel_id=None):
+        posted.append((bot_token, channel_id))
+        return "ts"
+
+    monkeypatch.setattr(n, "get_notify_target", target)
+    monkeypatch.setattr(n, "get_decrypted_bot_token_for_user", token)
+    monkeypatch.setattr(n, "post_suggestion", fake_post_one)
+    await _seed_client(mock_db, "cg1")
+    agent = await _agent(mock_db, ["cg1"])
+    await runner.run_agent(mock_db, mock_mongo_client, agent, as_of=AS_OF)
+    assert posted == [("tok", "C_ACCOUNT")]
+
+    # With a channel of its own, that channel is used with the same bot token.
+    assert await n.post_new_suggestions(mock_db, USER, [{"id": "s1"}], channel_id="C_AGENT") == 1
+    assert posted[-1] == ("tok", "C_AGENT")
