@@ -236,8 +236,13 @@ async def prompt_context(db, user_id) -> dict:
 
 def change_entry(tool: str, result: dict) -> dict | None:
     """The `agent_changes` entry for one tool result, or None when nothing changed. Carries the count of
-    lines that went out, so the chat can say "2 applied"."""
-    if not isinstance(result, dict) or not result.get("changed"):
+    lines that went out, so the chat can say "2 applied". A card_closed or conflict refusal is "stale":
+    the card moved on without the chat (the cron, Slack, another tab), so the sheet must re-read it."""
+    if not isinstance(result, dict):
+        return None
+    if not result.get("ok") and result.get("error") in (CARD_CLOSED, CONFLICT):
+        return {"tool": tool, "changed": "stale"}
+    if not result.get("changed"):
         return None
     entry = {"tool": tool, "changed": result["changed"]}
     if "count" in result:

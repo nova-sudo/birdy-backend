@@ -127,9 +127,19 @@ async def test_read_only_chat_refuses_every_card_action(mock_db, monkeypatch, st
     for tool, kw in ((t.apply_card_lines, {}), (t.dismiss_card, {"reason": "x"}), (t.edit_card, {"next_steps": "x"})):
         out = await tool(mock_db, USER, **kw)
         assert out["ok"] is False and out["error"] == "card_closed" and out["read_only"] is True, tool.__name__
+        assert t.change_entry(tool.__name__, out) == {"tool": tool.__name__, "changed": "stale"}
     got = await t.get_card(mock_db, USER)
     assert got["card"]["can_act"] is False and got["card"]["read_only"] is True
     assert (await t.prompt_context(mock_db, USER))["card"]["can_act"] is False
+
+
+def test_refusals_tell_the_sheet_to_re_read():
+    """card_closed and conflict mean the sheet is stale: they become a "stale" change for the FE."""
+    assert t.change_entry("apply_card_lines", {"ok": False, "error": "card_closed"}) == {
+        "tool": "apply_card_lines", "changed": "stale"}
+    assert t.change_entry("edit_card", {"ok": False, "error": "conflict"})["changed"] == "stale"
+    assert t.change_entry("apply_card_lines", {"ok": False, "error": "nothing_to_apply"}) is None
+    assert t.change_entry("add_lesson", {"ok": False, "error": "empty_lesson"}) is None
 
 
 async def test_dismiss_with_reason_makes_lesson(mock_db):
