@@ -281,7 +281,7 @@ def mcp_call(mock_db, monkeypatch, subscription_state):
     """Call an MCP tool through the real ASGI app (auth, middleware, tool) as a minted-token user.
 
     await mcp_call("get_alerts", {}, user="alice@example.com", scope="birdy.read", token_type="mcp")
-    -> SimpleNamespace(is_error, text). `scope=None` leaves the scope claim out entirely.
+    -> SimpleNamespace(is_error, text). `scope=None` leaves the scope claim out; `token_type=None` leaves `type` out.
     """
     import time
     import uuid
@@ -305,7 +305,9 @@ def mcp_call(mock_db, monkeypatch, subscription_state):
     monkeypatch.setattr("ai.mcp.server.is_mcp_token_valid", _token_valid)
 
     async def _call(name, args=None, *, user="alice@example.com", scope=None, token_type="access"):
-        claims = {"sub": user, "type": token_type, "exp": int(time.time()) + 600}
+        claims = {"sub": user, "exp": int(time.time()) + 600}
+        if token_type is not None:  # None leaves `type` out entirely
+            claims["type"] = token_type
         if scope is not None:
             claims["scope"] = scope
         if token_type == "mcp":

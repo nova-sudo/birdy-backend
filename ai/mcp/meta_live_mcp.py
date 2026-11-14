@@ -28,7 +28,7 @@ from core.mongo_client import get_shared_mongo_client
 from core.utils import get_result_value
 from integrations.facebook_utils.facebook import get_facebook_token
 from services.meta_campaign_scope import campaign_filter
-from ai.mcp.access import READ, WRITE
+from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 logger = logging.getLogger(__name__)

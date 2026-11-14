@@ -36,6 +36,7 @@ LIVE = {"tags": {"write", "live"}, "annotations": {"readOnlyHint": False, "destr
 
 MCP_RATE_LIMIT_PER_MINUTE = 120
 _RATE_TTL_SECONDS = 120
+_index_ready = False
 
 
 def token_scopes(claims: dict) -> set[str]:
@@ -43,14 +44,20 @@ def token_scopes(claims: dict) -> set[str]:
     `type: "access"` tokens and manual tokens issued before scopes existed)."""
     scope = claims.get("scope")
     if scope is None:
-        return {READ_SCOPE, WRITE_SCOPE}
+        # Only the two token kinds that predate scopes get full access by default.
+        if claims.get("type") in ("access", "mcp"):
+            return {READ_SCOPE, WRITE_SCOPE}
+        return set()
     return set(str(scope).split())
 
 
 async def _enforce_rate_limit(db, user_id: str) -> None:
     minute = int(time.time() // 60)
+    global _index_ready
     coll = db["mcp_rate"]
-    await coll.create_index("expires_at", expireAfterSeconds=0)
+    if not _index_ready:
+        await coll.create_index("expires_at", expireAfterSeconds=0)
+        _index_ready = True
     doc = await coll.find_one_and_update(
         {"user_id": user_id, "minute": minute},
         {"$inc": {"count": 1}, "$setOnInsert": {"expires_at": _expiry()}},
@@ -76,7 +83,9 @@ class BirdyAccessMiddleware(Middleware):
                 'This Birdy connection is view-only. Reconnect with "View and make changes" to do this.'
             )
 
-        if claims.get("type") == "mcp":
+        # Only the internal orchestrator/login token is exempt; any other type (mcp, missing,
+        # refresh, ...) is treated as external.
+        if claims.get("type") != "access":
             client = get_shared_mongo_client()
             try:
                 await billing_middleware.require_active_subscription(claims.get("sub"), client)
@@ -87,6 +96,6 @@ class BirdyAccessMiddleware(Middleware):
                     f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
                     "to keep using Birdy here."
                 )
-            await _enforce_rate_limit(get_db(client), claims["sub"])
+            await _enforce_rate_limit(get_db(client), claims.get("sub"))
 
         return await call_next(context)
