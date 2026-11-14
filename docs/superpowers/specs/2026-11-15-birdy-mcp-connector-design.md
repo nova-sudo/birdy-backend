@@ -107,6 +107,8 @@ Kept app-only: connecting or removing integrations, billing, account settings, t
 
 ### 4. Connect page (frontend, birdy-beta)
 
+- **Chosen mocks (2026-11-15):** Connect tab = option A "Guided steps"; consent screen = option A "Compact card"; alert form = "Also email me" switch. All in `/Users/abdelrahman/Desktop/Birdy/mocks/mcp-connect/index.html`.
+
 - Settings → "Connect to AI" page: the MCP URL with copy button; per-agent tabs (claude.ai, Claude Desktop, Claude Code, ChatGPT, Cursor) with steps; active connections list with revoke; "Create token" for manual setups; the check-in prompt.
 - Plus `/connect/authorize` consent page.
 - Per project rules: 2–3 HTML mock options of both screens presented before building; built with the pd-* kit; verified with crawl + screenshots.
