@@ -33,6 +33,7 @@ Why: owners increasingly live in their AI assistant; Birdy should be reachable t
 - Birdy pushing messages into a Claude chat (MCP/agents don't support it).
 - Admin / cross-account tools over MCP (admin console stays app-only).
 - Billing, onboarding, OAuth-integration setup (connecting Meta/GHL accounts) over MCP — done in the app.
+- `send_lead_message` and the report designer in v1 (planned for v2).
 - Rich UI rendering (`render_ui_tools`, dashkit visuals) — MCP returns data; the agent renders it.
 - Publishing to Anthropic's/OpenAI's connector directories (later, separate).
 
@@ -80,6 +81,21 @@ Picked by the owner in conversation: C, A first.
   2. Called again with that code and identical arguments, it executes and returns before/after.
   The tool description tells the agent to show the preview and get the owner's yes before step 2. Same idea as the `confirmed` gate in `ai/tools/call_analysis_tools.py`, but enforced by a server-issued code rather than a boolean. Annotations are still set, as a second layer.
 
+### 2b. App features beyond Ask Birdy (v1)
+
+Things owners do in the Birdy app that Ask Birdy can't do today. Each one wraps the existing router or service logic rather than copying it.
+
+- **Client context:** `get_client` (setup, targets, connected accounts, data freshness, notes); client notes list / add / delete (`routers/client_notes.py`); `set_client_target` (CPL and lead targets that `check_my_accounts` measures against). Tool descriptions tell the agent to read a client's notes before answering about that client.
+- **Lead follow-up:** `get_lead` (contact detail, journey, AI summary; `routers/leads.py`), `get_lead_messages`, `get_call_transcript`. All read-only.
+- **Attribution:** `attribution_status` (is tracking healthy for this client), `leads_by_ad`, `funnel`, `attribution_overview` (`routers/attribution.py`).
+- **Slack reports:** list / create / update / delete / send test (`routers/slack_reports.py`). Sending a test posts to a real Slack channel, so it goes through the two-step confirmation.
+- **Data freshness:** `refresh_client_data` (one client or all) and `refresh_status` (`routers/client_groups.py` refresh endpoints). This is a write-scope tool but doesn't need two-step confirmation, because it only re-pulls data.
+- **MCP prompts** (they show up in the agent's prompt menu): "Weekly client review", "Why did CPL jump for {client}?", "Prep me for a call with {client}", "What did my agent do this week?", and the daily check-in. Each one is a short template that tells the agent which Birdy tools to call.
+
+Deferred to v2: `send_lead_message` (replying to leads through GHL) and the report designer.
+
+Kept app-only: connecting or removing integrations, billing, account settings, tracking install, admin.
+
 ### 3. Watching the data
 
 - **Ask**: a `check_my_accounts` tool — one call returns, per client, spend / leads / CPL vs target and vs prior period, fired alerts, and agent findings, ranked by what needs attention. Also the backbone of the daily check-in.
@@ -112,7 +128,7 @@ Picked by the owner in conversation: C, A first.
 
 1. OAuth + consent page + Connect page (install works end to end with existing tools).
 2. Media buying agent tools (stock agent first, then custom agents, then dashboard suggestions), with the two-step confirmation.
-3. Remaining tool parity.
+3. Remaining Ask Birdy tool parity, plus the app features in 2b (client context, leads, attribution, Slack reports, refresh, MCP prompts).
 4. Watching: `check_my_accounts`, fired-alert tools, email delivery, "Ask Claude" links, check-in prompt.
 
 ## Left to the builder
