@@ -21,6 +21,7 @@ from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
 
 DEFAULT_EXPIRY_DAYS = 365
+LAST_USED_THROTTLE = timedelta(minutes=10)
 
 
 async def create_mcp_tokens_indexes(mongo_client):
@@ -29,7 +30,7 @@ async def create_mcp_tokens_indexes(mongo_client):
     await db["mcp_tokens"].create_index("user_id")
 
 
-async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None) -> dict:
+async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None, access: str = "write") -> dict:
     """Mint a new long-lived MCP bearer token and record it for revocation."""
     days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
     jti = uuid.uuid4().hex
@@ -40,8 +41,12 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
     # naive UTC value as local time, silently shifting `exp` by the host's UTC
     # offset on any non-UTC machine.
     exp_epoch = int(time.time()) + days * 86400
+    # Lazy: importing ai.mcp at module load is circular (ai.mcp.server imports this module).
+    from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
+
+    scope = READ_SCOPE if access == "read" else f"{READ_SCOPE} {WRITE_SCOPE}"
     token = pyjwt.encode(
-        {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp"},
+        {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp", "scope": scope},
         JWT_SECRET,
         algorithm=JWT_ALGORITHM,
     )
@@ -55,6 +60,9 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
         "expires_at": expires_at,
         "revoked": False,
         "revoked_at": None,
+        "access": "read" if access == "read" else "write",
+        "kind": "manual",
+        "last_used_at": None,
     }
     await db["mcp_tokens"].insert_one(doc)
 
@@ -69,7 +77,7 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
 
 async def list_mcp_tokens(db, user_id: str) -> list[dict]:
     """List a user's issued MCP tokens (never the raw secret — that's shown once at creation)."""
-    docs = await db["mcp_tokens"].find({"user_id": user_id}).sort("created_at", -1).to_list(None)
+    docs = await db["mcp_tokens"].find({"user_id": user_id, "kind": {"$ne": "oauth"}}).sort("created_at", -1).to_list(None)
     return [
         {
             "id": d["id"],
@@ -91,12 +99,69 @@ async def revoke_mcp_token(db, user_id: str, token_id: str) -> bool:
     return result.matched_count > 0
 
 
+async def _touch_last_used(db, doc: dict) -> None:
+    """Record use at most once per LAST_USED_THROTTLE for the token and its grant."""
+    now = datetime.utcnow()
+    cutoff = now - LAST_USED_THROTTLE
+    stale = {"$or": [{"last_used_at": None}, {"last_used_at": {"$lt": cutoff}}]}
+    await db["mcp_tokens"].update_one({"jti": doc["jti"], **stale}, {"$set": {"last_used_at": now}})
+    if doc.get("grant_id"):
+        await db["oauth_grants"].update_one({"id": doc["grant_id"], **stale}, {"$set": {"last_used_at": now}})
+
+
 async def is_mcp_token_valid(db, jti: str) -> bool:
     """Belt-and-suspenders check used by the MCP auth verifier: the JWT's own
     `exp` is already checked by JWTVerifier before this runs; this additionally
-    confirms the token hasn't been revoked and its DB record still exists.
+    confirms the token hasn't been revoked (directly, or via its OAuth grant)
+    and its DB record still exists. Also stamps `last_used_at` (throttled).
     """
     doc = await db["mcp_tokens"].find_one({"jti": jti})
     if not doc or doc.get("revoked"):
         return False
+    if doc.get("grant_id"):
+        grant = await db["oauth_grants"].find_one({"id": doc["grant_id"]})
+        if not grant or grant.get("revoked"):
+            return False
+    await _touch_last_used(db, doc)
+    return True
+
+
+async def list_connections(db, user_id: str) -> list[dict]:
+    """Active manual tokens and OAuth grants for this user, newest first."""
+    rows = []
+    manual = await db["mcp_tokens"].find(
+        {"user_id": user_id, "kind": {"$ne": "oauth"}, "revoked": {"$ne": True}}
+    ).to_list(None)
+    for d in manual:
+        rows.append({
+            "id": d["id"], "kind": "manual", "name": d["name"],
+            "access": d.get("access", "write"),
+            "created_at": d["created_at"], "last_used_at": d.get("last_used_at"),
+            "expires_at": d.get("expires_at"),
+        })
+    grants = await db["oauth_grants"].find({"user_id": user_id, "revoked": {"$ne": True}}).to_list(None)
+    for g in grants:
+        rows.append({
+            "id": g["id"], "kind": "oauth", "name": g["client_name"], "access": g["access"],
+            "created_at": g["created_at"], "last_used_at": g.get("last_used_at"), "expires_at": None,
+        })
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows
+
+
+async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
+    """Revoke a manual token or an OAuth grant (and all its tokens) owned by user_id."""
+    if await revoke_mcp_token(db, user_id, connection_id):
+        return True
+    now = datetime.utcnow()
+    res = await db["oauth_grants"].update_one(
+        {"id": connection_id, "user_id": user_id},
+        {"$set": {"revoked": True, "revoked_at": now}},
+    )
+    if res.matched_count == 0:
+        return False
+    await db["mcp_tokens"].update_many(
+        {"grant_id": connection_id, "user_id": user_id},
+        {"$set": {"revoked": True, "revoked_at": now}},
+    )
     return True

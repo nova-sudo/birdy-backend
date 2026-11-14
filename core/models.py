@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Dict, Optional, List
+from typing import Dict, Literal, Optional, List
 
 
 class RegisterRequest(BaseModel):
@@ -274,6 +274,7 @@ class CapabilitiesRequest(BaseModel):
 class CreateMcpTokenRequest(BaseModel):
     name: str                          # e.g. "Claude Desktop on my laptop"
     expiry_days: Optional[int] = 365
+    access: Literal["read", "write"] = "write"
 
 
 # ── AI Credentials (BYOK) ───────────────────────────────────────────────────

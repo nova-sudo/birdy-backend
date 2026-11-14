@@ -14,7 +14,9 @@ from fastapi import APIRouter, Depends, HTTPException
 from core.database import get_db
 from core.models import CreateMcpTokenRequest
 from dependencies import get_mongo_client, get_current_user
-from services.mcp_token_service import create_mcp_token, list_mcp_tokens, revoke_mcp_token
+from services.mcp_token_service import (
+    create_mcp_token, list_mcp_tokens, revoke_mcp_token, list_connections, revoke_connection,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +32,7 @@ async def create_token(
     never stored or shown again, only its metadata (name, id, expiry)."""
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
-        result = await create_mcp_token(db, current_user, request.name, request.expiry_days)
+        result = await create_mcp_token(db, current_user, request.name, request.expiry_days, request.access)
         logger.info(f"Created MCP token '{request.name}' ({result['id']}) for {current_user}")
         return {"success": True, **result}
 
@@ -55,3 +57,20 @@ async def delete_token(token_id: str, current_user: str = Depends(get_current_us
             raise HTTPException(status_code=404, detail="Token not found")
         logger.info(f"Revoked MCP token {token_id} for {current_user}")
         return {"success": True, "message": "Token revoked"}
+
+
+@router.get("/api/mcp/connections")
+async def get_connections(current_user: str = Depends(get_current_user)):
+    """Everything connected to this user's Birdy over MCP: manual tokens and OAuth grants."""
+    async with get_mongo_client() as mongo_client:
+        return await list_connections(get_db(mongo_client), current_user)
+
+
+@router.delete("/api/mcp/connections/{connection_id}")
+async def delete_connection(connection_id: str, current_user: str = Depends(get_current_user)):
+    """Revoke a manual token or an OAuth grant (with all its tokens). Immediate."""
+    async with get_mongo_client() as mongo_client:
+        if not await revoke_connection(get_db(mongo_client), current_user, connection_id):
+            raise HTTPException(status_code=404, detail="Connection not found")
+        logger.info(f"Revoked MCP connection {connection_id} for {current_user}")
+        return {"success": True, "message": "Connection revoked"}
