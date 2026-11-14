@@ -31,6 +31,7 @@ from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from services.mcp_token_service import is_mcp_token_valid
+from ai.mcp.access import BirdyAccessMiddleware
 
 _jwt_verifier = JWTVerifier(public_key=JWT_SECRET, algorithm=JWT_ALGORITHM)
 
@@ -55,6 +56,7 @@ class _RevocationAwareVerifier(TokenVerifier):
 
 
 mcp = FastMCP(name="Birdy AI Tools", auth=_RevocationAwareVerifier())
+mcp.add_middleware(BirdyAccessMiddleware())
 
 # stateless_http=True: required for Vercel — serverless invocations have no
 # sticky sessions, so the MCP transport must not rely on server-held session state.

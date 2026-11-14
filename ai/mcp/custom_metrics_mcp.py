@@ -28,6 +28,7 @@ from services.metric_orchestrator import (
     evaluate_formula_aggregated,
     resolve_preset,
 )
+from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -141,7 +142,7 @@ _LIST_CUSTOM_METRICS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_LIST_CUSTOM_METRICS_DESCRIPTION)
+@mcp.tool(description=_LIST_CUSTOM_METRICS_DESCRIPTION, **READ)
 async def list_custom_metrics() -> dict:
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())
@@ -171,7 +172,7 @@ _COMPUTE_CUSTOM_METRIC_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_COMPUTE_CUSTOM_METRIC_DESCRIPTION)
+@mcp.tool(description=_COMPUTE_CUSTOM_METRIC_DESCRIPTION, **READ)
 async def compute_custom_metric(
     metric_id: str,
     preset: str = "last_7d",
@@ -257,7 +258,7 @@ _LIST_AVAILABLE_METRIC_FIELDS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_LIST_AVAILABLE_METRIC_FIELDS_DESCRIPTION)
+@mcp.tool(description=_LIST_AVAILABLE_METRIC_FIELDS_DESCRIPTION, **READ)
 async def list_available_metric_fields() -> dict:
     metrics = []
     labels = {
@@ -301,7 +302,7 @@ _CREATE_CUSTOM_METRIC_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_CREATE_CUSTOM_METRIC_DESCRIPTION)
+@mcp.tool(description=_CREATE_CUSTOM_METRIC_DESCRIPTION, **WRITE)
 async def create_custom_metric(
     name: str,
     formula_text: str | None = None,
@@ -405,7 +406,7 @@ _UPDATE_CUSTOM_METRIC_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_UPDATE_CUSTOM_METRIC_DESCRIPTION)
+@mcp.tool(description=_UPDATE_CUSTOM_METRIC_DESCRIPTION, **WRITE)
 async def update_custom_metric(
     metric_id: str,
     name: str | None = None,
@@ -486,7 +487,7 @@ _DELETE_CUSTOM_METRIC_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_DELETE_CUSTOM_METRIC_DESCRIPTION)
+@mcp.tool(description=_DELETE_CUSTOM_METRIC_DESCRIPTION, **WRITE)
 async def delete_custom_metric(metric_id: str) -> dict:
     """
     Args:

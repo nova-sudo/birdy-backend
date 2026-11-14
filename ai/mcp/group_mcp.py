@@ -14,10 +14,11 @@ orchestrator if the MCP path is unavailable.
 
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 
-@mcp.tool
+@mcp.tool(**READ)
 async def get_client_groups() -> dict:
     """List all client groups (business clients) for the user. Returns group IDs, names, and which integrations are linked. Call this first to discover available groups before filtering other queries."""
     user_id = _current_user_id()

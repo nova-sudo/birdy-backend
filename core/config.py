@@ -21,3 +21,5 @@ CORS_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3005",
 ]
+
+FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")

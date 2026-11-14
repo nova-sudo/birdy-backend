@@ -20,6 +20,7 @@ from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from core.utils import mongo_to_dict
 from services.alert_service import format_condition_display, evaluate_alert
+from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 logger = logging.getLogger(__name__)
@@ -31,7 +32,7 @@ _VALID_TYPES = "win, warning"
 _VALID_FREQUENCIES = "realtime, hourly, daily, weekly"
 
 
-@mcp.tool
+@mcp.tool(**READ)
 async def get_alerts(status: str | None = None) -> dict:
     """List the user's alerts with their conditions, status, and trigger history.
 
@@ -89,7 +90,7 @@ _CREATE_ALERT_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_CREATE_ALERT_DESCRIPTION)
+@mcp.tool(description=_CREATE_ALERT_DESCRIPTION, **WRITE)
 async def create_alert(
     name: str,
     metric: str,
@@ -186,7 +187,7 @@ async def create_alert(
     }
 
 
-@mcp.tool
+@mcp.tool(**WRITE)
 async def update_alert(
     alert_id: str,
     name: str | None = None,

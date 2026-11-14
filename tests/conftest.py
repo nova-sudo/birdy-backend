@@ -258,3 +258,74 @@ def pytest_terminal_summary(terminalreporter):
         terminalreporter.section("network guard: attempts outside any test")
         for what in outside:
             terminalreporter.write_line(what)
+
+
+# ---------------------------------------------------------------------------
+# Driving the real MCP ASGI app with a minted token
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def subscription_state():
+    """Whether require_active_subscription passes for mcp_call tests (active by default)."""
+    return {"active": True}
+
+
+@pytest.fixture
+def no_subscription(subscription_state):
+    """Make every user's subscription inactive: require_active_subscription raises 402."""
+    subscription_state["active"] = False
+
+
+@pytest.fixture
+def mcp_call(mock_db, monkeypatch, subscription_state):
+    """Call an MCP tool through the real ASGI app (auth, middleware, tool) as a minted-token user.
+
+    await mcp_call("get_alerts", {}, user="alice@example.com", scope="birdy.read", token_type="mcp")
+    -> SimpleNamespace(is_error, text). `scope=None` leaves the scope claim out entirely.
+    """
+    import time
+    import uuid
+    import httpx
+    import jwt as pyjwt
+    from fastapi import HTTPException
+    from fastmcp import Client
+    from fastmcp.client.transports import StreamableHttpTransport
+    from core.config import JWT_SECRET, JWT_ALGORITHM
+    from ai.mcp import mcp
+
+    async def _active(current_user, mongo_client):
+        if not subscription_state["active"]:
+            raise HTTPException(status_code=402, detail={"code": "NO_ACTIVE_SUBSCRIPTION"})
+        return {"status": "active"}
+
+    async def _token_valid(db, jti):
+        return True
+
+    monkeypatch.setattr("billing_middleware.require_active_subscription", _active)
+    monkeypatch.setattr("ai.mcp.server.is_mcp_token_valid", _token_valid)
+
+    async def _call(name, args=None, *, user="alice@example.com", scope=None, token_type="access"):
+        claims = {"sub": user, "type": token_type, "exp": int(time.time()) + 600}
+        if scope is not None:
+            claims["scope"] = scope
+        if token_type == "mcp":
+            claims["jti"] = uuid.uuid4().hex
+        token = pyjwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM)
+
+        # A fresh app per call: the streamable-HTTP session manager runs its lifespan once per
+        # instance, and the shared mcp_app's is owned by main.py. Same server, same middleware.
+        app = mcp.http_app(path="/", stateless_http=True)
+
+        def factory(headers=None, timeout=None, auth=None, **kwargs):
+            return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://mcp.test",
+                                     headers={**(headers or {}), "Authorization": f"Bearer {token}"},
+                                     timeout=timeout, **kwargs)
+
+        transport = StreamableHttpTransport(url="http://mcp.test/", httpx_client_factory=factory)
+        async with app.router.lifespan_context(app):
+            async with Client(transport) as client:
+                res = await client.call_tool(name, args or {}, raise_on_error=False)
+        text = "".join(getattr(c, "text", "") for c in res.content)
+        return types.SimpleNamespace(is_error=res.is_error, text=text)
+
+    return _call
