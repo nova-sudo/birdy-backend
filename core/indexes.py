@@ -57,6 +57,7 @@ def _load_creators():
     from services.lead_summary import create_lead_summary_indexes
     from services.landing_funnel import create_landing_funnel_indexes
     from services.tracked_leads import create_tracked_leads_indexes
+    from ai.mcp.confirm import create_confirm_code_indexes
     from services.mcp_token_service import create_mcp_tokens_indexes
     from services.slack_bot_service import create_slack_bot_indexes
     from services.slack_interaction_store import create_slack_ui_interaction_indexes
@@ -76,6 +77,7 @@ def _load_creators():
         create_tracked_leads_indexes,
         create_landing_funnel_indexes,
         create_mcp_tokens_indexes,
+        create_confirm_code_indexes,
         create_slack_bot_indexes,
         create_slack_ui_interaction_indexes,
         create_slack_report_indexes,
