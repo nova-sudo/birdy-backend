@@ -70,7 +70,7 @@ Picked by the owner in conversation: C, A first.
 
 - Port every Ask Birdy tool not yet on MCP into `ai/mcp/*_mcp.py` modules (same pattern as existing ones; add names to `MCP_TOOL_NAMES`), so the orchestrator and external agents share them.
 - New `agent_mcp.py` exposing the media buying agents, wrapping the logic behind `routers/agent_stock.py`, `routers/agents.py`, and `routers/dashboard.py` (not duplicating it).
-- **Which agent (decided):** tools act on the owner's **Birdy Media Buying Agent** (`stock_media_buying`) by default. Every agent tool takes an optional `agent` (name or id) so the owner can point at a custom agent instead, and a `set_default_agent` tool lets them switch the default for their connection. `list_agents` shows both kinds.
+- **Which agent (decided):** tools act on the owner's **Birdy Media Buying Agent** (`stock_media_buying`) by default. Every agent tool takes an optional `agent` (name or id) so the owner can point at a custom agent instead, and a `set_default_agent` tool lets them switch their default (stored per user, so it applies to every connection). `list_agents` shows both kinds.
   - Stock agent: settings, runs (latest / by id / by month), cards, apply / apply-all / dismiss / edit / undo cards, file a card line, lessons, outcomes, Slack templates (get/put/delete/preview), weekly post, preview.
   - Custom agents: playbook/rules, client targets/overrides, activity, work/history, claims, impact, confidence, proposals accept/reject, memory add/delete, exceptions, schedule, Slack channel, activate/deactivate, dry-run (start + poll job), undo auto-action, graduate rule.
   - Dashboard suggestions: apply / deny / undo.
