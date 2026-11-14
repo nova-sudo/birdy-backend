@@ -11,6 +11,7 @@ leaked or unwanted token can be revoked without rotating JWT_SECRET and
 invalidating every user's session.
 """
 
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -19,6 +20,8 @@ import jwt as pyjwt
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_EXPIRY_DAYS = 365
 LAST_USED_THROTTLE = timedelta(minutes=10)
@@ -99,14 +102,24 @@ async def revoke_mcp_token(db, user_id: str, token_id: str) -> bool:
     return result.matched_count > 0
 
 
-async def _touch_last_used(db, doc: dict) -> None:
-    """Record use at most once per LAST_USED_THROTTLE for the token and its grant."""
+def _is_fresh(doc: dict | None, cutoff: datetime) -> bool:
+    last = (doc or {}).get("last_used_at")
+    return bool(last and last >= cutoff)
+
+
+async def _touch_last_used(db, doc: dict, grant: dict | None = None) -> None:
+    """Best-effort: record use at most once per LAST_USED_THROTTLE for the token and its grant.
+    Telemetry only, so a failed write must never fail the request."""
     now = datetime.utcnow()
     cutoff = now - LAST_USED_THROTTLE
     stale = {"$or": [{"last_used_at": None}, {"last_used_at": {"$lt": cutoff}}]}
-    await db["mcp_tokens"].update_one({"jti": doc["jti"], **stale}, {"$set": {"last_used_at": now}})
-    if doc.get("grant_id"):
-        await db["oauth_grants"].update_one({"id": doc["grant_id"], **stale}, {"$set": {"last_used_at": now}})
+    try:
+        if not _is_fresh(doc, cutoff):
+            await db["mcp_tokens"].update_one({"jti": doc["jti"], **stale}, {"$set": {"last_used_at": now}})
+        if doc.get("grant_id") and not _is_fresh(grant, cutoff):
+            await db["oauth_grants"].update_one({"id": doc["grant_id"], **stale}, {"$set": {"last_used_at": now}})
+    except Exception as exc:
+        logger.warning("MCP last_used_at update failed: %s", exc)
 
 
 async def is_mcp_token_valid(db, jti: str) -> bool:
@@ -118,11 +131,12 @@ async def is_mcp_token_valid(db, jti: str) -> bool:
     doc = await db["mcp_tokens"].find_one({"jti": jti})
     if not doc or doc.get("revoked"):
         return False
+    grant = None
     if doc.get("grant_id"):
         grant = await db["oauth_grants"].find_one({"id": doc["grant_id"]})
         if not grant or grant.get("revoked"):
             return False
-    await _touch_last_used(db, doc)
+    await _touch_last_used(db, doc, grant)
     return True
 
 
@@ -151,9 +165,13 @@ async def list_connections(db, user_id: str) -> list[dict]:
 
 async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
     """Revoke a manual token or an OAuth grant (and all its tokens) owned by user_id."""
-    if await revoke_mcp_token(db, user_id, connection_id):
-        return True
     now = datetime.utcnow()
+    res = await db["mcp_tokens"].update_one(
+        {"id": connection_id, "user_id": user_id, "kind": {"$ne": "oauth"}},
+        {"$set": {"revoked": True, "revoked_at": now}},
+    )
+    if res.matched_count > 0:
+        return True
     res = await db["oauth_grants"].update_one(
         {"id": connection_id, "user_id": user_id},
         {"$set": {"revoked": True, "revoked_at": now}},

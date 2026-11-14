@@ -280,3 +280,47 @@ async def test_last_used_at_is_throttled_to_once_per_ten_minutes(mock_db):
     await mock_db["mcp_tokens"].update_one({"jti": "tt"}, {"$set": {"last_used_at": stale}})
     assert await mcp_token_service.is_mcp_token_valid(mock_db, "tt")
     assert (await mock_db["mcp_tokens"].find_one({"jti": "tt"}))["last_used_at"] > stale
+
+
+@pytest.mark.asyncio
+async def test_failed_last_used_write_does_not_fail_verification(mock_db, monkeypatch):
+    created = await mcp_token_service.create_mcp_token(mock_db, ALICE, "Mine")
+
+    class Boom:
+        def __getitem__(self, name):
+            coll = mock_db[name]
+
+            class C:
+                find_one = staticmethod(coll.find_one)
+
+                async def update_one(self, *a, **k):
+                    raise RuntimeError("write concern timeout")
+
+            return C()
+
+    assert await mcp_token_service.is_mcp_token_valid(Boom(), created["id"]) is True
+
+
+@pytest.mark.asyncio
+async def test_legacy_token_doc_lists_and_verifies(api, mock_db):
+    await mock_db["mcp_tokens"].insert_one({
+        "id": "old", "user_id": ALICE, "name": "Legacy", "jti": "old",
+        "created_at": datetime.utcnow(), "expires_at": datetime.utcnow() + timedelta(days=5),
+        "revoked": False, "revoked_at": None,
+    })
+    assert await mcp_token_service.is_mcp_token_valid(mock_db, "old") is True
+    rows = await mcp_token_service.list_connections(mock_db, ALICE)
+    assert [(r["name"], r["kind"], r["access"]) for r in rows] == [("Legacy", "manual", "write")]
+
+
+def test_delete_oauth_access_token_id_404(api, mock_db):
+    import anyio
+
+    async def seed():
+        await mock_db["mcp_tokens"].insert_one({
+            "id": "tt", "jti": "tt", "user_id": ALICE, "name": "x", "kind": "oauth", "grant_id": "g1",
+            "created_at": datetime.utcnow(), "expires_at": datetime.utcnow(), "revoked": False,
+        })
+
+    anyio.run(seed)
+    assert api.delete("/api/mcp/connections/tt").status_code == 404
