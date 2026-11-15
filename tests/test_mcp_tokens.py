@@ -77,9 +77,9 @@ async def test_is_mcp_token_valid_false_for_unknown_jti(mock_db):
 
 @pytest.mark.asyncio
 async def test_verifier_accepts_valid_mcp_token_and_rejects_after_revocation(mock_db):
-    from ai.mcp.server import _RevocationAwareVerifier
+    from ai.mcp import mcp
 
-    verifier = _RevocationAwareVerifier()
+    verifier = mcp.auth  # the live server's verifier (BirdyOAuthProvider)
     created = await mcp_token_service.create_mcp_token(mock_db, "alice@example.com", "Claude Desktop")
 
     result = await verifier.verify_token(created["token"])
@@ -96,9 +96,9 @@ async def test_verifier_accepts_normal_access_token_without_any_db_record(mock_d
     """type: "access" tokens (login cookie, or the orchestrator's internal
     token) must keep working even with an empty mcp_tokens collection —
     the revocation lookup only applies to type: "mcp" tokens."""
-    from ai.mcp.server import _RevocationAwareVerifier
+    from ai.mcp import mcp
 
-    verifier = _RevocationAwareVerifier()
+    verifier = mcp.auth  # the live server's verifier (BirdyOAuthProvider)
     access_token = pyjwt.encode(
         {"sub": "alice@example.com", "exp": int(time.time()) + 60, "type": "access"},
         JWT_SECRET,
@@ -114,9 +114,9 @@ async def test_verifier_accepts_normal_access_token_without_any_db_record(mock_d
 async def test_verifier_rejects_mcp_token_with_no_matching_record(mock_db):
     """A syntactically valid, correctly-signed type: "mcp" token whose jti was
     never issued (or whose record was deleted) must be rejected."""
-    from ai.mcp.server import _RevocationAwareVerifier
+    from ai.mcp import mcp
 
-    verifier = _RevocationAwareVerifier()
+    verifier = mcp.auth  # the live server's verifier (BirdyOAuthProvider)
     forged = pyjwt.encode(
         {"sub": "alice@example.com", "jti": "not-a-real-jti", "exp": int(time.time()) + 60, "type": "mcp"},
         JWT_SECRET,

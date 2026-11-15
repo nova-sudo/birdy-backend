@@ -18,11 +18,16 @@ load_access_token is also the verifier for every bearer token reaching /mcp
 import calendar
 import re
 from datetime import datetime
+from functools import partial
 from urllib.parse import urlparse
 
 from fastmcp.server.auth import AccessToken, OAuthProvider
 from fastmcp.server.auth.auth import ClientRegistrationOptions, RevocationOptions
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from mcp.server.auth.handlers.metadata import MetadataHandler
+from mcp.server.auth.handlers.revoke import RevocationErrorResponse, RevocationHandler, RevocationRequest
+from mcp.server.auth.json_response import PydanticJSONResponse
+from mcp.server.auth.middleware.client_auth import AuthenticationError, ClientAuthenticator
 from mcp.server.auth.provider import (
     AuthorizationCode,
     AuthorizationParams,
@@ -30,7 +35,12 @@ from mcp.server.auth.provider import (
     RegistrationError,
     TokenError,
 )
+from mcp.server.auth.routes import build_metadata, cors_middleware
 from mcp.shared.auth import OAuthClientInformationFull, OAuthToken
+from pydantic import AnyHttpUrl, ValidationError
+from starlette.requests import Request
+from starlette.responses import Response
+from starlette.routing import Route
 
 from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
 from core.config import API_PUBLIC_URL, FRONTEND_URL, JWT_ALGORITHM, JWT_SECRET
@@ -40,6 +50,10 @@ from services import oauth_store
 from services.mcp_token_service import create_oauth_access_token, is_mcp_token_valid
 
 ACCESS_TOKEN_SECONDS = 3600
+# The MCP endpoint is main.py's mount at /mcp; the OAuth endpoints live under it.
+MCP_RESOURCE_URL = f"{API_PUBLIC_URL}/mcp"
+# Public clients (Claude, ChatGPT register with "none") authenticate by PKCE alone.
+CLIENT_AUTH_METHODS = ["client_secret_post", "client_secret_basic", "none"]
 ALL_SCOPES = [READ_SCOPE, WRITE_SCOPE]
 
 _jwt_verifier = JWTVerifier(public_key=JWT_SECRET, algorithm=JWT_ALGORITHM)
@@ -93,10 +107,52 @@ class BirdyRefreshToken(RefreshToken):
     user_id: str
 
 
+class _RevocationHandler(RevocationHandler):
+    """The SDK's /revoke (RFC 7009), except a public client may leave out
+    client_secret: mcp's RevocationRequest makes the field required, so public
+    clients got a 400. Client authentication is unchanged: a client registered
+    with a secret still has to send it (ClientAuthenticator, 401 otherwise)."""
+
+    async def handle(self, request: Request) -> Response:
+        try:
+            client = await self.client_authenticator.authenticate_request(request)
+        except AuthenticationError as e:
+            return PydanticJSONResponse(
+                status_code=401,
+                content=RevocationErrorResponse(error="unauthorized_client", error_description=e.message),
+            )
+        try:
+            form = await request.form()
+            req = RevocationRequest.model_validate({"client_secret": None, **dict(form)})
+        except ValidationError as e:
+            return PydanticJSONResponse(
+                status_code=400,
+                content=RevocationErrorResponse(error="invalid_request", error_description=str(e)),
+            )
+
+        loaders = [self.provider.load_access_token, partial(self.provider.load_refresh_token, client)]
+        if req.token_type_hint == "refresh_token":
+            loaders.reverse()
+        token = None
+        for loader in loaders:
+            token = await loader(req.token)
+            if token is not None:
+                break
+        # Unknown tokens still get 200 (RFC 7009 2.2).
+        if token and token.client_id == client.client_id:
+            await self.provider.revoke_token(token)
+        return Response(status_code=200, headers={"Cache-Control": "no-store", "Pragma": "no-cache"})
+
+
 class BirdyOAuthProvider(OAuthProvider):
+    """Endpoints at {API_PUBLIC_URL}/mcp/{authorize,token,register,revoke}; the
+    issuer is API_PUBLIC_URL itself, so the discovery documents are served at the
+    root app (main.py): /.well-known/oauth-authorization-server and
+    /.well-known/oauth-protected-resource/mcp."""
+
     def __init__(self):
         super().__init__(
-            base_url=f"{API_PUBLIC_URL}/mcp",
+            base_url=MCP_RESOURCE_URL,
             issuer_url=API_PUBLIC_URL,
             client_registration_options=ClientRegistrationOptions(
                 enabled=True, valid_scopes=ALL_SCOPES, default_scopes=ALL_SCOPES,
@@ -107,6 +163,44 @@ class BirdyOAuthProvider(OAuthProvider):
     @staticmethod
     def _db():
         return get_db(get_shared_mongo_client())
+
+    # ── routes + discovery metadata ─────────────────────────────────────────
+
+    def _get_resource_url(self, path: str | None = None) -> AnyHttpUrl:
+        # base_url already ends in /mcp. FastMCP builds the sub-app with path="/" and
+        # main.py asks for well-known routes with mcp_path="/mcp"; both mean this URL
+        # (no trailing slash), which is also what the 401's resource_metadata points at.
+        return AnyHttpUrl(MCP_RESOURCE_URL)
+
+    def _authorization_server_metadata(self):
+        # The SDK sets issuer = base_url (…/mcp), which would not match the
+        # authorization_servers entry (the root issuer) the resource metadata advertises.
+        metadata = build_metadata(
+            self.base_url, self.service_documentation_url,
+            self.client_registration_options, self.revocation_options,
+        )
+        return metadata.model_copy(update={
+            "issuer": self.issuer_url,
+            "token_endpoint_auth_methods_supported": CLIENT_AUTH_METHODS,
+            "revocation_endpoint_auth_methods_supported": CLIENT_AUTH_METHODS,
+        })
+
+    def get_routes(self, mcp_path: str | None = None) -> list[Route]:
+        routes = []
+        for route in super().get_routes(mcp_path):
+            if route.path == "/.well-known/oauth-authorization-server":
+                route = Route(
+                    route.path,
+                    endpoint=cors_middleware(MetadataHandler(self._authorization_server_metadata()).handle,
+                                             ["GET", "OPTIONS"]),
+                    methods=["GET", "OPTIONS"],
+                )
+            elif route.path == "/revoke":
+                handler = _RevocationHandler(self, ClientAuthenticator(self))
+                route = Route("/revoke", endpoint=cors_middleware(handler.handle, ["POST", "OPTIONS"]),
+                              methods=["POST", "OPTIONS"])
+            routes.append(route)
+        return routes
 
     # ── clients (DCR) ───────────────────────────────────────────────────────
 

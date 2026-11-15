@@ -28,7 +28,7 @@ from routers import auth, ghl, meta, hotprospector, client_groups, leads, settin
 from billing import router as billing_router
 from credits import router as credits_router
 
-from ai.mcp import mcp_app
+from ai.mcp import mcp, mcp_app
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -165,3 +165,7 @@ app.include_router(tracking.router)
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py
 app.mount("/mcp", mcp_app)
+# OAuth discovery must sit at the root (RFC 9728 / RFC 8414): clients probe
+# /.well-known/oauth-protected-resource/mcp and /.well-known/oauth-authorization-server.
+for _route in mcp.auth.get_well_known_routes(mcp_path="/mcp"):
+    app.router.routes.append(_route)
