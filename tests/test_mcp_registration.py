@@ -37,6 +37,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript"},
     "slack_reports_mcp": {"list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report"},
     "refresh_mcp": {"refresh_client_data", "refresh_status"},
+    "prompts_mcp": set(),  # prompts only, no tools
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())
