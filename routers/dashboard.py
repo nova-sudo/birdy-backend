@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from ai.agents.defaults import DENY_REASONS
-from ai.suggestions import actions, store
+from ai.suggestions import actions, store, views
 from ai.suggestions.contracts import WINDOWS
 from ai.suggestions.orchestrator import run_pass_for_user
 from ai.suggestions.agents.useless_ad_purger import STRICTNESS_LEVELS, DEFAULT_STRICTNESS
@@ -56,39 +56,7 @@ def _relative_time(dt: datetime | None) -> str:
     return f"{int(secs // 86400)}d ago"
 
 
-def _rule_kind(agent: str | None) -> str | None:
-    """'media_buying:pause_over_target' -> 'pause_over_target'; None for legacy agents."""
-    if agent and agent.startswith("media_buying:"):
-        return agent.split(":", 1)[1]
-    return None
-
-
-def _suggestion_to_api(doc: dict) -> dict:
-    return {
-        "id": doc.get("id"),
-        "status": doc.get("status", store.STATUS_OPEN),
-        "applied_count": len(doc.get("applied_targets") or []),
-        "severity": doc.get("severity"),
-        "icon": doc.get("icon", "sparkles"),
-        "client": doc.get("client_name"),
-        "platform": doc.get("platform", "Meta Ads"),
-        "title": doc.get("title"),
-        "description": doc.get("description"),
-        "stats": doc.get("stats") or [],
-        "window": doc.get("window"),
-        "agent_id": doc.get("agent_id"),
-        "rule_kind": _rule_kind(doc.get("agent")),
-        "rule_mode": doc.get("rule_mode"),
-        # False for flag-only items (nothing to write in Meta) — the work list
-        # shows "Got it" instead of Approve/Deny.
-        "has_action": bool(doc.get("action")),
-        "blocked_reason": doc.get("blocked_reason"),
-        "auto_failed": bool(doc.get("auto_failed")),
-        "undone_at": doc.get("undone_at"),
-        "applied_at": doc.get("applied_at"),
-        "creative_test_id": (doc.get("evidence") or {}).get("creative_test_id"),
-        "rule_id": doc.get("rule_id"),
-    }
+_suggestion_to_api = views.suggestion_to_api
 
 
 def _activity_to_api(doc: dict) -> dict:
@@ -147,10 +115,10 @@ async def summary(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
 
-        open_docs = await store.list_open_suggestions(db, current_user, limit=50)
+        open_docs = await views.list_open(db, current_user)
         # Recently-applied are returned too so the card can stay visible with a
         # lasting Undo (same affordance as the Slack card's Undo button).
-        applied_docs = await store.list_recent_applied(db, current_user, within_hours=24, limit=20)
+        applied_docs = await views.list_recent_applied(db, current_user)
         activity = await store.list_recent_activity(db, current_user, limit=30)
 
         triggered = await db["alerts"].find(
@@ -194,9 +162,9 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
             actor=store.ACTOR_USER, source="dashboard",
         )
         if res["outcome"] == "not_found":
-            raise HTTPException(status_code=404, detail="Suggestion not found")
+            raise HTTPException(status_code=404, detail=views.NOT_FOUND_MESSAGE)
         if res["outcome"] == "failed":
-            raise HTTPException(status_code=502, detail=res.get("detail", "Action failed"))
+            raise HTTPException(status_code=502, detail=res.get("detail", views.APPLY_FAILED_MESSAGE))
         if res["outcome"] == "closed":
             # Dismissed or resolved since the list was loaded: nothing was written.
             return _conflict(res)
@@ -210,15 +178,13 @@ async def apply_suggestion(suggestion_id: str, current_user: str = Depends(get_c
                 "redirect": res.get("redirect")}
 
 
-def _decided_by(res: dict) -> dict | None:
-    d = res.get("decided_by")
-    return {"actor": d.get("actor"), "source": d.get("source")} if isinstance(d, dict) else None
+_decided_by = views.decided_by
 
 
 def _conflict(res: dict) -> JSONResponse:
     """409 for a decision on an item that is no longer open (outcome on the body)."""
     return JSONResponse(status_code=409, content={
-        "detail": res.get("detail") or "This item was already handled",
+        "detail": views.conflict_detail(res),
         "outcome": res["outcome"], "status": res.get("status"), "decided_by": _decided_by(res),
     })
 
@@ -232,9 +198,9 @@ async def dismiss_suggestion(suggestion_id: str, current_user: str = Depends(get
             actor=store.ACTOR_USER, source="dashboard",
         )
         if res["outcome"] == "not_found":
-            raise HTTPException(status_code=404, detail="Suggestion not found")
+            raise HTTPException(status_code=404, detail=views.NOT_FOUND_MESSAGE)
         if res["outcome"] == "busy":
-            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+            raise HTTPException(status_code=409, detail=views.BUSY_MESSAGE)
         if not res["ok"]:
             return _conflict(res)
         return {"ok": True}
@@ -258,9 +224,9 @@ async def deny_suggestion(suggestion_id: str, body: DenyBody, current_user: str 
             reason_code=body.reason_code, note=body.note,
         )
         if res["outcome"] == "not_found":
-            raise HTTPException(status_code=404, detail="Suggestion not found")
+            raise HTTPException(status_code=404, detail=views.NOT_FOUND_MESSAGE)
         if res["outcome"] == "busy":
-            raise HTTPException(status_code=409, detail="Applying right now — try again in a moment")
+            raise HTTPException(status_code=409, detail=views.BUSY_MESSAGE)
         if not res["ok"]:
             return _conflict(res)
         # What Birdy learned from the note (for the "Birdy will remember: …" toast).
@@ -280,11 +246,11 @@ async def undo_suggestion(suggestion_id: str, current_user: str = Depends(get_cu
             actor=store.ACTOR_USER, source="dashboard",
         )
         if res["outcome"] == "not_found":
-            raise HTTPException(status_code=404, detail="Suggestion not found")
+            raise HTTPException(status_code=404, detail=views.NOT_FOUND_MESSAGE)
         if res["outcome"] == "failed":
-            raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
+            raise HTTPException(status_code=502, detail=res.get("detail", views.UNDO_FAILED_MESSAGE))
         if res["outcome"] == "not_undoable":
-            raise HTTPException(status_code=409, detail=res.get("detail", "Nothing to undo"))
+            raise HTTPException(status_code=409, detail=res.get("detail", views.NOTHING_TO_UNDO_MESSAGE))
         # "undone" (reversed) and "noop" (nothing was applied to reverse) are
         # both successes — undo is idempotent, so re-undoing settles quietly.
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
