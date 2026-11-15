@@ -47,7 +47,7 @@ async def test_fired_alerts_collapse_repeated_rows(mock_db, set_current_user):
     u = "alice@example.com"
     set_current_user(u)
     await _alert(mock_db, u)
-    for m in (120, 105, 90, 75):  # 15-minute passes while it stays triggered
+    for m in (240, 180, 120, 60):  # hourly passes while it stays triggered
         await _note(mock_db, u, "a1", timedelta(minutes=m))
     await _note(mock_db, u, "a1", timedelta(days=3))  # a separate, earlier firing
     out = await watch_mcp.get_fired_alerts.fn(days=7)
@@ -56,6 +56,26 @@ async def test_fired_alerts_collapse_repeated_rows(mock_db, set_current_user):
     assert latest["count"] == 4
     assert latest["first_triggered_at"] < latest["last_seen_at"]
     assert out["fired"][1]["count"] == 1
+
+
+async def test_fired_alerts_gap_is_longer_than_the_hourly_cadence(mock_db, set_current_user):
+    u = "alice@example.com"
+    set_current_user(u)
+    await _alert(mock_db, u)
+    for m in (120, 60):  # 60 minutes apart: one firing
+        await _note(mock_db, u, "a1", timedelta(minutes=m))
+    out = await watch_mcp.get_fired_alerts.fn(days=7)
+    assert len(out["fired"]) == 1 and out["fired"][0]["count"] == 2
+
+
+async def test_fired_alerts_rows_two_hours_apart_are_two_firings(mock_db, set_current_user):
+    u = "alice@example.com"
+    set_current_user(u)
+    await _alert(mock_db, u)
+    for m in (240, 120):  # 120 minutes apart: two firings
+        await _note(mock_db, u, "a1", timedelta(minutes=m))
+    out = await watch_mcp.get_fired_alerts.fn(days=7)
+    assert len(out["fired"]) == 2 and [f["count"] for f in out["fired"]] == [1, 1]
 
 
 async def test_fired_alerts_group_name_by_id(mock_db, set_current_user):

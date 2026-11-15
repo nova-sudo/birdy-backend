@@ -52,8 +52,8 @@ async def check_my_accounts(days: int = 7) -> dict:
 async def get_fired_alerts(days: int = 7) -> dict:
     """The alerts that fired in the last N days (1-90, default 7), newest first. Use it for "what went off?" and before explain_alert.
 
-    The alert job re-checks every 15 minutes and logs a row per pass while an alert stays triggered, so rows are
-    collapsed into one firing: consecutive rows of the same alert (and client) no more than 30 minutes apart are
+    The alert job runs hourly and logs a row per pass while an alert stays triggered, so rows are
+    collapsed into one firing: consecutive rows of the same alert (and client) no more than 90 minutes apart are
     one firing. Each firing has alert_id, alert_name, condition_display, group_id and client_name (null for
     account-wide alerts), first_triggered_at, last_seen_at, count (how many passes it stayed triggered), message
     and current_value.

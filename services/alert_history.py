@@ -5,9 +5,12 @@ from datetime import datetime, timedelta
 from core.constants import METRIC_LABELS
 from services.alert_service import format_condition_display
 
-# The 15-minute alert job writes one alert_notifications row per pass while an alert stays triggered.
-# Rows of the same (alert_id, group_id) no more than this far apart are one firing.
-FIRING_GAP = timedelta(minutes=30)
+# The alert job runs hourly (Vercel cron "15 * * * *") and writes one alert_notifications row per pass while
+# an alert stays triggered. The gap must be longer than that cadence (plus slack for a late or retried run),
+# or every pass would read as a separate firing. Rows of the same (alert_id, group_id) no more than this far
+# apart are one firing.
+FIRING_GAP_MINUTES = 90
+FIRING_GAP = timedelta(minutes=FIRING_GAP_MINUTES)
 
 
 def collapse_firings(rows: list[dict]) -> list[dict]:
