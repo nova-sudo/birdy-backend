@@ -228,24 +228,14 @@ class ActivateBody(BaseModel):
     only_flag: Optional[list[str]] = None
 
 
-FLAG_ONLY_KEY = "flag_only_client_group_ids"  # scope key: watched, never claimed or acted on
+FLAG_ONLY_KEY = claims.FLAG_ONLY_KEY
 
 
 async def _claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move: bool,
                        only_flag) -> JSONResponse | None:
-    """Claim the clients an active agent acts on. Clients in `only_flag` stay in its scope with
-    no claim (and any claim this agent holds on them is released). Returns a 409 response
-    naming the holders when another agent has any of the rest."""
-    skip = set(only_flag or [])
-    await claims.release_clients(db, user_id, agent_id, skip)
-    conflicts = await claims.claim_clients(db, user_id, agent_id, [g for g in ids if g not in skip], move=move)
-    if conflicts:
-        return JSONResponse(status_code=409, content={
-            "detail": "Another agent already acts on " + ", ".join(
-                sorted({c["holder_name"] or "another agent" for c in conflicts})),
-            "conflicts": conflicts})
-    await claims.mark_claimed(db, agent_id)  # it holds what it should, so the migration never touches it
-    return None
+    """ai.agents.claims.claim_scope as a 409 response."""
+    conflict = await claims.claim_scope(db, user_id, agent_id, ids, move=move, only_flag=only_flag)
+    return JSONResponse(status_code=409, content=conflict) if conflict else None
 
 
 @router.patch("/{agent_id}")

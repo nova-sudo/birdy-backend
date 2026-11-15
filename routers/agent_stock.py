@@ -5,7 +5,6 @@ The Birdy Media Buying Agent's API: settings, preview, runs and reports, cards, 
 lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a custom agent a 400.
 """
 
-import copy
 from contextlib import contextmanager
 import logging
 import os
@@ -19,19 +18,17 @@ from pydantic import BaseModel, ConfigDict
 
 from ai import conversation_log
 from ai.agents import access as agent_access
-from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
 from ai.agents.stock import add as stock_add
+from ai.agents.stock import agent_settings
 from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import cards as stock_cards
 from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import reports
 from ai.agents.stock import runner as stock_runner
-from ai.agents.stock import settings as stock_settings
-from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
-from ai.agents.stock import weekly as stock_weekly
+from ai.agents.stock.apply import APPLY_BUDGET_SECONDS
 from ai.agents.stock.scoreboard import clear_row
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -41,7 +38,6 @@ router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 logger = logging.getLogger(__name__)
 
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
-APPLY_BUDGET_SECONDS = 20      # the dashboard waits this long for lines in the request; the cron finishes the rest
 
 
 def _utcnow() -> datetime:
@@ -87,41 +83,12 @@ async def patch_settings(agent_id: str, body: SettingsPatch,
         agent = await agents_router._agent_or_404(db, current_user, agent_id)
         if agent.get("type") != agent_store.TYPE_STOCK:
             raise HTTPException(status_code=400, detail="Only the Birdy Media Buying Agent has these settings")
-        patch = body.settings or {}
-        errors = stock_settings.shape_errors(patch)
-        if not errors and (patch.get("slack") or {}).get("templates"):
-            patch = copy.deepcopy(patch)
-            for kind, t in patch["slack"]["templates"].items():
-                if t is None:
-                    continue
-                try:
-                    patch["slack"]["templates"][kind] = stock_templates.validate_template(kind, t)
-                except stock_templates.TemplateError as e:
-                    errors += [{"field": f"slack.templates.{kind}", "message": m} for m in e.errors]
-        if errors:
-            return JSONResponse(status_code=400, content={"detail": "Some settings are invalid", "errors": errors})
-        await agents_router._require_owned_groups(db, current_user, (patch.get("clients") or {}).keys())
-
-        current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
-        merged = stock_settings.merge_settings(current, patch)
-        update: dict = {"settings": merged}
-
-        if body.client_group_ids is not None:
-            ids = list(dict.fromkeys(body.client_group_ids))
-            await agents_router._require_owned_groups(db, current_user, ids)
-            scope = agent.get("scope") or {}
-            before = list(scope.get("client_group_ids") or [])
-            flag_only = [g for g in (body.only_flag if body.only_flag is not None
-                                     else scope.get(agents_router.FLAG_ONLY_KEY) or []) if g in ids]
-            update["scope"] = {**scope, "client_group_ids": ids, agents_router.FLAG_ONLY_KEY: flag_only}
-            if agent.get("status") == "active":
-                resp = await agents_router._claim_scope(db, current_user, agent_id, ids,
-                                                        move=body.move_claims, only_flag=flag_only)
-                if resp is not None:
-                    return resp
-                await claims.release_clients(db, current_user, agent_id, set(before) - set(ids))
-
-        updated = await agent_store.update_agent(db, current_user, agent_id, update)
+        try:
+            updated = await agent_settings.update_settings(
+                db, current_user, agent, settings=body.settings, client_group_ids=body.client_group_ids,
+                move_claims=body.move_claims, only_flag=body.only_flag)
+        except agent_settings.SettingsError as e:
+            return JSONResponse(status_code=e.status, content=e.body)
         return agents_router._agent_to_api(updated)
 
 
@@ -337,29 +304,14 @@ async def apply_all(agent_id: str, run_id: str, current_user: str = Depends(get_
 # Weekly report
 # ---------------------------------------------------------------------------
 
-WEEKLY_REFUSED = {"preview": "A preview never posts to Slack."}
-
-
 @router.post("/{agent_id}/runs/{run_id}/weekly/post")
 async def post_weekly(agent_id: str, run_id: str, current_user: str = Depends(get_current_user)):
     """Post the run's weekly message to Slack. Pressing again says it is already posted; it never posts twice."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _stock_agent(db, current_user, agent_id)
-        run = await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id})
-        if run is None or not run.get("weekly"):
-            raise HTTPException(status_code=404, detail="This run has no weekly report")
-        try:
-            res = await stock_weekly.post_weekly(db, run, agent, by=current_user)
-        except stock_slack.SlackPublishError as e:
-            raise HTTPException(status_code=502, detail=str(e))
-        if res["outcome"] == "not_built":
-            raise HTTPException(status_code=404, detail="This run has no weekly report")
-        if res["outcome"] == "preview":
-            raise HTTPException(status_code=409, detail=WEEKLY_REFUSED["preview"])
-        if res["outcome"] == "in_progress":
-            raise HTTPException(status_code=409, detail="The weekly report is being posted. Check Slack in a moment.")
-        return res
+        with _http_errors():
+            return await reports.post_weekly_report(db, agent, run_id, by=current_user)
 
 
 # ---------------------------------------------------------------------------
@@ -387,12 +339,7 @@ def _template_error(e: stock_templates.TemplateError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": "This template can't be used", "errors": e.errors})
 
 
-async def _save_template(db, agent: dict, user_id: str, kind: str, template: dict | None) -> dict:
-    """None resets it: merge_settings drops a null template, so it is really gone."""
-    current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
-    merged = stock_settings.merge_settings(current, {"slack": {"templates": {kind: template}}})
-    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$unset": {f"{stock_slack.NOTICES}.{kind}": ""}})
-    return await agent_store.update_agent(db, user_id, agent["_id"], {"settings": merged})
+_save_template = reports.save_template
 
 
 @router.get("/{agent_id}/slack-templates/{kind}")

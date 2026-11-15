@@ -6,6 +6,7 @@ templates. The HTTP routes (routers/agent_stock.py) and the MCP tools (ai/mcp/st
 these functions, so there is one implementation (list_cards has no route: it serves the MCP tool only). A missing thing raises ReportError, which each caller maps to its own error.
 """
 
+import copy
 import re
 from datetime import datetime, timezone
 from typing import Optional
@@ -204,3 +205,47 @@ async def list_cards(db, agent_id: str, status: str, limit: int) -> list[dict]:
         q["status"] = {"$in": CARD_LIST_STATUSES[status]}
     rows = await db[stock_runner.CARDS].find(q).sort("created_at", -1).limit(limit).to_list(length=limit)
     return [await card_for_api(db, c) for c in rows]
+
+
+async def save_template(db, agent: dict, user_id: str, kind: str, template: dict | None) -> dict:
+    """None resets it: merge_settings drops a null template, so it is really gone. Returns the updated agent."""
+    current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
+    merged = stock_settings.merge_settings(current, {"slack": {"templates": {kind: template}}})
+    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$unset": {f"{stock_slack.NOTICES}.{kind}": ""}})
+    return await agent_store.update_agent(db, user_id, agent["_id"], {"settings": merged})
+
+
+WEEKLY_REFUSED = {"preview": "A preview never posts to Slack."}
+NO_WEEKLY = "This run has no weekly report"
+
+
+async def weekly_run(db, agent_id: str, run_id: str) -> dict:
+    """The agent's run that has a weekly report, else ReportError 404."""
+    run = await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id})
+    if run is None or not run.get("weekly"):
+        raise ReportError(404, NO_WEEKLY)
+    return run
+
+
+def weekly_text(run: dict) -> str:
+    """The week's report as plain text: what would go to Slack, without the layout."""
+    v = (stock_weekly.weekly_view(run) or {}).get("values") or {}
+    parts = [("Weekly report", v.get("week")), ("Comparison", v.get("comparison")), ("Improved", v.get("improved")),
+             ("Decreased", v.get("decreased")), ("Status check", v.get("status_check")), ("Wins", v.get("wins"))]
+    return "\n\n".join(f"{title}: {text}" for title, text in parts if text)
+
+
+async def post_weekly_report(db, agent: dict, run_id: str, *, by: str) -> dict:
+    """Post the run's weekly message to Slack. Posting again says it is already posted; it never posts twice."""
+    run = await weekly_run(db, agent["_id"], run_id)
+    try:
+        res = await stock_weekly.post_weekly(db, run, agent, by=by)
+    except stock_slack.SlackPublishError as e:
+        raise ReportError(502, str(e))
+    if res["outcome"] == "not_built":
+        raise ReportError(404, NO_WEEKLY)
+    if res["outcome"] == "preview":
+        raise ReportError(409, WEEKLY_REFUSED["preview"])
+    if res["outcome"] == "in_progress":
+        raise ReportError(409, "The weekly report is being posted. Check Slack in a moment.")
+    return res

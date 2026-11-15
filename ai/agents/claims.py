@@ -18,6 +18,7 @@ logger = logging.getLogger(__name__)
 
 CLAIMS = "agent_client_claims"
 CLAIMS_MIGRATED = "claims_migrated_at"  # on the agent: it has its claims, migrate_claims skips it
+FLAG_ONLY_KEY = "flag_only_client_group_ids"  # scope key: watched, never claimed or acted on
 
 
 async def ensure_indexes(db) -> None:
@@ -121,3 +122,17 @@ async def migrate_claims(db) -> None:
                 logger.info("claims migration: %s keeps %s, %s only watches it",
                             conflicts[0]["holder_id"], gid, a["_id"])
         await mark_claimed(db, a["_id"])
+
+
+async def claim_scope(db, user_id: str, agent_id: str, ids: list[str], *, move: bool, only_flag) -> dict | None:
+    """Claim the clients an active agent acts on. Clients in `only_flag` stay in its scope with
+    no claim (and any claim this agent holds on them is released). Returns {"detail", "conflicts"}
+    naming the holders when another agent has any of the rest, else None."""
+    skip = set(only_flag or [])
+    await release_clients(db, user_id, agent_id, skip)
+    conflicts = await claim_clients(db, user_id, agent_id, [g for g in ids if g not in skip], move=move)
+    if conflicts:
+        return {"detail": "Another agent already acts on " + ", ".join(
+            sorted({c["holder_name"] or "another agent" for c in conflicts})), "conflicts": conflicts}
+    await mark_claimed(db, agent_id)  # it holds what it should, so the migration never touches it
+    return None
