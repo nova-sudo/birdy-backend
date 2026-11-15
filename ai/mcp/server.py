@@ -24,16 +24,10 @@ Two kinds of valid bearer token reach this server:
 
 from fastmcp import FastMCP
 from fastmcp.server.auth import TokenVerifier, AccessToken
-from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.server.dependencies import get_access_token
 
-from core.config import JWT_SECRET, JWT_ALGORITHM
-from core.database import get_db
-from core.mongo_client import get_shared_mongo_client
-from services.mcp_token_service import is_mcp_token_valid
 from ai.mcp.access import BirdyAccessMiddleware
-
-_jwt_verifier = JWTVerifier(public_key=JWT_SECRET, algorithm=JWT_ALGORITHM)
+from ai.mcp.oauth_provider import verify_birdy_token
 
 
 class _RevocationAwareVerifier(TokenVerifier):
@@ -42,17 +36,8 @@ class _RevocationAwareVerifier(TokenVerifier):
     session/internal `type: "access"` tokens skip the DB round-trip entirely."""
 
     async def verify_token(self, token: str) -> AccessToken | None:
-        result = await _jwt_verifier.verify_token(token)
-        if result is None:
-            return None
-        if result.claims.get("type") == "mcp":
-            jti = result.claims.get("jti")
-            if not jti:
-                return None
-            db = get_db(get_shared_mongo_client())
-            if not await is_mcp_token_valid(db, jti):
-                return None
-        return result
+        # Same logic the OAuth provider's load_access_token uses (ai/mcp/oauth_provider.py).
+        return await verify_birdy_token(token)
 
 
 mcp = FastMCP(name="Birdy AI Tools", auth=_RevocationAwareVerifier())

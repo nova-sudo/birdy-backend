@@ -23,3 +23,5 @@ CORS_ORIGINS = [
 ]
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")
+# Public URL of this API (OAuth issuer; the MCP server is served at {API_PUBLIC_URL}/mcp).
+API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://birdy-backend.vercel.app").rstrip("/")

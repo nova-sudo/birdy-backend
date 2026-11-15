@@ -33,26 +33,28 @@ async def create_mcp_tokens_indexes(mongo_client):
     await db["mcp_tokens"].create_index("user_id")
 
 
-async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None, access: str = "write") -> dict:
-    """Mint a new long-lived MCP bearer token and record it for revocation."""
-    days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
+def scope_for_access(access: str) -> str:
+    """JWT `scope` claim for an access level: read -> birdy.read; write -> birdy.read birdy.write."""
+    # Lazy: importing ai.mcp at module load is circular (ai.mcp.server imports this module).
+    from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
+
+    return READ_SCOPE if access == "read" else f"{READ_SCOPE} {WRITE_SCOPE}"
+
+
+async def _mint_mcp_token(db, user_id: str, name: str, access: str, lifetime_seconds: int,
+                          kind: str, extra_claims: dict | None = None, extra_fields: dict | None = None) -> dict:
+    """Sign a `type: "mcp"` JWT and record its jti in mcp_tokens (checked on every request)."""
+    access = "read" if access == "read" else "write"
     jti = uuid.uuid4().hex
     now = datetime.utcnow()
-    expires_at = now + timedelta(days=days)
+    expires_at = now + timedelta(seconds=lifetime_seconds)
 
     # time.time() (not datetime.utcnow().timestamp()) — the latter treats the
     # naive UTC value as local time, silently shifting `exp` by the host's UTC
     # offset on any non-UTC machine.
-    exp_epoch = int(time.time()) + days * 86400
-    # Lazy: importing ai.mcp at module load is circular (ai.mcp.server imports this module).
-    from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
-
-    scope = READ_SCOPE if access == "read" else f"{READ_SCOPE} {WRITE_SCOPE}"
-    token = pyjwt.encode(
-        {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp", "scope": scope},
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-    )
+    exp_epoch = int(time.time()) + lifetime_seconds
+    claims = {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp", "scope": scope_for_access(access)}
+    token = pyjwt.encode({**claims, **(extra_claims or {})}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
     doc = {
         "id": jti,
@@ -63,9 +65,10 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
         "expires_at": expires_at,
         "revoked": False,
         "revoked_at": None,
-        "access": "read" if access == "read" else "write",
-        "kind": "manual",
+        "access": access,
+        "kind": kind,
         "last_used_at": None,
+        **(extra_fields or {}),
     }
     await db["mcp_tokens"].insert_one(doc)
 
@@ -73,9 +76,28 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
         "id": jti,
         "name": name,
         "token": token,
+        "scope": claims["scope"],
         "created_at": now,
         "expires_at": expires_at,
     }
+
+
+async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None, access: str = "write") -> dict:
+    """Mint a new long-lived MCP bearer token and record it for revocation."""
+    days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
+    minted = await _mint_mcp_token(db, user_id, name, access, days * 86400, kind="manual")
+    return {k: minted[k] for k in ("id", "name", "token", "created_at", "expires_at")}
+
+
+async def create_oauth_access_token(db, *, user_id: str, grant_id: str, client_id: str,
+                                    client_name: str, access: str, lifetime_seconds: int) -> dict:
+    """Short-lived access token for an OAuth grant. Carries grant_id so revoking the
+    grant (revoke_connection) stops it on the very next request."""
+    return await _mint_mcp_token(
+        db, user_id, client_name, access, lifetime_seconds, kind="oauth",
+        extra_claims={"grant_id": grant_id, "client_id": client_id},
+        extra_fields={"grant_id": grant_id, "client_id": client_id},
+    )
 
 
 async def list_mcp_tokens(db, user_id: str) -> list[dict]:
