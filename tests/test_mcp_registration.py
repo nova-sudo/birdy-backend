@@ -34,7 +34,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "creatives_mcp": {"find_ads", "list_ad_accounts", "list_adsets", "list_creative_tests", "get_creative_test", "draft_creative_test", "post_creative_test", "scale_creative_test"},
     "attribution_mcp": {"get_closes_by_ad", "attribution_status", "leads_by_ad", "funnel", "attribution_overview"},
     "client_mcp": {"get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target"},
-    "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript"},
+    "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript", "send_lead_message"},
     "slack_reports_mcp": {"list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report"},
     "refresh_mcp": {"refresh_client_data", "refresh_status"},
     "watch_mcp": {"check_my_accounts", "get_fired_alerts", "explain_alert"},

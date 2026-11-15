@@ -2,22 +2,27 @@
 ai/mcp/leads_mcp.py
 -------------------
 One lead (a GoHighLevel contact): the full detail page, the live message thread and call transcripts.
-A lead is identified by its contact_id and must belong to one of the caller's client groups. user_id always
+The send tool is live (two steps). A lead is identified by its contact_id and must belong to one of the caller's client groups. user_id always
 comes from the token. Messaging problems come back as {"error": ...} dicts, not exceptions.
 """
 
 import re
+from typing import Literal
 
 from fastmcp.exceptions import ToolError
 
-from ai.mcp.access import READ
+from ai.mcp.access import LIVE, READ
+from ai.mcp.confirm import two_step
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from services.ghl_messages import (
-    MessagingFailed, MessagingReconnect, MessagingUnavailable, RecordingNotFound,
+    MAX_MESSAGE_LENGTH, MAX_SUBJECT_LENGTH, MessageInvalid, MessagingFailed, MessagingReconnect,
+    MessagingUnavailable, MessagingUnconfirmed, RecordingNotFound, check_sendable,
     fetch_call_transcript, fetch_lead_messages,
 )
+from services.ghl_messages import send_lead_message as send_lead_message_service
+from services.ghl_live import safe_token_for
 from services.lead_detail import build_lead_detail, find_lead_contact
 from services.lead_journey import build_lead_journey
 from services.lead_summary import get_lead_summary
@@ -108,3 +113,88 @@ async def get_call_transcript(contact_id: str, message_id: str) -> dict:
     except (MessagingUnavailable, MessagingFailed):
         return dict(_UNAVAILABLE)
     return {"transcript": transcript}
+
+
+# ---------------------------------------------------------------------------
+# Live (two steps): a real SMS or email to a lead
+# ---------------------------------------------------------------------------
+
+_GHL_CHANNEL = {"sms": "SMS", "email": "Email"}
+
+
+def _mask_phone(phone: str) -> str:
+    digits = re.sub(r"\D", "", phone or "")
+    return f"•••• {digits[-4:]}" if digits else "••••"
+
+
+def _mask_email(email: str) -> str:
+    local, _, domain = (email or "").strip().partition("@")
+    return f"{local[:1]}•••@{domain}"
+
+
+def _lead_name(contact: dict) -> str:
+    name = " ".join(p for p in (contact.get("firstName"), contact.get("lastName")) if p).strip()
+    return name or contact.get("name") or "this lead"
+
+
+@mcp.tool(**LIVE)
+async def send_lead_message(contact_id: str, channel: Literal["sms", "email"], body: str,
+                            subject: str | None = None, confirm_code: str | None = None) -> dict:
+    """Send a real SMS or email to a lead through GoHighLevel, from the client's own GoHighLevel number or address. It cannot be undone.
+
+    Two steps. Called without confirm_code it sends nothing and returns a preview (who it goes to with the phone or email partly hidden, the channel, the subject and the exact message) and a one-time confirm_code. Show the preview to the user and only call again with confirm_code after they say yes.
+    The second call must repeat exactly the same contact_id, channel, body and subject. Any change (even one character) is refused and nothing is sent. A lead with no phone (sms) or no email (email), an email without a subject, an empty message, a message over 1600 characters, or GoHighLevel needing a reconnect returns {"error": ...} and no code.
+    Returns {ok: true, message} when sent. {ok: false, error} when GoHighLevel rejected it or could not confirm it: if it could not confirm, check get_lead_messages before sending again.
+
+    Args:
+        contact_id: The GoHighLevel contact id, as returned by get_ghl_contacts or get_unified_leads.
+        channel: sms or email.
+        body: The message text (up to 1600 characters). Leading and trailing whitespace is trimmed.
+        subject: Required for email (up to 300 characters), ignored for sms.
+        confirm_code: The code from the preview, once the user has agreed.
+    """
+    db, user_id = _db(), _current_user_id()
+    doc = await _owned_lead(db, user_id, contact_id)
+    ghl_channel = _GHL_CHANNEL.get(channel)
+    if not ghl_channel:
+        return {"error": "channel must be sms or email."}
+    # What the user is asked about is bound to the code exactly as typed; both steps then clean it the same way.
+    args = {"contact_id": contact_id, "channel": channel, "body": body, "subject": subject}
+    message = (body or "").strip()
+    if not message:
+        return {"error": "The message is empty."}
+    if len(message) > MAX_MESSAGE_LENGTH:
+        return {"error": f"The message is too long ({len(message)} characters; at most {MAX_MESSAGE_LENGTH})."}
+    if subject is not None and len(subject) > MAX_SUBJECT_LENGTH:
+        return {"error": f"The subject is too long (at most {MAX_SUBJECT_LENGTH} characters)."}
+    contact = doc.get("contact_data") or {}
+    try:
+        clean_subject = check_sendable(contact, ghl_channel, subject)
+    except MessageInvalid as e:
+        return {"error": e.detail}
+    if not confirm_code and not await safe_token_for(db, user_id, doc.get("location_id")):
+        return dict(_RECONNECT)
+
+    async def preview():
+        out = {"to": _lead_name(contact), "channel": channel, "body": message}
+        if ghl_channel == "Email":
+            out["email"] = _mask_email(contact.get("email"))
+            out["subject"] = clean_subject
+        else:
+            out["phone"] = _mask_phone(contact.get("phone"))
+        return out
+
+    async def execute():
+        try:
+            sent = await send_lead_message_service(db, user_id, doc.get("location_id"), contact_id,
+                                                   ghl_channel, message, clean_subject)
+        except (MessagingReconnect, MessagingUnavailable):
+            return dict(_RECONNECT)
+        except MessagingUnconfirmed:
+            return {"ok": False, "error": "GoHighLevel did not confirm the message, so it may still have been sent. "
+                                          "Check get_lead_messages before sending again."}
+        except MessagingFailed:
+            return {"ok": False, "error": "GoHighLevel rejected the message. Nothing was sent."}
+        return {"ok": True, "message": sent}
+
+    return await two_step(db, user_id, "send_lead_message", args, confirm_code, preview, execute)
