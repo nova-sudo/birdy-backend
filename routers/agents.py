@@ -29,6 +29,7 @@ from ai.agents import access as agent_access
 from ai.agents import store as agent_store
 from ai.agents import validation
 from ai.agents.stock import lessons as stock_lessons
+from ai.agents.stock import reports
 from ai.agents.stock import settings as stock_settings
 from ai.agents.defaults import (
     DEFAULT_GUARDRAILS,
@@ -90,10 +91,7 @@ def _rule_to_api(doc: dict) -> dict:
     return out
 
 
-def _memory_to_api(doc: dict) -> dict:
-    out = {k: v for k, v in doc.items() if k != "_id"}
-    out["id"] = doc["_id"]
-    return out
+_memory_to_api = reports.memory_to_api
 
 
 # ---------------------------------------------------------------------------
@@ -830,11 +828,7 @@ async def undo_auto(agent_id: str, suggestion_id: str, current_user: str = Depen
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
 
 
-def _proposal_to_api(doc: dict) -> dict:
-    out = {k: v for k, v in doc.items() if k != "_id"}
-    out["id"] = doc["_id"]
-    out["rule_label"] = learning.RULE_LABELS.get(doc.get("rule_kind"), doc.get("rule_kind"))
-    return out
+_proposal_to_api = reports.proposal_to_api
 
 
 @router.get("/{agent_id}/proposals")

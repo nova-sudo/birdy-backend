@@ -41,7 +41,6 @@ router = APIRouter(prefix="/api/agents", tags=["agent-stock"])
 logger = logging.getLogger(__name__)
 
 PREVIEW_BUDGET_SECONDS = 170   # of Vercel's 300 s; with the runner's capped reads the request ends well inside it
-OUTCOME_ROWS = 100
 APPLY_BUDGET_SECONDS = 20      # the dashboard waits this long for lines in the request; the cron finishes the rest
 
 

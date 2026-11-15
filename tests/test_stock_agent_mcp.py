@@ -127,3 +127,29 @@ async def test_cards_of_other_user_invisible(mock_db, set_current_user):
     with pytest.raises(ToolError, match="Run not found"):
         await t.get_agent_run.fn(run_id="r1")
     assert (await t.get_agent_overview.fn())["agent"]["id"] == bob["_id"]
+
+
+async def test_other_agent_of_same_user_card_not_returned(mock_db, set_current_user):
+    set_current_user(ALICE)
+    stock = await _stock(mock_db)
+    custom = await agent_store.create_agent(mock_db, ALICE, type=agent_store.TYPE_CUSTOM, name="Side")
+    await _card(mock_db, custom, "cx", "rx")
+    assert (await t.get_agent_cards.fn(status="all"))["cards"] == []
+    with pytest.raises(ToolError, match="Card not found"):
+        await t.get_agent_card.fn(card_id="cx")
+    assert stock["_id"]
+
+
+async def test_lists_say_when_truncated(mock_db, set_current_user, monkeypatch):
+    set_current_user(ALICE)
+    agent = await _stock(mock_db)
+    monkeypatch.setattr(t, "CARD_LIST_LIMIT", 2)
+    monkeypatch.setattr(t, "SCOREBOARD_ROWS", 2)
+    for i in range(3):
+        await _card(mock_db, agent, f"c{i}", "r1", created_at=datetime(2026, 11, 3, 8, i))
+        await mock_db[OUTCOMES].insert_one({"_id": f"o{i}", "agent_id": agent["_id"], "result": "won",
+                                            "created_at": datetime(2026, 11, 1, 0, i)})
+    out = await t.get_agent_cards.fn()
+    assert out["count"] == 2 and out["more"] is True
+    board = await t.get_agent_outcomes.fn()
+    assert len(board["rows"]) == 2 and board["more_rows"] is True and board["won"] == 3

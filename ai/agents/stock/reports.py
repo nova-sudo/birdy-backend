@@ -3,7 +3,7 @@ ai/agents/stock/reports.py
 --------------------------
 What the Birdy Media Buying Agent did and found: runs and reports, cards, scoreboard, lessons, months and Slack
 templates. The HTTP routes (routers/agent_stock.py) and the MCP tools (ai/mcp/stock_agent_mcp.py) both read through
-these functions, so there is one implementation. A missing thing raises ReportError, which each caller maps to its own error.
+these functions, so there is one implementation (list_cards has no route: it serves the MCP tool only). A missing thing raises ReportError, which each caller maps to its own error.
 """
 
 import re
@@ -13,6 +13,7 @@ from typing import Optional
 from ai.agents import learning
 from ai.agents import store as agent_store
 from ai.agents.stock import apply as stock_apply
+from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import months as stock_months
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
@@ -36,7 +37,7 @@ class ReportError(Exception):
         self.status, self.detail = status, detail
 
 
-def _utcnow() -> datetime:
+def _utcnow() -> datetime:   # the one clock for learned() and month_report(); patch it in tests
     return datetime.now(timezone.utc)
 
 
@@ -113,7 +114,6 @@ async def learned(db, agent_id: str, run: dict) -> list[dict]:
 
 async def suggestions(db, agent_id: str) -> list[dict]:
     """The open "Make it a rule?" suggestions."""
-    from ai.agents.stock import lessons as stock_lessons
     rows = await db[agent_store.PROPOSALS].find(
         {"agent_id": agent_id, "kind": stock_lessons.PROMOTE, "status": "open"}).sort("created_at", 1).to_list(length=None)
     return [proposal_to_api(p) for p in rows]

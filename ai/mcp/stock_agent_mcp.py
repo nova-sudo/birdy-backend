@@ -119,7 +119,7 @@ async def get_agent_month(month: str, agent: str | None = None) -> dict:
 
 @mcp.tool(**READ)
 async def get_agent_cards(status: Literal["open", "applied", "dismissed", "all"] = "open", agent: str | None = None) -> dict:
-    """The agent's cards (proposed changes per client), newest first, summarised. Up to 50.
+    """The agent's cards (proposed changes per client), newest first, summarised. Returns up to 50; `more` is true when there are older ones not shown.
 
     "open" is what is waiting on the owner to apply or dismiss; use get_agent_card for one card's lines and reasoning.
 
@@ -128,8 +128,9 @@ async def get_agent_cards(status: Literal["open", "applied", "dismissed", "all"]
         agent: Optional agent id or name. Defaults to the owner's Birdy Media Buying Agent.
     """
     db, _, found = await _stock(agent)
-    cards = await reports.list_cards(db, found["_id"], status, CARD_LIST_LIMIT)
-    return {"status": status, "count": len(cards), "cards": [_card_summary(c) for c in cards]}
+    cards = await reports.list_cards(db, found["_id"], status, CARD_LIST_LIMIT + 1)
+    return {"status": status, "count": min(len(cards), CARD_LIST_LIMIT), "more": len(cards) > CARD_LIST_LIMIT,
+            "cards": [_card_summary(c) for c in cards[:CARD_LIST_LIMIT]]}
 
 
 @mcp.tool(**READ)
@@ -162,7 +163,7 @@ async def get_agent_lessons(agent: str | None = None) -> list[dict]:
 
 @mcp.tool(**READ)
 async def get_agent_outcomes(agent: str | None = None) -> dict:
-    """The agent's scoreboard: moves won and lost, and its most recent scored changes (up to 20 rows).
+    """The agent's scoreboard: moves won and lost, and its most recent scored changes (up to 20 rows; `more_rows` is true when older ones are cut; won/lost/moves cover all of them).
 
     Use it to answer "is the agent actually helping?".
 
@@ -171,7 +172,7 @@ async def get_agent_outcomes(agent: str | None = None) -> dict:
     """
     db, _, found = await _stock(agent)
     board = await reports.scoreboard(db, found["_id"])
-    return {**board, "rows": board["rows"][:SCOREBOARD_ROWS]}
+    return {**board, "rows": board["rows"][:SCOREBOARD_ROWS], "more_rows": len(board["rows"]) > SCOREBOARD_ROWS}
 
 
 @mcp.tool(**READ)
