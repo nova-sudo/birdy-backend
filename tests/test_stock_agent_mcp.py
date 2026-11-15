@@ -227,7 +227,11 @@ async def test_apply_all_previews_open_cards_then_applies(mock_db, writable, mon
     assert first["preview"]["count"] == 1 and first["preview"]["cards"][0]["card"]["id"] == "c1"
     run.assert_not_awaited()
     out = await t.apply_all_cards.fn(run_id="r1", confirm_code=first["confirm_code"])
-    assert run.await_args.kwargs["source"] == "mcp" and out["outcome"] == "queued" and out["summary"]
+    assert run.await_args.kwargs["source"] == "mcp" and out["outcome"] == "queued" and "queued" in out["summary"]
+    run.return_value = {"ok": True, "outcome": "applied", "reason": None, "applied": 2}
+    again = await t.apply_all_cards.fn(run_id="r1")
+    done = await t.apply_all_cards.fn(run_id="r1", confirm_code=again["confirm_code"])
+    assert "Applied 2" in done["summary"] and "queued" not in done["summary"]
 
 
 async def test_undo_card_line_two_step(writable, monkeypatch):
@@ -285,6 +289,7 @@ async def test_dismiss_card_records_source_mcp(mock_db, writable):
 
 async def test_edit_card_keeps_only_given_lines(mock_db, writable):
     out = await t.edit_card.fn(card_id="c1", keep_line_ids=["l1"])
+    assert "1 line" in out["summary"]
     assert [ln["id"] for ln in out["card"]["lines"]] == ["l1"]
     stored = await mock_db[CARDS].find_one({"_id": "c1"})
     assert [ln["id"] for ln in stored["lines"]] == ["l1"]
@@ -299,6 +304,7 @@ async def test_add_agent_lesson_client_needs_a_card_and_all_does_not(mock_db, wr
     assert out["lesson"]["id"] == "m1" and lesson.await_args.kwargs["source"] == "mcp"
     out = await t.add_agent_lesson.fn(text="x", card_id="c1")
     assert lesson.await_args.kwargs["client_group_id"] == "g1" and out["summary"]
+    assert lesson.await_args.kwargs["source"] == "mcp" and lesson.await_args.kwargs["source_ref"] == "c1"
 
 
 async def test_update_agent_settings_merges_and_refuses_bad(mock_db, writable):
@@ -349,8 +355,7 @@ async def test_write_tools_cannot_touch_another_users_card(mock_db, set_current_
     applied.assert_not_awaited()
     card = await mock_db[CARDS].find_one({"_id": "c1"})
     assert card["status"] == "open" and len(card["lines"]) == 2
-    # alice's code is no use to bob either: it is bound to the user
-    assert await mock_db["mcp_confirm_codes"].count_documents({}) == 0
+    assert await mock_db["mcp_confirm_codes"].count_documents({}) == 0   # no code was issued for bob
 
 
 async def test_new_tools_are_tagged_write_and_live():
@@ -362,3 +367,22 @@ async def test_new_tools_are_tagged_write_and_live():
     for name in ("dismiss_card", "edit_card", "add_agent_lesson", "update_agent_settings",
                  "set_agent_slack_template", "reset_agent_slack_template"):
         assert tools[name].tags == {"write"}
+
+
+async def test_bob_cannot_replay_alices_confirm_code(mock_db, set_current_user, monkeypatch):
+    alice = await _stock(mock_db, ALICE)
+    await _run(mock_db, alice, "r1")
+    await _card(mock_db, alice, "c1", "r1", lines=_two_lines())
+    applied = AsyncMock()
+    monkeypatch.setattr(t.stock_apply, "apply_card", applied)
+    set_current_user(ALICE)
+    code = (await t.apply_card.fn(card_id="c1", line_ids=["l1"]))["confirm_code"]
+    set_current_user(BOB)
+    await _stock(mock_db, BOB)
+    with pytest.raises(ToolError, match="Card not found"):
+        await t.apply_card.fn(card_id="c1", line_ids=["l1"], confirm_code=code)
+    applied.assert_not_awaited()
+    # the code is still alice's, unspent
+    set_current_user(ALICE)
+    applied.return_value = {"ok": True, "outcome": "applied", "reason": None, "card": {}, "lines": []}
+    assert (await t.apply_card.fn(card_id="c1", line_ids=["l1"], confirm_code=code))["outcome"] == "applied"

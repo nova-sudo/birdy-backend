@@ -331,7 +331,15 @@ async def apply_all_cards(run_id: str, agent: str | None = None, confirm_code: s
 def _apply_all_summary(res: dict) -> str:
     if not res.get("ok"):
         return f"Could not apply the run's cards: {res.get('reason') or res.get('outcome')}."
-    return "Started applying every open card in the run; lines that did not finish in time are finished in the background."
+    outcome = res.get("outcome")
+    if outcome == "queued":
+        return (f"Applied {res.get('applied', 0)} line(s) so far; the rest are queued and finish in the background "
+                "(check get_agent_run for progress).")
+    if outcome == "applied":
+        return f"Applied {res.get('applied', 0)} line(s) across the run's open cards."
+    if outcome == "noop":
+        return "Nothing to apply: the run has no open lines waiting."
+    return f"Nothing was applied: {res.get('failed', 0)} failed, {res.get('blocked', 0)} blocked."
 
 
 @mcp.tool(**LIVE)
@@ -440,7 +448,7 @@ async def edit_card(card_id: str, keep_line_ids: list[str], additional_changes: 
         db, user_id, keep_line_ids=keep_line_ids, additional_changes=additional_changes))
     if not res.get("ok"):
         raise ToolError(res.get("reason") or res.get("error") or "Could not edit the card")
-    return {**res, "summary": f"Kept {_plural(len(keep_line_ids), 'line')} on the card."}
+    return {**res, "summary": f"The card now has {_plural(len(res['card']['lines']), 'line')}."}
 
 
 @mcp.tool(**WRITE)
@@ -457,17 +465,16 @@ async def add_agent_lesson(text: str, scope: Literal["client", "all"] = "client"
         agent: Optional agent id or name. Defaults to the owner's Birdy Media Buying Agent.
     """
     db, user_id, found = await _stock(agent)
-    if card_id:
-        await _owned_card(db, user_id, found, card_id)
-        res = await _in_card_context(card_id, lambda: stock_card_tools.add_lesson(db, user_id, text=text, scope=scope))
-    elif scope == "client":
+    card = await _owned_card(db, user_id, found, card_id) if card_id else None
+    if card is None and scope == "client":
         raise ToolError('A lesson for one client needs card_id (the card of that client), or use scope "all".')
-    else:
-        lesson = await stock_lessons.lesson_from_text(db, found, (text or "").strip(), source=SOURCE, author=user_id)
-        res = ({"ok": True, "changed": "lesson", "lesson": {"id": lesson["_id"], "text": lesson.get("text"),
-                                                              "client_group_id": None}} if lesson else {"ok": False, "error": "empty_lesson"})
-    if not res.get("ok"):
-        raise ToolError("The lesson was empty." if res.get("error") == "empty_lesson" else res.get("error") or "Could not save the lesson")
+    gid = card.get("client_group_id") if card is not None and scope == "client" else None
+    lesson = await stock_lessons.lesson_from_text(db, found, (text or "").strip(), source=SOURCE, author=user_id,
+                                                  client_group_id=gid, source_ref=card_id)
+    if lesson is None:
+        raise ToolError("The lesson was empty.")
+    res = {"ok": True, "changed": "lesson",
+           "lesson": {"id": lesson["_id"], "text": lesson.get("text"), "client_group_id": gid}}
     return {**res, "summary": "Saved the lesson." if scope == "all" else "Saved the lesson for this client."}
 
 
