@@ -247,6 +247,11 @@ def _lines_of(card: dict, ids: list[str] | None) -> list[dict]:
     return [ln for ln in lines if (ln.get("id") in ids if ids is not None else ln.get("state") == "proposed")]
 
 
+def _lines_state(card: dict, ids: list[str] | None) -> list:
+    """Fingerprint of the lines a decision touches, so a card edited after its preview needs a fresh yes."""
+    return sorted((str(ln.get("id")), str(ln.get("state"))) for ln in _lines_of(card, ids))
+
+
 def _card_preview(card: dict, ids: list[str] | None) -> dict:
     view = card_view(card)
     keep = {ln.get("id") for ln in _lines_of(card, ids)}
@@ -292,7 +297,7 @@ async def apply_card(card_id: str, line_ids: list[str] | None = None, agent: str
         return _with_summary(res, "apply it")
 
     return await two_step(db, user_id, "apply_card", {"agent_id": found["_id"], "card_id": card_id, "line_ids": ids},
-                          confirm_code, preview, execute)
+                          confirm_code, preview, execute, state=_lines_state(card, ids))
 
 
 @mcp.tool(**LIVE)
@@ -313,10 +318,11 @@ async def apply_all_cards(run_id: str, agent: str | None = None, confirm_code: s
     if run is None:
         raise ToolError("Run not found")
 
+    cards = await db[stock_runner.CARDS].find(
+        {"run_id": run_id, "agent_id": found["_id"], "user_id": user_id, "status": {"$in": list(_OPEN_STATUSES)}}
+    ).sort("created_at", 1).to_list(length=None)
+
     async def preview():
-        cards = await db[stock_runner.CARDS].find(
-            {"run_id": run_id, "agent_id": found["_id"], "user_id": user_id, "status": {"$in": list(_OPEN_STATUSES)}}
-        ).sort("created_at", 1).to_list(length=None)
         return {"count": len(cards), "cards": [_card_preview(c, None) for c in cards]}
 
     async def execute():
@@ -325,7 +331,8 @@ async def apply_all_cards(run_id: str, agent: str | None = None, confirm_code: s
         return {**res, "summary": _apply_all_summary(res)}
 
     return await two_step(db, user_id, "apply_all_cards", {"agent_id": found["_id"], "run_id": run_id},
-                          confirm_code, preview, execute)
+                          confirm_code, preview, execute,
+                          state=sorted((c["_id"], _lines_state(c, None)) for c in cards))
 
 
 def _apply_all_summary(res: dict) -> str:

@@ -251,3 +251,27 @@ async def test_undo_unknown_applied_type_is_refused_without_code(mock_db, alice)
     assert out["ok"] is False and out["outcome"] == "not_undoable" and "confirm_code" not in out
     await _sug(mock_db, "e", status="applied", applied_at=datetime.utcnow(), applied_action_type="enable_ads", applied_targets=TARGETS)
     assert (await t.undo_suggestion.fn(suggestion_id="e"))["preview"]["action"] == "pause_ads"
+
+
+async def test_apply_suggestion_action_changed_after_preview_refused(mock_db, alice, monkeypatch):
+    await _sug(mock_db)
+    svc = _svc(monkeypatch, "apply_suggestion", {"ok": True, "outcome": "applied"})
+    first = await t.apply_suggestion.fn(suggestion_id="s1")
+    await mock_db[sug_store.SUGGESTIONS].update_one({"_id": "s1"}, {"$set": {"action.targets": TARGETS[:1]}})
+    out = await t.apply_suggestion.fn(suggestion_id="s1", confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    svc.assert_not_awaited()
+
+
+async def test_flag_only_undo_and_ack_say_nothing_changed_in_meta(mock_db, alice, monkeypatch):
+    await _sug(mock_db, "f1", status="applied", applied_at=datetime.utcnow(), action={}, applied_targets=[])
+    _svc(monkeypatch, "undo_suggestion", {"ok": True, "outcome": "undone", "succeeded": []})
+    first = await t.undo_suggestion.fn(suggestion_id="f1")
+    assert "nothing changes in Meta" in first["preview"]["summary"]
+    out = await t.undo_suggestion.fn(suggestion_id="f1", confirm_code=first["confirm_code"])
+    assert out["summary"] == "Reopened the suggestion; nothing changed in Meta."
+    await _sug(mock_db, "f2", action={})
+    _svc(monkeypatch, "apply_suggestion", {"ok": True, "outcome": "applied", "succeeded": [], "failed": []})
+    first = await t.apply_suggestion.fn(suggestion_id="f2")
+    out = await t.apply_suggestion.fn(suggestion_id="f2", confirm_code=first["confirm_code"])
+    assert out["summary"] == "Acknowledged it; nothing changed in Meta."

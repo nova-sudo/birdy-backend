@@ -75,3 +75,22 @@ async def test_expired_code_is_refused(mock_db, freeze_time_plus_601s):
     code = await issue_code(mock_db, "alice", "apply_card", ARGS)
     freeze_time_plus_601s()
     assert not await consume_code(mock_db, "alice", "apply_card", ARGS, code)
+
+
+@pytest.mark.asyncio
+async def test_state_changed_between_preview_and_confirm_is_refused(mock_db):
+    ran = []
+
+    async def preview():
+        return {"p": 1}
+
+    async def execute():
+        ran.append(1)
+        return {"ok": True}
+
+    first = await two_step(mock_db, "alice", "apply_card", ARGS, None, preview, execute, state={"text": "v1"})
+    out = await two_step(mock_db, "alice", "apply_card", ARGS, first["confirm_code"], preview, execute, state={"text": "v2"})
+    assert "changed since the preview" in out["error"] and ran == []
+    first = await two_step(mock_db, "alice", "apply_card", ARGS, None, preview, execute, state={"text": "v2"})
+    assert await two_step(mock_db, "alice", "apply_card", ARGS, first["confirm_code"], preview, execute,
+                          state={"text": "v2"}) == {"ok": True}

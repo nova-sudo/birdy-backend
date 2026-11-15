@@ -170,7 +170,10 @@ async def post_creative_test(test_id: str, confirm_code: str | None = None) -> d
         return await creative_tools.post_creative_test(
             db, user_id, mongo_client=get_shared_mongo_client(), test_id=test["id"], confirmed=True)
 
-    return await two_step(db, user_id, "post_creative_test", args, confirm_code, preview, execute)
+    # What the preview showed: a draft edited after it (draft_creative_test) needs a fresh yes.
+    state = {"name": test.get("name"), "creative": test.get("creative"), "targets": test.get("targets"),
+             "accounts": accounts}
+    return await two_step(db, user_id, "post_creative_test", args, confirm_code, preview, execute, state=state)
 
 
 @mcp.tool(**LIVE)

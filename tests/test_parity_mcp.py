@@ -362,3 +362,13 @@ async def test_bob_cannot_reach_alices_data_through_any_new_tool(name, args, ok,
     scale.assert_not_awaited()
     assert (await mock_db[store.TESTS].find_one({"id": draft["id"]}))["name"] == "Alice test"
     assert await mock_db[store.TESTS].count_documents({"user_id": BOB}) == 0
+
+
+async def test_post_code_refused_when_draft_edited_after_preview(mock_db, alice, enqueue):
+    from ai.mcp import creatives_mcp as t
+    test = await _draft(mock_db)
+    first = await t.post_creative_test.fn(test_id=test["id"])
+    await store.update_test(mock_db, ALICE, test["id"], {"creative": {"destination": "website", "primary_text": "new copy"}})
+    out = await t.post_creative_test.fn(test_id=test["id"], confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    enqueue.assert_not_awaited()

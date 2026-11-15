@@ -155,9 +155,12 @@ async def apply_suggestion(suggestion_id: str, confirm_code: str | None = None) 
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", []),
                 "failed": res.get("failed", []), "status": res.get("status"),
                 "decided_by": views.decided_by(res), "redirect": res.get("redirect"),
-                "summary": "Applied the suggestion in Meta." if res["outcome"] != "already" else "It was already applied."}
+                "summary": "It was already applied." if res["outcome"] == "already" else
+                           "Acknowledged it; nothing changed in Meta." if not doc.get("action") else "Applied the suggestion in Meta."}
 
-    return await two_step(db, user_id, "apply_suggestion", {"suggestion_id": suggestion_id}, confirm_code, preview, execute)
+    # What the preview showed: an action changed after it needs a fresh yes.
+    return await two_step(db, user_id, "apply_suggestion", {"suggestion_id": suggestion_id}, confirm_code, preview, execute,
+                          state={"action": doc.get("action")})
 
 
 @mcp.tool(**LIVE)
@@ -195,6 +198,8 @@ async def undo_suggestion(suggestion_id: str, confirm_code: str | None = None) -
         if not res.get("ok"):
             return _refusal(res, views.UNDO_FAILED_MESSAGE)
         return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", []),
-                "summary": "Undid the suggestion in Meta." if res["outcome"] == "undone" else "Nothing was applied; nothing changed."}
+                "summary": "Nothing was applied; nothing changed." if res["outcome"] != "undone" else
+                           "Reopened the suggestion; nothing changed in Meta." if _INVERSE.get(applied_type) is None
+                           else "Undid the suggestion in Meta."}
 
     return await two_step(db, user_id, "undo_suggestion", {"suggestion_id": suggestion_id}, confirm_code, preview, execute)

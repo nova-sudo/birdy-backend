@@ -240,3 +240,12 @@ async def test_preview_never_writes_the_take_but_the_send_does(mock_db, alice, p
     assert sr.TAKE_PREVIEW in first["preview"]["message"]
     await t.send_test_slack_report.fn(report_id=rep["id"], confirm_code=first["confirm_code"])
     assert calls == [ALICE] and "Spend is steady." in posts[0]["text"] and sr.TAKE_PREVIEW not in posts[0]["text"]
+
+
+async def test_send_code_refused_when_channel_changed_after_preview(mock_db, alice, posts):
+    await _connect(mock_db)
+    rep = await _make()
+    first = await t.send_test_slack_report.fn(report_id=rep["id"])
+    await t.update_slack_report.fn(report_id=rep["id"], channel_id="C0NEW", channel_name="new")
+    out = await t.send_test_slack_report.fn(report_id=rep["id"], confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"] and posts == []

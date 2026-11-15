@@ -206,4 +206,7 @@ async def send_test_slack_report(report_id: str, confirm_code: str | None = None
         label = await _channel_label(db, user_id, report, channel or "")
         return {"ok": True, **res, "summary": f"Posted the report to #{label}."}
 
-    return await two_step(db, user_id, "send_test_slack_report", {"report_id": report_id}, confirm_code, preview, execute)
+    # What the preview showed: a channel or template edited after it needs a fresh yes.
+    state = {k: report.get(k) for k in ("name", "channel_id", "template", "trigger")}
+    return await two_step(db, user_id, "send_test_slack_report", {"report_id": report_id}, confirm_code, preview, execute,
+                          state=state)

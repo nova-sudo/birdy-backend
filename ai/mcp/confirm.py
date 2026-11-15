@@ -4,6 +4,11 @@ A live tool called without a code returns a preview plus a one-time code. Only
 a second call carrying that code, the same user, the same tool and the exact
 same arguments executes. The model cannot skip the step: nothing runs without a
 code the server issued.
+
+A tool also passes `state`: a fingerprint of the object the preview showed (a
+draft's content, a report's channel and blocks). The owner said yes to that
+preview, so if the object changed before the confirm call the code is refused
+and nothing runs.
 """
 
 import hashlib
@@ -21,6 +26,10 @@ INVALID_CODE_ERROR = (
     "This confirmation code is invalid, expired, or for different arguments. "
     "Nothing was changed. Call again without confirm_code to get a fresh preview."
 )
+STATE_CHANGED_ERROR = (
+    "This changed since the preview, so nothing was changed. Call again without "
+    "confirm_code to get a fresh preview and ask the user again."
+)
 NEXT_STEP = (
     "Show this preview to the user. If they agree, call this tool again with "
     "the same arguments plus confirm_code."
@@ -32,10 +41,17 @@ def _now() -> datetime:
     return datetime.utcnow()
 
 
-def _args_hash(args: dict) -> str:
-    clean = {k: v for k, v in (args or {}).items() if k != "confirm_code"}
-    canonical = json.dumps(clean, sort_keys=True, separators=(",", ":"), default=str)
+def _hash(value) -> str:
+    canonical = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
     return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _args_hash(args: dict) -> str:
+    return _hash({k: v for k, v in (args or {}).items() if k != "confirm_code"})
+
+
+def _state_hash(state) -> str | None:
+    return None if state is None else _hash(state)
 
 
 async def create_confirm_code_indexes(mongo_client):
@@ -44,7 +60,7 @@ async def create_confirm_code_indexes(mongo_client):
     await db[COLLECTION].create_index("code", unique=True)
 
 
-async def issue_code(db, user_id: str, tool: str, args: dict) -> str:
+async def issue_code(db, user_id: str, tool: str, args: dict, state=None) -> str:
     code = secrets.token_urlsafe(6)
     now = _now()
     await db[COLLECTION].insert_one(
@@ -53,6 +69,7 @@ async def issue_code(db, user_id: str, tool: str, args: dict) -> str:
             "user_id": user_id,
             "tool": tool,
             "args_hash": _args_hash(args),
+            "state_hash": _state_hash(state),
             "created_at": now,
             "expires_at": now + timedelta(seconds=CONFIRM_TTL_SECONDS),
         }
@@ -60,11 +77,11 @@ async def issue_code(db, user_id: str, tool: str, args: dict) -> str:
     return code
 
 
-async def consume_code(db, user_id: str, tool: str, args: dict, code: str) -> bool:
-    """Atomically burn the code. True only for a live code matching user, tool and args."""
+async def _burn(db, user_id: str, tool: str, args: dict, code: str) -> dict | None:
+    """Atomically delete and return the live code matching user, tool and args."""
     if not code:
-        return False
-    doc = await db[COLLECTION].find_one_and_delete(
+        return None
+    return await db[COLLECTION].find_one_and_delete(
         {
             "code": code,
             "user_id": user_id,
@@ -74,7 +91,12 @@ async def consume_code(db, user_id: str, tool: str, args: dict, code: str) -> bo
             "expires_at": {"$gt": _now()},
         }
     )
-    return doc is not None
+
+
+async def consume_code(db, user_id: str, tool: str, args: dict, code: str, state=None) -> bool:
+    """Atomically burn the code. True only for a live code matching user, tool, args and state."""
+    doc = await _burn(db, user_id, tool, args, code)
+    return doc is not None and doc.get("state_hash") == _state_hash(state)
 
 
 async def two_step(
@@ -85,15 +107,22 @@ async def two_step(
     confirm_code: str | None,
     preview: Callable[[], Awaitable[dict]],
     execute: Callable[[], Awaitable[dict]],
+    *,
+    state=None,
 ) -> dict:
+    """`state` fingerprints what the preview shows; recompute it from the freshly
+    loaded object on both calls. Use stable content fields, never timestamps."""
     if not confirm_code:
         return {
             "needs_confirmation": True,
             "preview": await preview(),
-            "confirm_code": await issue_code(db, user_id, tool, args),
+            "confirm_code": await issue_code(db, user_id, tool, args, state),
             "expires_in_seconds": CONFIRM_TTL_SECONDS,
             "next": NEXT_STEP,
         }
-    if not await consume_code(db, user_id, tool, args, confirm_code):
+    doc = await _burn(db, user_id, tool, args, confirm_code)
+    if doc is None:
         return {"error": INVALID_CODE_ERROR}
+    if doc.get("state_hash") != _state_hash(state):
+        return {"error": STATE_CHANGED_ERROR}
     return await execute()
