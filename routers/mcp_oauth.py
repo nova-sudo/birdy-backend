@@ -9,17 +9,36 @@ auth_token cookie, approves or denies it here. See services/oauth_store.py.
 import logging
 from typing import Literal
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 
 from billing_middleware import require_active_subscription
+from core.config import CORS_ORIGINS, FRONTEND_URL
 from core.database import get_db
-from dependencies import get_mongo_client, get_current_user, get_current_claims
+from dependencies import get_mongo_client, get_current_claims
 from services import oauth_store
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+
+async def session_claims(request: Request) -> dict:
+    """Claims of a real browser session. An MCP token (type "mcp") sent as the
+    auth_token cookie must not be able to approve new connections."""
+    claims = await get_current_claims(request)
+    if claims.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    return claims
+
+
+async def same_origin_json(request: Request) -> None:
+    """CSRF guard for the cookie-authenticated decision POST (cookies are SameSite=none)."""
+    if request.headers.get("content-type", "").split(";")[0].strip().lower() != "application/json":
+        raise HTTPException(status_code=415, detail="Content-Type must be application/json")
+    origin = request.headers.get("origin")
+    if origin is not None and origin.rstrip("/") not in {*CORS_ORIGINS, FRONTEND_URL}:
+        raise HTTPException(status_code=403, detail="Origin not allowed")
 
 
 class DecisionRequest(BaseModel):
@@ -28,7 +47,7 @@ class DecisionRequest(BaseModel):
 
 
 @router.get("/api/oauth/requests/{request_id}")
-async def get_oauth_request(request_id: str, current_user: str = Depends(get_current_user)):
+async def get_oauth_request(request_id: str, _claims: dict = Depends(session_claims)):
     """What the consent page shows. redirect_host is where the owner's approval
     is sent; client_name is chosen by the client and can be spoofed."""
     async with get_mongo_client() as mongo_client:
@@ -39,7 +58,8 @@ async def get_oauth_request(request_id: str, current_user: str = Depends(get_cur
 
 
 @router.post("/api/oauth/requests/{request_id}/decision")
-async def decide_oauth_request(request_id: str, body: DecisionRequest, claims: dict = Depends(get_current_claims)):
+async def decide_oauth_request(request_id: str, body: DecisionRequest, claims: dict = Depends(session_claims),
+                               _csrf: None = Depends(same_origin_json)):
     if claims.get("imp"):
         raise HTTPException(status_code=403, detail="Admins can't connect AI tools while viewing as a user.")
     user_id = claims["sub"]
