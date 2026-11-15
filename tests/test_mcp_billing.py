@@ -5,6 +5,12 @@ import asyncio
 import pytest
 
 import credits
+from fastmcp.server.dependencies import get_access_token
+from ai.mcp import mcp
+from ai.mcp.access import LIVE, READ
+from ai.mcp.confirm import two_step
+from core.database import get_db
+from core.mongo_client import get_shared_mongo_client
 from services import mcp_billing
 from services.mcp_billing import charge_mcp_call, has_credits, mcp_charge_amount
 
@@ -150,3 +156,81 @@ async def test_parallel_calls_near_zero_then_blocked(mcp_call, mock_db):
     assert nxt.is_error and OUT_MSG in nxt.text
     user = await mock_db["users"].find_one({"user_id": USER})
     assert user["credits"]["topup_balance"] >= 0
+
+
+@pytest.fixture
+def temp_tools():
+    """Throwaway tools: a live two-step tool (state can be flipped) and a read tool returning an error dict."""
+    state = {"v": 1}
+
+    @mcp.tool(name="zz_live_two_step", **LIVE)
+    async def zz_live_two_step(confirm_code: str | None = None) -> dict:
+        """temp"""
+        user_id = get_access_token().claims["sub"]
+        db = get_db(get_shared_mongo_client())
+
+        async def preview():
+            return {"action": "go"}
+
+        async def execute():
+            return {"ok": True, "done": True}
+
+        return await two_step(db, user_id, "zz_live_two_step", {}, confirm_code, preview, execute, state=dict(state))
+
+    @mcp.tool(name="zz_error_result", **READ)
+    async def zz_error_result(kind: str = "error") -> dict:
+        """temp"""
+        return {"error": "nope"} if kind == "error" else {"ok": False, "detail": "x"}
+
+    yield state
+    mcp.remove_tool("zz_live_two_step")
+    mcp.remove_tool("zz_error_result")
+
+
+async def _charges(db):
+    return await db["ai_usage"].find({"source": "mcp"}).to_list(None)
+
+
+@pytest.mark.asyncio
+async def test_error_result_costs_nothing(mcp_call, mock_db, temp_tools):
+    await _give(mock_db)
+    await mcp_call("zz_error_result", {"kind": "error"}, user=USER, token_type="mcp")
+    await mcp_call("zz_error_result", {"kind": "ok_false"}, user=USER, token_type="mcp")
+    assert await _charges(mock_db) == []
+
+
+@pytest.mark.asyncio
+async def test_preview_charges_base_only_and_live_execute_adds_live_fee(mcp_call, mock_db, temp_tools):
+    await _give(mock_db)
+    pre = await mcp_call("zz_live_two_step", {}, user=USER, scope="birdy.read birdy.write", token_type="mcp")
+    code = __import__("json").loads(pre.text)["confirm_code"]
+    rows = await _charges(mock_db)
+    assert len(rows) == 1 and rows[0]["credits"] < 1.0  # preview: no live fee
+    done = await mcp_call("zz_live_two_step", {"confirm_code": code}, user=USER,
+                          scope="birdy.read birdy.write", token_type="mcp")
+    assert not done.is_error
+    rows = await _charges(mock_db)
+    assert len(rows) == 2
+    assert max(r["credits"] for r in rows) >= 1.2  # base 0.2 + live 1.0 + data
+
+
+@pytest.mark.asyncio
+async def test_bad_code_costs_nothing(mcp_call, mock_db, temp_tools):
+    await _give(mock_db)
+    res = await mcp_call("zz_live_two_step", {"confirm_code": "wrong"}, user=USER,
+                         scope="birdy.read birdy.write", token_type="mcp")
+    assert "error" in res.text
+    assert await _charges(mock_db) == []
+
+
+@pytest.mark.asyncio
+async def test_state_changed_costs_nothing(mcp_call, mock_db, temp_tools):
+    await _give(mock_db)
+    scope = "birdy.read birdy.write"
+    pre = await mcp_call("zz_live_two_step", {}, user=USER, scope=scope, token_type="mcp")
+    code = __import__("json").loads(pre.text)["confirm_code"]
+    before = len(await _charges(mock_db))
+    temp_tools["v"] = 2  # the world moved on after the preview
+    res = await mcp_call("zz_live_two_step", {"confirm_code": code}, user=USER, scope=scope, token_type="mcp")
+    assert "error" in res.text
+    assert len(await _charges(mock_db)) == before

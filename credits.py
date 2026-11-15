@@ -23,6 +23,7 @@ lives in ``credits_middleware.py``; metering is recorded from the AI orchestrato
 via :func:`record_usage`.
 """
 
+import asyncio
 import logging
 import os
 import time
@@ -375,27 +376,35 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
     """Draw `charge` credits from the user's balance and append a ledger row.
 
     Draw from the plan allowance first, then from purchased top-up credits.
-    Read-modify-write is acceptable: in practice a user runs one question
-    at a time, and a lost race only under-charges by a single question.
+    The write is optimistic: it only lands if `credits.rev` is still what we
+    read, otherwise we re-read and retry, so concurrent charges (an MCP burst)
+    never overwrite each other.
     """
-    credits, _ = await _load_and_sync(db, user_id)
-    remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
-    from_allowance = min(charge, remaining_allowance)
-    from_topup = charge - from_allowance
-    new_used = round(credits["used"] + from_allowance, 4)
-    new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
+    for _ in range(_CHARGE_RETRIES):
+        credits, _ = await _load_and_sync(db, user_id)
+        remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
+        from_allowance = min(charge, remaining_allowance)
+        from_topup = charge - from_allowance
+        new_used = round(credits["used"] + from_allowance, 4)
+        new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
+        rev = credits.get("rev")  # missing on balances written before the version field
 
-    await db["users"].update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "credits.allowance": credits["allowance"],
-            "credits.period_key": credits["period_key"],
-            "credits.used": new_used,
-            "credits.topup_balance": new_topup,
-            "credits.updated_at": datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
+        res = await db["users"].update_one(
+            {"user_id": user_id, "credits.rev": rev},
+            {"$set": {
+                "credits.allowance": credits["allowance"],
+                "credits.period_key": credits["period_key"],
+                "credits.used": new_used,
+                "credits.topup_balance": new_topup,
+                "credits.updated_at": datetime.now(timezone.utc),
+                "credits.rev": (rev or 0) + 1,
+            }},
+        )
+        if res.matched_count:
+            break
+        await asyncio.sleep(0)  # lost the race: yield, re-read, retry
+    else:
+        raise RuntimeError(f"credit charge for {user_id} lost the write race {_CHARGE_RETRIES} times")
 
     await db["ai_usage"].insert_one({
         "user_id": user_id,
@@ -403,6 +412,9 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
         "credits": charge,
         "created_at": datetime.now(timezone.utc),
     })
+
+
+_CHARGE_RETRIES = 25
 
 
 # Whisper is priced per audio minute, not per token (OpenAI: $0.006/min).
@@ -478,7 +490,7 @@ async def add_topup(db, user_id: str, credits_amount: int, payment_id: str) -> b
         res = await db["users"].update_one(
             {"user_id": user_id, "credits.credited_topup_ids": {"$ne": payment_id}},
             {
-                "$inc": {"credits.topup_balance": float(credits_amount)},
+                "$inc": {"credits.topup_balance": float(credits_amount), "credits.rev": 1},
                 "$addToSet": {"credits.credited_topup_ids": payment_id},
                 "$set": {"credits.updated_at": datetime.now(timezone.utc)},
             },
@@ -515,7 +527,7 @@ async def grant_credits(db, user_id: str, amount: float, admin: str, note: Optio
     res = await db["users"].update_one(
         {"user_id": user_id},
         {
-            "$inc": {"credits.topup_balance": amount},
+            "$inc": {"credits.topup_balance": amount, "credits.rev": 1},
             "$set": {"credits.updated_at": datetime.now(timezone.utc)},
         },
         upsert=False,
