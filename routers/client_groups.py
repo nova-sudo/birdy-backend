@@ -75,6 +75,7 @@ from services.ghl_service import (
 )
 from services.ad_leads import fetch_ad_leads, opp_rollup
 from services import client_rename as client_rename_svc
+from services import client_refresh as refresh_svc
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
@@ -2913,16 +2914,7 @@ async def refresh_integration_data(
         if not group:
             raise HTTPException(status_code=404, detail="Client group not found")
 
-        status_field = f"{integration}_refresh_status"
-        # The claim timestamp goes with the status. The ghl-tick decides whether
-        # a running group is held or merely stuck by looking at the claim time,
-        # so a manual refresh that set the status alone stayed claimable — and
-        # the tick would run a second FULL LOAD of the same location alongside
-        # this one, each prune deleting contacts the other had just written.
-        claim = {status_field: "running"}
-        if integration == "ghl":
-            claim["_ghl_claimed_at"] = datetime.utcnow()
-        await db.client_groups.update_one({"id": group_id}, {"$set": claim})
+        await refresh_svc.claim_refresh(db, group_id, integration)
 
     background_tasks.add_task(_run_refresh, group_id, integration, current_user, group)
     return {"status": "started", "integration": integration}
@@ -2930,75 +2922,7 @@ async def refresh_integration_data(
 
 async def _run_refresh(group_id: str, integration: str, user_id: str, group: dict):
     """Background task: full invalidate + refresh for one integration."""
-    status_field = f"{integration}_refresh_status"
-    refresh_field = f"last_{integration}_refresh"
-
-    try:
-        async with get_mongo_client() as mongo_client:
-            db = mongo_client[DB_NAME]
-
-            if integration == "meta":
-                from services.meta_refresh_manager import start_refresh
-
-                ad_account_id = group.get("meta_ad_account_id")
-                if not ad_account_id:
-                    logger.warning(f"No Meta ad account for group {group_id}")
-                    await db.client_groups.update_one(
-                        {"id": group_id},
-                        {"$set": {status_field: "error"},
-                         "$unset": {"_ghl_claimed_at": ""}},
-                    )
-                    return
-
-                # Delegate to the resilient refresh manager
-                await start_refresh(group_id, user_id, group, mongo_client)
-                return  # manager handles status updates
-
-            elif integration == "ghl":
-                location_id = group.get("ghl_location_id")
-                if not location_id:
-                    logger.warning(f"No GHL location for group {group_id}")
-                    await db.client_groups.update_one(
-                        {"id": group_id},
-                        {"$set": {status_field: "error"},
-                         "$unset": {"_ghl_claimed_at": ""}},
-                    )
-                    return
-
-                await fetch_and_cache_ghl_data_optimized(
-                    group_id=group_id,
-                    ghl_location_id=location_id,
-                    user_id=user_id,
-                    mongo_client=mongo_client,
-                    is_initial_load=True,
-                )
-
-            # Mark complete
-            await db.client_groups.update_one(
-                {"id": group_id},
-                {"$set": {
-                    status_field: "complete",
-                    refresh_field: datetime.utcnow(),
-                },
-                 "$unset": {"_ghl_claimed_at": ""}},
-            )
-            logger.info(f"Refresh complete: {integration} for group {group_id}")
-
-    except Exception as e:
-        logger.error(f"Refresh failed: {integration} for group {group_id}: {e}", exc_info=True)
-        error_msg = str(e)[:300]
-        try:
-            async with get_mongo_client() as mc:
-                await mc[DB_NAME].client_groups.update_one(
-                    {"id": group_id},
-                    {"$set": {
-                        status_field: "error",
-                        f"{integration}_refresh_error": error_msg,
-                    },
-                     "$unset": {"_ghl_claimed_at": ""}},
-                )
-        except Exception:
-            pass
+    await refresh_svc.run_refresh(group_id, integration, user_id, group)
 
 
 # ---------------------------------------------------------------------------
@@ -3012,30 +2936,10 @@ async def get_refresh_status(
 ):
     """Poll the refresh status for a group's integrations."""
     async with get_mongo_client() as mongo_client:
-        db = mongo_client[DB_NAME]
-        group = await db.client_groups.find_one(
-            {"id": group_id, "user_id": current_user},
-            {
-                "meta_refresh_status": 1, "ghl_refresh_status": 1,
-                "meta_refresh_error": 1, "ghl_refresh_error": 1,
-                "meta_token_error": 1, "_id": 0,
-            },
-        )
-        if not group:
+        status = await refresh_svc.get_refresh_status(mongo_client, group_id, current_user)
+        if status is None:
             raise HTTPException(status_code=404, detail="Client group not found")
-
-        # Get granular Meta refresh progress from job tracker
-        from services.meta_refresh_manager import get_refresh_progress
-        meta_progress = await get_refresh_progress(group_id, mongo_client)
-
-        return {
-            "meta_refresh_status": group.get("meta_refresh_status", "idle"),
-            "ghl_refresh_status": group.get("ghl_refresh_status", "idle"),
-            "meta_refresh_error": group.get("meta_refresh_error"),
-            "ghl_refresh_error": group.get("ghl_refresh_error"),
-            "meta_token_error": group.get("meta_token_error", False),
-            "meta_refresh_progress": meta_progress,
-        }
+        return status
 
 
 # ---------------------------------------------------------------------------
