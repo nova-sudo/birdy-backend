@@ -158,3 +158,33 @@ async def test_slack_alert_block_has_ask_claude_link(mock_db, slack):
     buttons = [e for b in slack[0]["blocks"] if b["type"] == "actions" for e in b["elements"]]
     assert [b["url"] for b in buttons] == [ask_claude_url(alert_prompt(alert))]
     assert buttons[0]["text"]["text"] == "Ask Claude about this" and len(buttons[0]["url"]) <= 3000
+
+
+async def test_alert_created_already_triggered_emails_on_next_pass(mock_db, sent, run_job):
+    """I5: create-time evaluation sets status "triggered" without emailing; the cron must still email once."""
+    await _alert(mock_db)
+    await mock_db["alerts"].update_one({"id": "a1"}, {"$set": {"status": "triggered"}})
+    await run_job()
+    await run_job()
+    assert len(sent) == 1
+
+
+def _per_client(*triggered):
+    return {"triggered": bool(triggered), "message": "Triggered for: " + ", ".join(triggered), "current_value": 9.0,
+            "progress_pct": 100.0,
+            "per_client_results": [{"group_id": gid, "group_name": gid.title(), "triggered": gid in triggered}
+                                   for gid in ("acme", "beta")]}
+
+
+async def test_second_client_triggering_emails_once_for_it(mock_db, sent, run_job):
+    await _alert(mock_db)
+    await run_job(_per_client("acme"))
+    await run_job(_per_client("acme"))
+    assert len(sent) == 1
+    await run_job(_per_client("acme", "beta"))
+    await run_job(_per_client("acme", "beta"))
+    assert len(sent) == 2 and "Beta" in sent[1]["text"]
+    # acme clears and fires again while beta holds: one more email, for acme
+    await run_job(_per_client("beta"))
+    await run_job(_per_client("acme", "beta"))
+    assert len(sent) == 3

@@ -9,6 +9,18 @@ from services.alert_service import evaluate_alert
 logger = logging.getLogger(__name__)
 
 
+EMAILED_FIELD = "emailed_keys"
+_TOTAL_KEY = "*"
+
+
+def _firing_keys(eval_result: dict) -> set:
+    """What is firing right now: each triggered client of a per-client alert, else the alert as a whole."""
+    per_client = eval_result.get("per_client_results")
+    if per_client:
+        return {str(r.get("group_id") or r.get("group_name")) for r in per_client if r.get("triggered")}
+    return {_TOTAL_KEY} if eval_result.get("triggered") else set()
+
+
 def _channels(alert: dict) -> list:
     """The alert's channels; stored unvalidated, so anything unknown is simply ignored."""
     channels = alert.get("notification_channels")
@@ -66,9 +78,15 @@ async def evaluate_all_alerts():
                     await alert_fired(db, alert, eval_result, wait=True)
 
                     if eval_result["triggered"]:
-                        # Same transition test report_events.alert_fired uses: an alert that stays
-                        # triggered is re-evaluated every pass but fires only once.
-                        newly_triggered = alert.get("status") != "triggered"
+                        # Email once per firing: per client for a per-client alert, so a second client
+                        # starting to trigger emails too. Tracked on the alert rather than by the status
+                        # transition, because creating an already-firing alert sets "triggered" itself.
+                        firing = _firing_keys(eval_result)
+                        emailed = set(alert.get(EMAILED_FIELD) or []) & firing
+                        new_firing = firing - emailed
+                        wants_email = bool(new_firing) and "email" in _channels(alert)
+                        # One attempt per firing (no retries in v1): marked before sending.
+                        update[EMAILED_FIELD] = sorted(emailed | new_firing if wants_email else emailed)
                         update["status"] = "triggered"
                         update["last_triggered_at"] = datetime.utcnow()
                         await db["alerts"].update_one({"id": alert["id"]},
@@ -82,11 +100,12 @@ async def evaluate_all_alerts():
                             "read": False
                         })
                         logger.info(f"🚨 Alert triggered: {alert['name']} — {eval_result['message']}")
-                        if newly_triggered and "email" in _channels(alert):
+                        if wants_email:
                             await _email_owner(db, alert, eval_result, note.inserted_id)
                     else:
                         if alert.get("status") == "triggered":
                             update["status"] = "active"
+                        update[EMAILED_FIELD] = []
                         await db["alerts"].update_one({"id": alert["id"]}, {"$set": update})
 
                 except Exception as e:
