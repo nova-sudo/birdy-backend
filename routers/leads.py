@@ -32,7 +32,7 @@ from services.ghl_messages import (
     MessagingFailed, MessagingReconnect, MessagingUnavailable, MessagingUnconfirmed, RecordingNotFound,
     fetch_call_recording, fetch_call_transcript, fetch_lead_messages, send_lead_message,
 )
-from services.lead_detail import build_lead_detail
+from services.lead_detail import build_lead_detail, find_lead_contact
 from services.lead_journey import build_lead_journey
 from services.lead_summary import get_lead_summary
 
@@ -85,7 +85,7 @@ class SendMessageBody(BaseModel):
 
 
 async def _find_contact(db, user_id: str, contact_id: str) -> dict:
-    doc = await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
+    doc = await find_lead_contact(db, user_id, contact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Lead not found")
     return doc

@@ -34,6 +34,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "creatives_mcp": {"find_ads", "list_ad_accounts", "list_adsets", "list_creative_tests", "get_creative_test", "draft_creative_test", "post_creative_test", "scale_creative_test"},
     "attribution_mcp": {"get_closes_by_ad"},
     "client_mcp": {"get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target"},
+    "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript"},
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())
