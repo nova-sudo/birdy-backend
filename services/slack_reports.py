@@ -263,6 +263,35 @@ async def _target(db, report: dict) -> tuple[str | None, str | None]:
     return decrypt(token_enc), channel
 
 
+async def render_report(db, report: dict, now_utc: datetime, key: str | None = None,
+                        event: dict | None = None) -> dict:
+    """
+    Build one report's message without posting it. Returns {"skipped": reason}
+    (SKIPPED: nothing to send to or about) or {"token", "channel", "blocks",
+    "fallback", "ctx", "key"}. send_report posts exactly this, so a preview built
+    here matches what gets sent.
+    """
+    template = rt.normalize(report.get("template"))
+    if not rt.has_content(template):
+        return {"skipped": "the report has no content"}
+
+    token, channel = await _target(db, report)
+    if not token or not channel:
+        return {"skipped": "Slack isn't connected or no channel is chosen"}
+
+    frequency = template["frequency"]
+    key = key or now_utc.date().isoformat()
+    previous = rt.previous_for(report.get("last_figures"), key, frequency)
+    ctx = await rt.build_context(db, report["user_id"], template, now_utc, previous=previous)
+    ctx.event = event or {}
+    if not ctx.groups:
+        return {"skipped": "no active clients"}
+
+    take = await rt.write_take(db, report["user_id"], template, rt.render(template, ctx)[1])
+    blocks, fallback = rt.render(template, ctx, take=take)
+    return {"token": token, "channel": channel, "blocks": blocks, "fallback": fallback, "ctx": ctx, "key": key}
+
+
 async def send_report(db, report: dict, now_utc: datetime, key: str | None = None,
                       event: dict | None = None, record: bool = True) -> tuple[str, str | None]:
     """
@@ -271,35 +300,21 @@ async def send_report(db, report: dict, now_utc: datetime, key: str | None = Non
     `event` fills the event placeholders (services/report_events.py). A test
     send (record=False) leaves the figures the next send compares with alone.
     """
-    template = rt.normalize(report.get("template"))
-    if not rt.has_content(template):
-        return SKIPPED, "the report has no content"
-
-    token, channel = await _target(db, report)
-    if not token or not channel:
-        return SKIPPED, "Slack isn't connected or no channel is chosen"
-
-    frequency = template["frequency"]
-    key = key or now_utc.date().isoformat()
-    previous = rt.previous_for(report.get("last_figures"), key, frequency)
-    ctx = await rt.build_context(db, report["user_id"], template, now_utc, previous=previous)
-    ctx.event = event or {}
-    if not ctx.groups:
-        return SKIPPED, "no active clients"
-
-    take = await rt.write_take(db, report["user_id"], template, rt.render(template, ctx)[1])
-    blocks, fallback = rt.render(template, ctx, take=take)
+    built = await render_report(db, report, now_utc, key=key, event=event)
+    if "skipped" in built:
+        return SKIPPED, built["skipped"]
 
     from slack_sdk.web.async_client import AsyncWebClient
     try:
-        await AsyncWebClient(token=token).chat_postMessage(channel=channel, text=fallback, blocks=blocks)
+        await AsyncWebClient(token=built["token"]).chat_postMessage(
+            channel=built["channel"], text=built["fallback"], blocks=built["blocks"])
     except Exception as e:
         logger.warning("slack report %s: post failed: %s", report["id"], e)
         return FAILED, _slack_error(e)
 
     if record:
         await db[REPORTS].update_one({"id": report["id"]},
-                                     {"$set": {"last_figures": rt.snapshot(ctx, key)}})
+                                     {"$set": {"last_figures": rt.snapshot(built["ctx"], built["key"])}})
     return SENT, None
 
 

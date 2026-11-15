@@ -29,3 +29,4 @@ from ai.mcp import creatives_mcp  # noqa: F401
 from ai.mcp import attribution_mcp  # noqa: F401
 from ai.mcp import client_mcp  # noqa: F401
 from ai.mcp import leads_mcp  # noqa: F401
+from ai.mcp import slack_reports_mcp  # noqa: F401

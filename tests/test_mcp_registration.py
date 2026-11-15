@@ -35,6 +35,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "attribution_mcp": {"get_closes_by_ad", "attribution_status", "leads_by_ad", "funnel", "attribution_overview"},
     "client_mcp": {"get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target"},
     "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript"},
+    "slack_reports_mcp": {"list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report"},
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())
