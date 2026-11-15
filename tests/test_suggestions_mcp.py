@@ -232,3 +232,22 @@ async def test_read_scope_cannot_deny_or_apply(mcp_call, mock_db, alice):
     assert not res.is_error
     res = await mcp_call("apply_suggestion", {"suggestion_id": "s1"}, scope="birdy.write", token_type="mcp")
     assert not res.is_error and "confirm_code" in res.text
+
+
+async def test_apply_flag_only_item_previews_then_acknowledges(mock_db, alice):
+    await _sug(mock_db, "flag", action=None)
+    first = await t.apply_suggestion.fn(suggestion_id="flag")
+    assert first["needs_confirmation"] and first["preview"]["summary"] == "Acknowledge: nothing changes in Meta"
+    assert first["preview"]["touches"] == []
+    out = await t.apply_suggestion.fn(suggestion_id="flag", confirm_code=first["confirm_code"])
+    assert out["ok"] is True and out["succeeded"] == [] and out["failed"] == []
+    doc = await mock_db[sug_store.SUGGESTIONS].find_one({"_id": "flag"})
+    assert doc["status"] == "applied" and not doc.get("applied_targets")
+
+
+async def test_undo_unknown_applied_type_is_refused_without_code(mock_db, alice):
+    await _sug(mock_db, "u", status="applied", applied_at=datetime.utcnow(), applied_action_type="mystery", applied_targets=TARGETS)
+    out = await t.undo_suggestion.fn(suggestion_id="u")
+    assert out["ok"] is False and out["outcome"] == "not_undoable" and "confirm_code" not in out
+    await _sug(mock_db, "e", status="applied", applied_at=datetime.utcnow(), applied_action_type="enable_ads", applied_targets=TARGETS)
+    assert (await t.undo_suggestion.fn(suggestion_id="e"))["preview"]["action"] == "pause_ads"

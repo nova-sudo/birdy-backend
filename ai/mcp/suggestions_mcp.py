@@ -20,6 +20,7 @@ from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 
 SOURCE = "mcp"
+_INVERSE = {ACTION_PAUSE_ADS: ACTION_ENABLE_ADS, ACTION_ENABLE_ADS: ACTION_PAUSE_ADS}
 
 
 def _error(outcome: str, message: str, **extra) -> dict:
@@ -118,7 +119,7 @@ async def apply_suggestion(suggestion_id: str, confirm_code: str | None = None) 
     """Approve a suggestion and run its action in the owner's live Meta ads (for example pausing the ads it names).
 
     Two steps. Called without confirm_code it changes nothing and returns a preview (the action and the ads or campaigns it touches, with the stats behind it) and a one-time confirm_code. Show the preview to the user and only call again with confirm_code after they say yes.
-    The second call must repeat the same arguments. A suggestion that is already closed, has no action, or is being applied right now returns `ok: false` with the reason and no code. A guardrail on the agent can also block it (`blocked_reason`); the suggestion then stays open.
+    The second call must repeat the same arguments. A suggestion that is already closed or being applied right now returns `ok: false` with the reason and no code. A flag-only suggestion (nothing to write in Meta) is just acknowledged: the preview says so and approving marks it done. A guardrail on the agent can also block it (`blocked_reason`); the suggestion then stays open.
 
     Args:
         suggestion_id: The suggestion's id (from get_suggestions).
@@ -136,13 +137,13 @@ async def apply_suggestion(suggestion_id: str, confirm_code: str | None = None) 
             return {"ok": True, "outcome": "already", "status": status, "summary": "It was already applied; nothing to confirm."}
         if store.has_live_claim(doc):
             return _error("busy", views.BUSY_MESSAGE)
-        if not doc.get("action"):
-            return _error("no_action", "This suggestion only flags something; there is nothing to apply. Use deny_suggestion to clear it.")
 
     async def preview():
         action = doc.get("action") or {}
+        flag_only = not action
         return {"suggestion_id": suggestion_id, "title": doc.get("title"), "client": doc.get("client_name"),
                 "description": doc.get("description"), "action": action.get("type"),
+                **({"summary": "Acknowledge: nothing changes in Meta"} if flag_only else {}),
                 "touches": _touches(action.get("targets")), "params": action.get("params") or {},
                 "stats": doc.get("stats") or [], "window": doc.get("window")}
 
@@ -177,13 +178,15 @@ async def undo_suggestion(suggestion_id: str, confirm_code: str | None = None) -
     if not confirm_code:
         if doc.get("status") != store.STATUS_APPLIED:
             return {"ok": True, "outcome": "noop", "succeeded": [], "summary": "Nothing is applied, so there is nothing to undo."}
-        if applied_type in actions.CREATIVE_ACTIONS:
+        if applied_type is not None and applied_type not in _INVERSE:
+            return _error("not_undoable", views.NOTHING_TO_UNDO_MESSAGE)
+        if applied_type is None and doc.get("applied_targets"):
             return _error("not_undoable", views.NOTHING_TO_UNDO_MESSAGE)
 
     async def preview():
-        inverse = ACTION_ENABLE_ADS if applied_type == ACTION_PAUSE_ADS else ACTION_PAUSE_ADS
+        inverse = _INVERSE.get(applied_type)
         return {"suggestion_id": suggestion_id, "title": doc.get("title"), "client": doc.get("client_name"),
-                "action": inverse, "touches": _touches(doc.get("applied_targets")), "stats": doc.get("stats") or [],
+                "action": inverse, **({"summary": "Reopen: nothing changes in Meta"} if inverse is None else {}), "touches": _touches(doc.get("applied_targets")), "stats": doc.get("stats") or [],
                 "applied_at": doc.get("applied_at")}
 
     async def execute():
