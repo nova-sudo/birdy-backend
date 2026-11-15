@@ -95,6 +95,7 @@ async def test_draft_delegates_and_drops_chat_markup(alice, monkeypatch):
                                          source_ad_id="ad1", targets={"cpl": 20})
     assert out["draft"] == {"test_id": "x"} and "creative_block" not in out
     assert m.await_args.args[1] == ALICE and m.await_args.kwargs["ad_account_ids"] == ["act_1"]
+    assert m.await_args.kwargs["created_via"] == "mcp"
 
 
 # ---- call analysis ----------------------------------------------------------------------------------------
@@ -219,7 +220,7 @@ async def test_scale_creative_test_two_step(mock_db, alice, enqueue, monkeypatch
     from ai.mcp import creatives_mcp as t
     test = await _draft(mock_db, name="live", status=store.TESTING)
     resolved = [{"ad_account_id": "act_2", "adset_id": "as2", "adset_name": "Set 2", "page_id": "p2"}]
-    monkeypatch.setattr("ai.tools.creative_tools._resolve_accounts", AsyncMock(return_value=(resolved, [])))
+    monkeypatch.setattr("ai.tools.creative_tools.resolve_accounts", AsyncMock(return_value=(resolved, [])))
     first = await t.scale_creative_test.fn(test_id=test["id"], ad_account_ids=["act_2"])
     assert first["needs_confirmation"] and first["preview"]["accounts"][0]["ad_account_id"] == "act_2"
     enqueue.assert_not_awaited()
@@ -236,7 +237,7 @@ async def test_scale_issues_no_code_for_draft_or_open_needs(mock_db, alice, enqu
     out = await t.scale_creative_test.fn(test_id=draft["id"], ad_account_ids=["act_2"])
     assert out["error"] and "confirm_code" not in out
     live = await _draft(mock_db, name="live", status=store.TESTING)
-    monkeypatch.setattr("ai.tools.creative_tools._resolve_accounts",
+    monkeypatch.setattr("ai.tools.creative_tools.resolve_accounts",
                         AsyncMock(return_value=([], [{"ad_account_id": "act_2", "adsets": []}])))
     out = await t.scale_creative_test.fn(test_id=live["id"], ad_account_ids=["act_2"])
     assert out["needs"] and "confirm_code" not in out
@@ -282,3 +283,82 @@ async def test_read_scope_cannot_draft_post_or_scale(mcp_call, mock_db):
     assert await mock_db["mcp_confirm_codes"].count_documents({}) == 0
     res = await mcp_call("post_creative_test", {"test_id": test["id"]}, scope="birdy.write", token_type="mcp")
     assert not res.is_error and "confirm_code" in res.text
+
+
+async def test_scale_code_survives_reordered_account_list(mock_db, alice, enqueue, monkeypatch):
+    from ai.mcp import creatives_mcp as t
+    test = await _draft(mock_db, name="live", status=store.TESTING)
+    monkeypatch.setattr("ai.tools.creative_tools.resolve_accounts", AsyncMock(return_value=([{"ad_account_id": "act_2", "adset_id": "a", "page_id": "p"}], [])))
+    first = await t.scale_creative_test.fn(test_id=test["id"], ad_account_ids=["act_2", "act_3"])
+    await t.scale_creative_test.fn(test_id=test["id"], ad_account_ids=["act_3", "act_2"], confirm_code=first["confirm_code"])
+    enqueue.assert_awaited_once()
+
+
+async def test_draft_records_created_via_mcp(mock_db, alice):
+    from ai.mcp import creatives_mcp as t
+    await mock_db["client_groups"].insert_one({"id": "g1", "user_id": ALICE, "meta_ad_account_id": "act_1", "name": "Acme"})
+    import ai.tools.creative_tools as ct
+    from unittest.mock import patch
+    ad = {"ad_id": "ad1", "ad_account_id": "act_1", "client_group_id": "g1", "body": "b", "title": "t"}
+    acc = [{"ad_account_id": "act_1", "adset_id": "as1", "page_id": "p1"}]
+    with patch("services.creatives.reads.find_ad", AsyncMock(return_value=ad)), \
+         patch.object(ct, "resolve_accounts", AsyncMock(return_value=(acc, []))), \
+         patch("services.creatives.reads.ad_accounts", AsyncMock(return_value=[{"ad_account_id": "act_1", "name": "A"}])):
+        out = await t.draft_creative_test.fn(name="N", origin="revive", destination="website", ad_account_ids=["act_1"],
+                                             source_ad_id="ad1", targets={"cpl": 20})
+    assert "error" not in out, out
+    doc = await mock_db[store.TESTS].find_one({"id": out["draft"]["test_id"]})
+    assert doc["created_via"] == "mcp"
+
+
+# ---- every new tool, called as BOB against ALICE's data ----------------------------------------------------
+
+async def _seed_alice(db):
+    await db["client_groups"].insert_one({
+        "id": "g1", "user_id": ALICE, "name": "Acme", "meta_ad_account_id": "act_1", "ghl_location_id": "loc1",
+        "hotprospector_call_cache": {"last_7d": {"total_calls": 4}}})
+    await db["call_logs"].insert_one({"user_id": ALICE, "location_id": "loc1", "direction": "inbound", "duration_seconds": 90,
+                                      "recording_url": "http://x/r.mp3", "started_at": __import__("datetime").datetime.utcnow()})
+    await db["meta_cache"].insert_one({"user_id": ALICE, "id": "ad1", "name": "Spring"})
+    return (await _draft(db, name="Alice test"), await _draft(db, name="Alice live", status=store.TESTING))
+
+
+BOB_CALLS = [
+    ("get_daily_metrics", {}, lambda o: not o.get("groups") and not o.get("series") and "Acme" not in str(o)),
+    ("get_metrics_by_day_windows", {"windows_days": [30]}, lambda o: "Acme" not in str(o)),
+    ("get_call_center_stats", {}, lambda o: o["total"] == 0),
+    ("get_call_recordings_summary", {"group_id": "g1"}, lambda o: o.get("ok") is False and "not found" in o["error"]),
+    ("get_closes_by_ad", {}, lambda o: "Acme" not in str(o) and not o.get("rows")),
+    ("find_ads", {"q": "Spring"}, lambda o: not o.get("ads")),
+    ("list_ad_accounts", {}, lambda o: not o["ad_accounts"]),
+    ("list_adsets", {"ad_account_id": "act_1", "destination": "website"}, lambda o: "error" in o),
+    ("list_creative_tests", {}, lambda o: o == {"tests": []}),
+    ("get_creative_test", {"code_or_id": "{code}"}, lambda o: o == {"error": "Creative test not found"}),
+    ("analyze_call_recordings", {"group_id": "g1", "focus": "x"}, lambda o: o.get("ok") is False and "confirm_code" not in o),
+    ("draft_creative_test", {"test_id": "{id}", "ad_account_ids": ["act_1"]}, lambda o: "error" in o and "confirm_code" not in o),
+    ("post_creative_test", {"test_id": "{id}"}, lambda o: o == {"error": "Creative test not found"}),
+    ("scale_creative_test", {"test_id": "{live}", "ad_account_ids": ["act_1"]}, lambda o: o == {"error": "Creative test not found"}),
+]
+
+
+@pytest.mark.parametrize("name,args,ok", BOB_CALLS, ids=[c[0] for c in BOB_CALLS])
+async def test_bob_cannot_reach_alices_data_through_any_new_tool(name, args, ok, mock_db, set_current_user, enqueue, monkeypatch):
+    from ai.mcp import mcp
+    draft, live = await _seed_alice(mock_db)
+    transcribe = AsyncMock()
+    monkeypatch.setattr("services.call_analysis_service.analyze_calls", transcribe)
+    scale = AsyncMock()
+    monkeypatch.setattr("ai.tools.creative_tools.resolve_accounts", scale)
+    fill = {"{id}": draft["id"], "{code}": draft["code"], "{live}": live["id"]}
+    args = {k: fill.get(v, v) if isinstance(v, str) else v for k, v in args.items()}
+    set_current_user(BOB)
+    tool = (await mcp.get_tools())[name]
+    out = await tool.fn(**args)
+    assert ok(out), out
+    assert "confirm_code" not in out
+    assert await mock_db["mcp_confirm_codes"].count_documents({}) == 0
+    enqueue.assert_not_awaited()
+    transcribe.assert_not_awaited()
+    scale.assert_not_awaited()
+    assert (await mock_db[store.TESTS].find_one({"id": draft["id"]}))["name"] == "Alice test"
+    assert await mock_db[store.TESTS].count_documents({"user_id": BOB}) == 0

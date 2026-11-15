@@ -124,7 +124,7 @@ async def draft_creative_test(name: str | None = None, origin: Literal["new", "r
         _db(), _current_user_id(), mongo_client=get_shared_mongo_client(), name=name, origin=origin,
         destination=destination, ad_account_ids=ad_account_ids, source_ad_id=source_ad_id,
         primary_text=primary_text, headline=headline, cta_type=cta_type, website_url=website_url,
-        adset_ids=adset_ids, page_ids=page_ids, lead_form_id=lead_form_id, targets=targets, test_id=test_id)
+        adset_ids=adset_ids, page_ids=page_ids, lead_form_id=lead_form_id, targets=targets, test_id=test_id, created_via="mcp")
     out.pop("creative_block", None)  # markup for Ask Birdy's chat UI only
     return out
 
@@ -148,20 +148,14 @@ async def post_creative_test(test_id: str, confirm_code: str | None = None) -> d
         confirm_code: The code from the preview, after the user agreed.
     """
     user_id, db = _current_user_id(), _db()
-    test = await creative_tools._resolve_test(db, user_id, test_id)
+    test = await creative_tools.resolve_test(db, user_id, test_id)
     if test is None:
         return {"error": NOT_FOUND}
     if test.get("status") != store.DRAFT:
         return {"error": "This test is already posted; only a draft can be posted"}
-    accounts = test.get("draft_accounts") or []
-    if not accounts:
-        return {"error": "This draft has no accounts yet; call draft_creative_test first"}
-    requested = test.get("requested_accounts") or [a["ad_account_id"] for a in accounts]
-    resolved = {a["ad_account_id"] for a in accounts}
-    needs = test.get("draft_needs") or [{"ad_account_id": a} for a in requested if a not in resolved]
-    if needs or not set(requested) <= resolved:
-        return {"error": "draft_not_ready", "needs": needs,
-                "message": "Some requested accounts still need an ad set, page or lead form. Nothing was posted."}
+    accounts, refusal = creative_tools.draft_readiness(test)
+    if refusal:
+        return refusal
 
     # Bound to the canonical id, so a code for one test never works for another.
     args = {"test_id": test["id"]}
@@ -199,7 +193,7 @@ async def scale_creative_test(test_id: str, ad_account_ids: list[str], adset_ids
         confirm_code: The code from the preview, after the user agreed.
     """
     user_id, db, client = _current_user_id(), _db(), get_shared_mongo_client()
-    test = await creative_tools._resolve_test(db, user_id, test_id)
+    test = await creative_tools.resolve_test(db, user_id, test_id)
     if test is None:
         return {"error": NOT_FOUND}
     acts = list(dict.fromkeys(ad_account_ids or []))
@@ -207,15 +201,16 @@ async def scale_creative_test(test_id: str, ad_account_ids: list[str], adset_ids
         return {"error": "ad_account_ids is required"}
     if test.get("status") in (store.DRAFT, store.ARCHIVED):
         return {"error": "Accounts can only be added to a posted, unarchived test"}
-    args = {"test_id": test["id"], "ad_account_ids": acts, "adset_ids": adset_ids or {},
-            "page_ids": page_ids or {}, "lead_form_id": lead_form_id}
+    # Order-insensitive, so a reordered list is not refused as a replay.
+    args = {"test_id": test["id"], "ad_account_ids": sorted(acts), "adset_ids": dict(sorted((adset_ids or {}).items())),
+            "page_ids": dict(sorted((page_ids or {}).items())), "lead_form_id": lead_form_id}
     destination = (test.get("creative") or {}).get("destination")
     accounts: list[dict] = []
     if not confirm_code:
         if destination not in creative_tools.DESTINATIONS:
             return {"error": "This test has no destination, so ad sets cannot be matched"}
         try:
-            accounts, needs = await creative_tools._resolve_accounts(
+            accounts, needs = await creative_tools.resolve_accounts(
                 db, client, user_id, acts, destination, adset_ids, page_ids, lead_form_id)
         except creative_tools.reads.ReadError as e:
             return {"error": e.message}

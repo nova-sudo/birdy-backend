@@ -42,13 +42,16 @@ def _fail(error: str, **extra) -> dict:
     return {"error": error, **extra}
 
 
-async def _resolve_test(db, user_id: str, ref) -> dict | None:
+async def resolve_test(db, user_id: str, ref) -> dict | None:
     """A test of this user by id or by code ("CT-0042")."""
     ref = str(ref or "").strip()
     if not ref:
         return None
     test = await (store.get_test_by_code if CODE_RE.match(ref) else store.get_test)(db, user_id, ref)
     return None if test and test.get("managed_by") else test
+
+
+_resolve_test = resolve_test  # kept for older callers
 
 
 def _thumbnail(test: dict):
@@ -100,7 +103,7 @@ async def list_creative_tests(db, user_id, mongo_client=None, status=None, **_):
 
 
 async def get_creative_test(db, user_id, mongo_client=None, code_or_id=None, **_):
-    test = await _resolve_test(db, user_id, code_or_id)
+    test = await resolve_test(db, user_id, code_or_id)
     if test is None:
         return _fail("Creative test not found")
     ads = await store.list_test_ads(db, test["id"], user_id=user_id)
@@ -213,7 +216,7 @@ def _ad_creative(ad: dict) -> dict:
             "media": {k: v for k, v in media.items() if v}}
 
 
-async def _resolve_accounts(db, mongo_client, user_id, acts, destination, adset_ids=None,
+async def resolve_accounts(db, mongo_client, user_id, acts, destination, adset_ids=None,
                             page_ids=None, lead_form_id=None):
     """(accounts, needs). Auto-picks an ad set / page / lead form when exactly one fits; every
     id the model passes is checked against what Meta lists for that (owned) account."""
@@ -303,10 +306,10 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
                               ad_account_ids=None, source_ad_id=None, attachment_index=None,
                               primary_text=None, headline=None, cta_type=None, website_url=None,
                               adset_ids=None, page_ids=None, lead_form_id=None, targets=None,
-                              test_id=None, session_id=None, **_):
+                              test_id=None, session_id=None, created_via="chat", **_):
     existing = None
     if test_id:
-        existing = await _resolve_test(db, user_id, test_id)
+        existing = await resolve_test(db, user_id, test_id)
         if existing is None:
             return _fail("Creative test not found")
         if existing.get("status") != store.DRAFT:
@@ -363,7 +366,7 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
             creative[key] = val
 
     try:
-        accounts, needs = await _resolve_accounts(
+        accounts, needs = await resolve_accounts(
             db, mongo_client, user_id, acts, destination, adset_ids, page_ids, lead_form_id)
     except reads.ReadError as e:
         return _fail(e.message)
@@ -377,7 +380,7 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
                 norm_targets["metrics"] = pre["metrics"]
         test = await store.create_test(
             db, user_id, name=name.strip(), origin=origin, creative=creative, targets=norm_targets,
-            source=source, created_via="chat")
+            source=source, created_via=created_via)
         test = await store.update_test(
             db, user_id, test["id"],
             {"draft_accounts": accounts, "requested_accounts": acts, "draft_needs": needs})
@@ -426,22 +429,31 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
     return _json(out)
 
 
-async def post_creative_test(db, user_id, mongo_client=None, test_id=None, confirmed=False, **_):
-    if confirmed is not True:
-        return _confirmation_required("post this creative test")
-    test = await _resolve_test(db, user_id, test_id)
-    if test is None:
-        return _fail("Creative test not found")
+def draft_readiness(test: dict) -> tuple[list[dict], dict | None]:
+    """(accounts, None) when a draft can be posted, else ([], the error dict to return). Shared by
+    post_creative_test and its MCP twin so the two cannot drift."""
     accounts = test.get("draft_accounts") or []
     if not accounts:
-        return _fail("This draft has no accounts yet; call draft_creative_test first")
+        return [], _fail("This draft has no accounts yet; call draft_creative_test first")
     requested = test.get("requested_accounts") or [a["ad_account_id"] for a in accounts]
     resolved = {a["ad_account_id"] for a in accounts}
     open_needs = test.get("draft_needs") or [{"ad_account_id": a} for a in requested if a not in resolved]
     if open_needs or not set(requested) <= resolved:
-        return {"error": "draft_not_ready", "needs": open_needs,
-                "message": "Some requested accounts still need an ad set, page or lead form. "
-                           "Ask the user, then call draft_creative_test again. Nothing was posted."}
+        return [], {"error": "draft_not_ready", "needs": open_needs,
+                    "message": "Some requested accounts still need an ad set, page or lead form. "
+                               "Ask the user, then call draft_creative_test again. Nothing was posted."}
+    return accounts, None
+
+
+async def post_creative_test(db, user_id, mongo_client=None, test_id=None, confirmed=False, **_):
+    if confirmed is not True:
+        return _confirmation_required("post this creative test")
+    test = await resolve_test(db, user_id, test_id)
+    if test is None:
+        return _fail("Creative test not found")
+    accounts, refusal = draft_readiness(test)
+    if refusal:
+        return refusal
     try:
         res = await reads.enqueue_accounts(db, user_id, test["id"], accounts, add_accounts=False)
     except posting.PostingError as e:
@@ -453,7 +465,7 @@ async def scale_creative_test(db, user_id, mongo_client=None, test_id=None, ad_a
                               confirmed=False, adset_ids=None, page_ids=None, lead_form_id=None, **_):
     if confirmed is not True:
         return _confirmation_required("add accounts to this creative test")
-    test = await _resolve_test(db, user_id, test_id)
+    test = await resolve_test(db, user_id, test_id)
     if test is None:
         return _fail("Creative test not found")
     acts = list(dict.fromkeys(ad_account_ids or []))
@@ -463,7 +475,7 @@ async def scale_creative_test(db, user_id, mongo_client=None, test_id=None, ad_a
     if destination not in DESTINATIONS:
         return _fail("This test has no destination, so ad sets cannot be matched")
     try:
-        accounts, needs = await _resolve_accounts(
+        accounts, needs = await resolve_accounts(
             db, mongo_client, user_id, acts, destination, adset_ids, page_ids, lead_form_id)
         if needs:
             return {"needs": needs, "message": "Nothing was posted. Ask the user to pick these, "
@@ -480,7 +492,7 @@ async def pause_creative_ads(db, user_id, mongo_client=None, test_id=None, ad_ac
                              confirmed=False, **_):
     if confirmed is not True:
         return _confirmation_required("pause these ads")
-    test = await _resolve_test(db, user_id, test_id)
+    test = await resolve_test(db, user_id, test_id)
     if test is None:
         return _fail("Creative test not found")
     try:
@@ -491,7 +503,7 @@ async def pause_creative_ads(db, user_id, mongo_client=None, test_id=None, ad_ac
 
 
 async def update_creative_targets(db, user_id, mongo_client=None, test_id=None, targets=None, **_):
-    test = await _resolve_test(db, user_id, test_id)
+    test = await resolve_test(db, user_id, test_id)
     if test is None:
         return _fail("Creative test not found")
     if test.get("status") == store.ARCHIVED:
