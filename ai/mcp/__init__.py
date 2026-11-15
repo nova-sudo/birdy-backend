@@ -18,3 +18,4 @@ from ai.mcp import compare_mcp  # noqa: F401
 from ai.mcp import meta_live_mcp  # noqa: F401
 from ai.mcp import custom_metrics_mcp  # noqa: F401
 from ai.mcp import unified_leads_mcp  # noqa: F401
+from ai.mcp import agent_mcp  # noqa: F401

@@ -22,6 +22,7 @@ EXPECTED_TOOLS_BY_MODULE = {
         "create_custom_metric", "update_custom_metric", "delete_custom_metric",
     },
     "unified_leads_mcp": {"get_unified_leads", "get_unified_lead_stats"},
+    "agent_mcp": {"list_agents", "set_default_agent"},
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())

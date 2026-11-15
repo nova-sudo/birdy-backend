@@ -47,8 +47,11 @@ async def test_mcp_tool_names_matches_server_registration():
     from ai.mcp import mcp
 
     registered = set((await mcp.get_tools()).keys())
-    assert mcp_client.MCP_TOOL_NAMES == registered, (
+    # Tools built for external MCP clients only: the orchestrator keeps its internal paths for them, so
+    # they are deliberately absent from MCP_TOOL_NAMES.
+    external_only = {"list_agents", "set_default_agent"}
+    assert mcp_client.MCP_TOOL_NAMES == registered - external_only, (
         f"MCP_TOOL_NAMES is out of sync with the server's registered tools.\n"
         f"In MCP_TOOL_NAMES but not registered: {mcp_client.MCP_TOOL_NAMES - registered}\n"
-        f"Registered but missing from MCP_TOOL_NAMES: {registered - mcp_client.MCP_TOOL_NAMES}"
+        f"Registered but missing from MCP_TOOL_NAMES: {registered - external_only - mcp_client.MCP_TOOL_NAMES}"
     )

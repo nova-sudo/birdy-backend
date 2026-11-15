@@ -25,6 +25,7 @@ from ai.agents import history as ad_history
 from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents import replay
+from ai.agents import access as agent_access
 from ai.agents import store as agent_store
 from ai.agents import validation
 from ai.agents.stock import lessons as stock_lessons
@@ -100,7 +101,7 @@ def _memory_to_api(doc: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 async def _agent_or_404(db, user_id: str, agent_id: str) -> dict:
-    agent = await agent_store.get_agent(db, user_id, agent_id)
+    agent = await agent_access.find_agent(db, user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent

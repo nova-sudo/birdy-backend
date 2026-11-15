@@ -18,6 +18,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
 
 from ai import conversation_log
+from ai.agents import access as agent_access
 from ai.agents import claims
 from ai.agents import store as agent_store
 from ai.agents import history as ad_history
@@ -326,7 +327,7 @@ class UndoBody(BaseModel):
 
 async def _require_card(db, agent_id: str, card_id: str, user_id: str) -> None:
     """The card must be this agent's. A different agent's card is a 404, like another user's."""
-    if not await db[stock_runner.CARDS].find_one({"_id": card_id, "agent_id": agent_id, "user_id": user_id}, {"_id": 1}):
+    if await agent_access.find_card(db, user_id, agent_id, card_id) is None:
         raise HTTPException(status_code=404, detail="Card not found")
 
 
