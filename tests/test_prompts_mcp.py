@@ -9,8 +9,7 @@ import pytest
 
 from ai.mcp import mcp
 
-# Task 21 adds check_my_accounts and removes it from this set.
-PENDING = {"check_my_accounts"}
+PENDING: set[str] = set()  # tools a prompt names before the tool ships
 
 PROMPT_NAMES = {"weekly_client_review", "why_did_cpl_jump", "prep_client_call", "agent_week", "daily_check_in"}
 CLIENT_PROMPTS = {"why_did_cpl_jump", "prep_client_call"}

@@ -59,7 +59,7 @@ async def test_mcp_tool_names_matches_server_registration():
                      "get_lead", "get_lead_messages", "get_call_transcript",
                      "list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
                      "attribution_status", "leads_by_ad", "funnel", "attribution_overview",
-                     "refresh_client_data", "refresh_status"}
+                     "refresh_client_data", "refresh_status", "check_my_accounts"}
     assert mcp_client.MCP_TOOL_NAMES == registered - external_only, (
         f"MCP_TOOL_NAMES is out of sync with the server's registered tools.\n"
         f"In MCP_TOOL_NAMES but not registered: {mcp_client.MCP_TOOL_NAMES - registered}\n"

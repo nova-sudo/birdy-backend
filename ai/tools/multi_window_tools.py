@@ -384,6 +384,30 @@ def _split_series(rows: list[dict], prev_since_iso: str, since_iso: str, until_i
     return full[i:], full[:i]
 
 
+async def fetch_group_daily(g, meta_token, since_iso, prev_since_iso, until_iso):
+    """One client's daily series for [since, until] plus its summary against the equal range before
+    (prev_since .. since-1), from one Meta fetch. Returns (result, raw_rows). A client that can't be read
+    carries meta_error / meta_note instead of days. Shared by get_daily_metrics and the account check."""
+    res = {"group_id": g.get("id"), "group_name": g.get("name"), "currency": g.get("ad_account_currency")}
+    campaign_ids = g.get("meta_campaign_ids")
+    if not g.get("meta_ad_account_id"):
+        res["meta_error"] = "Meta is not connected for this client."
+        return res, []
+    if campaign_ids is not None and len(campaign_ids) == 0:
+        res["meta_note"] = NO_CAMPAIGNS_NOTE
+        return res, []
+    if not meta_token:
+        res["meta_error"] = "No Meta token found. Please connect your Meta account first."
+        return res, []
+    data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, prev_since_iso, until_iso, campaign_ids)
+    if "error" in data:
+        res["meta_error"] = data["error"]
+        return res, []
+    res["days"], previous = _split_series(data["days"], prev_since_iso, since_iso, until_iso)
+    res["summary"] = _summarize(res["days"], previous)
+    return res, data["days"]
+
+
 async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=None, **kwargs):
     """
     Meta spend, leads, clicks, impressions, CPL and CTR per calendar day for the
@@ -418,27 +442,8 @@ async def get_daily_metrics(db, user_id, days=30, group_ids=None, mongo_client=N
         token_doc = await get_facebook_token(user_id, db.client)
         meta_token = (token_doc or {}).get("access_token")
 
-    async def _one(g):
-        res = {"group_id": g.get("id"), "group_name": g.get("name"), "currency": g.get("ad_account_currency")}
-        campaign_ids = g.get("meta_campaign_ids")
-        if not g.get("meta_ad_account_id"):
-            res["meta_error"] = "Meta is not connected for this client."
-            return res, []
-        if campaign_ids is not None and len(campaign_ids) == 0:
-            res["meta_note"] = NO_CAMPAIGNS_NOTE
-            return res, []
-        if not meta_token:
-            res["meta_error"] = "No Meta token found. Please connect your Meta account first."
-            return res, []
-        data = await _fetch_daily_insights(g["meta_ad_account_id"], meta_token, prev_since_iso, until_iso, campaign_ids)
-        if "error" in data:
-            res["meta_error"] = data["error"]
-            return res, []
-        res["days"], previous = _split_series(data["days"], prev_since_iso, since_iso, until_iso)
-        res["summary"] = _summarize(res["days"], previous)
-        return res, data["days"]
-
-    results = await asyncio.gather(*(_one(g) for g in groups))
+    results = await asyncio.gather(
+        *(fetch_group_daily(g, meta_token, since_iso, prev_since_iso, until_iso) for g in groups))
     per_group = [r for r, _ in results]
     all_rows = [row for _, rows in results for row in rows]
     currencies = {r.get("currency") for r in per_group if r.get("days")}
