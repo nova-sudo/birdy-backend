@@ -228,16 +228,13 @@ async def pending_offers(db, agent: dict) -> list[dict]:
     return out
 
 
-async def graduate(db, agent: dict, rule_id: str, choice: str, *, now: datetime | None = None) -> dict:
-    """Answer a pending offer for this rule. A graduation offer takes any
-    choice; a brake notice alone takes keep_asking (it acknowledges the notice).
-    Either way the rule's brake notice is dismissed. Raises KeyError for an
-    unknown rule, NoOffer when nothing is pending for it."""
+async def check_graduation(db, agent: dict, rule_id: str, choice: str) -> dict:
+    """The rule, when `choice` is a valid answer to an offer pending for it; changes nothing.
+    Raises KeyError for an unknown rule, NoOffer when nothing is pending for it (or, for an
+    auto choice, when the rule is no longer on ask)."""
     if choice not in CHOICES:
         raise ValueError(f"choice must be one of {list(CHOICES)}")
-    now = now or _now()
-    agent_id = agent["_id"]
-    rule = await db[RULES].find_one({"_id": rule_id, "agent_id": agent_id})
+    rule = await db[RULES].find_one({"_id": rule_id, "agent_id": agent["_id"]})
     if rule is None:
         raise KeyError(f"rule {rule_id} not found")
     offers = [o for o in await pending_offers(db, agent) if o["rule_id"] == rule_id]
@@ -245,6 +242,19 @@ async def graduate(db, agent: dict, rule_id: str, choice: str, *, now: datetime 
     has_brake = any(o["type"] == "brake" for o in offers)
     if not (has_grad or (has_brake and choice == "keep_asking")):
         raise NoOffer(f"no pending offer for rule {rule_id}")
+    if choice != "keep_asking" and rule.get("mode") != "ask":
+        raise NoOffer(f"rule {rule_id} is no longer on ask")
+    return rule
+
+
+async def graduate(db, agent: dict, rule_id: str, choice: str, *, now: datetime | None = None) -> dict:
+    """Answer a pending offer for this rule. A graduation offer takes any
+    choice; a brake notice alone takes keep_asking (it acknowledges the notice).
+    Either way the rule's brake notice is dismissed. Raises KeyError for an
+    unknown rule, NoOffer when nothing is pending for it."""
+    rule = await check_graduation(db, agent, rule_id, choice)
+    now = now or _now()
+    agent_id = agent["_id"]
 
     if choice == "keep_asking":
         streak = int((rule.get("stats") or {}).get("streak") or 0)

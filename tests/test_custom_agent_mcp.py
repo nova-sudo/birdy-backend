@@ -20,8 +20,8 @@ READ_TOOLS = {"get_agent_playbook", "get_agent_activity", "get_agent_history", "
               "get_agent_confidence", "get_agent_proposals", "get_agent_memory", "get_agent_offers", "get_dry_run"}
 WRITE_TOOLS = {"accept_proposal", "reject_proposal", "set_rule_param", "set_client_target_for_agent",
                "set_client_override", "add_agent_memory", "add_agent_exception", "set_agent_schedule",
-               "set_agent_slack_channel", "delete_agent_memory", "graduate_rule", "start_dry_run", "deactivate_agent"}
-LIVE_TOOLS = {"activate_agent", "undo_auto_action"}
+               "set_agent_slack_channel", "delete_agent_memory", "start_dry_run", "deactivate_agent"}
+LIVE_TOOLS = {"activate_agent", "undo_auto_action", "graduate_rule"}
 
 
 async def _group(db, gid="g1", name="Acme", user=ALICE):
@@ -464,3 +464,49 @@ async def test_write_scope_live_tool_previews_over_the_wire(mcp_call, mock_db, a
 async def test_no_subscription_blocks_external_calls(mcp_call, no_subscription, alice):
     res = await mcp_call("get_agent_playbook", {"agent": alice["_id"]}, scope="birdy.read", token_type="mcp")
     assert res.is_error
+
+
+# ---- I2: graduating a rule to auto is two-step -------------------------------------------------------------
+
+async def _offer(db, rule):
+    await db[agent_store.RULES].update_one({"_id": rule["_id"]}, {"$set": {"mode": "ask", "stats.streak": 10}})
+
+
+async def test_graduate_rule_to_auto_needs_confirmation(mock_db, alice):
+    rule = await _rule(mock_db, alice, "pause_over_target")
+    await _offer(mock_db, rule)
+    first = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_notify", agent=alice["_id"])
+    assert first["needs_confirmation"] and "without asking" in first["preview"]["result"]
+    assert (await mock_db[agent_store.RULES].find_one({"_id": rule["_id"]}))["mode"] == "ask"
+    other = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_silent", agent=alice["_id"],
+                                     confirm_code=first["confirm_code"])
+    assert "Nothing was changed" in other["error"]
+    first = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_notify", agent=alice["_id"])
+    out = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_notify", agent=alice["_id"],
+                                   confirm_code=first["confirm_code"])
+    assert out["ok"] and out["rule"]["mode"] == "auto"
+
+
+async def test_graduate_rule_keep_asking_is_one_step(mock_db, alice):
+    rule = await _rule(mock_db, alice, "pause_over_target")
+    await _offer(mock_db, rule)
+    out = await t.graduate_rule.fn(rule_id=rule["_id"], choice="keep_asking", agent=alice["_id"])
+    assert out["ok"] and out["rule"]["mode"] == "ask"
+    assert await mock_db["mcp_confirm_codes"].count_documents({}) == 0
+
+
+async def test_graduate_rule_without_offer_issues_no_code(mock_db, alice):
+    rule = await _rule(mock_db, alice, "pause_over_target")
+    out = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_silent", agent=alice["_id"])
+    assert out["ok"] is False and await mock_db["mcp_confirm_codes"].count_documents({}) == 0
+
+
+async def test_graduate_rule_edited_after_preview_refused(mock_db, alice):
+    rule = await _rule(mock_db, alice, "pause_over_target")
+    await _offer(mock_db, rule)
+    first = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_notify", agent=alice["_id"])
+    await mock_db[agent_store.RULES].update_one({"_id": rule["_id"]}, {"$set": {"params.cpl_multiple": 9}})
+    out = await t.graduate_rule.fn(rule_id=rule["_id"], choice="auto_notify", agent=alice["_id"],
+                                   confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    assert (await mock_db[agent_store.RULES].find_one({"_id": rule["_id"]}))["mode"] == "ask"

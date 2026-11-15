@@ -409,26 +409,50 @@ async def delete_agent_memory(memory_id: str, agent: str | None = None) -> dict:
     return {**res, "summary": "The agent forgot it."}
 
 
-@mcp.tool(**WRITE)
+@mcp.tool(**LIVE)
 async def graduate_rule(rule_id: str, choice: Literal["auto_notify", "auto_silent", "keep_asking"],
-                        agent: str | None = None) -> dict:
+                        agent: str | None = None, confirm_code: str | None = None) -> dict:
     """Answer a graduation offer from get_agent_offers: let the rule run on its own (and tell the owner, or not), or keep asking first.
 
-    With no offer waiting for the rule it returns `ok: false` and changes nothing.
+    keep_asking is saved on the first call. auto_notify and auto_silent let the agent change live Meta ads without asking,
+    so they are two steps: the first call changes nothing and returns a preview and a confirm_code.
+    Show the preview to the user and only call again with confirm_code after they say yes. Pass the same arguments.
+    With no offer waiting for the rule it returns `ok: false`, changes nothing and issues no code.
 
     Args:
         rule_id: The rule id from get_agent_offers.
         choice: auto_notify (run on its own, tell me), auto_silent (run on its own) or keep_asking.
         agent: Optional custom agent id or name. Defaults to the owner's default agent.
+        confirm_code: The code from the preview, once the user has agreed (only for auto_notify or auto_silent).
     """
-    db, _, found = await _custom(agent)
+    db, user_id, found = await _custom(agent)
     try:
-        rule = await custom_ops.graduate_rule(db, found, rule_id, choice)
+        # Say it now if it can't work, so the user is never asked to confirm something that will be refused.
+        current = await custom_ops.graduate_rule(db, found, rule_id, choice, check_only=True)
     except custom_ops.OpError as e:
         return _refused(e)
-    said = {"keep_asking": "The agent will keep asking first.", "auto_notify": "The rule now runs on its own and tells the owner.",
-            "auto_silent": "The rule now runs on its own."}[choice]
-    return {"ok": True, "rule": rule, "summary": said}
+
+    async def execute():
+        try:
+            rule = await custom_ops.graduate_rule(db, found, rule_id, choice)
+        except custom_ops.OpError as e:
+            return _refused(e)
+        said = {"keep_asking": "The agent will keep asking first.", "auto_notify": "The rule now runs on its own and tells the owner.",
+                "auto_silent": "The rule now runs on its own."}[choice]
+        return {"ok": True, "rule": rule, "summary": said}
+
+    if choice == "keep_asking":
+        return await execute()
+
+    async def preview():
+        return {"action": "Let this rule run on its own", "agent": found.get("name"), "rule": current,
+                "result": "The agent will make this rule's changes in live Meta ads without asking first"
+                          + (", and tell the owner after." if choice == "auto_notify" else ", silently.")}
+
+    # Bound to the rule the preview showed (its kind and params), so an edit in between needs a fresh yes.
+    state = {k: current.get(k) for k in ("kind", "params", "mode")}
+    return await two_step(db, user_id, "graduate_rule", {"agent_id": found["_id"], "rule_id": rule_id, "choice": choice},
+                          confirm_code, preview, execute, state=state)
 
 
 @mcp.tool(**WRITE)

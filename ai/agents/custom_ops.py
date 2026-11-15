@@ -84,9 +84,13 @@ async def reject_proposal(db, agent: dict, proposal_id: str) -> dict:
     return {"proposal": reports.proposal_to_api(proposal)}
 
 
-async def graduate_rule(db, agent: dict, rule_id: str, choice: str) -> dict:
+async def graduate_rule(db, agent: dict, rule_id: str, choice: str, *, check_only: bool = False) -> dict:
+    """Answer a graduation offer. check_only validates it the same way and changes nothing."""
     try:
-        rule = await learning.graduate(db, agent, rule_id, choice)
+        if check_only:
+            rule = await learning.check_graduation(db, agent, rule_id, choice)
+        else:
+            rule = await learning.graduate(db, agent, rule_id, choice)
     except KeyError:
         raise OpError(404, "Rule not found")
     except learning.NoOffer:

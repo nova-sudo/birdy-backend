@@ -309,10 +309,10 @@ async def test_add_agent_lesson_client_needs_a_card_and_all_does_not(mock_db, wr
 
 async def test_update_agent_settings_merges_and_refuses_bad(mock_db, writable):
     agent, _ = writable
-    out = await t.update_agent_settings.fn(settings={"weekly": {"auto_post": True}})
-    assert out["agent"]["settings"]["weekly"]["auto_post"] is True
+    out = await t.update_agent_settings.fn(settings={"weekly": {"enabled": True, "weekday": 2}})
+    assert out["agent"]["settings"]["weekly"]["weekday"] == 2
     stored = await mock_db[agent_store.AGENTS].find_one({"_id": agent["_id"]})
-    assert stored["settings"]["weekly"]["auto_post"] is True
+    assert stored["settings"]["weekly"]["enabled"] is True
     with pytest.raises(ToolError, match="invalid"):
         await t.update_agent_settings.fn(settings={"zones": {"currency": 5}})
     with pytest.raises(ToolError, match="Unknown client group"):
@@ -361,10 +361,10 @@ async def test_write_tools_cannot_touch_another_users_card(mock_db, set_current_
 async def test_new_tools_are_tagged_write_and_live():
     from ai.mcp import mcp
     tools = await mcp.get_tools()
-    for name in ("apply_card", "apply_all_cards", "undo_card_line", "post_weekly_report"):
+    for name in ("apply_card", "apply_all_cards", "undo_card_line", "post_weekly_report", "update_agent_settings"):
         assert tools[name].tags == {"write", "live"}
         assert "Show the preview to the user and only call again with confirm_code after they say yes." in tools[name].description
-    for name in ("dismiss_card", "edit_card", "add_agent_lesson", "update_agent_settings",
+    for name in ("dismiss_card", "edit_card", "add_agent_lesson",
                  "set_agent_slack_template", "reset_agent_slack_template"):
         assert tools[name].tags == {"write"}
 
@@ -386,3 +386,82 @@ async def test_bob_cannot_replay_alices_confirm_code(mock_db, set_current_user, 
     set_current_user(ALICE)
     applied.return_value = {"ok": True, "outcome": "applied", "reason": None, "card": {}, "lines": []}
     assert (await t.apply_card.fn(card_id="c1", line_ids=["l1"], confirm_code=code))["outcome"] == "applied"
+
+
+# ---- I2: a change toward autonomy is two-step --------------------------------------------------------------
+
+async def _codes(db):
+    return await db["mcp_confirm_codes"].count_documents({})
+
+
+async def test_update_settings_auto_post_needs_confirmation(mock_db, writable):
+    agent, _ = writable
+    first = await t.update_agent_settings.fn(settings={"weekly": {"auto_post": True}})
+    assert first["needs_confirmation"] and "weekly_report" in first["preview"]
+    stored = await mock_db[agent_store.AGENTS].find_one({"_id": agent["_id"]})
+    assert (stored.get("settings") or {}).get("weekly", {}).get("auto_post") is not True
+    other = await t.update_agent_settings.fn(settings={"weekly": {"auto_post": True}, "modes": {"remove": "auto"}},
+                                             confirm_code=first["confirm_code"])
+    assert "Nothing was changed" in other["error"]
+    first = await t.update_agent_settings.fn(settings={"weekly": {"auto_post": True}})
+    out = await t.update_agent_settings.fn(settings={"weekly": {"auto_post": True}}, confirm_code=first["confirm_code"])
+    assert out["agent"]["settings"]["weekly"]["auto_post"] is True
+
+
+async def test_update_settings_mode_auto_lists_who_acts_alone(mock_db, writable):
+    agent, _ = writable
+    await mock_db["client_groups"].insert_one({"id": "g1", "user_id": ALICE, "name": "Acme"})
+    first = await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"},
+                                                       "clients": {"g1": {"modes": {"revive": "auto"}}}})
+    acts = first["preview"]["will_act_on_their_own"]
+    assert any("every client" in a and "pausing" in a for a in acts) and any("Acme" in a for a in acts)
+    out = await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"},
+                                                     "clients": {"g1": {"modes": {"revive": "auto"}}}},
+                                           confirm_code=first["confirm_code"])
+    assert out["agent"]["settings"]["modes"]["remove"] == "auto"
+
+
+async def test_update_settings_lowering_autonomy_is_one_step(mock_db, writable):
+    agent, _ = writable
+    await mock_db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$set": {"settings.modes.remove": "auto"}})
+    out = await t.update_agent_settings.fn(settings={"modes": {"remove": "flag"}})
+    assert out["agent"]["settings"]["modes"]["remove"] == "flag" and await _codes(mock_db) == 0
+
+
+async def test_update_settings_invalid_toward_auto_issues_no_code(mock_db, writable):
+    with pytest.raises(ToolError, match="invalid"):
+        await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"}, "zones": {"currency": 5}})
+    with pytest.raises(ToolError, match="Unknown client group"):
+        await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"}}, client_group_ids=["not-mine"])
+    assert await _codes(mock_db) == 0
+
+
+async def test_update_settings_changed_since_preview_refused(mock_db, writable):
+    agent, _ = writable
+    first = await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"}})
+    await t.update_agent_settings.fn(settings={"weekly": {"weekday": 3}})
+    out = await t.update_agent_settings.fn(settings={"modes": {"remove": "auto"}}, confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    stored = await mock_db[agent_store.AGENTS].find_one({"_id": agent["_id"]})
+    assert stored["settings"]["modes"]["remove"] != "auto"
+
+
+# ---- I3: the code binds the previewed state ---------------------------------------------------------------
+
+async def test_apply_card_edited_after_preview_refused(mock_db, writable):
+    _, applied = writable
+    first = await t.apply_card.fn(card_id="c1")
+    await t.edit_card.fn(card_id="c1", keep_line_ids=["l1"])
+    out = await t.apply_card.fn(card_id="c1", confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    applied.assert_not_awaited()
+
+
+async def test_apply_all_cards_changed_after_preview_refused(mock_db, writable, monkeypatch):
+    run = AsyncMock(return_value={"ok": True, "outcome": "applied", "reason": None, "applied": 1})
+    monkeypatch.setattr(t.stock_apply, "apply_run", run)
+    first = await t.apply_all_cards.fn(run_id="r1")
+    await t.edit_card.fn(card_id="c1", keep_line_ids=["l2"])
+    out = await t.apply_all_cards.fn(run_id="r1", confirm_code=first["confirm_code"])
+    assert "changed since the preview" in out["error"]
+    run.assert_not_awaited()

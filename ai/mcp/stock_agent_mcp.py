@@ -4,7 +4,8 @@ ai/mcp/stock_agent_mcp.py
 Tools for the Birdy Media Buying Agent: what it did, what it found and what is waiting on the owner (read), and
 the owner's decisions on it (write). Each wraps the logic behind the matching route in routers/agent_stock.py
 (ai/agents/stock/reports.py, apply.py, agent_settings.py). Tools that change live ads or post to Slack
-(apply_card, apply_all_cards, undo_card_line, post_weekly_report) are two-step: a preview and a confirm_code first.
+(apply_card, apply_all_cards, undo_card_line, post_weekly_report, and update_agent_settings when it lets the agent
+act on its own) are two-step: a preview and a confirm_code first.
 """
 
 from typing import Literal
@@ -490,14 +491,44 @@ def _agent_view(agent: dict) -> dict:
             "settings": agent.get("settings") or {}, "scope": agent.get("scope") or {}}
 
 
-@mcp.tool(**WRITE)
+def _settings_error(e: agent_settings.SettingsError) -> ToolError:
+    errors = "; ".join(f"{x.get('field')}: {x.get('message')}" for x in e.body.get("errors") or [])
+    return ToolError(f"{e.body.get('detail')}" + (f" ({errors})" if errors else ""))
+
+
+_CHANGE_LABELS = {"remove": "pausing ads", "add": "adding ads", "revive": "reviving ads"}
+
+
+async def _autonomy_preview(db, user_id: str, raised: list[dict]) -> dict:
+    gids = [r["client_group_id"] for r in raised if r["client_group_id"]]
+    names = {g["id"]: g.get("name") async for g in db["client_groups"].find(
+        {"id": {"$in": gids}, "user_id": user_id}, {"id": 1, "name": 1})}
+    acts, weekly = [], False
+    for r in raised:
+        if r["change"] == "weekly_auto_post":
+            weekly = True
+            continue
+        who = names.get(r["client_group_id"]) or r["client_group_id"] if r["client_group_id"] \
+            else "every client that follows the agency default"
+        acts.append(f"{_CHANGE_LABELS[r['change']]}: {who}")
+    return {"action": "Let the Birdy Media Buying Agent act on its own",
+            "will_act_on_their_own": acts,
+            **({"weekly_report": "The weekly report will post to Slack by itself, without asking."} if weekly else {}),
+            "result": "From the next run, these changes go live in Meta (or Slack) without a confirm."}
+
+
+@mcp.tool(**LIVE)
 async def update_agent_settings(settings: dict | None = None, client_group_ids: list[str] | None = None,
                                 move_claims: bool = False, only_flag: list[str] | None = None,
-                                agent: str | None = None) -> dict:
+                                agent: str | None = None, confirm_code: str | None = None) -> dict:
     """Change the Birdy Media Buying Agent's settings and which clients it watches. Same body as PATCH /settings.
 
     Only the fields given change; `settings` is merged into the current ones (get_agent_overview shows them).
     Invalid values are refused with the reasons and nothing is saved.
+    A change that lets the agent act on its own (any mode set to "auto", or weekly.auto_post turned on) is two steps:
+    the first call saves nothing and returns a preview and a confirm_code.
+    Show the preview to the user and only call again with confirm_code after they say yes. Pass the same arguments.
+    Every other change is saved on the first call.
 
     Args:
         settings: Settings to merge, for example {"zones": {...}, "clients": {"<client_group_id>": {...}}, "weekly": {"auto_post": true}}.
@@ -505,16 +536,34 @@ async def update_agent_settings(settings: dict | None = None, client_group_ids: 
         move_claims: When another agent already acts on one of those clients, take it over instead of refusing.
         only_flag: Watched clients the agent may only flag on, never change.
         agent: Optional agent id or name. Defaults to the owner's Birdy Media Buying Agent.
+        confirm_code: The code from the preview, once the user has agreed (only for a change toward acting on its own).
     """
     db, user_id, found = await _stock(agent)
     try:
-        updated = await agent_settings.update_settings(db, user_id, found, settings=settings,
-                                                       client_group_ids=client_group_ids, move_claims=move_claims,
-                                                       only_flag=only_flag)
+        patch = await agent_settings.check_update(db, user_id, settings=settings, client_group_ids=client_group_ids)
     except agent_settings.SettingsError as e:
-        errors = "; ".join(f"{x.get('field')}: {x.get('message')}" for x in e.body.get("errors") or [])
-        raise ToolError(f"{e.body.get('detail')}" + (f" ({errors})" if errors else ""))
-    return {"agent": _agent_view(updated), "summary": "Updated the agent's settings."}
+        raise _settings_error(e)
+    raised = agent_settings.autonomy_raised(found, patch)
+
+    async def preview():
+        return await _autonomy_preview(db, user_id, raised)
+
+    async def execute():
+        try:
+            updated = await agent_settings.update_settings(db, user_id, found, settings=settings,
+                                                           client_group_ids=client_group_ids, move_claims=move_claims,
+                                                           only_flag=only_flag)
+        except agent_settings.SettingsError as e:
+            raise _settings_error(e)
+        return {"agent": _agent_view(updated), "summary": "Updated the agent's settings."}
+
+    if not raised:
+        return await execute()
+    args = {"agent_id": found["_id"], "settings": settings, "client_group_ids": client_group_ids,
+            "move_claims": move_claims, "only_flag": only_flag}
+    # Bound to the settings the preview was computed from, so a change in between needs a fresh yes.
+    state = {"settings": found.get("settings"), "scope": found.get("scope")}
+    return await two_step(db, user_id, "update_agent_settings", args, confirm_code, preview, execute, state=state)
 
 
 def _template_kind(kind: str) -> str:
