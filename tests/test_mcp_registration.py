@@ -23,6 +23,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     },
     "unified_leads_mcp": {"get_unified_leads", "get_unified_lead_stats"},
     "agent_mcp": {"list_agents", "set_default_agent"},
+    "stock_agent_mcp": {"get_agent_overview", "get_agent_runs", "get_agent_run", "get_agent_month", "get_agent_cards", "get_agent_card", "get_agent_lessons", "get_agent_outcomes", "get_agent_slack_template"},
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())

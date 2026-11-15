@@ -6,9 +6,9 @@ lessons. Owner-scoped like routers/agents.py: another user's agent is a 404, a c
 """
 
 import copy
+from contextlib import contextmanager
 import logging
 import os
-import re
 import time
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -26,14 +26,13 @@ from ai.agents.stock import add as stock_add
 from ai.agents.stock import apply as stock_apply
 from ai.agents.stock import cards as stock_cards
 from ai.agents.stock import lessons as stock_lessons
-from ai.agents.stock import months as stock_months
+from ai.agents.stock import reports
 from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import settings as stock_settings
 from ai.agents.stock import slack as stock_slack
 from ai.agents.stock import templates as stock_templates
 from ai.agents.stock import weekly as stock_weekly
-from ai.agents.stock.cards import STATE_PROPOSED, STATUS_CLOSING, STATUS_OPEN, STATUS_PARTLY_APPLIED
-from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON, clear_row
+from ai.agents.stock.scoreboard import clear_row
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from routers import agents as agents_router
@@ -57,46 +56,20 @@ async def _stock_agent(db, user_id: str, agent_id: str) -> dict:
     return agent
 
 
-def _with_id(doc: dict, drop: tuple = ()) -> dict:
-    out = {k: v for k, v in doc.items() if k != "_id" and k not in drop}
-    out["id"] = doc["_id"]
-    return out
+_with_id = reports.with_id
+_run_to_api = reports.run_to_api
+_card_to_api = reports.card_to_api
+_card_for_api = reports.card_for_api
+CLIENT_FIELDS, OUTCOME_FIELDS = reports.CLIENT_FIELDS, reports.OUTCOME_FIELDS
 
 
-CLIENT_FIELDS = ("state", "error", "reason", "carded", "stale", "card_id", "wait_for", "health_due")
-OUTCOME_FIELDS = ("client_group_id", "creative_key", "ad_name", "treatment_ids", "result", "spend", "leads",
-                  "cpl", "currency", "card_id", "line_id", "ad_id", "baseline_cpl", "live_since", "flagged",
-                  "unscored_reason", "cleared_by", "cleared_at", "cleared_from", "created_at", "scored_at")
-
-
-def _run_to_api(run: dict) -> dict:
-    """The run as the report needs it: no owner id, no Slack channel, and per client only its
-    outcome, not the working data a resumed tick keeps."""
-    out = _with_id(run, drop=("user_id", "claimed_at", "claim_kind", "in_flight", "tick_now", "tick_deadline", "open_preview", "slack",
-                                "weekly"))
-    out["slack"] = {"ts": (run.get("slack") or {}).get("ts")}
-    out["clients"] = {g: {k: c[k] for k in CLIENT_FIELDS if k in c} for g, c in (run.get("clients") or {}).items()}
-    return out
-
-
-def _card_to_api(card: dict, *, has_newer: bool = False) -> dict:
-    out = _with_id(card, drop=("user_id",))
-    # Only a live card still waiting on a person can be applied. A preview card never can, a card a
-    # newer one has replaced never can, and a partly applied one can only while it has lines left.
-    # `has_newer` is sent too: a card with only failed lines left has can_apply false but can be retried.
-    status = card.get("status")
-    left = any(ln.get("state") == STATE_PROPOSED for ln in card.get("lines") or [])
-    out["has_newer"] = has_newer
-    out["can_apply"] = not card.get("preview") and not has_newer and (
-        status == STATUS_OPEN or (status == STATUS_PARTLY_APPLIED and left))
-    return out
-
-
-async def _card_for_api(db, card: dict) -> dict:
-    # A preview is never replaced: it says what a run would do, and later live cards don't change that.
-    has_newer = (not card.get("preview") and card.get("status") in (STATUS_OPEN, STATUS_PARTLY_APPLIED)
-                 and await stock_apply.has_newer_card(db, card))
-    return _card_to_api(card, has_newer=has_newer)
+@contextmanager
+def _http_errors():
+    """The shared report functions raise ReportError; here it is an HTTP error."""
+    try:
+        yield
+    except reports.ReportError as e:
+        raise HTTPException(status_code=e.status, detail=e.detail)
 
 
 class SettingsPatch(BaseModel):
@@ -194,34 +167,9 @@ async def start_preview(agent_id: str, current_user: str = Depends(get_current_u
 # Runs and reports
 # ---------------------------------------------------------------------------
 
-async def _scoreboard(db, agent_id: str) -> dict:
-    rows = await db[OUTCOMES].find({"agent_id": agent_id}).sort("created_at", -1).to_list(length=None)
-    results = [str(r.get("result") or "").lower() for r in rows]
-    return {"won": results.count(WON), "lost": results.count(LOST),
-            "moves": len(rows) - results.count(UNSCORED) - results.count(CLEARED),
-            "rows": [{"id": r["_id"], **{k: r[k] for k in OUTCOME_FIELDS if k in r}} for r in rows[:OUTCOME_ROWS]]}
-
-
-async def _learned(db, agent_id: str, run: dict) -> list[dict]:
-    """"What I learned" in a report: the lessons made since the report before it, up to this one's end
-    (or now, while it is still open). Each can be kept or overruled."""
-    if not run.get("as_of"):
-        return []
-    prev = await db[stock_runner.RUNS].find(
-        {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}, "as_of": {"$lt": run["as_of"]}}
-    ).sort("as_of", -1).limit(1).to_list(length=1)
-    window = {"$lte": run.get("finished_at") or _utcnow().replace(tzinfo=None)}
-    if prev:   # from where the report before it finished, so no lesson shows in two reports
-        window["$gt"] = prev[0].get("finished_at") or prev[0]["as_of"]
-    rows = await db[agent_store.MEMORY].find({"agent_id": agent_id, "created_at": window}).sort("created_at", 1).to_list(length=None)
-    return [agents_router._memory_to_api(m) for m in rows]
-
-
-async def _suggestions(db, agent_id: str) -> list[dict]:
-    """The open "Make it a rule?" suggestions."""
-    rows = await db[agent_store.PROPOSALS].find(
-        {"agent_id": agent_id, "kind": stock_lessons.PROMOTE, "status": "open"}).sort("created_at", 1).to_list(length=None)
-    return [agents_router._proposal_to_api(p) for p in rows]
+_scoreboard = reports.scoreboard
+_learned = reports.learned
+_suggestions = reports.suggestions
 
 
 @router.get("/{agent_id}/runs")
@@ -231,13 +179,7 @@ async def list_runs(agent_id: str, limit: int = Query(20, ge=1, le=100), before:
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        q: dict = {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}}
-        if before is not None:
-            q["as_of"] = {"$lt": stock_runner._naive(before)}
-        rows = await db[stock_runner.RUNS].find(q).sort("as_of", -1).limit(limit + 1).to_list(length=limit + 1)
-        more = len(rows) > limit
-        runs = [_run_to_api(r) for r in rows[:limit]]
-        return {"runs": runs, "next_before": runs[-1]["as_of"] if more else None}
+        return await reports.list_runs(db, agent_id, limit, before)
 
 
 @router.get("/{agent_id}/runs/latest")
@@ -249,17 +191,7 @@ async def latest_run(agent_id: str, kind: Optional[str] = Query(None, pattern="^
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        q = {"agent_id": agent_id, "kind": stock_runner.PREVIEW} if kind \
-            else {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}}
-        rows = await db[stock_runner.RUNS].find(q).sort("as_of", -1).limit(1).to_list(length=1)
-        if not rows:
-            return {"run": None, "open_cards": 0}
-        open_cards = 0
-        if not kind:
-            waiting = db[stock_runner.CARDS].find(
-                {"run_id": rows[0]["_id"], "agent_id": agent_id, "tag": "changes", "status": {"$in": [STATUS_OPEN, STATUS_PARTLY_APPLIED]}})
-            open_cards = sum([1 async for c in waiting if (await _card_for_api(db, c))["can_apply"]])
-        return {"run": _run_to_api(rows[0]), "open_cards": open_cards}
+        return await reports.latest_run(db, agent_id, preview=bool(kind))
 
 
 @router.get("/{agent_id}/runs/{run_id}")
@@ -267,17 +199,8 @@ async def get_run(agent_id: str, run_id: str, current_user: str = Depends(get_cu
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        run = await db[stock_runner.RUNS].find_one({"_id": run_id, "agent_id": agent_id})
-        if run is None:
-            raise HTTPException(status_code=404, detail="Run not found")
-        cards = await db[stock_runner.CARDS].find(
-            {"run_id": run_id, "agent_id": agent_id, "status": {"$ne": STATUS_CLOSING}}
-        ).sort("created_at", 1).to_list(length=None)
-        follow_ups = [{"client_group_id": c["client_group_id"], **f}
-                      for c in cards for f in c.get("follow_ups") or []]
-        return {"run": _run_to_api(run), "cards": [await _card_for_api(db, c) for c in cards], "follow_ups": follow_ups,
-                "scoreboard": await _scoreboard(db, agent_id), "learned": await _learned(db, agent_id, run),
-                "proposals": await _suggestions(db, agent_id), "weekly": stock_weekly.weekly_view(run)}
+        with _http_errors():
+            return await reports.get_run(db, agent_id, run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -453,24 +376,16 @@ class TemplateBody(BaseModel):
 
 
 def _kind_or_404(kind: str) -> str:
-    if kind not in stock_settings.TEMPLATE_KINDS:
-        raise HTTPException(status_code=404, detail=f"No template called {kind!r}")
-    return kind
+    with _http_errors():
+        return reports.check_template_kind(kind)
 
 
-def _stored_templates(agent: dict) -> dict:
-    return ((agent.get("settings") or {}).get("slack") or {}).get("templates") or {}
+_stored_templates = reports.stored_templates
+_template_view = reports.template_view
 
 
 def _template_error(e: stock_templates.TemplateError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": "This template can't be used", "errors": e.errors})
-
-
-def _template_view(kind: str, agent: dict) -> dict:
-    stored = _stored_templates(agent).get(kind)
-    return {"kind": kind, "customised": bool(stored), "template": stored or stock_templates.DEFAULT_TEMPLATES[kind],
-            "defaults": stock_templates.DEFAULT_TEMPLATES[kind], "placeholders": list(stock_templates.KIND_TOKENS[kind]),
-            "notice": ((agent.get(stock_slack.NOTICES) or {}).get(kind) or {}).get("message")}
 
 
 async def _save_template(db, agent: dict, user_id: str, kind: str, template: dict | None) -> dict:
@@ -552,24 +467,14 @@ async def get_card_chat(agent_id: str, card_id: str, current_user: str = Depends
         return await conversation_log.card_transcript(db, current_user, card_id)
 
 
-_MONTH_RE = re.compile(r"^\d{4}-\d{2}$")
-
-
 @router.get("/{agent_id}/months/{month}")
 async def get_month(agent_id: str, month: str, current_user: str = Depends(get_current_user)):
     """The whole-month report: per client, the month's leads, spend, CPL and zone, and how many cards were decided."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _stock_agent(db, current_user, agent_id)
-        try:
-            if not _MONTH_RE.match(month):
-                raise ValueError(month)
-            stock_months.parse_month(month)
-        except ValueError:
-            raise HTTPException(status_code=400, detail="bad_month")
-        if month > stock_months.current_month(agent, _utcnow()):
-            raise HTTPException(status_code=400, detail="future_month")
-        return await stock_months.month_rows(db, agent, month)
+        with _http_errors():
+            return await reports.month_report(db, agent, month)
 
 
 @router.get("/{agent_id}/lessons")
@@ -578,8 +483,7 @@ async def get_lessons(agent_id: str, current_user: str = Depends(get_current_use
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _stock_agent(db, current_user, agent_id)
-        return [{"uses": 0, "last_used": [], **agents_router._memory_to_api(m)}
-                for m in await agent_store.list_memory(db, agent_id, active_only=False)]
+        return await reports.lessons(db, agent_id)
 
 
 @router.post("/{agent_id}/lessons/{lesson_id}/keep")
