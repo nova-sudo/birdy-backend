@@ -14,6 +14,8 @@ BirdyAccessMiddleware runs on every tool call:
 Internal `type: "access"` tokens (orchestrator, login cookie) skip both gates.
 """
 
+import asyncio
+import logging
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -26,7 +28,10 @@ import billing_middleware
 from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
-from ai.mcp.outcome import reset_outcome, set_outcome, start_activity
+from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars, set_outcome, start_activity
+from services import mcp_billing
+
+logger = logging.getLogger(__name__)
 
 READ_SCOPE = "birdy.read"
 WRITE_SCOPE = "birdy.write"
@@ -38,6 +43,8 @@ LIVE = {"tags": {"write", "live"}, "annotations": {"readOnlyHint": False, "destr
 MCP_RATE_LIMIT_PER_MINUTE = 120
 _RATE_TTL_SECONDS = 120
 _index_ready = False
+_CHARGE_TIMEOUT_SECONDS = 0.3
+_FREE_OUTCOMES = {"refused", "bad_code", "state_changed"}
 
 
 def token_scopes(claims: dict) -> set[str]:
@@ -79,6 +86,29 @@ def _expiry():
     return datetime.now(timezone.utc) + timedelta(seconds=_RATE_TTL_SECONDS)
 
 
+async def _charge_call(db, claims: dict, tool_name: str, result) -> None:
+    """Charge an external call that ran cleanly. Refused, bad-code, state-changed and error results are free."""
+    outcome = get_outcome() or {}
+    kind = outcome.get("kind")
+    if kind in _FREE_OUTCOMES:
+        return
+    structured = getattr(result, "structured_content", None)
+    if is_error_result(structured):
+        return
+    await mcp_billing.charge_mcp_call(
+        db, claims.get("sub"), tool=tool_name,
+        grant_id=claims.get("grant_id") or claims.get("jti"),
+        chars=response_chars(result), live=kind == "live_executed",
+    )
+
+
+async def _charge_safely(db, claims: dict, tool_name: str, result) -> None:
+    try:
+        await asyncio.wait_for(_charge_call(db, claims, tool_name, result), _CHARGE_TIMEOUT_SECONDS)
+    except Exception as exc:  # incl. TimeoutError: a billing hiccup never costs the caller their result
+        logger.warning("MCP charge failed for %s: %r", tool_name, exc)
+
+
 class BirdyAccessMiddleware(Middleware):
     async def on_call_tool(self, context, call_next):
         reset_outcome()
@@ -107,6 +137,13 @@ class BirdyAccessMiddleware(Middleware):
                     f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
                     "to keep using Birdy here."
                 )
-            await _enforce_rate_limit(get_db(client), claims.get("sub"))
+            db = get_db(client)
+            if not await mcp_billing.has_credits(db, claims.get("sub")):
+                set_outcome("refused", reason="out_of_credits")
+                raise ToolError(mcp_billing.OUT_OF_CREDITS_MESSAGE)
+            await _enforce_rate_limit(db, claims.get("sub"))
 
-        return await call_next(context)
+        result = await call_next(context)
+        if claims.get("type") != "access":
+            await _charge_safely(get_db(get_shared_mongo_client()), claims, context.message.name, result)
+        return result

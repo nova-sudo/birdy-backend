@@ -103,9 +103,16 @@ _settings_cache = {"data": None, "ts": 0.0}
 DEFAULT_MARKUP = float(MODEL_PRICING[DEFAULT_MODEL]["markup"])  # gpt-4o → 4.0
 MARKUP_MIN, MARKUP_MAX = 1.0, 20.0
 
+# External MCP requests are priced per call, not per token (the markup is not applied).
+MCP_PRICING_DEFAULTS = {"mcp_base_fee": 0.2, "mcp_per_10k_chars": 1.0, "mcp_live_fee": 1.0, "mcp_max_per_call": 10.0}
+MCP_PRICING_MIN, MCP_PRICING_MAX = 0.0, 100.0
+
 
 def _default_settings() -> dict:
-    return {"markup": DEFAULT_MARKUP, "rate_mode": DEFAULT_RATE_MODE, "updated_at": None, "updated_by": None}
+    return {
+        "markup": DEFAULT_MARKUP, "rate_mode": DEFAULT_RATE_MODE, "updated_at": None, "updated_by": None,
+        **MCP_PRICING_DEFAULTS,
+    }
 
 
 async def get_credits_settings(db, *, fresh: bool = False) -> dict:
@@ -129,13 +136,17 @@ async def get_credits_settings(db, *, fresh: bool = False) -> dict:
         "enforce": bool(doc["enforce"]) if doc.get("enforce") is not None else CREDITS_ENFORCE,
         "updated_at": doc.get("updated_at"),
         "updated_by": doc.get("updated_by"),
+        **{k: float(doc[k]) if doc.get(k) is not None else d for k, d in MCP_PRICING_DEFAULTS.items()},
     }
     _settings_cache["data"] = data
     _settings_cache["ts"] = now
     return data
 
 
-async def set_credits_settings(db, *, markup=None, rate_mode=None, enforce=None, admin: Optional[str] = None) -> dict:
+async def set_credits_settings(
+    db, *, markup=None, rate_mode=None, enforce=None, admin: Optional[str] = None,
+    mcp_base_fee=None, mcp_per_10k_chars=None, mcp_live_fee=None, mcp_max_per_call=None,
+) -> dict:
     """Update the markup, rate mode, and/or enforcement. Clamps markup to a sane
     range and validates the mode; invalidates the in-process cache so the change
     takes effect on the next charge/check."""
@@ -149,6 +160,15 @@ async def set_credits_settings(db, *, markup=None, rate_mode=None, enforce=None,
         update["rate_mode"] = rate_mode
     if enforce is not None:
         update["enforce"] = bool(enforce)
+    for key, value in (
+        ("mcp_base_fee", mcp_base_fee), ("mcp_per_10k_chars", mcp_per_10k_chars),
+        ("mcp_live_fee", mcp_live_fee), ("mcp_max_per_call", mcp_max_per_call),
+    ):
+        if value is not None:
+            value = float(value)
+            if not (MCP_PRICING_MIN <= value <= MCP_PRICING_MAX):
+                raise ValueError(f"{key} must be between {MCP_PRICING_MIN:g} and {MCP_PRICING_MAX:g}")
+            update[key] = value
     if update:
         update["updated_at"] = datetime.now(timezone.utc)
         if admin:
