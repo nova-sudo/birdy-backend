@@ -20,7 +20,6 @@ and the verification state together.
 
 import logging
 import os
-from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
@@ -29,15 +28,13 @@ from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from pydantic import BaseModel
 
-from services import landing_funnel as landing_funnel_service
+from services import attribution_reports
 from services import lead_collection as lead_collection_service
 from services.attribution_service import (
     META_URL_PARAMETERS,
     ensure_site_id,
     install_status,
-    leads_by_ad,
 )
-from services.tracked_leads import TRACKED_LEADS
 
 logger = logging.getLogger(__name__)
 
@@ -146,43 +143,19 @@ async def get_leads_by_ad(
     every other lead figure in Birdy rather than with when we happened to
     resolve the match.
     """
-    def _parse(value: str | None) -> datetime | None:
-        if not value:
-            return None
-        try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00")).replace(tzinfo=None)
-        except ValueError:
-            raise HTTPException(status_code=400, detail=f"Invalid date: {value}")
-
     async with get_mongo_client() as mongo_client:
         await _require_group(group_id, current_user, mongo_client)
-        rows = await leads_by_ad(
-            current_user, group_id, _parse(start), _parse(end),
-            mongo_client, include_predated=include_predated,
-        )
-
-    return {
-        "group_id": group_id,
-        "start": start,
-        "end": end,
-        "ads": rows,
-        "attributed_leads": sum(r["leads"] for r in rows),
-    }
+        try:
+            return await attribution_reports.leads_by_ad_report(
+                current_user, group_id, start, end, mongo_client, include_predated=include_predated,
+            )
+        except attribution_reports.AttributionInputError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
 # The landing-page funnel
 # ---------------------------------------------------------------------------
-
-def _parse_day(value: str | None, field: str) -> str | None:
-    """An ISO date off the query string, as the day key the rollup stores."""
-    if not value:
-        return None
-    try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).strftime("%Y-%m-%d")
-    except ValueError:
-        raise HTTPException(status_code=400, detail=f"Invalid {field} date: {value}")
-
 
 @router.get("/funnel/{group_id}")
 async def get_landing_funnel(
@@ -203,52 +176,13 @@ async def get_landing_funnel(
     """
     if not start or not end:
         raise HTTPException(status_code=400, detail="start and end are required")
-    start_day = _parse_day(start, "start")
-    end_day = _parse_day(end, "end")
-    if start_day > end_day:
-        raise HTTPException(status_code=400, detail="start must not be after end")
 
     async with get_mongo_client() as mongo_client:
         group = await _require_group(group_id, current_user, mongo_client)
-        config = lead_collection_service.read(group)
-        method = config["method"]
-
-        applicable = method in lead_collection_service.NEEDS_SCRIPT
-        if method == lead_collection_service.METHOD_UNKNOWN:
-            applicable = await landing_funnel_service.has_any_data(group_id, mongo_client)
-
-        if not applicable:
-            return {
-                "group_id": group_id,
-                "group_name": group.get("name"),
-                "method": method,
-                "applicable": False,
-                "reason": (
-                    "This client's leads come from Meta Instant Forms, which never "
-                    "send anyone to a page of their own."
-                    if method == lead_collection_service.METHOD_INSTANT_FORM else
-                    "This client's form tool sends leads to GoHighLevel, so its "
-                    "pages carry no Birdy script to measure. Leads are attributed "
-                    "from GoHighLevel."
-                    if method == lead_collection_service.METHOD_FORM_TO_GHL else
-                    "No landing page activity has reached Birdy for this client yet."
-                ),
-            }
-
-        funnel = await landing_funnel_service.funnel(
-            group_id, start_day, end_day, mongo_client,
-        )
-        status = await install_status(group_id, mongo_client)
-
-    return {
-        "group_id": group_id,
-        "group_name": group.get("name"),
-        "method": method,
-        "applicable": True,
-        "installed": status["installed"],
-        "last_seen_at": status["last_seen_at"],
-        **funnel,
-    }
+        try:
+            return await attribution_reports.funnel_report(group, start, end, mongo_client)
+        except attribution_reports.AttributionInputError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
 
 # ---------------------------------------------------------------------------
@@ -359,37 +293,4 @@ async def get_overview(current_user: str = Depends(get_current_user)):
     sort first, because they are the ones needing attention.
     """
     async with get_mongo_client() as mongo_client:
-        db = mongo_client[DB_NAME]
-        groups = await db["client_groups"].find(
-            {"user_id": current_user},
-            projection={
-                "id": 1, "name": 1, "client_status": 1, "_id": 0,
-                "attribution_site_id": 1, "lead_collection": 1,
-            },
-        ).to_list(None)
-
-        rows = []
-        for group in groups:
-            group_id = group["id"]
-            config = lead_collection_service.read(group)
-            status = await install_status(group_id, mongo_client)
-            leads = await db[TRACKED_LEADS].count_documents({"client_group_id": group_id})
-            rows.append({
-                "group_id": group_id,
-                "group_name": group.get("name"),
-                "client_status": group.get("client_status"),
-                "method": config["method"],
-                "form_provider": config["form_provider"],
-                "site_id": group.get("attribution_site_id"),
-                "installed": status["installed"],
-                "last_seen_at": status["last_seen_at"],
-                "ad_click_seen": status["first_ad_click_seen"],
-                "tracked_leads": leads,
-                "attributed_leads": status["attributed_leads"],
-            })
-
-    rows.sort(key=lambda r: (
-        r["method"] != lead_collection_service.METHOD_UNKNOWN,
-        (r["group_name"] or "").lower(),
-    ))
-    return {"clients": rows}
+        return await attribution_reports.overview_report(current_user, mongo_client)

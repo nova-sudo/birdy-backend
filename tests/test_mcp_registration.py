@@ -32,7 +32,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "hp_mcp": {"get_call_center_stats"},
     "call_analysis_mcp": {"get_call_recordings_summary", "analyze_call_recordings"},
     "creatives_mcp": {"find_ads", "list_ad_accounts", "list_adsets", "list_creative_tests", "get_creative_test", "draft_creative_test", "post_creative_test", "scale_creative_test"},
-    "attribution_mcp": {"get_closes_by_ad"},
+    "attribution_mcp": {"get_closes_by_ad", "attribution_status", "leads_by_ad", "funnel", "attribution_overview"},
     "client_mcp": {"get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target"},
     "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript"},
 }
