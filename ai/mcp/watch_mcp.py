@@ -25,7 +25,7 @@ async def check_my_accounts(days: int = 7) -> dict:
     ("high", "medium" or "ok"); and reasons, plain-English lines saying why. Money is in that client's ad account
     currency. Clients are sorted high first, then medium, then ok, biggest spend first. summary counts each level.
 
-    High means CPL more than 20% over target, an alert fired, or spend stopped. Medium means CPL up 25% or more,
+    High means CPL more than 20% over target, spend with zero leads above 1.2x the target CPL (reason "Spent X with no leads"), an alert fired, or spend stopped. Medium means CPL up 25% or more,
     leads down 25% or more (only when the prior period had 5+ leads), or open agent cards. A client with no Meta
     ad account is "ok" with that reason. A client whose data couldn't be loaded is "medium" with the reason.
 

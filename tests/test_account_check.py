@@ -2,7 +2,7 @@
 as get_daily_metrics, plus alerts fired and open agent cards. No LLM."""
 
 import asyncio
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastmcp.exceptions import ToolError
@@ -14,7 +14,11 @@ from services.account_check import build_account_check
 
 pytestmark = pytest.mark.asyncio
 
-TODAY = date.today()
+def _utcnow():
+    return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+TODAY = _utcnow().date()
 CUR_DAY = (TODAY - timedelta(days=1)).isoformat()       # last day of the period
 PRIOR_DAY = (TODAY - timedelta(days=14)).isoformat()    # first day fetched = inside the prior period (days=7)
 
@@ -98,6 +102,57 @@ async def test_cpl_over_1_2x_target_is_high(mock_db, meta):
     assert c["reasons"] == ["CPL $60.50 is 21% over the $50 target"]
 
 
+async def test_float_boundary_3_60_vs_target_3_is_not_high(mock_db, meta):
+    await _client(mock_db, targets={"cpl": 3})
+    meta["act_g1"] = {"cur": (7.2, 2), "prior": (7.2, 2)}  # CPL 3.60; 3 * 1.2 is 3.5999999999999996
+    assert _one(await _check(mock_db))["attention"] == "ok"
+
+
+async def test_spend_with_no_leads_over_limit_is_high(mock_db, meta):
+    await _client(mock_db, cid="g1", targets={"cpl": 50})
+    await _client(mock_db, cid="g2", name="B", targets={"cpl": 50})
+    await _client(mock_db, cid="g3", name="C")
+    meta["act_g1"] = {"cur": (61, 0), "prior": (61, 0)}   # over 1.2 x 50
+    meta["act_g2"] = {"cur": (60, 0), "prior": (60, 0)}   # exactly at the limit
+    meta["act_g3"] = {"cur": (500, 0), "prior": (500, 0)}  # no target
+    out = await _check(mock_db)
+    assert _one(out)["attention"] == "high"
+    assert _one(out)["reasons"] == ["Spent $61 with no leads (target $50)"]
+    assert _one(out, "g2")["attention"] == "ok"
+    assert _one(out, "g3")["attention"] == "ok"
+
+
+async def test_slow_client_times_out_as_medium(mock_db, meta, monkeypatch):
+    await _client(mock_db, cid="g1")
+    await _client(mock_db, cid="g2", name="B")
+    meta["act_g1"] = {"cur": (50, 5), "prior": (50, 5)}
+    meta["act_g2"] = {"cur": (50, 5), "prior": (50, 5)}
+    real = mw._fetch_daily_insights
+
+    async def slow(acct, *a, **k):
+        if acct == "act_g1":
+            await asyncio.sleep(5)
+        return await real(acct, *a, **k)
+
+    monkeypatch.setattr(mw, "_fetch_daily_insights", slow)
+    monkeypatch.setattr(account_check, "CLIENT_TIMEOUT_SECONDS", 0.05)
+    out = await _check(mock_db)
+    assert _one(out)["attention"] == "medium"
+    assert _one(out)["reasons"] == ["Couldn't load data: Meta took too long"]
+    assert _one(out, "g2")["attention"] == "ok"
+
+
+async def test_failed_load_keeps_high_from_alerts(mock_db, meta):
+    await _client(mock_db)
+    meta["act_g1"] = RuntimeError("boom")
+    await mock_db["alerts"].insert_one({"id": "a1", "user_id": "u1", "target_group_ids": ["g1"]})
+    await mock_db["alert_notifications"].insert_one(
+        {"alert_id": "a1", "user_id": "u1", "triggered_at": _utcnow()})
+    c = _one(await _check(mock_db))
+    assert c["attention"] == "high"
+    assert c["reasons"] == ["1 alert fired in this period", "Couldn't load data: boom"]
+
+
 async def test_client_with_no_target_never_high_on_cpl(mock_db, meta):
     await _client(mock_db)
     meta["act_g1"] = {"cur": (5000, 2), "prior": (5000, 2)}
@@ -123,7 +178,7 @@ async def test_alerts_fired_in_period_make_high(mock_db, meta):
     await _client(mock_db)
     await _client(mock_db, cid="g2", name="Other")
     meta["act_g1"] = meta["act_g2"] = {"cur": (50, 5), "prior": (50, 5)}
-    now = datetime.utcnow()
+    now = _utcnow()
     await mock_db["alerts"].insert_many([
         {"id": "a1", "user_id": "u1", "target_group_ids": ["g1"]},
         {"id": "a2", "user_id": "u1", "target_group_ids": ["g1", "g2"]},
@@ -218,7 +273,7 @@ async def test_scoped_to_user(mock_db, meta):
         {"_id": "c", "user_id": "alice", "agent_id": "a", "client_group_id": "ga", "status": "open"})
     await mock_db["alerts"].insert_one({"id": "al", "user_id": "alice", "target_group_ids": ["ga"]})
     await mock_db["alert_notifications"].insert_one(
-        {"alert_id": "al", "user_id": "alice", "group_id": "ga", "triggered_at": datetime.utcnow()})
+        {"alert_id": "al", "user_id": "alice", "group_id": "ga", "triggered_at": _utcnow()})
     bob = await _check(mock_db, user="bob")
     assert [c["client"]["name"] for c in bob["clients"]] == ["Bob Co"]
     assert bob["clients"][0]["attention"] == "ok"

@@ -13,26 +13,26 @@ Clients are matched by `client_groups.id`, never by name.
 
 import asyncio
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 from ai.agents.store import CARDS
+from ai.suggestions.agents.useless_ad_purger import _symbol
 from ai.tools import multi_window_tools as mw
 
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENCY = 8
+CLIENT_TIMEOUT_SECONDS = 20
 HIGH_CPL_RATIO = 1.2
 CPL_RISE_PCT = 25
 LEADS_DROP_PCT = -25
 MIN_PRIOR_LEADS = 5
 OPEN_CARD_STATUSES = ("open", "flagged")
 _RANK = {"high": 0, "medium": 1, "ok": 2}
-_SYMBOLS = {"USD": "$", "GBP": "£", "EUR": "€", "CAD": "CA$", "AUD": "A$", "NZD": "NZ$", "JPY": "¥", "INR": "₹"}
 
 
 def _money(value, currency) -> str:
-    code = (currency or "USD").upper()
-    prefix = _SYMBOLS.get(code, f"{code} ")
+    prefix = _symbol(currency)
     return f"{prefix}{value:,.0f}" if float(value).is_integer() else f"{prefix}{value:,.2f}"
 
 
@@ -45,8 +45,12 @@ def _attention(c: dict) -> tuple[str, list[str]]:
     high: list[str] = []
     medium: list[str] = []
     cpl, target = c["cpl"], c["target_cpl"]
-    if target and cpl is not None and cpl > target * HIGH_CPL_RATIO:
+    # CPL is already rounded to 2dp; compare against a rounded limit (3 * 1.2 is 3.5999999999999996).
+    limit = round(target * HIGH_CPL_RATIO, 2) if target else None
+    if limit and cpl is not None and cpl > limit:
         high.append(f"CPL {_money(cpl, cur)} is {round((cpl / target - 1) * 100)}% over the {_money(target, cur)} target")
+    elif limit and not c["leads"] and (c["spend"] or 0) > limit:
+        high.append(f"Spent {_money(c['spend'], cur)} with no leads (target {_money(target, cur)})")
     if c["alerts_fired"] >= 1:
         high.append(f"{_plural(c['alerts_fired'], 'alert', 'alerts')} fired in this period")
     if (c["prior"]["spend"] or 0) > 0 and not c["spend"]:
@@ -81,7 +85,11 @@ async def _load_metrics(group: dict, token, sem, since, prev_since, until) -> di
     row = _blank(group)
     try:
         async with sem:
-            res, _ = await mw.fetch_group_daily(group, token, since, prev_since, until)
+            res, _ = await asyncio.wait_for(
+                mw.fetch_group_daily(group, token, since, prev_since, until), CLIENT_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        row["_error"] = "Meta took too long"
+        return row
     except Exception as e:  # one bad client must not sink the check
         logger.warning("account check: client %s failed: %s", group.get("id"), e, exc_info=True)
         row["_error"] = str(e)[:120] or type(e).__name__
@@ -128,7 +136,7 @@ async def _open_cards(db, user_id: str) -> dict[str, int]:
 
 
 async def build_account_check(db, mongo_client, user_id: str, days: int = 7) -> dict:
-    today = date.today()
+    today = datetime.now(timezone.utc).date()
     until = (today - timedelta(days=1)).isoformat()
     since = (today - timedelta(days=days)).isoformat()
     prev_since = (today - timedelta(days=2 * days)).isoformat()
@@ -156,14 +164,13 @@ async def build_account_check(db, mongo_client, user_id: str, days: int = 7) -> 
         gid = c["client"]["id"]
         c["alerts_fired"], c["open_agent_cards"] = fired.get(gid, 0), cards.get(gid, 0)
         error, note = c.pop("_error", None), c.pop("_note", None)
+        c["attention"], c["reasons"] = _attention(c)  # alerts and cards apply even with no metrics
         if error:
-            c["attention"], c["reasons"] = "medium", [f"Couldn't load data: {error}"]
+            if c["attention"] == "ok":
+                c["attention"] = "medium"
+            c["reasons"].append(f"Couldn't load data: {error}")
         elif note:
-            # No metrics, but alerts or open cards can still apply; the note goes last.
-            c["attention"], reasons = _attention(c)
-            c["reasons"] = reasons + [note]
-        else:
-            c["attention"], c["reasons"] = _attention(c)
+            c["reasons"].append(note)
         clients.append(c)
 
     clients.sort(key=lambda c: (_RANK[c["attention"]], -(c["spend"] or 0)))
