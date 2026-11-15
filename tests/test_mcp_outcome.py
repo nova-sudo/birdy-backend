@@ -82,7 +82,7 @@ def test_response_chars_prefers_structured():
     assert response_chars(SimpleNamespace(structured_content=None, content=[SimpleNamespace(text="abc"), SimpleNamespace(text="de")])) == 5
 
 
-async def test_view_only_refusal_sets_outcome(monkeypatch):
+async def test_view_only_refusal_sets_outcome(monkeypatch, mock_db):  # mock_db: the refusal is logged
     seen = {}
     monkeypatch.setattr(access, "get_access_token", lambda: SimpleNamespace(claims={"sub": "a", "type": "mcp", "scope": "birdy.read"}))
     tool = SimpleNamespace(tags={"write"})

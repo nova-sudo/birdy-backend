@@ -35,6 +35,11 @@ def _breakdown(settings: dict, chars: int, live: bool) -> dict:
     return {"request": request_c, "data": data_c, "live": live_c, "total": total}
 
 
+async def charge_breakdown(db, chars: int, live: bool) -> dict:
+    """What a call costs ({request, data, live, total}), without charging it."""
+    return _breakdown(await get_credits_settings(db), chars, live)
+
+
 async def charge_mcp_call(db, user_id: str, *, tool: str, grant_id: str | None, chars: int, live: bool) -> dict:
     settings = await get_credits_settings(db)
     result = _breakdown(settings, chars, live)

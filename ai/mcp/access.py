@@ -29,7 +29,7 @@ from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars, set_outcome, start_activity
-from services import mcp_billing
+from services import mcp_activity, mcp_billing
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +45,8 @@ _RATE_TTL_SECONDS = 120
 _index_ready = False
 _CHARGE_TIMEOUT_SECONDS = 0.3
 _FREE_OUTCOMES = {"refused", "bad_code", "state_changed"}
+_ZERO_CREDITS = {"request": 0.0, "data": 0.0, "live": 0.0, "total": 0.0}
+_background: set = set()  # strong refs to in-flight charge-and-record tasks
 
 
 def token_scopes(claims: dict) -> set[str]:
@@ -86,64 +88,135 @@ def _expiry():
     return datetime.now(timezone.utc) + timedelta(seconds=_RATE_TTL_SECONDS)
 
 
-async def _charge_call(db, claims: dict, tool_name: str, result) -> None:
-    """Charge an external call that ran cleanly. Refused, bad-code, state-changed and error results are free."""
-    outcome = get_outcome() or {}
-    kind = outcome.get("kind")
-    if kind in _FREE_OUTCOMES:
-        return
+def _result_payload(result):
+    """What the client got, for the activity excerpt: the structured JSON, else the text blocks."""
     structured = getattr(result, "structured_content", None)
-    if is_error_result(structured):
-        return
-    await mcp_billing.charge_mcp_call(
-        db, claims.get("sub"), tool=tool_name,
-        grant_id=claims.get("grant_id") or claims.get("jti"),
-        chars=response_chars(result), live=kind == "live_executed",
-    )
+    if structured is not None:
+        return structured
+    text = "".join(getattr(b, "text", "") or "" for b in getattr(result, "content", None) or [])
+    return text or None
 
 
-async def _charge_safely(db, claims: dict, tool_name: str, result) -> None:
+def _kind_for(tags: set, outcome_kind: str | None) -> str:
+    if outcome_kind == "preview":
+        return "preview"
+    if outcome_kind == "live_executed":
+        return "live"
+    if outcome_kind in _FREE_OUTCOMES:
+        return "refused"
+    return "change" if "write" in tags else "lookup"
+
+
+async def _app_name(db, claims: dict) -> str:
+    """The claim `client_name`, else the connection's name from mcp_tokens by jti (looked up per call:
+    serverless has no shared memory to cache in). OAuth access tokens carry no client_name claim, so they
+    take the second path too."""
+    if claims.get("client_name"):
+        return claims["client_name"]
+    if claims.get("jti"):
+        doc = await db["mcp_tokens"].find_one({"jti": claims["jti"]}, {"name": 1})
+        if doc and doc.get("name"):
+            return doc["name"]
+    return "Unknown app"
+
+
+async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: dict, result, error, started: float) -> None:
+    """Charge (when the call earned a charge) and write the activity row, concurrently.
+
+    The row stores the price the charge formula gives (so a slow or failed charge still logs the amount).
+    Each half logs its own failure; neither raises."""
+    outcome = get_outcome() or {}
+    okind = outcome.get("kind")
+    structured = getattr(result, "structured_content", None)
+    free = okind in _FREE_OUTCOMES or error is not None or is_error_result(structured)
+    live = okind == "live_executed"
+    chars = response_chars(result) if result is not None else 0
+    grant_id = claims.get("grant_id") or claims.get("jti")
+    duration_ms = int((time.monotonic() - started) * 1000)
+
+    async def charge():
+        if not free:
+            await mcp_billing.charge_mcp_call(db, claims.get("sub"), tool=tool_name, grant_id=grant_id, chars=chars, live=live)
+
+    async def record():
+        app_name = await _app_name(db, claims)
+        app_kind = mcp_activity.app_kind_for(app_name)
+        if okind == "refused" and outcome.get("reason") == "rate_limit":
+            await mcp_activity.record_rate_limited(db, claims.get("sub"), grant_id, app_name, app_kind)
+            return
+        credits = _ZERO_CREDITS if free else await mcp_billing.charge_breakdown(db, chars, live)
+        reason = outcome.get("reason") if okind == "refused" else okind if okind in _FREE_OUTCOMES else None
+        await mcp_activity.record_call(
+            db, user_id=claims.get("sub"), grant_id=grant_id, app_name=app_name, app_kind=app_kind,
+            access="write" if WRITE_SCOPE in token_scopes(claims) else "read",
+            tool=tool_name, kind=_kind_for(tags, okind), refusal_reason=reason, args=args,
+            result=str(error) if error is not None else _result_payload(result),
+            result_status="error" if (free or error is not None) else "ok",
+            credits=credits, chars=chars, duration_ms=duration_ms, confirmed_after=outcome.get("confirmed_after"),
+        )
+
+    for name, outcome_of in zip(("charge", "activity log"), await asyncio.gather(charge(), record(), return_exceptions=True)):
+        if isinstance(outcome_of, BaseException):
+            logger.warning("MCP %s failed for %s: %r", name, tool_name, outcome_of)
+
+
+async def _finish_call(db, claims, tool_name, tags, args, result, error, started) -> None:
+    """Charge and log one external call within the latency budget.
+
+    The work runs as its own task, shielded from the timeout's cancel: a deduction is followed by its
+    ledger row (see credits._apply_charge) and a cancel between the two would lose that row. On timeout we
+    warn and return the result; the task keeps running to completion."""
+    task = asyncio.ensure_future(_charge_and_record(db, claims, tool_name, tags, args, result, error, started))
+    _background.add(task)
+    task.add_done_callback(_background.discard)
     try:
-        await asyncio.wait_for(_charge_call(db, claims, tool_name, result), _CHARGE_TIMEOUT_SECONDS)
-    except Exception as exc:  # incl. TimeoutError: a billing hiccup never costs the caller their result
-        logger.warning("MCP charge failed for %s: %r", tool_name, exc)
+        await asyncio.wait_for(asyncio.shield(task), _CHARGE_TIMEOUT_SECONDS)
+    except Exception as exc:  # incl. TimeoutError: a billing or logging hiccup never costs the caller their result
+        logger.warning("MCP charge/activity log did not finish for %s: %r", tool_name, exc)
 
 
 class BirdyAccessMiddleware(Middleware):
     async def on_call_tool(self, context, call_next):
         reset_outcome()
         start_activity()
+        started = time.monotonic()
         token = get_access_token()
         claims = token.claims if token else {}
         tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
-
-        if "write" in (tool.tags or set()) and WRITE_SCOPE not in token_scopes(claims):
-            set_outcome("refused", reason="view_only")
-            raise ToolError(
-                'This Birdy connection is view-only. Reconnect with "View and make changes" to do this.'
-            )
-
         # Only the internal orchestrator/login token is exempt; any other type (mcp, missing,
         # refresh, ...) is treated as external.
-        if claims.get("type") != "access":
-            client = get_shared_mongo_client()
-            try:
-                await billing_middleware.require_active_subscription(claims.get("sub"), client)
-            except HTTPException as exc:
-                if exc.status_code != 402:
-                    raise
-                set_outcome("refused", reason="no_subscription")
-                raise ToolError(
-                    f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
-                    "to keep using Birdy here."
-                )
-            db = get_db(client)
-            if not await mcp_billing.has_credits(db, claims.get("sub")):
-                set_outcome("refused", reason="out_of_credits")
-                raise ToolError(mcp_billing.OUT_OF_CREDITS_MESSAGE)
-            await _enforce_rate_limit(db, claims.get("sub"))
+        external = claims.get("type") != "access"
+        args = getattr(context.message, "arguments", None) or {}
+        db = get_db(get_shared_mongo_client()) if external else None
 
-        result = await call_next(context)
-        if claims.get("type") != "access":
-            await _charge_safely(get_db(get_shared_mongo_client()), claims, context.message.name, result)
+        try:
+            if "write" in (tool.tags or set()) and WRITE_SCOPE not in token_scopes(claims):
+                set_outcome("refused", reason="view_only")
+                raise ToolError(
+                    'This Birdy connection is view-only. Reconnect with "View and make changes" to do this.'
+                )
+
+            if external:
+                try:
+                    await billing_middleware.require_active_subscription(claims.get("sub"), get_shared_mongo_client())
+                except HTTPException as exc:
+                    if exc.status_code != 402:
+                        raise
+                    set_outcome("refused", reason="no_subscription")
+                    raise ToolError(
+                        f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
+                        "to keep using Birdy here."
+                    )
+                if not await mcp_billing.has_credits(db, claims.get("sub")):
+                    set_outcome("refused", reason="out_of_credits")
+                    raise ToolError(mcp_billing.OUT_OF_CREDITS_MESSAGE)
+                await _enforce_rate_limit(db, claims.get("sub"))
+
+            result = await call_next(context)
+        except Exception as exc:
+            if external:
+                await _finish_call(db, claims, context.message.name, tool.tags or set(), args, None, exc, started)
+            raise
+        if external:
+            await _finish_call(db, claims, context.message.name, tool.tags or set(), args, result, None, started)
         return result
