@@ -52,7 +52,8 @@ async def test_mcp_tool_names_matches_server_registration():
     external_only = {"list_agents", "set_default_agent",
                      "get_agent_overview", "get_agent_runs", "get_agent_run", "get_agent_month", "get_agent_cards", "get_agent_card", "get_agent_lessons", "get_agent_outcomes", "get_agent_slack_template",
                      "apply_card", "apply_all_cards", "undo_card_line", "post_weekly_report", "dismiss_card", "edit_card",
-                     "add_agent_lesson", "update_agent_settings", "set_agent_slack_template", "reset_agent_slack_template"}
+                     "add_agent_lesson", "update_agent_settings", "set_agent_slack_template", "reset_agent_slack_template",
+                     "get_agent_playbook", "get_agent_activity", "get_agent_history", "get_agent_claims", "get_agent_impact", "get_agent_confidence", "get_agent_proposals", "get_agent_memory", "get_agent_offers", "get_dry_run", "accept_proposal", "reject_proposal", "set_rule_param", "set_client_target_for_agent", "set_client_override", "add_agent_memory", "add_agent_exception", "set_agent_schedule", "set_agent_slack_channel", "delete_agent_memory", "graduate_rule", "start_dry_run", "deactivate_agent", "activate_agent", "undo_auto_action"}
     assert mcp_client.MCP_TOOL_NAMES == registered - external_only, (
         f"MCP_TOOL_NAMES is out of sync with the server's registered tools.\n"
         f"In MCP_TOOL_NAMES but not registered: {mcp_client.MCP_TOOL_NAMES - registered}\n"

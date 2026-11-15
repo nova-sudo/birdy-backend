@@ -20,15 +20,13 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from ai.agents import claims
-from ai.agents import confidence as agent_confidence
-from ai.agents import history as ad_history
+from ai.agents import custom_ops
 from ai.agents import learning
 from ai.agents import outcomes
 from ai.agents import replay
 from ai.agents import access as agent_access
 from ai.agents import store as agent_store
 from ai.agents import validation
-from ai.agents.stock import lessons as stock_lessons
 from ai.agents.stock import reports
 from ai.agents.stock import settings as stock_settings
 from ai.agents.defaults import (
@@ -36,7 +34,6 @@ from ai.agents.defaults import (
     DEFAULT_PARAMS,
     DEFAULT_PERMISSIONS,
 )
-from ai.suggestions import actions as sug_actions
 from ai.suggestions import store as sug_store
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
@@ -85,10 +82,7 @@ def _training_to_api(training: dict | None) -> dict:
     return {**training, "steps": {k: bool((training.get("steps") or {}).get(k)) for k in agent_store.STEP_KEYS}}
 
 
-def _rule_to_api(doc: dict) -> dict:
-    out = {k: v for k, v in doc.items() if k != "_id"}
-    out["id"] = doc["_id"]
-    return out
+_rule_to_api = custom_ops.rule_to_api
 
 
 _memory_to_api = reports.memory_to_api
@@ -97,6 +91,11 @@ _memory_to_api = reports.memory_to_api
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _op_response(e: custom_ops.OpError) -> JSONResponse:
+    """The body a custom_ops refusal carries, with its status: the same JSON the routes always answered with."""
+    return JSONResponse(status_code=e.status, content=e.body)
+
 
 async def _agent_or_404(db, user_id: str, agent_id: str) -> dict:
     agent = await agent_access.find_agent(db, user_id, agent_id)
@@ -347,21 +346,7 @@ async def get_claims(agent_id: str, current_user: str = Depends(get_current_user
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        gids = list(dict.fromkeys((agent.get("scope") or {}).get("client_group_ids") or []))
-        names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
-            {"id": {"$in": gids}, "user_id": current_user})}
-        held = {r["client_group_id"]: r["agent_id"] async for r in db[claims.CLAIMS].find(
-            {"user_id": current_user, "client_group_id": {"$in": gids}})}
-        holders = {a["_id"]: a.get("name") or "" async for a in db[agent_store.AGENTS].find(
-            {"_id": {"$in": [h for h in held.values() if h != agent_id]}, "user_id": current_user})}
-
-        def row(gid: str) -> dict:
-            holder = held.get(gid)
-            acting = "no_agent" if holder is None else "this_agent" if holder == agent_id else "other_agent"
-            return {"client_group_id": gid, "name": names[gid], "acting": acting,
-                    "holder_name": holders.get(holder) if acting == "other_agent" else None}
-
-        return {"clients": [row(g) for g in gids if g in names]}
+        return await custom_ops.claims_view(db, current_user, agent)
 
 
 # ---------------------------------------------------------------------------
@@ -459,18 +444,7 @@ async def get_history(agent_id: str, current_user: str = Depends(get_current_use
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        gids = (agent.get("scope") or {}).get("client_group_ids") or []
-        groups = {g["id"]: g async for g in db["client_groups"].find(
-            {"id": {"$in": list(gids)}, "user_id": current_user})}
-        states = await ad_history.statuses(db, [g for g in gids if groups.get(g, {}).get("meta_ad_account_id")])
-        clients = [{
-            "client_group_id": gid,
-            "name": groups[gid].get("name") or "",
-            "status": "ready" if ad_history.is_ready(state) else state["status"],
-            "error": state["error"],
-        } for gid, state in states.items()]
-        return {"total": len(clients), "ready": sum(c["status"] == "ready" for c in clients),
-                "clients": clients}
+        return await custom_ops.history_view(db, current_user, agent)
 
 
 # ---------------------------------------------------------------------------
@@ -504,7 +478,7 @@ async def list_memory(agent_id: str, current_user: str = Depends(get_current_use
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        return [_memory_to_api(m) for m in await agent_store.list_memory(db, agent_id)]
+        return await custom_ops.list_memory(db, agent_id)
 
 
 @router.delete("/{agent_id}/memory/{memory_id}")
@@ -512,9 +486,10 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        if not await stock_lessons.remove_lesson(db, agent_id, memory_id):
-            raise HTTPException(status_code=404, detail="Memory not found")
-        return {"ok": True}
+        try:
+            return await custom_ops.delete_memory(db, agent_id, memory_id)
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 # ---------------------------------------------------------------------------
@@ -529,7 +504,7 @@ async def delete_memory(agent_id: str, memory_id: str, current_user: str = Depen
 # contract, so the frontend polls exactly as before (the first poll sees done).
 
 DRY_RUN_BUDGET_SECONDS = replay.DRY_RUN_BUDGET_SECONDS
-JOB_TIMEOUT = replay.JOB_TIMEOUT
+JOB_TIMEOUT = custom_ops.JOB_TIMEOUT
 
 
 def _local_today(agent: dict) -> date:
@@ -543,7 +518,7 @@ async def start_dry_run(agent_id: str, current_user: str = Depends(get_current_u
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         # Local yesterday: every replayed day is complete.
-        job_id = await replay.start_dry_run_job(db, mongo_client, current_user, agent,
+        job_id = await custom_ops.start_dry_run(db, mongo_client, current_user, agent,
                                                 end=_local_today(agent) - timedelta(days=1), deadline=deadline)
     return {"job_id": job_id}
 
@@ -553,24 +528,10 @@ async def get_job(agent_id: str, job_id: str, current_user: str = Depends(get_cu
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        jobs = db[agent_store.JOBS]
-        job = await jobs.find_one({"_id": job_id, "agent_id": agent_id, "user_id": current_user})
-        if job is None:
-            raise HTTPException(status_code=404, detail="Job not found")
-        created = job.get("created_at")
-        if (job.get("status") in ("queued", "running") and isinstance(created, datetime)
-                and datetime.utcnow() - created > JOB_TIMEOUT):
-            # The platform killed the request that was running it: report and persist it.
-            await jobs.update_one({"_id": job_id, "status": job["status"]},
-                                  {"$set": {"status": "failed", "error": "timed_out",
-                                            "finished_at": datetime.utcnow()}})
-            job = {**job, "status": "failed", "error": "timed_out"}
-        out = {"status": job.get("status")}
-        if job.get("status") == "done":
-            out["result"] = job.get("result")
-        elif job.get("status") == "failed":
-            out["error"] = job.get("error")
-        return out
+        try:
+            return await custom_ops.get_job(db, current_user, agent_id, job_id)
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 # ---------------------------------------------------------------------------
@@ -585,14 +546,7 @@ def _case_to_api(case: dict) -> dict:
     return {k: case.get(k) for k in PUBLIC_CASE_KEYS}
 
 
-async def _confidence(db, agent: dict) -> dict:
-    """Compute the score and persist it on the agent (at_activation untouched)."""
-    conf = await agent_confidence.compute_confidence(db, agent)
-    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$set": {
-        **{f"confidence.{k}": v for k, v in conf.items()},
-        "confidence.updated_at": datetime.utcnow(),
-    }})
-    return conf
+_confidence = custom_ops.confidence
 
 
 async def _practice_case_or_404(db, agent_id: str, case_id: str) -> dict:
@@ -676,27 +630,6 @@ async def resolve_practice(agent_id: str, case_id: str, body: PracticeResolution
         return {"resolution": body.resolution}
 
 
-async def _stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list[dict]]:
-    """What stops the stock agent switching on: a client, zones that resolve for each, and a
-    finished preview. Also returns the settings errors behind any zone messages."""
-    ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
-    groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": user_id}).to_list(length=None)
-    errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
-    missing = [] if ids else ["Choose at least one client to watch"]
-    missing += [e["message"] for e in errors]
-    preview = await db[agent_store.RUNS].find_one(
-        {"agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}},
-        {"clients": 1}, sort=[("as_of", -1)])
-    # The newest finished preview must have covered every client in scope now.
-    covered = preview is not None and set(ids) <= set(preview.get("clients") or {})
-    # A preview that couldn't check any client proves nothing (an expired Meta token fails them all).
-    read = covered and any((preview["clients"].get(g) or {}).get("state") != "failed" for g in ids)
-    if not read:
-        missing.append("Preview the first report" if not covered
-                       else "Preview the first report again: it couldn't check any client")
-    return missing, errors
-
-
 @router.post("/{agent_id}/activate")
 async def activate(agent_id: str, body: Optional[ActivateBody] = None,
                    current_user: str = Depends(get_current_user)):
@@ -704,39 +637,12 @@ async def activate(agent_id: str, body: Optional[ActivateBody] = None,
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        if agent.get("status") == "active":
-            return _agent_to_api(agent)  # idempotent: nothing changes
-        if agent.get("type") == agent_store.TYPE_STOCK:
-            missing, errors = await _stock_missing(db, current_user, agent)
-            if missing:
-                return JSONResponse(status_code=409, content={
-                    "detail": "The agent isn't ready to switch on yet", "missing": missing, "errors": errors})
-            conf = {"score": None}
-        else:
-            conf = await _confidence(db, agent)
-            if not conf["ready"]:
-                return JSONResponse(status_code=409, content={
-                    "detail": "The agent isn't ready to switch on yet", "missing": conf["missing"]})
-        scope = agent.get("scope") or {}
-        ids = list(scope.get("client_group_ids") or [])
-        flag_only = [g for g in (body.only_flag if body.only_flag is not None
-                                 else scope.get(FLAG_ONLY_KEY) or []) if g in ids]
-        resp = await _claim_scope(db, current_user, agent_id, ids,
-                                  move=body.move_claims, only_flag=flag_only)
-        if resp is not None:
-            return resp
-        await db[agent_store.AGENTS].update_one(
-            {"_id": agent_id, "user_id": current_user}, {"$set": {f"scope.{FLAG_ONLY_KEY}": flag_only}})
-        for rule in await agent_store.list_rules(db, agent_id):
-            mode = ("ask" if rule["kind"] in agent_confidence.ASK_KINDS
-                    else "flag" if rule["kind"] in agent_confidence.FLAG_KINDS else None)
-            if mode is not None:
-                await agent_store.update_rule(db, agent_id, rule["_id"], mode=mode)  # syncs open items
-        await db[agent_store.AGENTS].update_one(
-            {"_id": agent_id, "user_id": current_user, "status": {"$ne": "active"}}, {
-            "$set": {"status": "active", "confidence.at_activation": conf["score"], "activated_at": datetime.utcnow()},
-            "$unset": {"turned_off_at": ""}})
-        return _agent_to_api(await agent_store.get_agent(db, current_user, agent_id))
+        try:
+            return _agent_to_api(await custom_ops.activate(
+                db, current_user, agent, move_claims=body.move_claims, only_flag=body.only_flag,
+                compute=_confidence))
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 @router.post("/{agent_id}/deactivate")
@@ -749,19 +655,17 @@ async def deactivate(agent_id: str, current_user: str = Depends(get_current_user
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        if agent.get("type") != agent_store.TYPE_STOCK:
-            raise HTTPException(status_code=409, detail="Only the Birdy Media Buying Agent can be turned off")
-        if agent.get("status") != "active":
-            return _agent_to_api(agent)  # idempotent: nothing changes
-        return _agent_to_api(await agent_store.update_agent(
-            db, current_user, agent_id, {"status": "draft", "turned_off_at": datetime.utcnow()}))
+        try:
+            return _agent_to_api(await custom_ops.deactivate(db, current_user, agent))
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 # ---------------------------------------------------------------------------
 # Learning: offers, graduation, auto-run undo, proposals
 # ---------------------------------------------------------------------------
 
-UNDO_AUTO_WINDOW = outcomes.UNDO_AUTO_WINDOW  # the activity feed's can_undo uses the same window
+UNDO_AUTO_WINDOW = custom_ops.UNDO_AUTO_WINDOW  # the activity feed's can_undo uses the same window
 
 
 @router.get("/{agent_id}/offers")
@@ -785,12 +689,9 @@ async def graduate_rule(agent_id: str, rule_id: str, body: GraduateBody,
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         try:
-            rule = await learning.graduate(db, agent, rule_id, body.choice)
-        except KeyError:
-            raise HTTPException(status_code=404, detail="Rule not found")
-        except learning.NoOffer:
-            raise HTTPException(status_code=409, detail="There is no offer to answer for this rule")
-        return _rule_to_api(rule)
+            return await custom_ops.graduate_rule(db, agent, rule_id, body.choice)
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 @router.post("/{agent_id}/suggestions/{suggestion_id}/undo-auto")
@@ -799,23 +700,10 @@ async def undo_auto(agent_id: str, suggestion_id: str, current_user: str = Depen
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        doc = await db[sug_store.SUGGESTIONS].find_one(
-            {"_id": suggestion_id, "user_id": current_user, "agent_id": agent_id})
-        if doc is None:
-            raise HTTPException(status_code=404, detail="Suggestion not found")
-        if (doc.get("status") != sug_store.STATUS_APPLIED
-                or (doc.get("decided_by") or {}).get("actor") != sug_store.ACTOR_BIRDY):
-            raise HTTPException(status_code=409, detail="Only an action Birdy ran on its own can be undone here")
-        applied_at = doc.get("applied_at")
-        if not isinstance(applied_at, datetime) or datetime.utcnow() - applied_at > UNDO_AUTO_WINDOW:
-            raise HTTPException(status_code=410, detail="Auto-run actions can only be undone for 24 hours")
-        res = await sug_actions.undo_suggestion(
-            db, mongo_client, current_user, suggestion_id, actor=sug_store.ACTOR_USER, source="dashboard")
-        if res["outcome"] == "not_found":
-            raise HTTPException(status_code=404, detail="Suggestion not found")
-        if res["outcome"] == "failed":
-            raise HTTPException(status_code=502, detail=res.get("detail", "Undo failed"))
-        return {"ok": True, "outcome": res["outcome"], "succeeded": res.get("succeeded", [])}
+        try:
+            return await custom_ops.undo_auto(db, mongo_client, current_user, agent_id, suggestion_id, source="dashboard")
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 _proposal_to_api = reports.proposal_to_api
@@ -827,11 +715,7 @@ async def list_proposals(agent_id: str, status: Literal["open", "accepted", "rej
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         await _agent_or_404(db, current_user, agent_id)
-        q: dict = {"agent_id": agent_id}
-        if status != "all":
-            q["status"] = status
-        docs = await db[agent_store.PROPOSALS].find(q).sort("created_at", -1).to_list(length=None)
-        return [_proposal_to_api(d) for d in docs]
+        return await custom_ops.list_proposals(db, agent_id, status)
 
 
 @router.post("/{agent_id}/proposals/{proposal_id}/accept")
@@ -839,27 +723,10 @@ async def accept_proposal(agent_id: str, proposal_id: str, current_user: str = D
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
-        stored = await db[agent_store.PROPOSALS].find_one({"_id": proposal_id, "agent_id": agent_id}, {"kind": 1})
-        if stored and stored.get("kind") == stock_lessons.PROMOTE:
-            # A "Make it a rule?" suggestion becomes a lesson. It has no rule and changes none.
-            try:
-                proposal, lesson = await stock_lessons.accept_promotion(db, agent, proposal_id, by=current_user)
-            except learning.ProposalNotFound:
-                raise HTTPException(status_code=404, detail="Proposal not found")
-            except learning.ProposalClosed:
-                raise HTTPException(status_code=409, detail="This proposal was already decided")
-            return {"proposal": _proposal_to_api(proposal), "rule": None, "lesson": _memory_to_api(lesson)}
         try:
-            proposal, rule = await learning.accept_proposal(db, agent, proposal_id)
-        except learning.ProposalNotFound:
-            raise HTTPException(status_code=404, detail="Proposal not found")
-        except learning.ProposalClosed:
-            raise HTTPException(status_code=409, detail="This proposal was already decided")
-        except learning.RuleChanged:
-            raise HTTPException(status_code=409, detail="The rule changed since this proposal was made; it is out of date")
-        except ValueError as e:
-            raise HTTPException(status_code=400, detail=str(e))
-        return {"proposal": _proposal_to_api(proposal), "rule": _rule_to_api(rule)}
+            return await custom_ops.accept_proposal(db, agent, proposal_id, by=current_user)
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 @router.post("/{agent_id}/proposals/{proposal_id}/reject")
@@ -868,12 +735,9 @@ async def reject_proposal(agent_id: str, proposal_id: str, current_user: str = D
         db = mongo_client[DB_NAME]
         agent = await _agent_or_404(db, current_user, agent_id)
         try:
-            proposal = await learning.reject_proposal(db, agent, proposal_id)
-        except learning.ProposalNotFound:
-            raise HTTPException(status_code=404, detail="Proposal not found")
-        except learning.ProposalClosed:
-            raise HTTPException(status_code=409, detail="This proposal was already decided")
-        return {"proposal": _proposal_to_api(proposal)}
+            return await custom_ops.reject_proposal(db, agent, proposal_id)
+        except custom_ops.OpError as e:
+            return _op_response(e)
 
 
 # ---------------------------------------------------------------------------

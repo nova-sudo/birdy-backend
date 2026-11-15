@@ -172,19 +172,19 @@ async def set_client_override(db, user_id, client_name=None, rule_kind=None, par
                                     "before": before, "after": value}}
 
 
-async def add_memory(db, user_id, text=None, **_):
+async def add_memory(db, user_id, text=None, source="chat", **_):
     agent = await _agent(db, user_id)
     if agent is None:
         return _fail(NO_AGENT)
     text = (text or "").strip() if isinstance(text, str) else ""
     if not text:
         return _fail("text is required")
-    await store.add_memory(db, agent["_id"], text=text, kind="fact", source="chat")
+    await store.add_memory(db, agent["_id"], text=text, kind="fact", source=source)
     return {"ok": True, "changed": {"text": text}}
 
 
 async def add_exception(db, user_id, text=None, client_name=None, ad_name_contains=None,
-                        weekdays=None, **_):
+                        weekdays=None, source="chat", **_):
     agent = await _agent(db, user_id)
     if agent is None:
         return _fail(NO_AGENT)
@@ -209,7 +209,7 @@ async def add_exception(db, user_id, text=None, client_name=None, ad_name_contai
     if not flt:
         return _fail("An exception needs at least one of client_name, ad_name_contains or weekdays. "
                      "For a general note, use add_memory instead.")
-    await store.add_memory(db, agent["_id"], text=text, kind="exception", source="chat", filter=flt)
+    await store.add_memory(db, agent["_id"], text=text, kind="exception", source=source, filter=flt)
     return {"ok": True, "changed": {"text": text, "filter": flt}}
 
 
