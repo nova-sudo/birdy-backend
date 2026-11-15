@@ -202,3 +202,29 @@ async def test_read_scope_refused_for_refresh_client_data(mcp_call, mock_db, ghl
     started = await mcp_call("refresh_client_data", {"client": "Acme", "integration": "meta"}, user=ALICE,
                              scope="birdy.read birdy.write", token_type="mcp")
     assert not started.is_error
+
+
+async def test_fresh_ghl_claim_is_held_and_not_restarted(mock_db, alice, ghl_calls):
+    await _both(mock_db, ghl_refresh_status="running", _ghl_claimed_at=datetime.utcnow() - timedelta(minutes=2))
+    out = await t.refresh_client_data.fn(client="Acme", integration="ghl")
+    await _drain()
+    assert out["started"] == [] and out["already_running"] == ["ghl"] and ghl_calls == []
+    status = await t.refresh_status.fn(client="Acme")
+    assert status["ghl_refresh_status"] == "running" and "ghl_refresh_hint" not in status
+
+
+async def test_concurrent_calls_start_one_ghl_load(mock_db, alice, ghl_calls):
+    await _both(mock_db)
+    outs = await asyncio.gather(*[t.refresh_client_data.fn(client="Acme", integration="ghl") for _ in range(3)])
+    await _drain()
+    assert sum(o["started"] == ["ghl"] for o in outs) == 1
+    assert len(ghl_calls) == 1
+
+
+async def test_stale_ghl_claim_is_reported_stale_with_a_hint(mock_db, alice):
+    await _both(mock_db, ghl_refresh_status="running",
+                _ghl_claimed_at=datetime.utcnow() - timedelta(minutes=client_refresh.GHL_CLAIM_HELD_MINUTES + 5))
+    status = await t.refresh_status.fn(client="Acme")
+    assert status["ghl_refresh_status"] == "stale"
+    assert "call refresh_client_data again" in status["ghl_refresh_hint"]
+    assert status["meta_refresh_status"] == "idle"

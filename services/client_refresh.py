@@ -21,8 +21,8 @@ logger = logging.getLogger(__name__)
 
 INTEGRATIONS = ("meta", "ghl")
 
-# A GHL claim younger than this means a load is in progress (routers/cron.py GHL_STALE_CLAIM_MINUTES releases
-# an older one as stuck).
+# A GHL claim younger than this means a load is in progress; an older one is stuck (routers/cron.py imports this
+# as GHL_STALE_CLAIM_MINUTES).
 GHL_CLAIM_HELD_MINUTES = 10
 
 _OPEN_META_JOB = ["pending", "in_progress", "partial"]
@@ -151,20 +151,41 @@ async def is_running(db, group: dict, integration: str) -> bool:
         return await db["meta_refresh_jobs"].count_documents(
             {"group_id": group["id"], "status": {"$in": _OPEN_META_JOB}}, limit=1
         ) > 0
+    return group.get("ghl_refresh_status") == "running" and not ghl_claim_is_stale(group)
+
+
+def ghl_claim_is_stale(group: dict) -> bool:
+    """A GHL refresh marked running whose claim is older than the held window: its task most likely died. The
+    ghl-tick only reclaims such a group when it is also due, so this can last until the nightly slot."""
     claimed = group.get("_ghl_claimed_at")
+    return (group.get("ghl_refresh_status") == "running" and bool(claimed)
+            and claimed < datetime.utcnow() - timedelta(minutes=GHL_CLAIM_HELD_MINUTES))
+
+
+async def claim_ghl_if_free(db, group_id: str) -> bool:
+    """Atomically claim a GHL refresh: only when the group is not running, or its claim is stale. False means
+    another caller holds it."""
     held_since = datetime.utcnow() - timedelta(minutes=GHL_CLAIM_HELD_MINUTES)
-    return group.get("ghl_refresh_status") == "running" and (not claimed or claimed > held_since)
+    res = await db.client_groups.update_one(
+        {"id": group_id, "$or": [{"ghl_refresh_status": {"$ne": "running"}},
+                                  {"_ghl_claimed_at": {"$lt": held_since}}]},
+        {"$set": {"ghl_refresh_status": "running", "_ghl_claimed_at": datetime.utcnow()}},
+    )
+    return res.modified_count == 1
 
 
-async def queue_refresh(mongo_client, user_id: str, group: dict, integration: str) -> None:
+async def queue_refresh(mongo_client, user_id: str, group: dict, integration: str) -> bool:
     """Start a refresh that outlives the caller. Meta becomes a pending job for the meta-tick cron; GHL runs as
-    an in-process task. The caller has checked the integration is connected and not already running."""
+    an in-process task. The caller has checked the integration is connected. False: it was already running (GHL
+    claim lost to a concurrent caller)."""
     if integration == "meta":
         from services.meta_refresh_manager import create_refresh_job
 
         await create_refresh_job(group["id"], user_id, group, mongo_client, status="pending")
-        return
-    await claim_refresh(mongo_client[DB_NAME], group["id"], "ghl")
+        return True
+    if not await claim_ghl_if_free(mongo_client[DB_NAME], group["id"]):
+        return False
     task = asyncio.create_task(run_refresh(group["id"], "ghl", user_id, group))
     _tasks.add(task)
     task.add_done_callback(_tasks.discard)
+    return True

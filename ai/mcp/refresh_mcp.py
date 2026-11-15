@@ -54,8 +54,10 @@ async def refresh_client_data(client: str, integration: Literal["meta", "ghl", "
         if await client_refresh.is_running(db, group, name):
             already_running.append(name)
         else:
-            await client_refresh.queue_refresh(mongo_client, user_id, group, name)
-            started.append(name)
+            if await client_refresh.queue_refresh(mongo_client, user_id, group, name):
+                started.append(name)
+            else:
+                already_running.append(name)
 
     out = {"client": _client(group), "started": started, "already_running": already_running,
            "check_with": "refresh_status"}
@@ -66,9 +68,9 @@ async def refresh_client_data(client: str, integration: Literal["meta", "ghl", "
 
 @mcp.tool(**READ)
 async def refresh_status(client: str) -> dict:
-    """Where a client's data refresh stands: for Meta and for GoHighLevel, its status ("idle", "running", "complete" or "error"), the last error if any, and for Meta the job's progress (status, current step, presets done of total).
+    """Where a client's data refresh stands: for Meta and for GoHighLevel, its status ("idle", "running", "complete", "error", or GoHighLevel "stale"), the last error if any, and for Meta the job's progress (status, current step, presets done of total).
 
-    Use it after refresh_client_data, polling every minute or so until the status is "complete" (a refresh takes a few minutes), or to see why a refresh failed. meta_token_error true means the Facebook connection needs renewing in Birdy.
+    Use it after refresh_client_data, polling every minute or so until the status is "complete" (a refresh takes a few minutes), or to see why a refresh failed. A GoHighLevel status of "stale" means a refresh that started long ago never finished and looks stuck: call refresh_client_data again to restart it. meta_token_error true means the Facebook connection needs renewing in Birdy.
     A name that matches several clients returns the candidates and nothing else.
 
     Args:
@@ -78,4 +80,8 @@ async def refresh_status(client: str) -> dict:
     db, user_id = get_db(mongo_client), _current_user_id()
     group = await resolve_client(db, user_id, client)
     status = await client_refresh.get_refresh_status(mongo_client, group["id"], user_id)
-    return {"client": _client(group), **(status or {})}
+    out = {"client": _client(group), **(status or {})}
+    if client_refresh.ghl_claim_is_stale(group):
+        out["ghl_refresh_status"] = "stale"
+        out["ghl_refresh_hint"] = "Looks stuck: call refresh_client_data again to restart it."
+    return out
