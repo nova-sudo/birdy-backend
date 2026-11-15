@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from ai.mcp import access
-from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars
+from ai.mcp.outcome import current_activity_id, get_outcome, is_error_result, reset_outcome, response_chars, start_activity
 from ai.mcp.confirm import two_step
 
 ARGS = {"card_id": "c1"}
@@ -33,15 +33,17 @@ async def test_two_step_sets_live_executed(mock_db):
     code = await _issue(mock_db)
     reset_outcome()
     await two_step(mock_db, "alice", "t", ARGS, code, AsyncMock(), AsyncMock(return_value={"ok": True}))
-    assert get_outcome() == {"kind": "live_executed", "activity_id": None}
+    assert get_outcome() == {"kind": "live_executed", "confirmed_after": None}
 
 
-async def test_live_executed_carries_activity_id(mock_db):
-    from ai.mcp.confirm import issue_code
-
-    code = await issue_code(mock_db, "alice", "t", ARGS, activity_id="act1")
+async def test_execute_confirms_after_the_preview_activity(mock_db):
+    start_activity()
+    preview_id = current_activity_id()
+    code = await _issue(mock_db)
+    start_activity()  # the execute call gets its own id
+    assert current_activity_id() != preview_id
     await two_step(mock_db, "alice", "t", ARGS, code, AsyncMock(), AsyncMock(return_value={"ok": True}))
-    assert get_outcome()["activity_id"] == "act1"
+    assert get_outcome()["confirmed_after"] == preview_id
 
 
 async def test_failed_execute_leaves_no_outcome(mock_db):
@@ -99,3 +101,33 @@ async def test_view_only_refusal_sets_outcome(monkeypatch):
         await access.BirdyAccessMiddleware().on_call_tool(context, call_next)
     assert get_outcome() == {"kind": "refused", "reason": "view_only"}
     assert "called" not in seen
+
+
+async def test_outcome_set_in_a_tool_is_visible_to_the_middleware(mcp_call, mock_db, monkeypatch):
+    """Real round trip: a tool runs two_step, and the middleware sees its outcome after call_next."""
+    from ai.mcp import mcp
+
+    seen = {}
+    real = access.BirdyAccessMiddleware.on_call_tool
+
+    async def spy(self, context, call_next):
+        result = await real(self, context, call_next)
+        seen["outcome"] = get_outcome()
+        seen["activity_id"] = current_activity_id()
+        return result
+
+    monkeypatch.setattr(access.BirdyAccessMiddleware, "on_call_tool", spy)
+
+    @mcp.tool(name="zz_outcome_probe")
+    async def probe() -> dict:
+        return await two_step(mock_db, "alice", "zz_outcome_probe", {}, None, AsyncMock(return_value={}), AsyncMock())
+
+    try:
+        res = await mcp_call("zz_outcome_probe", {}, scope="birdy.write", token_type="mcp")
+    finally:
+        mcp.remove_tool("zz_outcome_probe")
+    assert not res.is_error
+    assert seen["outcome"] == {"kind": "preview"}
+    # The preview stamped the middleware's pre-allocated id on its confirm code.
+    doc = await mock_db["mcp_confirm_codes"].find_one({"tool": "zz_outcome_probe"})
+    assert doc["activity_id"] == seen["activity_id"] and seen["activity_id"]

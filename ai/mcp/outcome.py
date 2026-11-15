@@ -2,14 +2,32 @@
 
 Tools and gates record the outcome (`two_step` for confirm-code tools, the middleware for
 refusals); the middleware resets it at the start of every call. Kinds: `preview`,
-`live_executed`, `bad_code`, `state_changed`, `refused`. Extras may carry `reason`,
-`activity_id` or `confirm_doc`.
+`live_executed`, `bad_code`, `state_changed`, `refused`. Extras may carry `reason` (refusals)
+or `confirmed_after` (a live_executed call: the activity id of the preview that issued the code).
+
+The middleware also pre-allocates this call's activity id, so a preview can stamp it on its
+confirm code before the activity row exists.
 """
 
 import json
+import uuid
 from contextvars import ContextVar, Token
 
 call_outcome: ContextVar[dict | None] = ContextVar("mcp_call_outcome", default=None)
+
+
+current_activity: ContextVar[str | None] = ContextVar("mcp_current_activity", default=None)
+
+
+def start_activity() -> str:
+    """Allocate this call's activity id (the middleware calls it at the start of every call)."""
+    activity_id = uuid.uuid4().hex
+    current_activity.set(activity_id)
+    return activity_id
+
+
+def current_activity_id() -> str | None:
+    return current_activity.get()
 
 
 def set_outcome(kind: str, **extra) -> None:

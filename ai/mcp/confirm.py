@@ -17,7 +17,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
-from ai.mcp.outcome import set_outcome
+from ai.mcp.outcome import current_activity_id, set_outcome
 from core.database import DB_NAME
 
 CONFIRM_TTL_SECONDS = 600
@@ -121,7 +121,7 @@ async def two_step(
         return {
             "needs_confirmation": True,
             "preview": await preview(),
-            "confirm_code": await issue_code(db, user_id, tool, args, state),
+            "confirm_code": await issue_code(db, user_id, tool, args, state, activity_id=current_activity_id()),
             "expires_in_seconds": CONFIRM_TTL_SECONDS,
             "next": NEXT_STEP,
         }
@@ -134,5 +134,5 @@ async def two_step(
         return {"error": STATE_CHANGED_ERROR}
     result = await execute()
     # Set only once execute() returns: a call that raised is free, whatever the code did.
-    set_outcome("live_executed", activity_id=doc.get("activity_id"))
+    set_outcome("live_executed", confirmed_after=doc.get("activity_id"))
     return result

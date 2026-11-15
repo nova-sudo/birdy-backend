@@ -26,7 +26,7 @@ import billing_middleware
 from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
-from ai.mcp.outcome import reset_outcome, set_outcome
+from ai.mcp.outcome import reset_outcome, set_outcome, start_activity
 
 READ_SCOPE = "birdy.read"
 WRITE_SCOPE = "birdy.write"
@@ -82,6 +82,7 @@ def _expiry():
 class BirdyAccessMiddleware(Middleware):
     async def on_call_tool(self, context, call_next):
         reset_outcome()
+        start_activity()
         token = get_access_token()
         claims = token.claims if token else {}
         tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
