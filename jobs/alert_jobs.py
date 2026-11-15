@@ -32,7 +32,7 @@ async def _email_owner(db, alert: dict, eval_result: dict, note_id) -> None:
 
 
 async def evaluate_all_alerts():
-    """Evaluate all active alerts every 15 minutes."""
+    """Evaluate all active alerts (the cron runs this hourly)."""
     async with get_mongo_client() as mongo_client:
         try:
             db = mongo_client[DB_NAME]

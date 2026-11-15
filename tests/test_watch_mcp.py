@@ -78,6 +78,17 @@ async def test_fired_alerts_rows_two_hours_apart_are_two_firings(mock_db, set_cu
     assert len(out["fired"]) == 2 and [f["count"] for f in out["fired"]] == [1, 1]
 
 
+@pytest.mark.parametrize("gap,firings", [(90, 1), (91, 2)])
+async def test_fired_alerts_gap_boundary(mock_db, set_current_user, gap, firings):
+    u = "alice@example.com"
+    set_current_user(u)
+    await _alert(mock_db, u)
+    for m in (300, 300 - gap):
+        await _note(mock_db, u, "a1", timedelta(minutes=m))
+    out = await watch_mcp.get_fired_alerts.fn(days=7)
+    assert len(out["fired"]) == firings
+
+
 async def test_fired_alerts_group_name_by_id(mock_db, set_current_user):
     u = "alice@example.com"
     set_current_user(u)

@@ -42,6 +42,15 @@ from ai.agents import store as agent_store  # noqa: E402
 
 BASE = os.getenv("LIVE_BASE", "http://localhost:8000")
 FRONTEND = os.getenv("FRONTEND_URL", "http://localhost:3005").rstrip("/")
+# Runs after core.config has loaded .env, so FRONTEND_URL from .env is checked too. No network or DB call has happened yet.
+# Refuse non-local targets: this script registers OAuth clients and writes a user to the .env database.
+_remote = [u for u in (BASE, FRONTEND)
+           if (urlparse(u).hostname or "") not in ("localhost", "127.0.0.1", "::1")]
+if _remote and os.getenv("MCP_LIVE_CHECK_ALLOW_REMOTE") != "1":
+    sys.exit(f"Refusing to run against a non-local target: {', '.join(_remote)}. "
+             "LIVE_BASE and FRONTEND_URL must be localhost, 127.0.0.1 or ::1 "
+             "(set MCP_LIVE_CHECK_ALLOW_REMOTE=1 as well to override).")
+
 USER = f"mcp-verify-{int(time.time())}@example.com"
 REDIRECT = "http://localhost:9999/callback"
 
@@ -246,9 +255,14 @@ async def main():
                 "client_id": w["client"]["client_id"]})
             check("refresh token of the revoked grant is dead", dead.status_code == 400, f"HTTP {dead.status_code}")
     finally:
-        await cleanup(db)
-        mongo.close()
+        try:
+            clean = await cleanup(db)
+        finally:
+            mongo.close()
 
+    if not clean:
+        print("CLEANUP INCOMPLETE: documents for the throwaway user remain (see above).")
+        sys.exit(2)
     failed = [r for r in results if not r[1]]
     print(f"\n{len(results) - len(failed)}/{len(results)} checks passed")
     if failed:
@@ -300,6 +314,7 @@ async def cleanup(db):
     c = await db["oauth_clients"].count_documents({"client_id": {"$in": registered_clients}})
     print(f"  {'oauth_clients (ours)':24s} {c}")
     print(f"  scanned {len(names)} collections for user_id; leftovers: {leftovers or 'none'}")
+    return not leftovers and not leftovers_u
 
 
 if __name__ == "__main__":
