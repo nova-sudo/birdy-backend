@@ -40,8 +40,8 @@ async def test_set_default_then_resolve_uses_custom(mock_db, set_current_user):
     assert out["default"]["id"] == custom and out["default"]["kind"] == "custom"
     assert (await agent_mcp.resolve_agent(mock_db, ALICE, None))["_id"] == custom
     assert [r["id"] for r in await agent_mcp.list_agents.fn() if r["is_default"]] == [custom]
-    with pytest.raises(ToolError, match="custom agent"):
-        await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="stock")
+    # a custom default never blocks the stock tools: they fall back to the stock agent
+    assert (await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="stock"))["_id"] != custom
 
 
 @pytest.mark.asyncio
@@ -85,3 +85,31 @@ async def test_router_404s_unchanged(mock_db):
     with pytest.raises(HTTPException) as e:
         await agent_stock._require_card(mock_db, mine, "nope", ALICE)
     assert (e.value.status_code, e.value.detail) == (404, "Card not found")
+
+
+@pytest.mark.asyncio
+async def test_custom_default_does_not_break_stock_tools(mock_db, set_current_user):
+    """I4: with a custom agent as the default, stock tools fall back to the stock agent."""
+    from ai.mcp import stock_agent_mcp
+    set_current_user(ALICE)
+    stock = await _agent(mock_db, ALICE, None, agent_store.TYPE_STOCK)
+    custom = await _agent(mock_db, ALICE, "Side agent")
+    await mock_db["users"].insert_one({"user_id": ALICE})
+    await agent_mcp.set_default_agent.fn(agent="Side agent")
+    assert (await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="stock"))["_id"] == stock
+    assert (await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="custom"))["_id"] == custom
+    assert (await agent_mcp.resolve_agent(mock_db, ALICE, None))["_id"] == custom
+    assert (await stock_agent_mcp.get_agent_cards.fn())["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_stock_default_custom_tools_use_the_only_custom_or_ask(mock_db, set_current_user):
+    set_current_user(ALICE)
+    await _agent(mock_db, ALICE, None, agent_store.TYPE_STOCK)
+    with pytest.raises(ToolError, match="don't have a custom agent yet"):
+        await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="custom")
+    one = await _agent(mock_db, ALICE, "Side")
+    assert (await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="custom"))["_id"] == one
+    await _agent(mock_db, ALICE, "Other")
+    with pytest.raises(ToolError, match="Which custom agent.*Side.*Other|Which custom agent.*Other.*Side"):
+        await agent_mcp.resolve_agent(mock_db, ALICE, None, kind="custom")

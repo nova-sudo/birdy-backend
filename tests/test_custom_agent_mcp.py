@@ -282,7 +282,7 @@ async def test_custom_tools_reject_stock_agent_with_hint(mock_db, set_current_us
     for call in calls:
         with pytest.raises(ToolError, match="media buying agent tools"):
             await call
-    with pytest.raises(ToolError, match="media buying agent tools"):  # the default agent is the stock one
+    with pytest.raises(ToolError, match="don't have a custom agent yet"):  # the default agent is the stock one
         await t.get_agent_memory.fn()
     assert await mock_db[agent_store.AGENTS].count_documents({"status": "active"}) == 0
 

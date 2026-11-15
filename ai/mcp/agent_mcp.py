@@ -50,19 +50,12 @@ async def _find_by_text(db, user_id: str, text: str) -> dict:
 
 async def resolve_agent(db, user_id: str, agent: str | None,
                         kind: Literal["stock", "custom", "any"] = "any") -> dict:
-    """The agent doc for `agent` (id or name), else the user's default, else their stock agent. Raises ToolError."""
+    """The agent doc for `agent` (id or name). With no `agent`: the user's default when it is of the
+    `kind` asked for; else, for kind "custom", their only custom agent; else their stock agent. Raises ToolError."""
     if agent:
         found = await _find_by_text(db, user_id, agent)
     else:
-        found = None
-        user = await db["users"].find_one({"user_id": user_id}, {DEFAULT_FIELD: 1})
-        default_id = (user or {}).get(DEFAULT_FIELD)
-        if default_id:
-            found = await agent_access.find_agent(db, user_id, default_id)
-        if found is None:
-            found = await db[agent_store.AGENTS].find_one({"user_id": user_id, "type": agent_store.TYPE_STOCK})
-        if found is None:
-            raise ToolError(f"You don't have a media buying agent yet. Set one up in Birdy: {FRONTEND_URL}/agents")
+        found = await _default_of_kind(db, user_id, kind)
     actual = _kind(found)
     if kind != "any" and actual != kind:
         if kind == "stock":
@@ -71,6 +64,26 @@ async def resolve_agent(db, user_id: str, agent: str | None,
         raise ToolError(f"'{_label(found)}' is the Birdy Media Buying Agent, not a custom agent. "
                         "Use the media buying agent tools for it.")
     return found
+
+
+async def _default_of_kind(db, user_id: str, kind: str) -> dict:
+    user = await db["users"].find_one({"user_id": user_id}, {DEFAULT_FIELD: 1})
+    default_id = (user or {}).get(DEFAULT_FIELD)
+    default = await agent_access.find_agent(db, user_id, default_id) if default_id else None
+    if default is not None and kind in ("any", _kind(default)):
+        return default
+    if kind == "custom":
+        customs = [a for a in await agent_store.list_agents(db, user_id) if _kind(a) == "custom"]
+        if len(customs) == 1:
+            return customs[0]
+        if customs:
+            raise ToolError("Which custom agent? Pass `agent` with one of: "
+                            + ", ".join(_label(a) for a in customs) + ".")
+        raise ToolError(f"You don't have a custom agent yet. Set one up in Birdy: {FRONTEND_URL}/agents")
+    stock = await db[agent_store.AGENTS].find_one({"user_id": user_id, "type": agent_store.TYPE_STOCK})
+    if stock is None:
+        raise ToolError(f"You don't have a media buying agent yet. Set one up in Birdy: {FRONTEND_URL}/agents")
+    return stock
 
 
 @mcp.tool(**READ)
