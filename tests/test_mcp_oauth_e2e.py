@@ -93,6 +93,7 @@ async def test_full_connect_flow(root_app, mock_db):
         assert asm["registration_endpoint"] == f"{MCP_URL}/register"
         assert asm["revocation_endpoint"] == f"{MCP_URL}/revoke"
         assert "none" in asm["token_endpoint_auth_methods_supported"]
+        assert "client_secret_basic" not in asm["token_endpoint_auth_methods_supported"]
 
         # an unauthenticated call to /mcp points the client at the resource metadata
         unauth = await _initialize_status(http, "not-a-token")

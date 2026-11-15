@@ -53,7 +53,7 @@ ACCESS_TOKEN_SECONDS = 3600
 # The MCP endpoint is main.py's mount at /mcp; the OAuth endpoints live under it.
 MCP_RESOURCE_URL = f"{API_PUBLIC_URL}/mcp"
 # Public clients (Claude, ChatGPT register with "none") authenticate by PKCE alone.
-CLIENT_AUTH_METHODS = ["client_secret_post", "client_secret_basic", "none"]
+CLIENT_AUTH_METHODS = ["client_secret_post", "none"]  # no client_secret_basic: the SDK token handler reads client_id from the form
 ALL_SCOPES = [READ_SCOPE, WRITE_SCOPE]
 
 _jwt_verifier = JWTVerifier(public_key=JWT_SECRET, algorithm=JWT_ALGORITHM)
