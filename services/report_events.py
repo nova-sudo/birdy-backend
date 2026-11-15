@@ -48,6 +48,7 @@ def describe_event(event: str, payload: dict) -> dict:
     """The placeholder values an event provides."""
     values = {k: str(payload.get(k) or "") for k in ("alert_name", "alert_message", "account_name", "metric_name")}
     values["event"] = TITLES[event].format(**values)
+    values["alert_id"] = str(payload.get("alert_id") or "")   # not a placeholder; lets the renderer link the alert
     return values
 
 

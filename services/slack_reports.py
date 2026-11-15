@@ -296,6 +296,9 @@ async def render_report(db, report: dict, now_utc: datetime, key: str | None = N
     else:
         take = TAKE_PREVIEW if rt.has_take(template) else None
     blocks, fallback = rt.render(template, ctx, take=take)
+    if event and event.get("alert_id") and len(blocks) < 50:
+        from services.ask_claude import alert_ask_claude_block
+        blocks = [*blocks, alert_ask_claude_block({"id": event["alert_id"], "name": event.get("alert_name", "")})]
     return {"token": token, "channel": channel, "blocks": blocks, "fallback": fallback, "ctx": ctx, "key": key}
 
 

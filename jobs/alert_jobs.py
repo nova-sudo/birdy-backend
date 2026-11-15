@@ -9,6 +9,28 @@ from services.alert_service import evaluate_alert
 logger = logging.getLogger(__name__)
 
 
+def _channels(alert: dict) -> list:
+    """The alert's channels; stored unvalidated, so anything unknown is simply ignored."""
+    channels = alert.get("notification_channels")
+    return channels if isinstance(channels, list) else []
+
+
+async def _email_owner(db, alert: dict, eval_result: dict, note_id) -> None:
+    """Email the owner once per firing. Never raises, never changes the alert's status;
+    the outcome is recorded on the notification row (email_sent). No retries in v1."""
+    sent = False
+    try:
+        from services import email_service
+        sent = bool(await email_service.send_alert_email(db, alert, eval_result))
+    except Exception as e:
+        logger.error("alert %s: email failed for user %s: %s", alert.get("id"), alert.get("user_id"), type(e).__name__)
+    logger.info("alert %s: email %s for user %s", alert.get("id"), "sent" if sent else "not sent", alert.get("user_id"))
+    try:
+        await db["alert_notifications"].update_one({"_id": note_id}, {"$set": {"email_sent": sent}})
+    except Exception as e:
+        logger.error("alert %s: could not record email_sent: %s", alert.get("id"), e)
+
+
 async def evaluate_all_alerts():
     """Evaluate all active alerts every 15 minutes."""
     async with get_mongo_client() as mongo_client:
@@ -44,11 +66,14 @@ async def evaluate_all_alerts():
                     await alert_fired(db, alert, eval_result, wait=True)
 
                     if eval_result["triggered"]:
+                        # Same transition test report_events.alert_fired uses: an alert that stays
+                        # triggered is re-evaluated every pass but fires only once.
+                        newly_triggered = alert.get("status") != "triggered"
                         update["status"] = "triggered"
                         update["last_triggered_at"] = datetime.utcnow()
                         await db["alerts"].update_one({"id": alert["id"]},
                                                       {"$set": update, "$inc": {"trigger_count": 1}})
-                        await db["alert_notifications"].insert_one({
+                        note = await db["alert_notifications"].insert_one({
                             "alert_id": alert["id"],
                             "user_id": alert["user_id"],
                             "message": eval_result["message"],
@@ -57,6 +82,8 @@ async def evaluate_all_alerts():
                             "read": False
                         })
                         logger.info(f"🚨 Alert triggered: {alert['name']} — {eval_result['message']}")
+                        if newly_triggered and "email" in _channels(alert):
+                            await _email_owner(db, alert, eval_result, note.inserted_id)
                     else:
                         if alert.get("status") == "triggered":
                             update["status"] = "active"
