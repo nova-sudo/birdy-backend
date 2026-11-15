@@ -71,7 +71,7 @@ For "by work" there were two ways to measure:
   - no subscription;
   - out of credits;
   - a tool that raises an error.
-- **Rates are editable:** all three live in the existing admin credits settings (`get_credits_settings` / `set_credits_settings`), so prices change without a deploy. The admin credits UI gets three inputs, next to the existing markup.
+- **Rates are editable:** all four (the three rates and the per-call cap) live in the existing admin credits settings (`get_credits_settings` / `set_credits_settings`), so prices change without a deploy. The admin credits UI gets four inputs, next to the existing markup.
 - **Charging:**
   - Charges go through the existing `_apply_charge` with a ledger row: `source: "mcp"`, `feature: "mcp_request"`, the tool name and the grant id.
   - They appear in the user's existing credit usage history.
