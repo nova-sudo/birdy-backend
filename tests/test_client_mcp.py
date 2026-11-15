@@ -133,21 +133,22 @@ async def test_delete_note_of_another_client_refused(mock_db, alice):
 
 async def test_set_target(mock_db, alice):
     await _group(mock_db, "g1", "Acme Dental", targets={"cpl": 20, "monthly_wins": 4})
-    out = await t.set_client_target.fn(client="Acme", cpl=15.5, leads_per_week=30)
-    assert out["targets"]["cpl"] == 15.5 and out["targets"]["leads_per_week"] == 30
-    assert out["targets"]["monthly_wins"] == 4
+    out = await t.set_client_target.fn(client="Acme", cpl=15.5, monthly_revenue=9000)
+    assert out["targets"] == {"cpl": 15.5, "monthly_wins": 4, "monthly_revenue": 9000}
     stored = (await mock_db["client_groups"].find_one({"id": "g1"}))["targets"]
-    assert stored["cpl"] == 15.5 and stored["leads_per_week"] == 30 and stored["monthly_wins"] == 4
+    assert stored["cpl"] == 15.5 and stored["monthly_revenue"] == 9000 and stored["monthly_wins"] == 4
 
 
-async def test_set_target_leaves_unsent_field_alone(mock_db, alice):
+async def test_set_non_cpl_target_only(mock_db, alice):
     await _group(mock_db, "g1", "Acme Dental", targets={"cpl": 20})
-    await t.set_client_target.fn(client="Acme", leads_per_week=10)
+    await t.set_client_target.fn(client="Acme", monthly_revenue=12000, aov=300, monthly_wins=0)
     stored = (await mock_db["client_groups"].find_one({"id": "g1"}))["targets"]
-    assert stored["cpl"] == 20 and stored["leads_per_week"] == 10
+    assert stored["cpl"] == 20 and stored["monthly_revenue"] == 12000 and stored["aov"] == 300
+    assert stored["monthly_wins"] == 0
 
 
-@pytest.mark.parametrize("kw", [{"cpl": -1}, {"cpl": 0}, {"leads_per_week": -5}, {"leads_per_week": 0}, {}])
+@pytest.mark.parametrize("kw", [{"cpl": -1}, {"monthly_revenue": -5}, {"aov": float("nan")},
+                                {"cpa": float("inf")}, {"cpl": True}, {}])
 async def test_set_target_rejects_negative(mock_db, alice, kw):
     await _group(mock_db, "g1", "Acme Dental", targets={"cpl": 20})
     with pytest.raises(ToolError):

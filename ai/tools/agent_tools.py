@@ -67,7 +67,7 @@ def _match_client(groups: list[dict], name) -> tuple[Optional[dict], Optional[di
         return partial[0], None
     if partial:
         return None, _fail(f"'{name}' matches more than one client",
-                           candidates=sorted(g.get("name") or "" for g in partial))
+                           candidates=sorted(g.get("name") or "" for g in partial), ambiguous=True)
     return None, _fail(f"No client matches '{name}'", candidates=names)
 
 

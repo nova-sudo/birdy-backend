@@ -6,6 +6,8 @@ name (names are denormalized copies across collections); a name is only a way to
 user_id always comes from the token. Other tool modules import `resolve_client` from here.
 """
 
+import math
+
 from fastmcp.exceptions import ToolError
 
 from ai.mcp.access import READ, WRITE
@@ -31,7 +33,7 @@ async def resolve_client(db, user_id: str, client: str) -> dict:
     group, err = _match_client(groups, client)
     if err:
         names = err.get("candidates") or []
-        if "more than one" in err["error"]:
+        if err.get("ambiguous"):
             raise ToolError(f"Several clients match '{client}': {', '.join(names)}. Which one?")
         msg = err["error"] if not needle else f"No client matches '{client}'."
         if names:
@@ -130,38 +132,46 @@ async def delete_client_note(client: str, note_id: str) -> dict:
     return {"success": True, "id": note_id, "client": group.get("name")}
 
 
-def _positive(value, label: str, integer: bool = False):
+def _amount(value, label: str):
+    """Same rule the targets route applies (any stored number, zero included), minus what can never be a goal."""
     if value is None:
         return None
-    ok = not isinstance(value, bool) and isinstance(value, (int,) if integer else (int, float))
-    if not ok or value <= 0:
-        raise ToolError(f"{label} must be a positive {'whole ' if integer else ''}number")
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+        raise ToolError(f"{label} must be a number, zero or more")
     return value
 
 
 @mcp.tool(**WRITE)
-async def set_client_target(client: str, cpl: float | None = None, leads_per_week: int | None = None) -> dict:
-    """Set a client's targets: cost per lead (in the client's own ad account currency) and/or leads per week. Both must be positive. A target you leave out is left as it is; other targets (wins, revenue) are never touched.
+async def set_client_target(client: str, cpl: float | None = None, cpa: float | None = None,
+                            monthly_wins: float | None = None, monthly_revenue: float | None = None,
+                            conversion_rate: float | None = None, monthly_spend: float | None = None,
+                            aov: float | None = None) -> dict:
+    """Set one or more of a client's targets, the goals the dashboard and agents measure the client against. Each must be zero or more. A target you leave out is left as it is.
 
-    Use it when the owner says what a client's goal should be. The same target the dashboard and the agents measure the client against.
+    Money values are in the client's own ad account currency. Use it when the owner says what a client's goal should be.
     A name that matches several clients returns the candidates and changes nothing.
 
     Args:
         client: The client's id or its name (a unique part of it is enough).
-        cpl: Target cost per lead, above zero.
-        leads_per_week: Target leads per week, a whole number above zero.
+        cpl: Cost per lead: spend divided by leads.
+        cpa: Cost per acquisition: spend divided by clients actually won. Not the same number as cpl.
+        monthly_wins: Clients won (closes) per month. Drives the client's health band.
+        monthly_revenue: Revenue per month.
+        conversion_rate: Lead to win conversion rate.
+        monthly_spend: Ad spend per month.
+        aov: Average order value.
     """
-    cpl = _positive(cpl, "cpl")
-    leads_per_week = _positive(leads_per_week, "leads_per_week", integer=True)
-    if cpl is None and leads_per_week is None:
-        raise ToolError("Give cpl and/or leads_per_week.")
+    given = dict(cpl=cpl, cpa=cpa, monthly_wins=monthly_wins, monthly_revenue=monthly_revenue,
+                 conversion_rate=conversion_rate, monthly_spend=monthly_spend, aov=aov)
+    sent = {k: _amount(v, k) for k, v in given.items() if v is not None}
+    if not sent:
+        raise ToolError("Give at least one target: " + ", ".join(client_targets.TARGET_FIELDS) + ".")
     db, user_id = _db(), _current_user_id()
     group = await resolve_client(db, user_id, client)
-    sent = {k: v for k, v in (("cpl", cpl), ("leads_per_week", leads_per_week)) if v is not None}
     before = {k: (group.get("targets") or {}).get(k) for k in sent}
     targets = await client_targets.apply_targets(db, user_id, group["id"], sent)
     if targets is None:
         raise ToolError("Client not found")
-    targets = {k: v for k, v in targets.items() if k != "updated_at"}
+    targets = client_targets.clean(targets)
     return {"id": group["id"], "client": group.get("name"), "before": before, "targets": targets,
             "summary": f"Updated {group.get('name')}'s targets: " + ", ".join(f"{k} {v}" for k, v in sent.items()) + "."}
