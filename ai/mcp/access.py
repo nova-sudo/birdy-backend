@@ -26,6 +26,7 @@ import billing_middleware
 from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from ai.mcp.outcome import reset_outcome, set_outcome
 
 READ_SCOPE = "birdy.read"
 WRITE_SCOPE = "birdy.write"
@@ -70,6 +71,7 @@ async def _enforce_rate_limit(db, user_id: str) -> None:
         return_document=True,
     )
     if doc["count"] > MCP_RATE_LIMIT_PER_MINUTE:
+        set_outcome("refused", reason="rate_limit")
         raise ToolError("Too many Birdy requests in a minute. Wait a moment and try again.")
 
 
@@ -79,11 +81,13 @@ def _expiry():
 
 class BirdyAccessMiddleware(Middleware):
     async def on_call_tool(self, context, call_next):
+        reset_outcome()
         token = get_access_token()
         claims = token.claims if token else {}
         tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
 
         if "write" in (tool.tags or set()) and WRITE_SCOPE not in token_scopes(claims):
+            set_outcome("refused", reason="view_only")
             raise ToolError(
                 'This Birdy connection is view-only. Reconnect with "View and make changes" to do this.'
             )
@@ -97,6 +101,7 @@ class BirdyAccessMiddleware(Middleware):
             except HTTPException as exc:
                 if exc.status_code != 402:
                     raise
+                set_outcome("refused", reason="no_subscription")
                 raise ToolError(
                     f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
                     "to keep using Birdy here."

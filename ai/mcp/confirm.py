@@ -17,6 +17,7 @@ import secrets
 from datetime import datetime, timedelta
 from typing import Awaitable, Callable
 
+from ai.mcp.outcome import set_outcome
 from core.database import DB_NAME
 
 CONFIRM_TTL_SECONDS = 600
@@ -60,7 +61,9 @@ async def create_confirm_code_indexes(mongo_client):
     await db[COLLECTION].create_index("code", unique=True)
 
 
-async def issue_code(db, user_id: str, tool: str, args: dict, state=None) -> str:
+async def issue_code(
+    db, user_id: str, tool: str, args: dict, state=None, activity_id: str | None = None
+) -> str:
     code = secrets.token_urlsafe(6)
     now = _now()
     await db[COLLECTION].insert_one(
@@ -70,6 +73,7 @@ async def issue_code(db, user_id: str, tool: str, args: dict, state=None) -> str
             "tool": tool,
             "args_hash": _args_hash(args),
             "state_hash": _state_hash(state),
+            "activity_id": activity_id,
             "created_at": now,
             "expires_at": now + timedelta(seconds=CONFIRM_TTL_SECONDS),
         }
@@ -113,6 +117,7 @@ async def two_step(
     """`state` fingerprints what the preview shows; recompute it from the freshly
     loaded object on both calls. Use stable content fields, never timestamps."""
     if not confirm_code:
+        set_outcome("preview")
         return {
             "needs_confirmation": True,
             "preview": await preview(),
@@ -122,7 +127,12 @@ async def two_step(
         }
     doc = await _burn(db, user_id, tool, args, confirm_code)
     if doc is None:
+        set_outcome("bad_code")
         return {"error": INVALID_CODE_ERROR}
     if doc.get("state_hash") != _state_hash(state):
+        set_outcome("state_changed")
         return {"error": STATE_CHANGED_ERROR}
-    return await execute()
+    result = await execute()
+    # Set only once execute() returns: a call that raised is free, whatever the code did.
+    set_outcome("live_executed", activity_id=doc.get("activity_id"))
+    return result
