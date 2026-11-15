@@ -503,16 +503,22 @@ async def _autonomy_preview(db, user_id: str, raised: list[dict]) -> dict:
     gids = [r["client_group_id"] for r in raised if r["client_group_id"]]
     names = {g["id"]: g.get("name") async for g in db["client_groups"].find(
         {"id": {"$in": gids}, "user_id": user_id}, {"id": 1, "name": 1})}
-    acts, weekly = [], False
+    acts, clients, weekly = [], {}, False
     for r in raised:
+        gid = r["client_group_id"]
         if r["change"] == "weekly_auto_post":
             weekly = True
             continue
-        who = names.get(r["client_group_id"]) or r["client_group_id"] if r["client_group_id"] \
-            else "every client that follows the agency default"
-        acts.append(f"{_CHANGE_LABELS[r['change']]}: {who}")
+        label = _CHANGE_LABELS[r["change"]]
+        if gid:
+            row = clients.setdefault(gid, {"client_group_id": gid, "name": names.get(gid), "gains": []})
+            row["gains"].append(label)
+            acts.append(f"{label}: {names.get(gid) or gid} ({gid})")
+        else:
+            acts.append(f"{label}: every client that follows the agency default")
     return {"action": "Let the Birdy Media Buying Agent act on its own",
             "will_act_on_their_own": acts,
+            **({"clients": list(clients.values())} if clients else {}),
             **({"weekly_report": "The weekly report will post to Slack by itself, without asking."} if weekly else {}),
             "result": "From the next run, these changes go live in Meta (or Slack) without a confirm."}
 
@@ -525,7 +531,8 @@ async def update_agent_settings(settings: dict | None = None, client_group_ids: 
 
     Only the fields given change; `settings` is merged into the current ones (get_agent_overview shows them).
     Invalid values are refused with the reasons and nothing is saved.
-    A change that lets the agent act on its own (any mode set to "auto", or weekly.auto_post turned on) is two steps:
+    A change that lets the agent act on its own is two steps: any mode set to "auto", weekly.auto_post turned on, or a
+    client it will now act on while that client's mode is auto (newly watched, or taken off only_flag). For those
     the first call saves nothing and returns a preview and a confirm_code.
     Show the preview to the user and only call again with confirm_code after they say yes. Pass the same arguments.
     Every other change is saved on the first call.
@@ -543,7 +550,7 @@ async def update_agent_settings(settings: dict | None = None, client_group_ids: 
         patch = await agent_settings.check_update(db, user_id, settings=settings, client_group_ids=client_group_ids)
     except agent_settings.SettingsError as e:
         raise _settings_error(e)
-    raised = agent_settings.autonomy_raised(found, patch)
+    raised = agent_settings.autonomy_raised(found, patch, client_group_ids=client_group_ids, only_flag=only_flag)
 
     async def preview():
         return await _autonomy_preview(db, user_id, raised)

@@ -50,10 +50,12 @@ async def check_update(db, user_id: str, *, settings: dict | None = None,
     return patch
 
 
-def autonomy_raised(agent: dict, patch: dict) -> list[dict]:
-    """What a settings patch newly lets the agent do on its own: a change type whose mode becomes
-    "auto" (for every client following the agency default, or for one client), or the weekly report
-    turning to post itself. Empty when the patch keeps or lowers autonomy."""
+def autonomy_raised(agent: dict, patch: dict, *, client_group_ids: list[str] | None = None,
+                    only_flag: list[str] | None = None) -> list[dict]:
+    """What a change newly lets the agent do on its own: a change type whose mode becomes "auto"
+    (for every client following the agency default, or for one client), a client that starts being
+    acted on while its effective mode is auto (newly watched, or leaving only_flag), or the weekly
+    report turning to post itself. Empty when the change keeps or lowers autonomy."""
     current = agent.get("settings") or copy.deepcopy(stock_settings.DEFAULT_SETTINGS)
     merged = stock_settings.merge_settings(current, patch)
     out: list[dict] = []
@@ -70,9 +72,28 @@ def autonomy_raised(agent: dict, patch: dict) -> list[dict]:
             now = a.get(kind) or after_modes.get(kind) or "ask"
             if now == "auto" and was != "auto" and kind not in agency_raised:
                 out.append({"change": kind, "client_group_id": gid})
+    out += [{"change": k, "client_group_id": gid}
+            for gid in _newly_acted_on(agent, client_group_ids, only_flag)
+            for k in stock_settings.MODE_KINDS if stock_settings.resolve_mode(merged, gid, k) == "auto"]
     if (merged.get("weekly") or {}).get("auto_post") is True and (current.get("weekly") or {}).get("auto_post") is not True:
         out.append({"change": "weekly_auto_post", "client_group_id": None})
-    return out
+    seen: set = set()
+    return [r for r in out if not ((r["change"], r["client_group_id"]) in seen
+                                   or seen.add((r["change"], r["client_group_id"])))]
+
+
+def _newly_acted_on(agent: dict, client_group_ids: list[str] | None, only_flag: list[str] | None) -> list[str]:
+    """Clients the agent may act on after the scope change but not before: newly watched, or leaving
+    only_flag. Mirrors how update_settings applies the scope (only when client_group_ids is given)."""
+    if client_group_ids is None:
+        return []
+    ids = list(dict.fromkeys(client_group_ids))
+    scope = agent.get("scope") or {}
+    before = set(scope.get("client_group_ids") or [])
+    before_flag = set(scope.get(claims.FLAG_ONLY_KEY) or [])
+    after_flag = {g for g in (only_flag if only_flag is not None else before_flag) if g in ids}
+    acted_before = before - before_flag
+    return [g for g in ids if g not in after_flag and g not in acted_before]
 
 
 async def update_settings(db, user_id: str, agent: dict, *, settings: dict | None = None,

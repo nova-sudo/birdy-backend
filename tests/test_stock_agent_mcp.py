@@ -465,3 +465,47 @@ async def test_apply_all_cards_changed_after_preview_refused(mock_db, writable, 
     out = await t.apply_all_cards.fn(run_id="r1", confirm_code=first["confirm_code"])
     assert "changed since the preview" in out["error"]
     run.assert_not_awaited()
+
+
+# ---- scope changes that grant autonomy ---------------------------------------------------------------------
+
+async def _scoped(db, agent, watched, flag_only=(), remove_mode="auto"):
+    for gid, name in (("g1", "Acme"), ("g2", "Beta")):
+        await db["client_groups"].insert_one({"id": gid, "user_id": ALICE, "name": name})
+    await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$set": {
+        "settings.modes": {"remove": remove_mode, "add": "ask", "revive": "ask"},
+        "scope.client_group_ids": list(watched), "scope.flag_only_client_group_ids": list(flag_only)}})
+
+
+async def test_watching_a_client_under_auto_needs_confirmation(mock_db, writable):
+    agent, _ = writable
+    await _scoped(mock_db, agent, ["g1"])
+    first = await t.update_agent_settings.fn(client_group_ids=["g1", "g2"])
+    assert first["needs_confirmation"]
+    assert first["preview"]["clients"] == [{"client_group_id": "g2", "name": "Beta", "gains": ["pausing ads"]}]
+    stored = await mock_db[agent_store.AGENTS].find_one({"_id": agent["_id"]})
+    assert stored["scope"]["client_group_ids"] == ["g1"]
+    out = await t.update_agent_settings.fn(client_group_ids=["g1", "g2"], confirm_code=first["confirm_code"])
+    assert out["agent"]["scope"]["client_group_ids"] == ["g1", "g2"]
+
+
+async def test_leaving_only_flag_under_auto_needs_confirmation(mock_db, writable):
+    agent, _ = writable
+    await _scoped(mock_db, agent, ["g1", "g2"], flag_only=["g2"])
+    first = await t.update_agent_settings.fn(client_group_ids=["g1", "g2"], only_flag=[])
+    assert first["needs_confirmation"] and [c["client_group_id"] for c in first["preview"]["clients"]] == ["g2"]
+    stored = await mock_db[agent_store.AGENTS].find_one({"_id": agent["_id"]})
+    assert stored["scope"]["flag_only_client_group_ids"] == ["g2"]
+    # keeping it flag-only, or dropping a client, is not a raise
+    out = await t.update_agent_settings.fn(client_group_ids=["g1", "g2"], only_flag=["g2"])
+    assert "needs_confirmation" not in out
+    out = await t.update_agent_settings.fn(client_group_ids=["g1"])
+    assert "needs_confirmation" not in out and out["agent"]["scope"]["client_group_ids"] == ["g1"]
+
+
+async def test_watching_a_client_under_ask_is_one_step(mock_db, writable):
+    agent, _ = writable
+    await _scoped(mock_db, agent, ["g1"], remove_mode="ask")
+    out = await t.update_agent_settings.fn(client_group_ids=["g1", "g2"])
+    assert "needs_confirmation" not in out and out["agent"]["scope"]["client_group_ids"] == ["g1", "g2"]
+    assert await _codes(mock_db) == 0
