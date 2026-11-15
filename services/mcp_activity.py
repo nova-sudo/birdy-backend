@@ -205,6 +205,8 @@ async def record_call(db, *, user_id, grant_id, app_name, app_kind, access, tool
 
 async def record_rate_limited(db, user_id: str, grant_id: str | None, app_name: str | None, app_kind: str = "other"):
     """Count a rate-limited refusal on this user's row for the current minute (one row per user per minute)."""
+    from uuid import uuid4
+
     now = _now()
     minute = now.replace(second=0, microsecond=0)
     await db[COLLECTION].update_one(
@@ -212,7 +214,7 @@ async def record_rate_limited(db, user_id: str, grant_id: str | None, app_name: 
         {
             "$inc": {"count": 1},
             "$setOnInsert": {
-                "id": current_activity_id(), "grant_id": grant_id, "app_name": app_name, "app_kind": app_kind,
+                "id": current_activity_id() or uuid4().hex, "grant_id": grant_id, "app_name": app_name, "app_kind": app_kind,
                 "access": None, "tool": None, "summary": "Too many requests in a minute. Some were refused",
                 "args": {}, "result_status": "error", "result_excerpt": None, "confirmed_after": None, "link": None,
                 "client_group_ids": [], "client_names": [],

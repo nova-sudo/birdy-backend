@@ -165,13 +165,15 @@ async def list_activity_apps(current_user: str = Depends(get_current_user)):
     """The distinct apps in this user's log (newest name wins), whether or not they are still connected."""
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
-        rows = await db[COLLECTION].find(
-            {"user_id": current_user, "grant_id": {"$ne": None}}, {"grant_id": 1, "app_name": 1, "app_kind": 1}
-        ).sort("created_at", -1).to_list(None)
-        apps: dict[str, dict] = {}
-        for r in rows:
-            apps.setdefault(r["grant_id"], {"grant_id": r["grant_id"], "app_name": r.get("app_name"),
-                                            "app_kind": r.get("app_kind")})
+        rows = await db[COLLECTION].aggregate([
+            {"$match": {"user_id": current_user, "grant_id": {"$ne": None}}},
+            {"$sort": {"created_at": -1}},
+            {"$group": {"_id": "$grant_id", "app_name": {"$first": "$app_name"}, "app_kind": {"$first": "$app_kind"},
+                        "last_at": {"$first": "$created_at"}}},
+            {"$sort": {"last_at": -1, "_id": 1}},
+        ]).to_list(None)
+        apps = {r["_id"]: {"grant_id": r["_id"], "app_name": r.get("app_name"), "app_kind": r.get("app_kind")}
+                for r in rows}
         revoked = await _revoked_by_grant(db, current_user, apps.keys())
     return [{**a, "revoked": revoked.get(gid, False)} for gid, a in apps.items()]
 

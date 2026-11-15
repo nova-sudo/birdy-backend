@@ -282,3 +282,10 @@ async def test_clients_resolved_from_args_and_named_in_summary(mcp_call, mock_db
 def test_summaries_for_previews_and_refusals():
     assert summarize("apply_card", {}, [{"id": "g", "name": "Acme"}], {"kind": "preview"}).startswith("Previewed: applied an agent card for Acme")
     assert summarize("apply_card", {}, [], {"kind": "refused"}).startswith("Could not do this")
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_row_always_has_an_id(mock_db):
+    await mcp_activity.record_rate_limited(mock_db, USER, "g1", "Claude")
+    [row] = await mock_db["mcp_activity"].find({}).to_list(None)
+    assert isinstance(row["id"], str) and row["id"]

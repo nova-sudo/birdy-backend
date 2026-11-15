@@ -172,3 +172,22 @@ async def test_confirmed_after_reverse_lookup(api):
                row("l1", _ago(hours=1), confirmed_after="p1"), row("l2", _ago(hours=1), confirmed_after="p0"))
     items = api.get("/api/mcp/activity", params={"confirmed_after": "p1"}).json()["items"]
     assert [i["id"] for i in items] == ["l1"]
+
+
+@pytest.mark.asyncio
+async def test_other_users_never_leak_into_totals_or_apps(api):
+    await seed(api.db, row("mine", _ago(hours=1), credits=0.5),
+               row("b1", _ago(hours=1), user=BOB, grant="gb", app_name="BobApp", credits=3),
+               row("b2", _ago(hours=2), user=BOB, grant="gb", app_name="BobApp", kind="refused", count=9))
+    first = api.get("/api/mcp/activity").json()
+    assert first["totals"] == {"requests": 1, "credits": 0.5}
+    apps = api.get("/api/mcp/activity/apps").json()
+    assert [a["grant_id"] for a in apps] == ["g1"]
+
+
+@pytest.mark.asyncio
+async def test_apps_newest_name_wins_one_entry_per_grant(api):
+    await seed(api.db, row("o", _ago(days=2), app_name="Old name"), row("n", _ago(hours=1), app_name="New name"),
+               row("z", _ago(hours=3), grant="g2", app_name="Cursor"))
+    apps = api.get("/api/mcp/activity/apps").json()
+    assert [(a["grant_id"], a["app_name"]) for a in apps] == [("g1", "New name"), ("g2", "Cursor")]
