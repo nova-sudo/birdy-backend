@@ -201,10 +201,12 @@ def _test_args(report: dict) -> dict:
 
 
 async def render_test(db, report: dict) -> dict:
-    """The message a test send would post (see sr.render_report)."""
-    return await sr.render_report(db, report, **_test_args(report))
+    """The message a test send would post, without the LLM take (see sr.render_report)."""
+    return await sr.render_report(db, report, include_take=False, **_test_args(report))
 
 
-async def send_test(db, report: dict) -> dict:
+async def send_test(db, report: dict, with_channel: bool = False) -> dict:
+    channel = (await sr._target(db, report))[1] if with_channel else None
     status, error = await sr.send_report(db, report, record=False, **_test_args(report))
-    return {"status": status, "error": error}
+    out = {"status": status, "error": error}
+    return {**out, "channel": channel} if with_channel else out

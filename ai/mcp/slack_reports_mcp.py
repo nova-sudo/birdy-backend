@@ -4,7 +4,7 @@ ai/mcp/slack_reports_mcp.py
 Tools for the owner's Slack reports (Hub -> Reports): list them (read), create, change or delete one (write), and
 post a test of one to Slack (live, two-step). They use the same request models, validation and writes as the
 dashboard routes (services/slack_report_ops.py), and the test send renders with the same function the real send
-posts with, so the preview is exactly what lands in Slack.
+posts with, so the preview has the same figures and layout as what lands in Slack.
 """
 
 from datetime import datetime, timezone
@@ -173,7 +173,7 @@ async def delete_slack_report(report_id: str) -> dict:
 async def send_test_slack_report(report_id: str, confirm_code: str | None = None) -> dict:
     """Post a Slack report to its channel right now as a test, with today's real figures (event reports get sample event details). It is not recorded as a run and doesn't change what the next scheduled send compares against.
 
-    Two steps. Called without confirm_code it posts nothing and returns a preview (the report's name, the Slack channel and the exact message text) and a one-time confirm_code. Show the preview to the user and only call again with confirm_code after they say yes.
+    Two steps. Called without confirm_code it posts nothing and returns a preview (the report's name, the Slack channel and the message text with today's figures; a one-line Birdy take, if the report has one, is written only when it's sent) and a one-time confirm_code. Show the preview to the user and only call again with confirm_code after they say yes.
     The second call must repeat the same report_id. If Slack isn't connected, the report has no channel to send to or has nothing to send, you get an error and no code.
 
     Args:
@@ -199,10 +199,11 @@ async def send_test_slack_report(report_id: str, confirm_code: str | None = None
     async def execute():
         if not await _slack_connected(db, user_id):
             raise ToolError(NOT_CONNECTED)
-        res = await ops.send_test(db, report)
+        res = await ops.send_test(db, report, with_channel=True)
+        channel = res.pop("channel")
         if res["status"] != sr.SENT:
             return {"ok": False, **res, "error": res["error"] or "The report was not sent."}
-        label = await _channel_label(db, user_id, report, report.get("channel_id") or "")
+        label = await _channel_label(db, user_id, report, channel or "")
         return {"ok": True, **res, "summary": f"Posted the report to #{label}."}
 
     return await two_step(db, user_id, "send_test_slack_report", {"report_id": report_id}, confirm_code, preview, execute)

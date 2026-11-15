@@ -49,7 +49,7 @@ def posts(monkeypatch):
     return sent
 
 
-async def _make(user_tool_kwargs=None, **kw):
+async def _make(**kw):
     args = {"name": "Friday wrap", "trigger": SCHEDULE, "channel_id": "C0OPS", "channel_name": "ops",
             "template": {"frequency": "daily", "blocks": BLOCKS}, **kw}
     return (await t.create_slack_report.fn(**args))["report"]
@@ -221,3 +221,22 @@ async def test_read_scope_cannot_call_write_or_live_tools(mcp_call, mock_db, ali
         assert res.is_error and "view-only" in res.text, tool
     ok = await mcp_call("list_slack_reports", {}, scope="birdy.read", token_type="mcp")
     assert not ok.is_error
+
+
+async def test_preview_never_writes_the_take_but_the_send_does(mock_db, alice, posts, monkeypatch):
+    from services import report_blocks as rt
+    await _connect(mock_db)
+    calls = []
+
+    async def fake_take(db, user_id, template, text):
+        calls.append(user_id)
+        return "Spend is steady."
+
+    monkeypatch.setattr(rt, "write_take", fake_take)
+    blocks = [{"type": "section", "text": "Spend {{spend}}\n{{birdy_take}}"}]
+    rep = await _make(template={"frequency": "daily", "blocks": blocks})
+    first = await t.send_test_slack_report.fn(report_id=rep["id"])
+    assert calls == [] and "Spend £120" in first["preview"]["message"]
+    assert sr.TAKE_PREVIEW in first["preview"]["message"]
+    await t.send_test_slack_report.fn(report_id=rep["id"], confirm_code=first["confirm_code"])
+    assert calls == [ALICE] and "Spend is steady." in posts[0]["text"] and sr.TAKE_PREVIEW not in posts[0]["text"]

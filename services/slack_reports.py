@@ -263,13 +263,17 @@ async def _target(db, report: dict) -> tuple[str | None, str | None]:
     return decrypt(token_enc), channel
 
 
+TAKE_PREVIEW = "A one-line Birdy take is written when it's sent."
+
+
 async def render_report(db, report: dict, now_utc: datetime, key: str | None = None,
-                        event: dict | None = None) -> dict:
+                        event: dict | None = None, include_take: bool = True) -> dict:
     """
     Build one report's message without posting it. Returns {"skipped": reason}
     (SKIPPED: nothing to send to or about) or {"token", "channel", "blocks",
-    "fallback", "ctx", "key"}. send_report posts exactly this, so a preview built
-    here matches what gets sent.
+    "fallback", "ctx", "key"}. send_report posts this, so a preview built here
+    has the same figures and layout. include_take=False (previews) skips the
+    metered LLM take and puts a note where it would go.
     """
     template = rt.normalize(report.get("template"))
     if not rt.has_content(template):
@@ -287,7 +291,10 @@ async def render_report(db, report: dict, now_utc: datetime, key: str | None = N
     if not ctx.groups:
         return {"skipped": "no active clients"}
 
-    take = await rt.write_take(db, report["user_id"], template, rt.render(template, ctx)[1])
+    if include_take:
+        take = await rt.write_take(db, report["user_id"], template, rt.render(template, ctx)[1])
+    else:
+        take = TAKE_PREVIEW if rt.has_take(template) else None
     blocks, fallback = rt.render(template, ctx, take=take)
     return {"token": token, "channel": channel, "blocks": blocks, "fallback": fallback, "ctx": ctx, "key": key}
 
