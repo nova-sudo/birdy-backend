@@ -157,6 +157,17 @@ async def test_state_changed_logged_free(mcp_call, mock_db, temp_tools):
     assert row["kind"] == "refused" and row["refusal_reason"] == "state_changed" and row["credits"]["total"] == 0
 
 
+def test_redaction_masks_extensions_and_bare_international_and_spares_datetimes_and_decimals():
+    out = redact({"body": "ring +1-555-123-4821x22 or UK 447911123456 today",
+                  "when": "2026-11-15T10:42:00Z", "when2": "2026-11-15 12:00:30+00:00",
+                  "n": "1234.56", "ctr": "0.0123456789", "spend": "spend 12345.678901", "ad": "120210000000000"})
+    assert "555" not in out["body"] and "447911" not in out["body"]
+    assert "•••• 4821" in out["body"] and "•••• 3456" in out["body"]
+    assert out["when"] == "2026-11-15T10:42:00Z" and out["when2"] == "2026-11-15 12:00:30+00:00"
+    assert out["n"] == "1234.56" and out["ctr"] == "0.0123456789" and out["spend"] == "spend 12345.678901"
+    assert out["ad"] == "120210000000000"
+
+
 def test_redaction_masks_phone_email_and_confirm_code():
     out = redact({
         "confirm_code": "abc", "body": "Hi, call me on +1 (555) 123-4821 or j.doe@acme.com",

@@ -22,10 +22,13 @@ EXCERPT_CHARS = 2000
 _MAX_CLIENTS = 5
 
 _EMAIL = re.compile(r"([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
-# A phone-looking run: optional +, digits with spaces, dots, dashes or brackets between. Long bare digit runs
-# (ad ids, timestamps) are not phones, so a candidate is masked only with 10-15 digits and a +, a separator
-# or exactly 10-11 digits.
-_PHONE = re.compile(r"(?<![\w])\+?\(?\d[\d\s().-]{8,}\d(?!\w)")
+# A phone-looking run: optional +, digits with spaces, dots, dashes or brackets between. It may be followed by
+# an extension ("x22"), but not by more digits or a colon (a time). A candidate is masked with 10-15 digits when
+# it has a +, a phone separator, or 10-12 bare digits (12 covers bare international numbers such as UK mobiles).
+# Longer bare runs (ad ids, ms timestamps) are left alone. A run whose only separator is one dot is a decimal,
+# and an ISO date inside the run means a datetime, so neither is masked. Known over-mask: a bare 10-digit
+# unix timestamp looks exactly like a US number.
+_PHONE = re.compile(r"(?<![\w])\+?\(?\d[\d\s().-]{8,}\d(?![\d:])")
 _PHONE_KEYS = {"phone", "phone_number", "phonenumber", "mobile", "cell", "to_number", "from_number"}
 _EMAIL_KEYS = {"email", "email_address", "emailaddress"}
 
@@ -43,7 +46,9 @@ def _mask_phone(match: re.Match) -> str:
     digits = re.sub(r"\D", "", raw)
     if not 10 <= len(digits) <= 15:
         return raw
-    if len(digits) > 11 and not raw.startswith("+") and not re.search(r"[\s().-]", raw):
+    if re.search(r"\d{4}-\d{2}-\d{2}", raw) or (raw.count(".") == 1 and not re.search(r"[\s()+-]", raw)):
+        return raw  # a datetime or a decimal
+    if len(digits) > 12 and not raw.startswith("+") and not re.search(r"[\s().-]", raw):
         return raw  # a long bare id
     return _mask_phone_digits(digits)
 
