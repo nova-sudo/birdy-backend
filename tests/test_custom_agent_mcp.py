@@ -155,30 +155,73 @@ async def test_activate_needs_confirmation(mock_db, alice, monkeypatch):
     assert "error" in again and "Nothing was changed" in again["error"]
 
 
-async def test_activate_not_ready_returns_error_dict(mock_db, alice, monkeypatch):
+async def test_activate_not_ready_issues_no_code(mock_db, alice, monkeypatch):
     _ready(monkeypatch, ready=False)
-    first = await t.activate_agent.fn(agent=alice["_id"])
-    out = await t.activate_agent.fn(agent=alice["_id"], confirm_code=first["confirm_code"])
+    out = await t.activate_agent.fn(agent=alice["_id"])
     assert out["ok"] is False and out["status"] == 409 and out["missing"] == ["Answer 3 practice cases"]
+    assert "confirm_code" not in out and await mock_db["mcp_confirm_codes"].count_documents({}) == 0
     assert (await agent_store.get_agent(mock_db, ALICE, alice["_id"]))["status"] != "active"
 
 
-async def test_activate_clash_with_other_agent_returns_error_dict(mock_db, alice, monkeypatch):
+async def test_activate_already_active_issues_no_code(mock_db, alice):
+    await agent_store.update_agent(mock_db, ALICE, alice["_id"], {"status": "active"})
+    out = await t.activate_agent.fn(agent=alice["_id"])
+    assert out["ok"] is True and "already on" in out["summary"] and "confirm_code" not in out
+
+
+async def test_activate_clash_with_other_agent_issues_no_code_until_move_claims(mock_db, alice, monkeypatch):
     from ai.agents import claims
     _ready(monkeypatch)
     other = await _custom(mock_db, name="Other")
     await claims.claim_clients(mock_db, ALICE, other["_id"], ["g1"])
-    first = await t.activate_agent.fn(agent=alice["_id"])
-    out = await t.activate_agent.fn(agent=alice["_id"], confirm_code=first["confirm_code"])
-    assert out["ok"] is False and "Other" in out["error"] and out["conflicts"]
+    out = await t.activate_agent.fn(agent=alice["_id"])
+    assert out["ok"] is False and "Other" in out["error"] and out["conflicts"] and "confirm_code" not in out
+    first = await t.activate_agent.fn(move_claims=True, agent=alice["_id"])
+    assert first["preview"]["takes_over_clients"] == ["Acme"] and first["preview"]["ready"] is True
+    done = await t.activate_agent.fn(move_claims=True, agent=alice["_id"], confirm_code=first["confirm_code"])
+    assert done["agent"]["status"] == "active" and await claims.holder(mock_db, ALICE, "g1") == alice["_id"]
+
+
+async def test_activate_code_replayed_with_other_arguments_is_refused(mock_db, alice, monkeypatch):
+    from ai.agents import claims
+    _ready(monkeypatch)
+    other = await _custom(mock_db, name="Other")
+    await claims.claim_clients(mock_db, ALICE, other["_id"], ["g1"])
+    first = await t.activate_agent.fn(move_claims=True, agent=alice["_id"])
+    out = await t.activate_agent.fn(move_claims=False, agent=alice["_id"], confirm_code=first["confirm_code"])
+    assert "error" in out and "Nothing was changed" in out["error"]
     assert (await agent_store.get_agent(mock_db, ALICE, alice["_id"]))["status"] != "active"
+    assert await claims.holder(mock_db, ALICE, "g1") == other["_id"]
 
 
-async def test_deactivate_agent_mirrors_the_route_refusal_for_custom_agents(mock_db, alice):
+async def test_deactivate_stock_agent_works_and_is_idempotent(mock_db, set_current_user):
+    set_current_user(ALICE)
+    stock = await agent_store.create_agent(mock_db, ALICE, type=agent_store.TYPE_STOCK)
+    await agent_store.update_agent(mock_db, ALICE, stock["_id"], {"status": "active"})
+    out = await t.deactivate_agent.fn()
+    assert out["ok"] is True and out["agent"]["status"] == "draft" and out["agent"]["turned_off_at"]
+    again = await t.deactivate_agent.fn(agent=stock["_id"])
+    assert again["ok"] is True and again["agent"]["status"] == "draft" and "already off" in again["summary"]
+
+
+async def test_deactivate_custom_agent_is_refused(mock_db, alice):
+    await agent_store.create_agent(mock_db, ALICE, type=agent_store.TYPE_STOCK)
     await agent_store.update_agent(mock_db, ALICE, alice["_id"], {"status": "active"})
     out = await t.deactivate_agent.fn(agent=alice["_id"])
     assert out == {"ok": False, "error": "Only the Birdy Media Buying Agent can be turned off", "status": 409}
     assert (await agent_store.get_agent(mock_db, ALICE, alice["_id"]))["status"] == "active"
+
+
+async def test_deactivate_other_users_stock_agent_unreachable(mock_db, set_current_user):
+    set_current_user(ALICE)
+    stock = await agent_store.create_agent(mock_db, ALICE, type=agent_store.TYPE_STOCK)
+    await agent_store.update_agent(mock_db, ALICE, stock["_id"], {"status": "active"})
+    set_current_user(BOB)
+    with pytest.raises(ToolError):
+        await t.deactivate_agent.fn(agent=stock["_id"])
+    with pytest.raises(ToolError, match="don't have a media buying agent"):
+        await t.deactivate_agent.fn()
+    assert (await agent_store.get_agent(mock_db, ALICE, stock["_id"]))["status"] == "active"
 
 
 async def _auto_suggestion(db, agent, sid="s1", applied_at=None, **kw):
@@ -197,6 +240,17 @@ async def test_undo_auto_action_two_step_source_mcp(mock_db, alice, monkeypatch)
     assert first["needs_confirmation"] and first["preview"]["title"] == "Paused ad X"
     out = await t.undo_auto_action.fn(suggestion_id="s1", agent=alice["_id"], confirm_code=first["confirm_code"])
     assert undo.await_args.kwargs["source"] == "mcp" and out["ok"] is True and out["succeeded"] == ["a1"]
+
+
+async def test_undo_code_replayed_with_other_suggestion_is_refused(mock_db, alice, monkeypatch):
+    await _auto_suggestion(mock_db, alice, "s1")
+    await _auto_suggestion(mock_db, alice, "s2")
+    undo = AsyncMock(return_value={"outcome": "undone"})
+    monkeypatch.setattr("ai.agents.custom_ops.sug_actions.undo_suggestion", undo)
+    first = await t.undo_auto_action.fn(suggestion_id="s1", agent=alice["_id"])
+    out = await t.undo_auto_action.fn(suggestion_id="s2", agent=alice["_id"], confirm_code=first["confirm_code"])
+    assert "error" in out and "Nothing was changed" in out["error"]
+    undo.assert_not_awaited()
 
 
 async def test_undo_auto_action_refusals_are_error_dicts(mock_db, alice, monkeypatch):
@@ -223,7 +277,7 @@ async def test_custom_tools_reject_stock_agent_with_hint(mock_db, set_current_us
     calls = [t.get_agent_playbook.fn(agent=stock["_id"]), t.get_agent_proposals.fn(agent=stock["_id"]),
              t.accept_proposal.fn(proposal_id="p", agent=stock["_id"]),
              t.set_rule_param.fn(rule_kind="revive_winner", param="min_leads", value=3, agent=stock["_id"]),
-             t.activate_agent.fn(agent=stock["_id"]), t.deactivate_agent.fn(agent=stock["_id"]),
+             t.activate_agent.fn(agent=stock["_id"]),
              t.start_dry_run.fn(agent=stock["_id"])]
     for call in calls:
         with pytest.raises(ToolError, match="media buying agent tools"):
@@ -399,7 +453,8 @@ async def test_read_scope_cannot_call_write_or_live_tools(mcp_call, mock_db, ali
         assert res.is_error and "view-only" in res.text, tool
 
 
-async def test_write_scope_live_tool_previews_over_the_wire(mcp_call, mock_db, alice):
+async def test_write_scope_live_tool_previews_over_the_wire(mcp_call, mock_db, alice, monkeypatch):
+    _ready(monkeypatch)
     res = await mcp_call("activate_agent", {"agent": alice["_id"]}, scope="birdy.write", token_type="mcp")
     assert not res.is_error and "confirm_code" in res.text
     res = await mcp_call("get_agent_playbook", {"agent": alice["_id"]}, scope="birdy.read", token_type="mcp")

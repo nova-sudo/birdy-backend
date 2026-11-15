@@ -449,17 +449,27 @@ async def start_dry_run(agent: str | None = None) -> dict:
 
 @mcp.tool(**WRITE)
 async def deactivate_agent(agent: str | None = None) -> dict:
-    """Turn an agent off, as the Birdy app's Turn off does. The app only lets the Birdy Media Buying Agent be turned off, so for a custom agent this returns `ok: false` with that reason and changes nothing.
+    """Turn the Birdy Media Buying Agent off. It goes back to a draft and stops acting on its clients; its settings, cards and history stay, and it can be switched on again in Birdy.
+
+    Leave agent out to turn off the owner's Birdy Media Buying Agent. Naming a custom agent returns `ok: false` with the reason (custom agents can't be turned off, only the media buying agent), and nothing changes.
 
     Args:
-        agent: Optional custom agent id or name. Defaults to the owner's default agent.
+        agent: Optional agent id or name. Defaults to the Birdy Media Buying Agent.
     """
-    db, user_id, found = await _custom(agent)
+    user_id = _current_user_id()
+    db = get_db(get_shared_mongo_client())
+    if agent:
+        found = await resolve_agent(db, user_id, agent)
+    else:
+        found = await db[agent_store.AGENTS].find_one({"user_id": user_id, "type": agent_store.TYPE_STOCK})
+        if found is None:
+            raise ToolError("You don't have a media buying agent yet.")
     try:
         updated = await custom_ops.deactivate(db, user_id, found)
     except custom_ops.OpError as e:
         return _refused(e)
-    return {"ok": True, "agent": _agent_view(updated), "summary": f"Turned {found.get('name')} off."}
+    said = f"Turned {found.get('name')} off." if found.get("status") == "active" else f"{found.get('name')} was already off."
+    return {"ok": True, "agent": _agent_view(updated), "summary": said}
 
 
 # ---------------------------------------------------------------------------
@@ -495,9 +505,26 @@ async def activate_agent(move_claims: bool = False, agent: str | None = None, co
         confirm_code: The code from the preview, once the user has agreed.
     """
     db, user_id, found = await _custom(agent)
+    if not confirm_code:
+        # Say it now if it can't work, so the user is never asked to confirm something that will be refused.
+        if found.get("status") == "active":
+            return {"ok": True, "agent": _agent_view(found), "summary": "It is already on; nothing to confirm."}
+        conf = await custom_ops.confidence(db, found)
+        if not conf["ready"]:
+            return {"ok": False, "error": "The agent isn't ready to switch on yet", "status": 409,
+                    "ready": False, "missing": conf["missing"]}
+        held = [] if move_claims else [c for c in (await custom_ops.claims_view(db, user_id, found))["clients"]
+                                       if c["acting"] == "other_agent"]
+        if held:
+            return {"ok": False, "status": 409, "conflicts": held,
+                    "error": "Another agent already acts on " + ", ".join(sorted({c["holder_name"] or "another agent" for c in held}))
+                             + ". Call again with move_claims to take them over."}
 
     async def preview():
-        return await _activate_preview(db, user_id, found)
+        out = await _activate_preview(db, user_id, found)
+        return {**out, "ready": True, "missing": [], "takes_over_clients": [
+            c["name"] for c in (await custom_ops.claims_view(db, user_id, found))["clients"]
+            if move_claims and c["acting"] == "other_agent"]}
 
     async def execute():
         try:
