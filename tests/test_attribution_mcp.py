@@ -76,6 +76,23 @@ async def test_leads_by_ad_happy_path(mock_db, alice):
     assert out["ads"] == [] and out["attributed_leads"] == 0
 
 
+async def test_leads_by_ad_end_date_is_inclusive(mock_db, alice):
+    """I6: a lead created during the end day counts, like funnel; the HTTP route keeps its midnight cut-off."""
+    from core.mongo_client import get_shared_mongo_client
+    from services import attribution_reports
+    await _group(mock_db)
+    await mock_db["attribution_matches"].insert_one({
+        "user_id": ALICE, "client_group_id": "g1", "ad_id": "ad-late", "adset_id": "as1", "campaign_id": "c1",
+        "contact_created_at": datetime(2026, 11, 14, 18, 30), "confidence": 100,
+    })
+    out = await t.leads_by_ad.fn(client="g1", start_date="2026-11-14", end_date="2026-11-14")
+    assert out["attributed_leads"] == 1 and out["ads"][0]["ad_id"] == "ad-late"
+    assert (await t.leads_by_ad.fn(client="g1", end_date="2026-11-13"))["attributed_leads"] == 0
+    route = await attribution_reports.leads_by_ad_report(ALICE, "g1", "2026-11-14", "2026-11-14",
+                                                         get_shared_mongo_client())
+    assert route["attributed_leads"] == 0
+
+
 async def test_funnel_happy_path(mock_db, alice):
     await _group(mock_db)
     await _seed_tracking(mock_db)

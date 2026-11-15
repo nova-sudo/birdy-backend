@@ -8,7 +8,7 @@ Callers pass a client group they already know belongs to the user. A bad date ra
 AttributionInputError, which the router turns into a 400 and the MCP tool into a ToolError.
 """
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from core.database import DB_NAME
 from services import landing_funnel as landing_funnel_service
@@ -40,12 +40,22 @@ def parse_day(value: str | None, field: str) -> str | None:
         raise AttributionInputError(f"Invalid {field} date: {value}")
 
 
+def _is_bare_day(value: str | None) -> bool:
+    return bool(value) and len(value) == 10 and value[4] == "-" and value[7] == "-"
+
+
 async def leads_by_ad_report(
     user_id: str, group_id: str, start: str | None, end: str | None, mongo_client,
-    include_predated: bool = False,
+    include_predated: bool = False, inclusive_end_day: bool = False,
 ) -> dict:
-    """Attributed leads per Meta ad for one client group, counted by contact creation date."""
+    """Attributed leads per Meta ad for one client group, counted by contact creation date.
+
+    `end` is compared as a timestamp, so a bare YYYY-MM-DD means midnight at the start of that
+    day (the HTTP route's long-standing behaviour). inclusive_end_day=True (the MCP tool) counts
+    a bare end day through its last moment, matching funnel_report."""
     start_at, end_at = parse_timestamp(start), parse_timestamp(end)
+    if inclusive_end_day and end_at is not None and _is_bare_day(end):
+        end_at = end_at + timedelta(days=1) - timedelta(milliseconds=1)
     rows = await leads_by_ad(
         user_id, group_id, start_at, end_at, mongo_client, include_predated=include_predated,
     )

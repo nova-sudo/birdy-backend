@@ -83,13 +83,14 @@ async def leads_by_ad(client: str, start_date: str | None = None, end_date: str 
 
     Args:
         client: The client's id (from get_client_groups) or its name (a unique part of it is enough).
-        start_date: Start of the window, YYYY-MM-DD. Omit for no lower bound.
-        end_date: End of the window, YYYY-MM-DD. Omit for no upper bound.
+        start_date: First day of the window, YYYY-MM-DD, inclusive. Omit for no lower bound.
+        end_date: Last day of the window, YYYY-MM-DD, inclusive (leads created that day count). Omit for no upper bound.
     """
     mongo_client, user_id = get_shared_mongo_client(), _current_user_id()
     group = await _group(get_db(mongo_client), user_id, client)
     try:
-        return await attribution_reports.leads_by_ad_report(user_id, group["id"], start_date, end_date, mongo_client)
+        return await attribution_reports.leads_by_ad_report(user_id, group["id"], start_date, end_date, mongo_client,
+                                                            inclusive_end_day=True)
     except AttributionInputError as e:
         raise _bad_input(e)
 
