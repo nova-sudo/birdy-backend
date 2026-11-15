@@ -13,13 +13,16 @@ orchestrator if the MCP path is unavailable.
 """
 
 import logging
+from typing import Literal
 from datetime import datetime, timedelta
 
 from core.constants import METRIC_LABELS, OPERATOR_LABELS
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from core.utils import mongo_to_dict
-from services.alert_service import format_condition_display, evaluate_alert
+from fastmcp.exceptions import ToolError
+from services.alert_service import format_condition_display, evaluate_alert, normalize_channels
+from services.slack_service import get_user_webhook
 from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
@@ -30,6 +33,7 @@ _VALID_OPERATORS = "gt (>), lt (<), eq (=), neq (≠), pct_drop (% decrease), pc
 _VALID_PERIODS = "today, day (yesterday), week (last 7 days), month (last 30 days)"
 _VALID_TYPES = "win, warning"
 _VALID_FREQUENCIES = "realtime, hourly, daily, weekly"
+SLACK_WARNING = "Slack isn't connected, so this alert will only show in Birdy until you connect it."
 
 
 @mcp.tool(**READ)
@@ -86,7 +90,9 @@ _CREATE_ALERT_DESCRIPTION = (
     "(hp_agent_outbound, hp_agent_inbound, hp_agent_answered, hp_agent_convos, hp_agent_appts, hp_agent_talk_min, hp_agent_answer_rate). "
     "For GHL tags, use 'tag:TAG_NAME' as the metric (e.g., 'tag:Hot Lead', 'tag:booked consult hp'). "
     f"Valid metrics: {_VALID_METRICS}. Valid operators: {_VALID_OPERATORS}. "
-    f"Valid periods: {_VALID_PERIODS}. Valid types: {_VALID_TYPES}. Valid frequencies: {_VALID_FREQUENCIES}."
+    f"Valid periods: {_VALID_PERIODS}. Valid types: {_VALID_TYPES}. Valid frequencies: {_VALID_FREQUENCIES}. "
+    "notification_channels chooses where it notifies: in_app (default), slack, email. "
+    "If slack is chosen but Slack isn't connected, the alert is still created and the result carries a warning."
 )
 
 
@@ -101,8 +107,15 @@ async def create_alert(
     frequency: str = "daily",
     target_group_ids: list[str] | None = None,
     description: str = "",
+    notification_channels: list[Literal["in_app", "slack", "email"]] | None = None,
 ) -> dict:
+    """Create an alert. notification_channels picks where it notifies: "in_app" (default), "slack", "email".
+    If "slack" is chosen but Slack isn't connected, the alert is still created and the result has a warning."""
     user_id = _current_user_id()
+    try:
+        channels = normalize_channels(notification_channels) if notification_channels is not None else ["in_app"]
+    except ValueError as e:
+        raise ToolError(str(e))
     mongo_client = get_shared_mongo_client()
     db = get_db(mongo_client)
 
@@ -146,7 +159,7 @@ async def create_alert(
         },
         "target_group_ids": target_group_ids or [],
         "target_group_names": group_names,
-        "notification_channels": ["in_app"],
+        "notification_channels": channels,
         "frequency": frequency or "daily",
         "status": "active",
         "last_triggered_at": None,
@@ -177,14 +190,18 @@ async def create_alert(
     except Exception as e:
         logger.warning(f"Auto-evaluation failed for {alert_id}: {e}")
 
-    return {
+    result = {
         "success": True,
         "alert_id": alert_id,
         "name": name,
         "condition_display": format_condition_display(alert_doc["condition"]),
         "target_groups": group_names or ["all groups"],
+        "notification_channels": channels,
         "message": f"Alert '{name}' created successfully.{eval_msg}",
     }
+    if "slack" in channels and not await get_user_webhook(user_id, mongo_client):
+        result["warning"] = SLACK_WARNING
+    return result
 
 
 @mcp.tool(**WRITE)
@@ -201,6 +218,7 @@ async def update_alert(
     target_group_ids: list[str] | None = None,
     description: str | None = None,
     snooze_hours: int | None = None,
+    notification_channels: list[Literal["in_app", "slack", "email"]] | None = None,
 ) -> dict:
     """Update an existing alert. Only provided fields are changed.
 
@@ -220,9 +238,17 @@ async def update_alert(
         target_group_ids: New target group IDs.
         description: New description.
         snooze_hours: Snooze alert for this many hours.
+        notification_channels: Replace where it notifies: in_app, slack, email. Omit to leave unchanged.
     """
     user_id = _current_user_id()
-    db = get_db(get_shared_mongo_client())
+    mongo_client = get_shared_mongo_client()
+    db = get_db(mongo_client)
+    channels = None
+    if notification_channels is not None:
+        try:
+            channels = normalize_channels(notification_channels)
+        except ValueError as e:
+            raise ToolError(str(e))
 
     alert = await db["alerts"].find_one({"id": alert_id, "user_id": user_id})
     if not alert:
@@ -240,6 +266,8 @@ async def update_alert(
         update_fields["type"] = type
     if frequency is not None:
         update_fields["frequency"] = frequency
+    if channels is not None:
+        update_fields["notification_channels"] = channels
 
     if any(v is not None for v in (metric, operator, value, period)):
         condition = alert.get("condition", {})
@@ -279,9 +307,12 @@ async def update_alert(
 
     await db["alerts"].update_one({"id": alert_id}, {"$set": update_fields})
 
-    return {
+    result = {
         "success": True,
         "alert_id": alert_id,
         "updated_fields": [k for k in update_fields if k != "updated_at"],
         "message": f"Alert '{alert.get('name')}' updated.",
     }
+    if channels and "slack" in channels and not await get_user_webhook(user_id, mongo_client):
+        result["warning"] = SLACK_WARNING
+    return result

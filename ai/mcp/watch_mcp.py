@@ -5,13 +5,20 @@ check_my_accounts: the "watch my data" tool behind the daily check-in and weekly
 The logic lives in services/account_check.py.
 """
 
+import asyncio
+
 from fastmcp.exceptions import ToolError
 
 from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from services import alert_service
 from services.account_check import build_account_check
+from services.alert_history import fired_alerts
+from core.utils import mongo_to_dict
+
+EVAL_TIMEOUT_SECONDS = 20
 
 
 @mcp.tool(**READ)
@@ -39,3 +46,58 @@ async def check_my_accounts(days: int = 7) -> dict:
         raise ToolError("days must be a whole number between 1 and 90.")
     client = get_shared_mongo_client()
     return await build_account_check(get_db(client), client, _current_user_id(), days)
+
+
+@mcp.tool(**READ)
+async def get_fired_alerts(days: int = 7) -> dict:
+    """The alerts that fired in the last N days (1-90, default 7), newest first. Use it for "what went off?" and before explain_alert.
+
+    The alert job re-checks every 15 minutes and logs a row per pass while an alert stays triggered, so rows are
+    collapsed into one firing: consecutive rows of the same alert (and client) no more than 30 minutes apart are
+    one firing. Each firing has alert_id, alert_name, condition_display, group_id and client_name (null for
+    account-wide alerts), first_triggered_at, last_seen_at, count (how many passes it stayed triggered), message
+    and current_value.
+
+    Args:
+        days: Window length in days, 1-90.
+    """
+    if not isinstance(days, int) or isinstance(days, bool) or days < 1 or days > 90:
+        raise ToolError("days must be a whole number between 1 and 90.")
+    db = get_db(get_shared_mongo_client())
+    return {"days": days, "fired": await fired_alerts(db, _current_user_id(), days)}
+
+
+@mcp.tool(**READ)
+async def explain_alert(alert_id: str) -> dict:
+    """Explain one alert: why it fired or didn't. Use after get_fired_alerts or get_alerts.
+
+    Returns alert (its settings), condition_display, last_eval_result (the stored result of the last check,
+    including per_client_results), recent_notifications (the last 10 firing rows), and now: a fresh evaluation
+    run just now, labelled "now". If that fresh check fails or takes over 20 seconds, now is {"error": ...} and
+    everything else is still returned. This changes nothing: no state is saved and no notification is created.
+
+    Args:
+        alert_id: The alert's id.
+    """
+    user_id = _current_user_id()
+    client = get_shared_mongo_client()
+    db = get_db(client)
+    alert = await db["alerts"].find_one({"id": alert_id, "user_id": user_id})
+    if not alert:
+        raise ToolError(f"Alert '{alert_id}' not found.")
+    notes = await db["alert_notifications"].find(
+        {"alert_id": alert_id, "user_id": user_id}, {"_id": 0}).sort("triggered_at", -1).limit(10).to_list(None)
+    try:
+        now = await asyncio.wait_for(alert_service.evaluate_alert(dict(alert), client), timeout=EVAL_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError:
+        now = {"error": f"Fresh evaluation timed out after {EVAL_TIMEOUT_SECONDS}s."}
+    except Exception as e:
+        now = {"error": f"Fresh evaluation failed: {e}"}
+    d = mongo_to_dict(alert)
+    return {
+        "alert": d,
+        "condition_display": alert_service.format_condition_display(d.get("condition", {})),
+        "last_eval_result": d.get("last_eval_result"),
+        "recent_notifications": [mongo_to_dict(n) for n in notes],
+        "now": now,
+    }
