@@ -51,8 +51,13 @@ def token_scopes(claims: dict) -> set[str]:
     return set(str(scope).split())
 
 
+def _minute() -> int:
+    """The current fixed rate-limit window (patched in tests to pin the clock)."""
+    return int(time.time() // 60)
+
+
 async def _enforce_rate_limit(db, user_id: str) -> None:
-    minute = int(time.time() // 60)
+    minute = _minute()
     global _index_ready
     coll = db["mcp_rate"]
     if not _index_ready:

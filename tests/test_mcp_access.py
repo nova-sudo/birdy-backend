@@ -54,8 +54,14 @@ async def test_internal_access_token_skips_subscription_gate(mcp_call, no_subscr
     assert not res.is_error
 
 
+@pytest.fixture
+def pinned_minute(monkeypatch):
+    """121 calls take seconds; pin the fixed window so a minute boundary can't split them."""
+    monkeypatch.setattr("ai.mcp.access._minute", lambda: 28_333_333)
+
+
 @pytest.mark.asyncio
-async def test_external_calls_rate_limited_per_user(mcp_call):
+async def test_external_calls_rate_limited_per_user(mcp_call, pinned_minute):
     for _ in range(120):
         res = await mcp_call("get_alerts", {}, user="alice@example.com", token_type="mcp")
         assert not res.is_error
@@ -88,7 +94,7 @@ async def test_unknown_or_missing_type_cannot_write(mcp_call, token_type):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("token_type", [None, "refresh"])
-async def test_unknown_or_missing_type_is_rate_limited(mcp_call, token_type):
+async def test_unknown_or_missing_type_is_rate_limited(mcp_call, pinned_minute, token_type):
     for _ in range(120):
         res = await mcp_call("get_alerts", {}, token_type=token_type)
         assert not res.is_error
