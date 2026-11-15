@@ -36,6 +36,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "client_mcp": {"get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target"},
     "leads_mcp": {"get_lead", "get_lead_messages", "get_call_transcript", "send_lead_message"},
     "slack_reports_mcp": {"list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report"},
+    "report_designer_mcp": {"list_report_clients", "list_report_metrics", "get_report_draft", "preview_report", "propose_report"},
     "refresh_mcp": {"refresh_client_data", "refresh_status"},
     "watch_mcp": {"check_my_accounts", "get_fired_alerts", "explain_alert"},
     "prompts_mcp": set(),  # prompts only, no tools

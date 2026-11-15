@@ -30,6 +30,7 @@ from ai.mcp import attribution_mcp  # noqa: F401
 from ai.mcp import client_mcp  # noqa: F401
 from ai.mcp import leads_mcp  # noqa: F401
 from ai.mcp import slack_reports_mcp  # noqa: F401
+from ai.mcp import report_designer_mcp  # noqa: F401
 from ai.mcp import refresh_mcp  # noqa: F401
 from ai.mcp import watch_mcp  # noqa: F401
 from ai.mcp import prompts_mcp  # noqa: F401

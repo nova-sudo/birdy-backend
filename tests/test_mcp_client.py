@@ -58,6 +58,7 @@ async def test_mcp_tool_names_matches_server_registration():
                      "get_client", "get_client_notes", "add_client_note", "delete_client_note", "set_client_target",
                      "get_lead", "get_lead_messages", "get_call_transcript", "send_lead_message",
                      "list_slack_reports", "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
+                     "list_report_clients", "list_report_metrics", "get_report_draft", "preview_report", "propose_report",
                      "attribution_status", "leads_by_ad", "funnel", "attribution_overview",
                      "refresh_client_data", "refresh_status", "check_my_accounts", "get_fired_alerts", "explain_alert"}
     assert mcp_client.MCP_TOOL_NAMES == registered - external_only, (
