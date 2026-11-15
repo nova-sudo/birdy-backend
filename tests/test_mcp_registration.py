@@ -28,6 +28,11 @@ EXPECTED_TOOLS_BY_MODULE = {
                         "add_agent_lesson", "update_agent_settings", "set_agent_slack_template", "reset_agent_slack_template"},
     "custom_agent_mcp": {"get_agent_playbook", "get_agent_activity", "get_agent_history", "get_agent_claims", "get_agent_impact", "get_agent_confidence", "get_agent_proposals", "get_agent_memory", "get_agent_offers", "get_dry_run", "accept_proposal", "reject_proposal", "set_rule_param", "set_client_target_for_agent", "set_client_override", "add_agent_memory", "add_agent_exception", "set_agent_schedule", "set_agent_slack_channel", "delete_agent_memory", "graduate_rule", "start_dry_run", "deactivate_agent", "activate_agent", "undo_auto_action"},
     "suggestions_mcp": {"get_suggestions", "apply_suggestion", "deny_suggestion", "undo_suggestion"},
+    "multi_window_mcp": {"get_daily_metrics", "get_metrics_by_day_windows"},
+    "hp_mcp": {"get_call_center_stats"},
+    "call_analysis_mcp": {"get_call_recordings_summary", "analyze_call_recordings"},
+    "creatives_mcp": {"find_ads", "list_ad_accounts", "list_adsets", "list_creative_tests", "get_creative_test", "draft_creative_test", "post_creative_test", "scale_creative_test"},
+    "attribution_mcp": {"get_closes_by_ad"},
 }
 
 ALL_EXPECTED_TOOLS = set().union(*EXPECTED_TOOLS_BY_MODULE.values())
