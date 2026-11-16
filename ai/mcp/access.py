@@ -219,7 +219,7 @@ class BirdyAccessMiddleware(Middleware):
         db = get_db(get_shared_mongo_client()) if external else None
 
         try:
-            if external and READ_SCOPE not in token_scopes(claims):
+            if external and not token_scopes(claims) & {READ_SCOPE, WRITE_SCOPE}:  # a write token also reads
                 # A signed token with no Birdy scope (e.g. some other short-lived JWT) gets nothing, not even reads.
                 set_outcome("refused", reason="no_scope")
                 raise ToolError("This token does not grant access to Birdy. Reconnect Birdy to continue.")

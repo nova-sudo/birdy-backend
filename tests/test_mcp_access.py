@@ -90,9 +90,10 @@ async def test_unknown_or_missing_type_is_refused_even_for_reads(mcp_call, mock_
 
 
 @pytest.mark.asyncio
-async def test_scoped_token_without_read_scope_is_refused(mcp_call):
-    res = await mcp_call("get_alerts", {}, token_type="mcp", scope="birdy.write")
+async def test_scoped_token_with_no_birdy_scope_is_refused(mcp_call):
+    res = await mcp_call("get_alerts", {}, token_type="mcp", scope="openid profile")
     assert res.is_error and "does not grant access" in res.text
+    assert not (await mcp_call("get_alerts", {}, token_type="mcp", scope="birdy.write")).is_error
 
 
 def test_token_scopes_unknown_type_gets_nothing():
