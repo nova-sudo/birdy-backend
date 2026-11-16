@@ -151,16 +151,30 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
             await mcp_billing.charge_mcp_call(db, claims.get("sub"), tool=tool_name, grant_id=grant_id, chars=chars, live=live)
 
     async def record():
-        app_name = await _app_name(db, claims)
-        app_kind = mcp_activity.app_kind_for(app_name)
-        if okind == "refused" and outcome.get("reason") == "rate_limit":
+        reason = outcome.get("reason") if okind == "refused" else okind if okind in _FREE_OUTCOMES else None
+        rate_limited = okind == "refused" and outcome.get("reason") == "rate_limit"
+        # Analytics must not depend on Mongo: a failed lookup sends None and re-raises after the events fire.
+        app_name, name_error, credits, credits_error = None, None, None, None
+        try:
+            app_name = await _app_name(db, claims)
+        except Exception as exc:
+            name_error = exc
+        if not rate_limited:
+            try:
+                credits = _ZERO_CREDITS if free else await mcp_billing.charge_breakdown(db, chars, live)
+            except Exception as exc:
+                credits_error = exc
+        if rate_limited:
             posthog_events.capture(claims.get("sub"), "mcp_refused", {"tool": tool_name, "reason": "rate_limit"})
+        else:
+            _track(claims.get("sub"), tool_name, _kind_for(tags, okind), reason, live and not free,
+                   free or error is not None, credits["total"] if credits else None, chars, duration_ms, app_name)
+        if name_error or credits_error:
+            raise name_error or credits_error
+        app_kind = mcp_activity.app_kind_for(app_name)
+        if rate_limited:
             await mcp_activity.record_rate_limited(db, claims.get("sub"), grant_id, app_name, app_kind)
             return
-        credits = _ZERO_CREDITS if free else await mcp_billing.charge_breakdown(db, chars, live)
-        reason = outcome.get("reason") if okind == "refused" else okind if okind in _FREE_OUTCOMES else None
-        _track(claims.get("sub"), tool_name, _kind_for(tags, okind), reason, live and not free, free or error is not None,
-               credits["total"], chars, duration_ms, app_name)
         await mcp_activity.record_call(
             db, user_id=claims.get("sub"), grant_id=grant_id, app_name=app_name, app_kind=app_kind,
             access="write" if WRITE_SCOPE in token_scopes(claims) else "read",

@@ -190,14 +190,17 @@ async def list_connections(db, user_id: str) -> list[dict]:
 async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
     """Revoke a manual token or an OAuth grant (and all its tokens) owned by user_id."""
     now = datetime.utcnow()
+    token_doc = await db["mcp_tokens"].find_one(
+        {"id": connection_id, "user_id": user_id, "kind": {"$ne": "oauth"}}, {"name": 1, "revoked": 1})
     res = await db["mcp_tokens"].update_one(
         {"id": connection_id, "user_id": user_id, "kind": {"$ne": "oauth"}},
         {"$set": {"revoked": True, "revoked_at": now}},
     )
     if res.matched_count > 0:
-        doc = await db["mcp_tokens"].find_one({"id": connection_id}, {"name": 1})
-        posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (doc or {}).get("name")})
+        if not (token_doc or {}).get("revoked"):
+            posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (token_doc or {}).get("name")})
         return True
+    grant_doc = await db["oauth_grants"].find_one({"id": connection_id, "user_id": user_id}, {"client_name": 1, "revoked": 1})
     res = await db["oauth_grants"].update_one(
         {"id": connection_id, "user_id": user_id},
         {"$set": {"revoked": True, "revoked_at": now}},
@@ -208,6 +211,6 @@ async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
         {"grant_id": connection_id, "user_id": user_id},
         {"$set": {"revoked": True, "revoked_at": now}},
     )
-    grant = await db["oauth_grants"].find_one({"id": connection_id}, {"client_name": 1})
-    posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (grant or {}).get("client_name")})
+    if not (grant_doc or {}).get("revoked"):
+        posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (grant_doc or {}).get("client_name")})
     return True

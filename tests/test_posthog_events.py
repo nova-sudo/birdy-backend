@@ -112,6 +112,9 @@ async def test_refused_reason(ph, mcp_call, temp_tools):
     await drain()
     refused = events(ph, "mcp_refused")
     assert [e["properties"]["reason"] for e in refused] == ["view_only", "bad_code"]
+    called = events(ph, "mcp_tool_called")
+    assert [e["properties"]["kind"] for e in called if e["properties"]["tool"] != "zz_live_two_step"] == ["refused"]
+    assert [e["properties"]["kind"] for e in called if e["properties"]["tool"] == "zz_live_two_step"] == ["refused"]
     assert all(set(e["properties"]) == {"tool", "reason", "$lib"} for e in refused)
 
 
@@ -121,6 +124,7 @@ async def test_rate_limit_refusal_fires_refused(ph, mcp_call, monkeypatch):
     await mcp_call("get_alerts", {}, user=USER, token_type="mcp")
     await drain()
     assert [e["properties"]["reason"] for e in events(ph, "mcp_refused")] == ["rate_limit"]
+    assert events(ph, "mcp_tool_called") == []
 
 
 @pytest.mark.asyncio
@@ -130,6 +134,8 @@ async def test_connected_and_disconnected_fired(ph, mock_db):
     assert await mcp_token_service.revoke_connection(mock_db, USER, created["id"])
     assert await mcp_token_service.revoke_connection(mock_db, USER, "g1")
     assert not await mcp_token_service.revoke_connection(mock_db, USER, "nope")
+    assert await mcp_token_service.revoke_connection(mock_db, USER, created["id"])  # already revoked: no new event
+    assert await mcp_token_service.revoke_connection(mock_db, USER, "g1")
     await drain()
     (con,) = events(ph, "mcp_connected")
     assert con["properties"] == {"app_name": "Laptop", "access": "read", "method": "token", "$lib": "birdy-backend"}
@@ -149,3 +155,18 @@ async def test_oauth_approve_fires_connected_only_when_allowed(api, monkeypatch)
     assert api.post(f"/api/oauth/requests/{ok}/decision", json={"allow": True, "access": "write"}).status_code == 200
     assert seen == [("alice@example.com", "mcp_connected", {"app_name": "Claude", "access": "write", "method": "oauth"})]
 
+
+
+@pytest.mark.asyncio
+async def test_events_fire_and_result_returns_when_mongo_lookups_raise(ph, mcp_call, monkeypatch):
+    async def boom(*a, **k):
+        raise RuntimeError("mongo down")
+
+    monkeypatch.setattr("ai.mcp.access._app_name", boom)
+    monkeypatch.setattr("ai.mcp.access.mcp_billing.charge_breakdown", boom)
+    res = await mcp_call("get_alerts", {}, user=USER, token_type="mcp")
+    await drain()
+    assert not res.is_error
+    (ev,) = events(ph, "mcp_tool_called")
+    assert ev["properties"]["app_name"] is None and ev["properties"]["credits_total"] is None
+    assert set(ev["properties"]) == TOOL_CALLED_KEYS | {"$lib"}

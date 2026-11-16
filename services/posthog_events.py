@@ -15,20 +15,18 @@ from core import config
 logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 2.0
-_client: httpx.AsyncClient | None = None
 _tasks: set = set()  # strong refs so in-flight sends aren't garbage-collected
-
-
-def _get_client() -> httpx.AsyncClient:
-    global _client
-    if _client is None:
-        _client = httpx.AsyncClient(timeout=_TIMEOUT_SECONDS)
-    return _client
+_client = None  # tests inject a fake; production creates one client per send
 
 
 async def _send(payload: dict) -> None:
     try:
-        await _get_client().post(f"{config.POSTHOG_HOST}/i/v0/e/", json=payload)
+        url = f"{config.POSTHOG_HOST}/i/v0/e/"
+        if _client is not None:
+            await _client.post(url, json=payload)
+        else:  # a client per send: never bound to a loop that has since closed
+            async with httpx.AsyncClient(timeout=_TIMEOUT_SECONDS) as client:
+                await client.post(url, json=payload)
     except Exception as exc:
         logger.warning("PostHog capture failed for %s: %r", payload.get("event"), exc)
 
