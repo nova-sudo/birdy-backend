@@ -86,6 +86,8 @@ async def test_list_filters_and_cursor(api):
     wide = api.get("/api/mcp/activity", params={"from": (_ago(days=40)).date().isoformat()}).json()["items"]
     assert "old" in [i["id"] for i in wide]
     assert api.get("/api/mcp/activity", params={"from": "nope"}).status_code == 400
+    assert api.get("/api/mcp/activity", params={"from": "2026-11-10junk"}).status_code == 400
+    assert api.get("/api/mcp/activity", params={"to": "2026-11-10T05:00"}).status_code == 400
     assert api.get("/api/mcp/activity", params={"cursor": "###"}).status_code == 400
 
 

@@ -40,7 +40,7 @@ def _iso(dt: datetime | None) -> str | None:
 
 def _parse_day(value: str, name: str) -> datetime:
     try:
-        return datetime.strptime(value[:10], "%Y-%m-%d") if len(value) >= 10 else datetime.fromisoformat(value)
+        return datetime.strptime(value, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(status_code=400, detail=f"`{name}` must be an ISO date (YYYY-MM-DD)")
 
