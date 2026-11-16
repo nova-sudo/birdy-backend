@@ -68,6 +68,7 @@ async def test_list_filters_and_cursor(api):
     hit = api.get("/api/mcp/activity", params={"client_group_id": "cg1"}).json()["items"]
     assert hit[0]["clients"] == [{"id": "cg1", "name": "Acme"}]
     assert hit[0]["credits"] == {"total": 0.5}
+    assert hit[0]["refusal_reason"] is None
 
     ids = [i["id"] for i in api.get("/api/mcp/activity").json()["items"]]
     assert "old" not in ids and "bobs" not in ids  # default 7 days, own rows only
@@ -118,12 +119,15 @@ async def test_totals_first_page_only(api):
 
 @pytest.mark.asyncio
 async def test_detail_owner_only_404(api):
-    await seed(api.db, row("mine", _ago(hours=1)), row("bobs", _ago(hours=1), user=BOB))
+    await seed(api.db, row("mine", _ago(hours=1), tool="get_alerts", kind="refused", refusal_reason="view_only"),
+               row("bobs", _ago(hours=1), user=BOB))
+    assert api.get("/api/mcp/activity").json()["items"][0]["refusal_reason"] == "view_only"
     ok = api.get("/api/mcp/activity/mine")
     assert ok.status_code == 200
     body = ok.json()
     assert body["args"] == {"secret_arg": "x"} and body["result_excerpt"] == "EXCERPT"
     assert "user_id" not in body and "_id" not in body
+    assert body["tool_label"] == "Checked alerts"
     assert api.get("/api/mcp/activity/bobs").status_code == 404
     assert api.get("/api/mcp/activity/nope").status_code == 404
 

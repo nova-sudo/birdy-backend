@@ -16,6 +16,7 @@ from fastapi.responses import Response
 
 from core.database import get_db
 from dependencies import get_mongo_client, get_current_user
+from ai.mcp.activity_labels import LABELS
 from services.mcp_activity import COLLECTION
 
 logger = logging.getLogger(__name__)
@@ -106,6 +107,7 @@ def _list_item(row: dict, revoked: dict[str, bool]) -> dict:
         "app_name": row.get("app_name"),
         "app_kind": row.get("app_kind"),
         "kind": row.get("kind"),
+        "refusal_reason": row.get("refusal_reason"),
         "summary": row.get("summary"),
         "clients": _clients(row),
         "credits": {"total": (row.get("credits") or {}).get("total", 0)},
@@ -226,4 +228,5 @@ async def get_activity(activity_id: str, current_user: str = Depends(get_current
     entry["created_at"] = _iso(row["created_at"])
     entry["clients"] = _clients(row)
     entry["revoked"] = bool(revoked.get(row.get("grant_id"), False))
+    entry["tool_label"] = (LABELS.get(row.get("tool")) or {}).get("label")
     return entry
