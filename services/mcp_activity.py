@@ -29,6 +29,8 @@ _EMAIL = re.compile(r"([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za
 # and an ISO date inside the run means a datetime, so neither is masked. Known over-mask: a bare 10-digit
 # unix timestamp looks exactly like a US number.
 _PHONE = re.compile(r"(?<![\w])\+?\(?\d[\d\s().-]{8,}\d(?![\d:])")
+# A confirm_code inside text-only output (JSON text or "confirm_code: abc"): the code value is replaced.
+_CONFIRM_CODE = re.compile(r"""(confirm_code["']?\s*[:=]\s*["']?)[^\s"',}]+""", re.I)
 _PHONE_KEYS = {"phone", "phone_number", "phonenumber", "mobile", "cell", "to_number", "from_number"}
 _EMAIL_KEYS = {"email", "email_address", "emailaddress"}
 
@@ -162,7 +164,7 @@ def _excerpt(result) -> str | None:
         return None
     text = result if isinstance(result, str) else json.dumps(redact(result), default=str, ensure_ascii=False)
     if isinstance(result, str):
-        text = _mask_text(text)
+        text = _mask_text(_CONFIRM_CODE.sub(r"\1••••••", text))
     return text[:EXCERPT_CHARS]
 
 
@@ -171,7 +173,7 @@ def _now() -> datetime:
 
 
 async def record_call(db, *, user_id, grant_id, app_name, app_kind, access, tool, kind, refusal_reason, args, result,
-                      result_status, credits, chars, duration_ms, confirmed_after, clients=None) -> str:
+                      result_status, credits, chars, duration_ms, confirmed_after, clients=None, created_at=None) -> str:
     """Insert one activity row and return its id (the activity id the middleware pre-allocated)."""
     from uuid import uuid4
 
@@ -198,16 +200,17 @@ async def record_call(db, *, user_id, grant_id, app_name, app_kind, access, tool
         "credits": credits,
         "response_chars": chars,
         "duration_ms": duration_ms,
-        "created_at": _now(),
+        "created_at": created_at or _now(),
     })
     return activity_id
 
 
-async def record_rate_limited(db, user_id: str, grant_id: str | None, app_name: str | None, app_kind: str = "other"):
+async def record_rate_limited(db, user_id: str, grant_id: str | None, app_name: str | None, app_kind: str = "other",
+                              created_at=None):
     """Count a rate-limited refusal on this user's row for the current minute (one row per user per minute)."""
     from uuid import uuid4
 
-    now = _now()
+    now = created_at or _now()
     minute = now.replace(second=0, microsecond=0)
     await db[COLLECTION].update_one(
         {"user_id": user_id, "kind": "refused", "refusal_reason": "rate_limit", "minute": minute},
@@ -244,5 +247,5 @@ def app_kind_for(app_name: str | None) -> str:
 async def create_mcp_activity_indexes(mongo_client):
     coll = mongo_client[DB_NAME][COLLECTION]
     await coll.create_index("created_at", expireAfterSeconds=RETENTION_SECONDS)
-    await coll.create_index([("user_id", 1), ("created_at", -1)])
+    await coll.create_index([("user_id", 1), ("created_at", -1), ("id", -1)])
     await coll.create_index("id", unique=True)

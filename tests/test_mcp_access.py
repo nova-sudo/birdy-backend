@@ -85,8 +85,8 @@ async def test_unknown_or_missing_type_is_refused_even_for_reads(mcp_call, mock_
     assert res.is_error and "does not grant access" in res.text
     res = await mcp_call("create_alert", ALERT_ARGS, token_type=token_type)
     assert res.is_error and "does not grant access" in res.text
-    # Refused before any rate-limit bucket is touched.
-    assert await mock_db["mcp_rate"].count_documents({}) == 0
+    # Refusals are rate-limited too (the limit runs first), so a looping client cannot flood the activity log.
+    assert (await mock_db["mcp_rate"].find_one({}))["count"] == 2
 
 
 @pytest.mark.asyncio

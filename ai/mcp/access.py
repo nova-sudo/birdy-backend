@@ -100,7 +100,7 @@ def _result_payload(result):
 def _kind_for(tags: set, outcome_kind: str | None) -> str:
     if outcome_kind == "preview":
         return "preview"
-    if outcome_kind == "live_executed":
+    if outcome_kind == "live_executed" and "live" in tags:
         return "live"
     if outcome_kind in _FREE_OUTCOMES:
         return "refused"
@@ -132,7 +132,8 @@ def _track(user_id, tool, kind, reason, live_ok, failed, credits_total, chars, d
         posthog_events.capture(user_id, "mcp_live_confirmed", {"tool": tool, "app_name": app_name})
 
 
-async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: dict, result, error, started: float) -> None:
+async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: dict, result, error, started: float,
+                             started_at: datetime | None = None) -> None:
     """Charge (when the call earned a charge) and write the activity row, concurrently.
 
     The row stores the price the charge formula gives (so a slow or failed charge still logs the amount).
@@ -141,7 +142,8 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
     okind = outcome.get("kind")
     structured = getattr(result, "structured_content", None)
     free = okind in _FREE_OUTCOMES or error is not None or is_error_result(structured)
-    live = okind == "live_executed"
+    # A confirmed two_step call is "live_executed"; only a LIVE-tagged tool pays the live fee.
+    live = okind == "live_executed" and "live" in tags
     chars = response_chars(result) if result is not None else 0
     grant_id = claims.get("grant_id") or claims.get("jti")
     duration_ms = int((time.monotonic() - started) * 1000)
@@ -173,7 +175,7 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
             raise name_error or credits_error
         app_kind = mcp_activity.app_kind_for(app_name)
         if rate_limited:
-            await mcp_activity.record_rate_limited(db, claims.get("sub"), grant_id, app_name, app_kind)
+            await mcp_activity.record_rate_limited(db, claims.get("sub"), grant_id, app_name, app_kind, created_at=started_at)
             return
         await mcp_activity.record_call(
             db, user_id=claims.get("sub"), grant_id=grant_id, app_name=app_name, app_kind=app_kind,
@@ -182,6 +184,7 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
             result=str(error) if error is not None else _result_payload(result),
             result_status="error" if (free or error is not None) else "ok",
             credits=credits, chars=chars, duration_ms=duration_ms, confirmed_after=outcome.get("confirmed_after"),
+            created_at=started_at,
         )
 
     for name, outcome_of in zip(("charge", "activity log"), await asyncio.gather(charge(), record(), return_exceptions=True)):
@@ -189,13 +192,13 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
             logger.warning("MCP %s failed for %s: %r", name, tool_name, outcome_of)
 
 
-async def _finish_call(db, claims, tool_name, tags, args, result, error, started) -> None:
+async def _finish_call(db, claims, tool_name, tags, args, result, error, started, started_at=None) -> None:
     """Charge and log one external call within the latency budget.
 
     The work runs as its own task, shielded from the timeout's cancel: a deduction is followed by its
     ledger row (see credits._apply_charge) and a cancel between the two would lose that row. On timeout we
     warn and return the result; the task keeps running to completion."""
-    task = asyncio.ensure_future(_charge_and_record(db, claims, tool_name, tags, args, result, error, started))
+    task = asyncio.ensure_future(_charge_and_record(db, claims, tool_name, tags, args, result, error, started, started_at))
     _background.add(task)
     task.add_done_callback(_background.discard)
     try:
@@ -209,6 +212,7 @@ class BirdyAccessMiddleware(Middleware):
         reset_outcome()
         start_activity()
         started = time.monotonic()
+        started_at = datetime.now(timezone.utc)
         token = get_access_token()
         claims = token.claims if token else {}
         tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
@@ -219,6 +223,10 @@ class BirdyAccessMiddleware(Middleware):
         db = get_db(get_shared_mongo_client()) if external else None
 
         try:
+            if external:
+                # First, so a looping client's refusals are bounded too (a rate-limit refusal is free and collapses to one row).
+                await _enforce_rate_limit(db, claims.get("sub"))
+
             if external and not token_scopes(claims) & {READ_SCOPE, WRITE_SCOPE}:  # a write token also reads
                 # A signed token with no Birdy scope (e.g. some other short-lived JWT) gets nothing, not even reads.
                 set_outcome("refused", reason="no_scope")
@@ -244,13 +252,12 @@ class BirdyAccessMiddleware(Middleware):
                 if not await mcp_billing.has_credits(db, claims.get("sub")):
                     set_outcome("refused", reason="out_of_credits")
                     raise ToolError(mcp_billing.OUT_OF_CREDITS_MESSAGE)
-                await _enforce_rate_limit(db, claims.get("sub"))
 
             result = await call_next(context)
         except Exception as exc:
             if external:
-                await _finish_call(db, claims, context.message.name, tool.tags or set(), args, None, exc, started)
+                await _finish_call(db, claims, context.message.name, tool.tags or set(), args, None, exc, started, started_at)
             raise
         if external:
-            await _finish_call(db, claims, context.message.name, tool.tags or set(), args, result, None, started)
+            await _finish_call(db, claims, context.message.name, tool.tags or set(), args, result, None, started, started_at)
         return result
