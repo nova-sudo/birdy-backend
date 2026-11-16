@@ -59,7 +59,7 @@ A view-only connection that tries to change something is refused with a clear me
 
 ## What it can do
 
-The connector has 113 tools in the families below. The full list, generated from the server, is in the [appendix](#tool-reference). In plain terms:
+The connector has 119 tools in the families below. The full list, generated from the server, is in the [appendix](#tool-reference). In plain terms:
 
 - **Check-in** (`watch`): `check_my_accounts` gives one verdict per client (who needs you and why). `get_fired_alerts` and `explain_alert` cover what went off.
 - **Clients** (`group`, `client`, `summary`, `compare`, `multi_window`, `meta`, `meta_live`, `ghl`, `hp`, `leads`, `unified_leads`, `attribution`, `call_analysis`, `custom_metrics`): find a client, read its notes and targets, metrics, period comparisons, Meta and GoHighLevel numbers, leads and call recordings, tracking status, and your own custom metrics. You can add or remove client notes and set targets.
@@ -69,6 +69,8 @@ The connector has 113 tools in the families below. The full list, generated from
 - **Creatives** (`creatives`): find ads and ad accounts, list and open creative tests, draft a test, post it, scale a winner.
 - **Alerts** (`alert`): list, create and edit alerts.
 - **Slack reports** (`slack_reports`): list, create, edit and delete reports; send a test.
+- **Reply to leads** (`leads`): `send_lead_message` sends a real SMS or email to a lead through GoHighLevel, from the client's own number or address. It can't be undone, so it uses the confirm code flow below: the preview shows who it goes to (phone or email partly hidden), the channel, the subject and the exact message. Send the same text in the second call or it is refused. A message can be up to 1600 characters.
+- **Report designer** (`report_designer`): `preview_report` shows a Slack report as the real message with your numbers. `propose_report` saves a draft of the schedule and the whole Slack message. Your live report does not change until you save the draft in Birdy's report designer.
 - **Refresh** (`refresh`): refresh one client's data and check where it stands.
 
 The server also offers ready-made prompts: a weekly client review, "why did CPL jump?", prep for a client call, and the agent's week. **Settings → Connect to AI** has a daily check-in prompt you can paste into a scheduled Claude task.
@@ -88,6 +90,41 @@ A confirm code:
 
 If a name is ambiguous ("Acme" matches "Acme Dental" and "Acme Law"), the tool returns the candidates and changes nothing.
 
+## Credits and the activity log
+
+### What a request costs
+
+Every request from a connected app uses Birdy credits. The price depends on how much data comes back:
+
+```
+base fee + per-10k-characters rate x (response characters / 10,000) + live fee
+```
+
+The live fee only applies when a change to live ads is actually carried out with a valid confirm code. The total is rounded to 2 decimals and capped per call. The admin markup is not applied: the rates are exactly what the user pays.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `mcp_base_fee` | 0.2 | Every charged request. |
+| `mcp_per_10k_chars` | 1.0 | Per 10,000 characters of the response. |
+| `mcp_live_fee` | 1.0 | Added when a live change runs after a confirm code. |
+| `mcp_max_per_call` | 10 | The most one request can cost. |
+
+The first step of a live tool (the preview) is a normal request, with no live fee.
+
+**Free.** A call that is refused or fails costs nothing: view-only access, no subscription, out of credits, the rate limit, a bad or expired confirm code, a changed state, a tool that raises an error, or a result with `ok: false` or a top-level `error`.
+
+**Out of credits.** When credit enforcement is on, a call is refused before it runs and the message tells the owner to top up in **Settings → Billing**. When enforcement is off, calls are metered but not blocked. The charge comes out of the account owner's balance and shows in the usual credit usage history (`source: "mcp"`, `feature: "mcp_request"`). If charging fails, the request still succeeds. Features that already meter AI use (lead summary, call analysis, lesson shaping) keep doing so on top.
+
+**Admin settings.** An admin sets the four values in the credits settings with `PUT /api/admin/credits/config` (`mcp_base_fee`, `mcp_per_10k_chars`, `mcp_live_fee`, `mcp_max_per_call`). Each is a number from 0 to 100. Changes apply with no deploy.
+
+### Activity log
+
+**Settings → Connect to AI**, below **Your connections**, has an activity log: a table of what connected apps did. Each row shows the time, the app, what happened, the kind (look-up, change, preview, live change or refused) and the credits. The header says how many requests and credits the period covers. You can filter by app, kind, client and period (7, 30 or 90 days), and **Export CSV**.
+
+Click a row to open a side panel with the details: the app and its access level, the tool and client, the result, what was asked, what Birdy did, and the credit breakdown (request, data, live). A preview and the change it led to link to each other. When the entry is about an agent card, a suggestion or a creative test, the panel links to that page in Birdy. Nothing is undone from the log. On mobile the panel fills the screen.
+
+The log never stores tokens or confirm codes. Phone numbers and emails are partly hidden. Message bodies are kept, so you can see exactly what was sent to a lead. Entries are kept for **180 days**, then removed. Too many requests in a minute (the rate limit) show as one row per minute with a count.
+
 ## Alerts and emails
 
 You can have Birdy email you when an alert fires. Turn on **Also email me** in the alert form on the Alerts page, or ask Claude to create the alert with email as a notification channel.
@@ -103,19 +140,19 @@ You can have Birdy email you when an alert fires. Turn on **Also email me** in t
 
 By design, an outside AI app can't:
 
-- touch **billing**, plans or credits;
+- touch **billing** or plans, or top up credits;
 - connect or remove **integrations** (Meta, GoHighLevel, Slack and so on);
 - change **account settings** or install tracking;
 - use any **admin** tool;
 - run the **refresh-all** cycle (it can refresh one client at a time).
 
-Connecting an app uses none of your credits. Connector calls are limited to 120 a minute per user.
+Connector requests use credits (see [Credits and the activity log](#credits-and-the-activity-log)); connecting an app does not. Connector calls are limited to 120 a minute per user.
 
 ## Revoking access
 
 Open **Settings → Connect to AI**. Every connected app (and every developer token) is listed with its access level and when it was last used. Click **Disconnect** on a connection and it stops working at once: the very next call with that app's current access is refused, not an hour later. You can reconnect any time.
 
-If your subscription lapses, connector calls stop with a message to reactivate.
+If your subscription lapses, connector calls stop with a message to reactivate. If you run out of credits, they stop with a message to top up.
 
 ## Known limits (v1)
 
@@ -152,12 +189,27 @@ Birdy is an OAuth 2.1 authorization server and an MCP resource server in one Fas
 | Manual token | Created in Settings → Connect to AI, `DEFAULT_EXPIRY_DAYS = 365`. |
 | Revocation | Every call re-checks the grant, so revoking in Birdy (`DELETE /api/mcp/connections/{id}`) takes effect on the next call. |
 | Rate limit | 120 calls per minute per user for external tokens (counted in Mongo). |
-| Subscription | External calls need an `active` or `trialing` subscription. No credits are charged. |
-| Internal calls | Ask Birdy's own orchestrator uses `type: "access"` tokens, skips these two gates and keeps its credit metering. |
+| Subscription | External calls need an `active` or `trialing` subscription. |
+| Credits | Every successful external call is charged (see [Credits and the activity log](#credits-and-the-activity-log)). With enforcement on, a call with no credits left is refused. Refused and failed calls are free. |
+| Internal calls | Ask Birdy's own orchestrator uses `type: "access"` tokens, skips these gates, the activity log and the request charge, and keeps its own credit metering. |
 
 `user_id` is always taken from the verified token, never from a tool argument.
 
 A token with no Birdy scope (neither `birdy.read` nor `birdy.write`) is refused for every tool, reads included. Admins viewing as a user cannot mint manual tokens.
+
+### Refusals
+
+A refused call is free, is logged with a reason and sends an `mcp_refused` event. The reasons:
+
+| Reason | Why |
+|---|---|
+| `no_scope` | The token has neither `birdy.read` nor `birdy.write`. |
+| `view_only` | A view-only token called a tool that makes changes. |
+| `no_subscription` | The subscription is not `active` or `trialing`. |
+| `out_of_credits` | Enforcement is on and the balance is 0 or less. |
+| `rate_limit` | More than 120 calls in a minute. Logged as one row per minute, with a count. |
+| `bad_code` | A live tool got a missing, expired, used or mismatched confirm code. |
+| `state_changed` | The confirm code was fine, but the thing it was previewed on has changed since. Ask for a new preview. |
 
 ### Error shapes
 
@@ -170,7 +222,34 @@ Raise `ToolError` for not-found and bad input. Return `{"ok": false, "error": ".
 | `API_PUBLIC_URL` | Public URL of the API. The OAuth issuer, and `{API_PUBLIC_URL}/mcp` is the connector link. Default `https://birdy-backend.vercel.app`. |
 | `FRONTEND_URL` | Where the consent page lives. Default `https://birdy-beta.vercel.app`. |
 | `RESEND_API_KEY` | Sends alert emails. Without it, emails are skipped. |
+| `POSTHOG_API_KEY` | Project key for server-side PostHog events. Without it, no events are sent. |
+| `POSTHOG_HOST` | PostHog host. Default `https://us.i.posthog.com`. |
 | `EMAIL_FROM` | Sender. Default `Birdy <alerts@birdy.ai>`; the domain must be verified in Resend. |
+
+### Activity API
+
+All endpoints need the Birdy login and only return the signed-in user's own entries. Entries live in the `mcp_activity` collection, one per external call, with a TTL index of 180 days (`services/mcp_activity.py`).
+
+| Endpoint | What it does |
+|---|---|
+| `GET /api/mcp/activity` | A page of entries, newest first, 50 at most. Filters: `app` (grant or token id), `kind` (`lookup`, `change`, `preview`, `live`, `refused`), `client_group_id`, `from`, `to`, `confirmed_after` (the entries that confirmed a given preview). Default period is the last 7 days. Pass the returned `next_cursor` as `cursor` for the next page. The first page also returns `totals` (requests and credits for the whole filtered period). |
+| `GET /api/mcp/activity/apps` | The apps seen in the log, including disconnected ones (marked `revoked`). |
+| `GET /api/mcp/activity/{id}` | One entry in full (redacted args, result excerpt, credits, `confirmed_after`, `link`). `404` for anyone but the owner. |
+| `GET /api/mcp/activity.csv` | The filtered list as CSV: time, app, kind, summary, client, result, credits. No arguments. At most 10,000 rows. |
+
+Logging, charging and events run after the tool returns and never change its result. The charge and the log write share a 300 ms budget. If it runs out, a warning is logged and the result is still returned.
+
+### PostHog events
+
+`services/posthog_events.py` sends events from the server (fire-and-forget, 2 s timeout) when `POSTHOG_API_KEY` is set. The `distinct_id` is the Birdy user id. No message text, arguments or client names are sent.
+
+| Event | When |
+|---|---|
+| `mcp_connected` | A grant is approved, or a manual token is created. |
+| `mcp_disconnected` | A connection is revoked. |
+| `mcp_tool_called` | Each external call (tool, kind, result status, credits, response size, duration, app name). |
+| `mcp_live_confirmed` | A live change ran after a valid confirm code. |
+| `mcp_refused` | A refused call (tool and reason). |
 
 ### Checking it locally
 
@@ -186,7 +265,7 @@ The script creates one throwaway user in the database named in `.env`, runs the 
 Generated from the registered tools with `python scripts/mcp_tool_table.py`. "make changes + confirm code" tools use the two-step flow above.
 
 
-<!-- 113 tools; generated by scripts/mcp_tool_table.py -->
+<!-- 119 tools; generated by scripts/mcp_tool_table.py -->
 
 ### agent
 
@@ -269,7 +348,7 @@ Generated from the registered tools with `python scripts/mcp_tool_table.py`. "ma
 | `get_agent_playbook` | view | A custom agent's playbook: each rule's params, mode and per-client overrides, each client's CPL target and currency, and which setup steps are done. |
 | `get_agent_proposals` | view | The rule changes (and "make it a rule?" suggestions) a custom agent proposes from what the owner denied, newest first. |
 | `get_dry_run` | view | Poll a dry run started with start_dry_run: its status, and its result (what the agent would have done over the last 30 days) once done. |
-| `graduate_rule` | make changes | Answer a graduation offer from get_agent_offers: let the rule run on its own (and tell the owner, or not), or keep asking first. |
+| `graduate_rule` | make changes + confirm code | Answer a graduation offer from get_agent_offers: let the rule run on its own (and tell the owner, or not), or keep asking first. |
 | `reject_proposal` | make changes | Say no to a proposal. |
 | `set_agent_schedule` | make changes | Set the daily time a custom agent runs and reports. |
 | `set_agent_slack_channel` | make changes | Choose the Slack channel a custom agent posts to, by channel id or name. |
@@ -320,6 +399,7 @@ Generated from the registered tools with `python scripts/mcp_tool_table.py`. "ma
 | `get_call_transcript` | view | The transcript of one recorded call with a lead, as plain text. |
 | `get_lead` | view | Everything Birdy knows about one lead: contact details, opportunities and their stages, ad attribution (campaign, ad, form answers), calls, a newest-first journey timeline (ad click, form fill, site visits, calls, appointments, stage changes) and a short AI summary of the lead. |
 | `get_lead_messages` | view | The live GoHighLevel conversation with one lead: SMS and email messages oldest first, plus call records that are not already logged. |
+| `send_lead_message` | make changes + confirm code | Send a real SMS or email to a lead through GoHighLevel, from the client's own GoHighLevel number or address. |
 
 ### meta
 
@@ -351,6 +431,16 @@ Generated from the registered tools with `python scripts/mcp_tool_table.py`. "ma
 |---|---|---|
 | `refresh_client_data` | make changes | Start a fresh pull of one client's ad data from Meta, its GoHighLevel leads and opportunities, or both. |
 | `refresh_status` | view | Where a client's data refresh stands: for Meta and for GoHighLevel, its status ("idle", "running", "complete", "error", or GoHighLevel "stale"), the last error if any, and for Meta the job's progress (status, current step, presets done of total). |
+
+### report_designer
+
+| Tool | Access | What it does |
+|---|---|---|
+| `get_report_draft` | view | The owner's current report draft and their saved (live) report, either of which may be null. |
+| `list_report_clients` | view | The owner's active clients as the report designer sees them: each one's id, name, which data sources are connected (Meta, GoHighLevel, HotProspector) and whether targets are set. |
+| `list_report_metrics` | view | What a Slack report can contain: the metrics (id, label, data source, whether available and whether a target comparison exists), the periods, the placeholder syntax (e.g. |
+| `preview_report` | view | Render a report as the real Slack message with the owner's own numbers (sample figures when they have none yet). |
+| `propose_report` | make changes | Save a Slack report as the owner's DRAFT: the schedule plus the WHOLE Block Kit message. |
 
 ### slack_reports
 
@@ -384,7 +474,7 @@ Generated from the registered tools with `python scripts/mcp_tool_table.py`. "ma
 | `reset_agent_slack_template` | make changes | Go back to the default for one of the agent's Slack message templates. |
 | `set_agent_slack_template` | make changes | Replace one of the agent's Slack message templates. |
 | `undo_card_line` | make changes + confirm code | Reverse one applied line on the client's live Meta ads (only soon after it was applied). |
-| `update_agent_settings` | make changes | Change the Birdy Media Buying Agent's settings and which clients it watches. |
+| `update_agent_settings` | make changes + confirm code | Change the Birdy Media Buying Agent's settings and which clients it watches. |
 
 ### suggestions
 
