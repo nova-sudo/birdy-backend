@@ -58,6 +58,13 @@ async def oauth_callback(code: str, response: Response, current_user: str = Depe
             return {"redirect_url": redirect_url}
         try:
             await save_agency_token(current_user, result, mongo_client)
+            # Groups that failed on the dead token sit in a 6h back-off; the
+            # reconnect is what they were waiting for, so let the next tick
+            # (every minute) take them now.
+            await mongo_client[DB_NAME]["client_groups"].update_many(
+                {"user_id": current_user, "_ghl_retry_after": {"$ne": None}},
+                {"$unset": {"_ghl_retry_after": ""}},
+            )
         except Exception as e:
             logger.error(f"Failed to save GoHighLevel agency tokens: {str(e)}")
             redirect_url = f"https://birdy-beta.vercel.app/settings?tab=integrations&status=error&error={urllib.parse.quote(str(e))}"
