@@ -254,3 +254,25 @@ async def test_overlapping_runs_email_once(mock_db, mock_mongo_client, sent, mon
 
     assert len(sent) == 1
     assert await mock_db["alert_notifications"].count_documents({}) == 1
+
+
+def test_email_card_shows_now_limit_and_pill():
+    alert = {"id": "a1", "name": "CPL above $40", "type": "warning",
+             "condition": {"metric": "cpl", "operator": "gt", "value": 40}}
+    result = {"message": "Triggered for: Glow Clinic", "current_value": 47.2,
+              "per_client_results": [{"group_name": "Glow Clinic", "triggered": True}]}
+    _, html, text = es.render_alert_email(alert, result)
+    assert "Alert triggered" in html and "$47.20" in html and "Alerts above" in html and "$40.00" in html and "Glow Clinic" in html
+    assert "Now: $47.20" in text and "Alerts above: $40.00" in text
+    assert "/birdy-mascot-VmH3J7Wq.png" in html
+
+
+def test_email_win_pill_and_percent_limits():
+    win = {"id": "a2", "name": "CTR up", "type": "win", "condition": {"metric": "ctr", "operator": "pct_rise", "value": 20}}
+    _, html, text = es.render_alert_email(win, {"message": "m", "current_value": 3.456})
+    assert "Win" in html and "3.5%" in html and "20% rise" in html and text.startswith("Win: CTR up")
+
+
+def test_email_without_condition_skips_numbers():
+    _, html, text = es.render_alert_email({"id": "a3", "name": "n"}, {"message": "m"})
+    assert "Alerts" not in html and "Now:" not in text
