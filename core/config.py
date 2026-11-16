@@ -28,6 +28,11 @@ API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://birdy-backend.vercel.app")
 # PostHog server-side events (services/posthog_events.py). Without a key, events are skipped.
 POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY", "")
 POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com").rstrip("/")
-# Alert emails (services/email_service.py). Without a key, email sending is skipped.
-RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
-EMAIL_FROM = os.getenv("EMAIL_FROM", "Birdy <alerts@birdy.ai>")
+# Alert emails over SMTP (services/email_service.py), same settings as nodemailer. Without SMTP_HOST/USER/PASS,
+# email sending is skipped. Gmail: host smtp.gmail.com, port 465, secure true, pass = a Google app password.
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "465") or 465)
+SMTP_SECURE = os.getenv("SMTP_SECURE", "true").strip().lower() in ("1", "true", "yes")  # true = SSL (465), false = STARTTLS (587)
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "") or (f"Birdy <{SMTP_USER}>" if SMTP_USER else "Birdy <alerts@birdy.ai>")

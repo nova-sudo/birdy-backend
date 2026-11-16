@@ -160,7 +160,7 @@ If your subscription lapses, connector calls stop with a message to reactivate. 
 - **GoHighLevel refresh may need a second call.** If `refresh_status` shows **stale** for GoHighLevel, the refresh stopped partway: call `refresh_client_data` again. A GoHighLevel refresh started from Claude can also lag by up to about 10 minutes before it begins.
 - **The Slack test preview leaves out the "Birdy's take" line.** The preview says one is written at send time; the real message includes it.
 - **Ask Birdy can't set email when it creates an alert.** Alerts created in Birdy's own chat are in-app only. Switch **Also email me** on afterwards in the alert form, or create the alert from Claude with `notification_channels`.
-- Alert emails need the sender to be configured on the server (`RESEND_API_KEY`); without it alerts still fire in the app and Slack.
+- Alert emails need the sender to be configured on the server (`SMTP_HOST`, `SMTP_USER`, `SMTP_PASS`); without it alerts still fire in the app and Slack.
 
 ---
 
@@ -221,10 +221,11 @@ Raise `ToolError` for not-found and bad input. Return `{"ok": false, "error": ".
 |---|---|
 | `API_PUBLIC_URL` | Public URL of the API. The OAuth issuer, and `{API_PUBLIC_URL}/mcp` is the connector link. Default `https://birdy-backend.vercel.app`. |
 | `FRONTEND_URL` | Where the consent page lives. Default `https://birdy-beta.vercel.app`. |
-| `RESEND_API_KEY` | Sends alert emails. Without it, emails are skipped. |
+| `SMTP_HOST`, `SMTP_PORT`, `SMTP_SECURE` | SMTP server for alert emails (nodemailer-style). Gmail: `smtp.gmail.com`, `465`, `true`. |
+| `SMTP_USER`, `SMTP_PASS` | SMTP login. For Gmail, the address and a [Google app password](https://myaccount.google.com/apppasswords). Without host, user and password, emails are skipped. |
 | `POSTHOG_API_KEY` | Project key for server-side PostHog events. Without it, no events are sent. |
 | `POSTHOG_HOST` | PostHog host. Default `https://us.i.posthog.com`. |
-| `EMAIL_FROM` | Sender. Default `Birdy <alerts@birdy.ai>`; the domain must be verified in Resend. |
+| `EMAIL_FROM` | Sender. Default `Birdy <SMTP_USER>`. Gmail only sends as the login address or a verified alias. |
 
 ### Activity API
 

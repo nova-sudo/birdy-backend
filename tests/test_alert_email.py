@@ -2,7 +2,6 @@
 from contextlib import asynccontextmanager
 from urllib.parse import parse_qs, urlparse
 
-import httpx
 import pytest
 
 import services.email_service as es
@@ -16,7 +15,7 @@ RESULT = {"triggered": True, "message": "Triggered for: Glow Clinic", "current_v
 
 @pytest.fixture
 def sent(monkeypatch):
-    """Record every send_email call instead of reaching Resend."""
+    """Record every send_email call instead of reaching SMTP."""
     calls = []
 
     async def fake_send(to, subject, html, text):
@@ -82,7 +81,7 @@ async def test_no_email_without_email_channel(mock_db, sent, run_job):
 
 async def test_failed_email_never_blocks_the_alert(mock_db, monkeypatch, run_job):
     async def boom(*a, **k):
-        raise RuntimeError("resend down")
+        raise RuntimeError("smtp down")
     monkeypatch.setattr(es, "send_email", boom)
     await _alert(mock_db)
     await run_job()
@@ -100,33 +99,71 @@ async def test_email_failure_returns_false_note(mock_db, monkeypatch, run_job):
     assert (await mock_db["alert_notifications"].find_one({}))["email_sent"] is False
 
 
-async def test_missing_api_key_does_not_raise(monkeypatch):
-    monkeypatch.setattr(es, "RESEND_API_KEY", "")
+async def test_missing_smtp_settings_do_not_raise(monkeypatch):
+    monkeypatch.setattr(es, "SMTP_PASS", "")
     assert await es.send_email("a@b.co", "s", "<p>h</p>", "t") is False
 
 
-async def test_send_email_posts_to_resend_and_swallows_errors(monkeypatch):
-    monkeypatch.setattr(es, "RESEND_API_KEY", "re_test")
-    seen = {}
+class FakeSMTP:
+    """Stands in for smtplib.SMTP / SMTP_SSL; records what a send did."""
+    log = []
+    fail = None
 
-    def handler(request):
-        seen["auth"] = request.headers["authorization"]
-        seen["json"] = request.read()
-        return httpx.Response(200, json={"id": "1"})
+    def __init__(self, host, port, timeout=None, context=None):
+        FakeSMTP.log.append(("connect", host, port, "ssl" if context is not None else "plain"))
 
-    real = httpx.AsyncClient
-    monkeypatch.setattr(es.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(handler), **kw))
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def starttls(self, context=None):
+        FakeSMTP.log.append(("starttls",))
+
+    def login(self, user, password):
+        if FakeSMTP.fail:
+            raise FakeSMTP.fail
+        FakeSMTP.log.append(("login", user, password))
+
+    def send_message(self, msg):
+        FakeSMTP.log.append(("send", msg["From"], msg["To"], msg["Subject"],
+                             msg.get_body(("plain",)).get_content(), msg.get_body(("html",)).get_content()))
+
+
+@pytest.fixture
+def smtp(monkeypatch):
+    FakeSMTP.log, FakeSMTP.fail = [], None
+    monkeypatch.setattr(es.smtplib, "SMTP_SSL", FakeSMTP)
+    monkeypatch.setattr(es.smtplib, "SMTP", FakeSMTP)
+    monkeypatch.setattr(es, "SMTP_HOST", "smtp.gmail.com")
+    monkeypatch.setattr(es, "SMTP_USER", "birdy@gmail.com")
+    monkeypatch.setattr(es, "SMTP_PASS", "app-pass")
+    monkeypatch.setattr(es, "EMAIL_FROM", "Birdy <birdy@gmail.com>")
+    return FakeSMTP
+
+
+async def test_send_email_over_ssl_sends_text_and_html(monkeypatch, smtp):
+    monkeypatch.setattr(es, "SMTP_SECURE", True)
+    monkeypatch.setattr(es, "SMTP_PORT", 465)
     assert await es.send_email("a@b.co", "Subj", "<p>h</p>", "t") is True
-    assert seen["auth"] == "Bearer re_test" and b'"text"' in seen["json"] and b'"html"' in seen["json"]
+    assert smtp.log[0] == ("connect", "smtp.gmail.com", 465, "ssl")
+    assert smtp.log[1] == ("login", "birdy@gmail.com", "app-pass")
+    _, frm, to, subject, text, html = smtp.log[2]
+    assert (frm, to, subject) == ("Birdy <birdy@gmail.com>", "a@b.co", "Subj")
+    assert text.strip() == "t" and "<p>h</p>" in html
 
-    def failing(request):
-        return httpx.Response(500, json={})
-    monkeypatch.setattr(es.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(failing), **kw))
-    assert await es.send_email("a@b.co", "Subj", "<p>h</p>", "t") is False
 
-    def raising(request):
-        raise httpx.ConnectTimeout("slow")
-    monkeypatch.setattr(es.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(raising), **kw))
+async def test_send_email_starttls_when_not_secure(monkeypatch, smtp):
+    monkeypatch.setattr(es, "SMTP_SECURE", False)
+    monkeypatch.setattr(es, "SMTP_PORT", 587)
+    assert await es.send_email("a@b.co", "Subj", "<p>h</p>", "t") is True
+    assert smtp.log[0] == ("connect", "smtp.gmail.com", 587, "plain") and smtp.log[1] == ("starttls",)
+
+
+async def test_send_email_swallows_smtp_errors(smtp):
+    import smtplib
+    smtp.fail = smtplib.SMTPAuthenticationError(535, b"bad credentials")
     assert await es.send_email("a@b.co", "Subj", "<p>h</p>", "t") is False
 
 

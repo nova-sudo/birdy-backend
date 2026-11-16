@@ -1,31 +1,49 @@
-"""Transactional email through Resend. Used for alert emails; never raises into callers."""
+"""Transactional email over SMTP (nodemailer-style settings). Used for alert emails; never raises into callers."""
+import asyncio
 import html as _html
 import logging
+import smtplib
+import ssl
+from email.message import EmailMessage
+from email.utils import make_msgid
 
-import httpx
-
-from core.config import EMAIL_FROM, FRONTEND_URL, RESEND_API_KEY
+from core.config import EMAIL_FROM, FRONTEND_URL, SMTP_HOST, SMTP_PASS, SMTP_PORT, SMTP_SECURE, SMTP_USER
 from services.ask_claude import alert_prompt, ask_claude_url
 
 logger = logging.getLogger(__name__)
 
-RESEND_URL = "https://api.resend.com/emails"
 TIMEOUT_SECONDS = 10
 
 
+def _build_message(to: str, subject: str, html: str, text: str) -> EmailMessage:
+    msg = EmailMessage()
+    msg["From"], msg["To"], msg["Subject"] = EMAIL_FROM, to, subject
+    msg["Message-ID"] = make_msgid(domain=(SMTP_USER.split("@")[-1] if "@" in SMTP_USER else None))
+    msg.set_content(text)
+    msg.add_alternative(html, subtype="html")
+    return msg
+
+
+def _send_sync(msg: EmailMessage) -> None:
+    context = ssl.create_default_context()
+    if SMTP_SECURE:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT_SECONDS, context=context) as smtp:
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+    else:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=TIMEOUT_SECONDS) as smtp:
+            smtp.starttls(context=context)
+            smtp.login(SMTP_USER, SMTP_PASS)
+            smtp.send_message(msg)
+
+
 async def send_email(to: str, subject: str, html: str, text: str) -> bool:
-    """POST one email to Resend. False (logged, no secrets) when the key is missing or anything fails."""
-    if not RESEND_API_KEY:
-        logger.warning("email not sent: RESEND_API_KEY is not set")
+    """Send one email over SMTP. False (logged, no secrets) when SMTP isn't configured or anything fails."""
+    if not (SMTP_HOST and SMTP_USER and SMTP_PASS):
+        logger.warning("email not sent: SMTP_HOST, SMTP_USER and SMTP_PASS must all be set")
         return False
     try:
-        async with httpx.AsyncClient(timeout=TIMEOUT_SECONDS) as client:
-            resp = await client.post(
-                RESEND_URL, headers={"Authorization": f"Bearer {RESEND_API_KEY}"},
-                json={"from": EMAIL_FROM, "to": [to], "subject": subject, "html": html, "text": text})
-        if resp.status_code >= 300:
-            logger.warning("email not sent: Resend answered %s", resp.status_code)
-            return False
+        await asyncio.to_thread(_send_sync, _build_message(to, subject, html, text))
         return True
     except Exception as e:
         logger.warning("email not sent: %s", type(e).__name__)
