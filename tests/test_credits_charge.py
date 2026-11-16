@@ -67,3 +67,50 @@ async def test_concurrent_charges_both_land(mock_db, monkeypatch):
     await asyncio.gather(*[credits._apply_charge(mock_db, USER, 1.0, ledger={}) for _ in range(5)])
     assert (await _credits(mock_db))["topup_balance"] == 5.0
     assert await mock_db["ai_usage"].count_documents({"user_id": USER}) == 5
+
+
+# ── period rollover keeps the version counter and cannot clobber a concurrent write ──
+
+def _old_period_user(rev=5, topup=7.0):
+    return {"user_id": USER, "credits": {
+        "allowance": 0, "used": 3.0, "topup_balance": topup, "credited_topup_ids": [],
+        "period_key": "2000-01", "rev": rev,
+    }}
+
+
+@pytest.mark.asyncio
+async def test_rollover_bumps_rev_and_keeps_topup(mock_db):
+    await mock_db["users"].insert_one(_old_period_user(rev=5))
+    got, _ = await credits._load_and_sync(mock_db, USER)
+    stored = (await mock_db["users"].find_one({"user_id": USER}))["credits"]
+    assert stored["rev"] == 6 and got["rev"] == 6
+    assert stored["used"] == 0.0 and stored["topup_balance"] == 7.0
+    assert stored["period_key"] != "2000-01"
+
+
+@pytest.mark.asyncio
+async def test_rollover_does_not_overwrite_a_concurrent_topup(mock_db):
+    await mock_db["users"].insert_one(_old_period_user(rev=5, topup=7.0))
+    real = mock_db["users"]
+
+    class _Users:
+        injected = False
+
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        async def update_one(self, flt, upd, **kw):
+            if not _Users.injected:  # a top-up lands between our read and our write
+                _Users.injected = True
+                await real.update_one(
+                    {"user_id": USER}, {"$inc": {"credits.topup_balance": 20.0, "credits.rev": 1}})
+            return await real.update_one(flt, upd, **kw)
+
+    class _Db:
+        def __getitem__(self, name):
+            return _Users() if name == "users" else mock_db[name]
+
+    got, _ = await credits._load_and_sync(_Db(), USER)
+    stored = (await mock_db["users"].find_one({"user_id": USER}))["credits"]
+    assert stored["topup_balance"] == 27.0 and got["topup_balance"] == 27.0
+    assert stored["rev"] == 7 and stored["period_key"] != "2000-01"

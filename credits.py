@@ -287,16 +287,29 @@ async def is_blocked(db, user_id: str) -> bool:
 async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
     """Load the user's credits, persisting a period rollover / plan change if
     needed. Returns (credits, subscription)."""
-    user = await db["users"].find_one(
-        {"user_id": user_id}, {"credits": 1, "subscription": 1, "_id": 0}
-    )
-    credits, changed = _effective_credits(user or {})
-    if changed:
-        await db["users"].update_one(
-            {"user_id": user_id},
-            {"$set": {"credits": {**credits, "updated_at": datetime.now(timezone.utc)}}},
-            upsert=True,
+    for _ in range(_CHARGE_RETRIES):
+        user = await db["users"].find_one(
+            {"user_id": user_id}, {"credits": 1, "subscription": 1, "_id": 0}
         )
+        credits, changed = _effective_credits(user or {})
+        if not changed:
+            break
+        stored = (user or {}).get("credits") or {}
+        rev = stored.get("rev")  # missing on balances written before the version field
+        credits["rev"] = (rev or 0) + 1
+        update = {"$set": {"credits": {**credits, "updated_at": datetime.now(timezone.utc)}}}
+        if user is None:
+            await db["users"].update_one({"user_id": user_id}, update, upsert=True)
+            break
+        # Only land the rollover if nobody wrote the balance (a top-up, a charge)
+        # or rolled the period since we read it; otherwise re-read and retry.
+        res = await db["users"].update_one(
+            {"user_id": user_id, "credits.rev": rev, "credits.period_key": stored.get("period_key")},
+            update,
+        )
+        if res.matched_count:
+            break
+        await asyncio.sleep(0)
     return credits, (user or {}).get("subscription") or {}
 
 
