@@ -83,3 +83,15 @@ async def test_mcp_server_still_accepts_mcp_token(mock_db):
     minted = await mcp_token_service.create_mcp_token(mock_db, ALICE, "Laptop")
     result = await mcp.auth.verify_token(minted["token"])
     assert result is not None and result.claims["sub"] == ALICE
+
+
+def _create(token):
+    client = TestClient(app)
+    client.cookies.set("auth_token", token)
+    return client.post("/api/mcp/tokens", json={"name": "Laptop"})
+
+
+def test_impersonating_admin_cannot_mint_an_mcp_token(mock_mongo_client):
+    assert _create(_session_token()).status_code == 200
+    res = _create(_session_token(imp=True, act="admin@birdy.ai"))
+    assert res.status_code == 403 and "viewing as a user" in res.json()["detail"]

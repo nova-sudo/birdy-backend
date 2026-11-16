@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, HTTPException
 
 from core.database import get_db
 from core.models import CreateMcpTokenRequest
-from dependencies import get_mongo_client, get_current_user
+from dependencies import get_mongo_client, get_current_user, get_current_claims
 from services.mcp_token_service import (
     create_mcp_token, list_mcp_tokens, revoke_mcp_token, list_connections, revoke_connection,
 )
@@ -27,9 +27,12 @@ router = APIRouter()
 async def create_token(
     request: CreateMcpTokenRequest,
     current_user: str = Depends(get_current_user),
+    claims: dict = Depends(get_current_claims),
 ):
     """Mint a new MCP bearer token. The raw token is returned once — it is
     never stored or shown again, only its metadata (name, id, expiry)."""
+    if claims.get("imp"):
+        raise HTTPException(status_code=403, detail="Admins can't create AI connections while viewing as a user.")
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
         result = await create_mcp_token(db, current_user, request.name, request.expiry_days, request.access)
