@@ -92,3 +92,27 @@ async def test_token_job_issues_tokens_for_every_client_location(mock_db, mock_m
     assert sorted(loc for _, loc, _ in fake_ghl) == ["kept", "lost"]
     saved = await gohl.get_subaccount_tokens(U, mock_mongo_client)
     assert saved["lost"]["access_token"] == "tok-lost" and saved["kept"]["access_token"] == "tok-kept"
+
+
+async def test_sync_replaces_an_expired_location_token(mock_db, mock_mongo_client, fake_ghl, monkeypatch):
+    # After a reconnect the stored location tokens are expired; the sync mints
+    # a new one instead of 401ing until the token cron next runs.
+    await _seed_agency(mock_db, subaccounts={
+        "stale": {"access_token": "old", "expires_at": datetime.now() - timedelta(hours=1)},
+    })
+    import httpx
+
+    class _Stop(Exception):
+        pass
+
+    async def _no_network(*a, **kw):
+        raise _Stop()
+
+    monkeypatch.setattr(httpx.AsyncClient, "send", _no_network)
+    try:
+        await ghl_service.fetch_and_cache_ghl_data_optimized("g1", "stale", U, mock_mongo_client)
+    except Exception:
+        pass  # only the token matters here
+    assert fake_ghl == [("co1", "stale", "agency-tok")]
+    saved = await gohl.get_subaccount_tokens(U, mock_mongo_client)
+    assert saved["stale"]["access_token"] == "tok-stale"

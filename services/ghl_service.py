@@ -8,7 +8,7 @@ import asyncio
 import logging
 import uuid
 from collections import Counter
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 
 from utils.phone_normalize import compute_match_keys
 from typing import Dict, List, Optional, Tuple
@@ -19,6 +19,7 @@ from integrations.gohighlevel import (
     ghl_integration,
     get_subaccount_tokens,
     mint_location_token,
+    agency_token_expires_within,
 )
 from services.contact_classifier import classify_contact_type
 
@@ -521,9 +522,14 @@ async def fetch_and_cache_ghl_data_optimized(
         location_data = subaccount_tokens.get(ghl_location_id, {})
 
         access_token = location_data.get("access_token")
-        if not access_token:
-            # Issue one from the agency token. Returning quietly here let the
-            # tick stamp the refresh complete while nothing was fetched.
+        token_expired = bool(location_data.get("expires_at")) and agency_token_expires_within(
+            location_data, timedelta(minutes=5)
+        )
+        if not access_token or token_expired:
+            # Issue one from the agency token: none (returning quietly here let
+            # the tick stamp the refresh complete while nothing was fetched),
+            # or an expired one (GHL 401s every call until the token cron next
+            # runs, e.g. for the first half hour after a reconnect).
             location_data = await mint_location_token(user_id, ghl_location_id, mongo_client) or {}
             access_token = location_data.get("access_token")
             if not access_token:
