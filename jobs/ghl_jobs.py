@@ -1,15 +1,16 @@
 import asyncio
 import logging
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from integrations.gohighlevel import (
+    AGENCY_JOB_REFRESH_MARGIN,
+    agency_token_expires_within,
+    ensure_fresh_agency_token,
     ghl_integration,
-    get_agency_token,
     get_subaccount_tokens,
-    save_agency_token,
     save_subaccount_token,
     fetch_location_details,
     get_contact_count_from_ghl,
@@ -132,51 +133,31 @@ async def refresh_tokens_for_all_users():
 
                 try:
                     # ============================================
-                    # STEP 1: Refresh agency token
+                    # STEP 1: Agency token, renewed well before it expires
                     # ============================================
-                    agency_token = await get_agency_token(user_id, mongo_client)
-
-                    # ============================================
-                    # STEP 1: Refresh agency token and get fresh credentials
-                    # ============================================
+                    agency_token = await ensure_fresh_agency_token(
+                        user_id, mongo_client, margin=AGENCY_JOB_REFRESH_MARGIN, retry_dead=True,
+                    )
                     if not agency_token or not agency_token.get("refresh_token"):
                         logger.error(f"❌ No agency token found for user {user_id}")
                         failed_count += 1
                         continue
-
-                    logger.info(f"🔄 Refreshing agency token for user {user_id}")
-                    refresh_token = agency_token.get("refresh_token")
-                    success, result = await ghl_integration.refresh_agency_token(refresh_token)
-
-                    if not success:
-                        logger.error(f"❌ Failed to refresh agency token for user {user_id}: {result.get('error')}")
+                    if agency_token_expires_within(agency_token, timedelta(0)):
+                        # Expired and the refresh was refused: GHL needs a reconnect.
+                        logger.error(
+                            f"❌ GHL agency token for {user_id} is expired and could not be "
+                            f"refreshed ({agency_token.get('refresh_error')}); needs a reconnect"
+                        )
                         failed_count += 1
-                        continue  # Skip location tokens if agency token failed
-
-                    # Save the refreshed agency token
-                    await save_agency_token(user_id, result, mongo_client)
-                    logger.info(f"✅ Refreshed agency token for user {user_id}")
+                        continue
                     refreshed_count += 1
 
-                    # ✅ FIX: Use the FRESH tokens from the result
-                    company_id = result.get("companyId")  # Note: API returns "companyId"
-                    agency_access_token = result.get("access_token")
-
-                    # Verify we have the required credentials
+                    company_id = agency_token.get("company_id")
+                    agency_access_token = agency_token.get("access_token")
                     if not company_id or not agency_access_token:
-                        logger.error(
-                            f"❌ Missing credentials after refresh for user {user_id}: "
-                            f"company_id={company_id}, has_token={bool(agency_access_token)}"
-                        )
-                        # Try to get from saved data
-                        fresh_agency_token = await get_agency_token(user_id, mongo_client)
-                        if fresh_agency_token:
-                            company_id = fresh_agency_token.get("company_id")
-                            agency_access_token = fresh_agency_token.get("access_token")
-
-                        if not company_id or not agency_access_token:
-                            failed_count += len(await get_subaccount_tokens(user_id, mongo_client))
-                            continue
+                        logger.error(f"❌ Missing company_id or access_token for user {user_id}")
+                        failed_count += len(await get_subaccount_tokens(user_id, mongo_client))
+                        continue
 
                     # ============================================
                     # STEP 2: Regenerate location tokens (not refresh!)

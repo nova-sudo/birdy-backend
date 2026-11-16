@@ -15,7 +15,9 @@ from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
 from integrations.gohighlevel import (
     ghl_integration,
-    get_agency_token,
+    ensure_fresh_agency_token,
+    ghl_error_status,
+    GHL_RECONNECT_MESSAGE,
     get_subaccount_tokens,
     save_agency_token,
     save_subaccount_token,
@@ -92,7 +94,7 @@ async def oauth_callback(code: str, response: Response, current_user: str = Depe
 async def get_subaccount_locations(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         try:
-            agency_token = await get_agency_token(current_user, mongo_client)
+            agency_token = await ensure_fresh_agency_token(current_user, mongo_client)
             if not agency_token:
                 raise HTTPException(status_code=400, detail="No agency token available. Please connect GoHighLevel in Settings.")
             company_id = agency_token.get("company_id")
@@ -102,6 +104,8 @@ async def get_subaccount_locations(current_user: str = Depends(get_current_user)
             success, locations = await ghl_integration.fetch_locations(company_id, access_token)
             if not success:
                 status_code = locations.get("status_code", 400)
+                if status_code in (401, 403):
+                    raise HTTPException(status_code=ghl_error_status(status_code), detail=GHL_RECONNECT_MESSAGE)
                 if status_code == 404:
                     raise HTTPException(status_code=404, detail="No locations available or incorrect GoHighLevel API configuration.")
                 raise HTTPException(status_code=status_code, detail=f"Failed to fetch locations: {locations.get('error', 'Unknown error')}")
@@ -131,7 +135,7 @@ async def add_subaccount(request: Request, current_user: str = Depends(get_curre
             if not location_id:
                 raise HTTPException(status_code=400, detail="location_id is required")
 
-            agency_token = await get_agency_token(current_user, mongo_client)
+            agency_token = await ensure_fresh_agency_token(current_user, mongo_client)
             if not agency_token:
                 raise HTTPException(status_code=400,
                                     detail="No agency token available. Please connect GoHighLevel in Settings.")

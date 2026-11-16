@@ -99,7 +99,7 @@ async def _wire_ghl(monkeypatch, mock_mongo_client, location_count, extra=()):
     async def _subaccount_tokens(*_a, **_kw):
         return {loc["id"]: {"access_token": "tok"} for loc in locations}
 
-    monkeypatch.setattr(onboarding, "get_agency_token", _agency_token)
+    monkeypatch.setattr(onboarding, "ensure_fresh_agency_token", _agency_token)
     monkeypatch.setattr(onboarding, "get_subaccount_tokens", _subaccount_tokens)
     monkeypatch.setattr(onboarding.ghl_integration, "fetch_locations", _fetch_locations)
     monkeypatch.setattr(

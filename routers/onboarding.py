@@ -47,7 +47,9 @@ from dependencies import get_current_user, get_mongo_client
 from integrations.facebook_utils.facebook import get_facebook_token
 from integrations.gohighlevel import (
     ghl_integration,
-    get_agency_token,
+    ensure_fresh_agency_token,
+    ghl_error_status,
+    GHL_RECONNECT_MESSAGE,
     get_subaccount_tokens,
     fetch_location_details,
     get_contact_count_from_ghl,
@@ -561,7 +563,7 @@ async def _prepare_review_job(user_id: str):
         prep_key = "onboarding.review_prep"
 
         try:
-            agency_token = await get_agency_token(user_id, mongo_client)
+            agency_token = await ensure_fresh_agency_token(user_id, mongo_client)
             if not agency_token:
                 raise RuntimeError("no agency token")
             company_id = agency_token.get("company_id")
@@ -951,7 +953,7 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
 
-        agency_token = await get_agency_token(current_user, mongo_client)
+        agency_token = await ensure_fresh_agency_token(current_user, mongo_client)
         if not agency_token:
             raise HTTPException(status_code=400, detail="No agency token available. Connect GoHighLevel first.")
         company_id = agency_token.get("company_id")
@@ -961,8 +963,11 @@ async def subaccounts_review(current_user: str = Depends(get_current_user)):
 
         success, locations = await ghl_integration.fetch_locations(company_id, access_token)
         if not success:
+            status_code = locations.get("status_code", 400)
+            if status_code in (401, 403):
+                raise HTTPException(status_code=ghl_error_status(status_code), detail=GHL_RECONNECT_MESSAGE)
             raise HTTPException(
-                status_code=locations.get("status_code", 400),
+                status_code=status_code,
                 detail=f"Failed to fetch locations: {locations.get('error', 'Unknown error')}",
             )
 
@@ -1092,7 +1097,7 @@ async def _mint_location_tokens(user_id: str, imports: list[dict]):
     surface them instead of a silent forever-pending row."""
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
-        agency_token = await get_agency_token(user_id, mongo_client)
+        agency_token = await ensure_fresh_agency_token(user_id, mongo_client)
         if not agency_token:
             logger.error(f"bulk import token minting: no agency token for {user_id}")
             return

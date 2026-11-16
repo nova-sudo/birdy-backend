@@ -27,7 +27,7 @@ from billing_middleware import check_client_limit
 # Integration imports
 from integrations.gohighlevel import (
     ghl_integration,
-    get_agency_token,
+    ensure_fresh_agency_token,
     get_subaccount_tokens,
     save_subaccount_token,
     fetch_location_details,
@@ -763,7 +763,7 @@ async def create_client_group_optimized(
 
             # STEP 1: Generate GHL location token if provided
             if request.ghl_location_id:
-                agency_token = await get_agency_token(current_user, mongo_client)
+                agency_token = await ensure_fresh_agency_token(current_user, mongo_client)
                 if not agency_token:
                     raise HTTPException(
                         status_code=400,

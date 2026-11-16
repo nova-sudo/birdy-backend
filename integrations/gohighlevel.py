@@ -400,6 +400,7 @@ class GHLIntegration:
         seen_ids: set = set()
         merged: list = []
         any_ok = False
+        token_rejected = False
 
         def _loc_id(loc):
             return loc.get("_id") or loc.get("id") or loc.get("locationId")
@@ -417,7 +418,7 @@ class GHLIntegration:
 
         async def _paginate(client, build_url, label, page_size, max_pages=50):
             """Generic skip-pagination helper. Returns True if endpoint ok."""
-            nonlocal any_ok
+            nonlocal any_ok, token_rejected
             skip = 0
             ok = False
             for page in range(max_pages):
@@ -443,6 +444,8 @@ class GHLIntegration:
                         if response.status_code >= 500 and attempt < retries - 1:
                             await asyncio.sleep(delay)
                             continue
+                        if response.status_code == 401:
+                            token_rejected = True
                         logger.warning(
                             f"{label} returned {response.status_code}: "
                             f"{response.text[:200]}"
@@ -488,6 +491,11 @@ class GHLIntegration:
                     f"installedLocations[isInstalled={installed_flag}]",
                     page_size=500,
                 )
+
+            # An expired or revoked token: say so, rather than let the legacy
+            # endpoint answer with an empty 404 that reads as "no locations".
+            if not any_ok and token_rejected:
+                return False, {"error": GHL_RECONNECT_MESSAGE, "status_code": 401}
 
             # ── 3. legacy /locations as last resort (capped at 100) ──
             if not any_ok:
@@ -1766,6 +1774,156 @@ async def get_agency_token(user_id: str, mongo_client: AsyncIOMotorClient):
     return None
 
 
+# ------------------------------------------------------------------
+# Keeping the agency token fresh
+# ------------------------------------------------------------------
+# A GHL refresh token works once: the refresh hands back a new one and kills
+# the old. Three places used to refresh on their own (the token cron every 30
+# minutes, a background task on login, /api/status) with no lock, and the
+# login one ran after the response on Vercel, where the function can be frozen
+# between GHL rotating the token and us saving it. Either way the saved refresh
+# token ends up dead and the connection is gone until a reconnect (Nov 2026:
+# every location call 401 for two days).
+#
+# Now there is one way to refresh: ensure_fresh_agency_token. It refreshes
+# only when the token is close to expiring, under a lease in the users
+# document so one process at a time does it, and saves the new tokens before
+# doing anything else.
+
+AGENCY_REFRESH_MARGIN = timedelta(minutes=10)
+# The cron renews well ahead of expiry (GHL access tokens last ~24h), so a
+# few failed runs in a row still leave a valid token.
+AGENCY_JOB_REFRESH_MARGIN = timedelta(hours=8)
+AGENCY_REFRESH_LEASE = "integrations.gohighlevel.agency_refresh_lease"
+_LEASE_SECONDS = 60
+_LEASE_WAIT_SECONDS = 15
+
+
+def agency_token_expires_within(agency: Optional[dict], margin: timedelta) -> bool:
+    """True when the token is missing an expiry or expires inside ``margin``."""
+    expires_at = (agency or {}).get("expires_at")
+    if isinstance(expires_at, str):
+        try:
+            expires_at = datetime.fromisoformat(expires_at)
+        except ValueError:
+            return True
+    if not isinstance(expires_at, datetime):
+        return True
+    if expires_at.tzinfo is not None:
+        expires_at = expires_at.astimezone(timezone.utc).replace(tzinfo=None)
+    return expires_at - datetime.now() <= margin
+
+
+async def ensure_fresh_agency_token(
+    user_id: str,
+    mongo_client: AsyncIOMotorClient,
+    margin: timedelta = AGENCY_REFRESH_MARGIN,
+    retry_dead: bool = False,
+) -> Optional[dict]:
+    """The agency token, refreshed first if it expires within ``margin``.
+
+    Use this instead of get_agency_token anywhere the token is sent to GHL.
+    Returns None when there is no GHL connection. When the refresh token has
+    been refused the token comes back as it is, with ``needs_reconnect`` set;
+    request paths then stop retrying it, the cron (``retry_dead``) keeps trying.
+    """
+    agency = await get_agency_token(user_id, mongo_client)
+    if not agency or not agency_token_expires_within(agency, margin):
+        return agency
+    if not agency.get("refresh_token"):
+        return agency
+    if agency.get("needs_reconnect") and not retry_dead:
+        return agency
+
+    users = mongo_client[os.getenv("MONGODB_DB", "birdyaidev")]["users"]
+    lease_id = os.urandom(8).hex()
+    now = datetime.now()
+    claimed = await users.update_one(
+        {
+            "user_id": user_id,
+            "$or": [
+                {AGENCY_REFRESH_LEASE: {"$exists": False}},
+                {f"{AGENCY_REFRESH_LEASE}.until": {"$lt": now}},
+            ],
+        },
+        {"$set": {AGENCY_REFRESH_LEASE: {"id": lease_id, "until": now + timedelta(seconds=_LEASE_SECONDS)}}},
+    )
+    if not claimed.modified_count:
+        # Someone else is refreshing. Wait for their token instead of using
+        # the same refresh token a second time.
+        for _ in range(_LEASE_WAIT_SECONDS):
+            await asyncio.sleep(1)
+            agency = await get_agency_token(user_id, mongo_client)
+            if not agency_token_expires_within(agency, margin):
+                return agency
+        return await get_agency_token(user_id, mongo_client)
+
+    try:
+        # Read again under the lease: the last holder may have just refreshed.
+        agency = await get_agency_token(user_id, mongo_client)
+        if not agency or not agency_token_expires_within(agency, margin):
+            return agency
+        refresh_token = agency.get("refresh_token")
+        if not refresh_token:
+            return agency
+
+        success, result = await ghl_integration.refresh_agency_token(refresh_token)
+        if success:
+            if not result.get("companyId"):
+                result["companyId"] = agency.get("company_id")
+            # The old refresh token is dead now; losing this save loses the
+            # connection, so try hard.
+            for attempt in range(3):
+                try:
+                    await save_agency_token(user_id, result, mongo_client)
+                    break
+                except Exception as e:
+                    logger.critical(
+                        f"Saving the refreshed GHL agency token for {user_id} failed "
+                        f"(attempt {attempt + 1}): {e}"
+                    )
+                    if attempt == 2:
+                        raise
+                    await asyncio.sleep(1)
+            logger.info(f"Refreshed GHL agency token for {user_id}")
+            return await get_agency_token(user_id, mongo_client)
+
+        status_code = result.get("status_code")
+        error = result.get("error") or "refresh failed"
+        logger.error(f"GHL agency token refresh failed for {user_id}: {status_code} {error}")
+        if status_code and 400 <= status_code < 500:
+            # GHL refused the refresh token itself; only a reconnect fixes it.
+            await users.update_one(
+                {"user_id": user_id, "integrations.gohighlevel.agency.refresh_token": refresh_token},
+                {"$set": {
+                    "integrations.gohighlevel.agency.needs_reconnect": True,
+                    "integrations.gohighlevel.agency.refresh_error": f"{status_code}: {error}"[:300],
+                    "integrations.gohighlevel.agency.refresh_failed_at": datetime.now(),
+                }},
+            )
+            return await get_agency_token(user_id, mongo_client)
+        return agency
+    finally:
+        await users.update_one(
+            {"user_id": user_id, f"{AGENCY_REFRESH_LEASE}.id": lease_id},
+            {"$unset": {AGENCY_REFRESH_LEASE: ""}},
+        )
+
+
+GHL_RECONNECT_MESSAGE = (
+    "Your GoHighLevel connection has expired. Reconnect GoHighLevel in Settings → Integrations."
+)
+
+
+def ghl_error_status(status_code: Optional[int]) -> int:
+    """The status to answer with when GHL refused us. GHL's 401/403 are about
+    the GHL token, but a 401 from our API signs the user out of Birdy, so they
+    go out as 409 (with GHL_RECONNECT_MESSAGE) instead."""
+    if status_code in (401, 403):
+        return 409
+    return status_code or 400
+
+
 async def mint_location_token(user_id: str, location_id: str, mongo_client, company_id: str = None,
                               agency_access_token: str = None) -> dict | None:
     """
@@ -1777,7 +1935,7 @@ async def mint_location_token(user_id: str, location_id: str, mongo_client, comp
     every client's sync with no token at all (Oct 2026: no contacts for days).
     """
     if not company_id or not agency_access_token:
-        agency = await get_agency_token(user_id, mongo_client) or {}
+        agency = await ensure_fresh_agency_token(user_id, mongo_client) or {}
         company_id = agency.get("company_id")
         agency_access_token = agency.get("access_token")
     if not company_id or not agency_access_token:

@@ -7,6 +7,8 @@ Now the job issues a token for every location a client uses, the sync issues
 one when it has none, and a sync that still has none fails loudly.
 """
 
+from datetime import datetime, timedelta
+
 import pytest
 
 import integrations.gohighlevel as gohl
@@ -21,7 +23,10 @@ def _users(db):
 
 
 async def _seed_agency(db, subaccounts=None):
-    gohl_doc = {"agency": {"company_id": "co1", "access_token": "agency-tok", "refresh_token": "r"}}
+    gohl_doc = {"agency": {
+        "company_id": "co1", "access_token": "agency-tok", "refresh_token": "r",
+        "expires_at": datetime.now() + timedelta(hours=20),
+    }}
     if subaccounts is not None:
         gohl_doc["subaccounts"] = subaccounts
     await _users(db).insert_one({"user_id": U, "integrations": {"gohighlevel": gohl_doc}})
