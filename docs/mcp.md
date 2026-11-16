@@ -157,6 +157,12 @@ Birdy is an OAuth 2.1 authorization server and an MCP resource server in one Fas
 
 `user_id` is always taken from the verified token, never from a tool argument.
 
+A token with no Birdy scope (neither `birdy.read` nor `birdy.write`) is refused for every tool, reads included. Admins viewing as a user cannot mint manual tokens.
+
+### Error shapes
+
+Raise `ToolError` for not-found and bad input. Return `{"ok": false, "error": "..."}` for a refused business outcome (for example a rejected live change). Both are free of charge and are logged as errors. A top-level `error` key without `ok` is accepted for older tools, but new tools should use the two shapes above.
+
 ### Server settings
 
 | Env var | Meaning |
