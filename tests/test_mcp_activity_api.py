@@ -88,6 +88,7 @@ async def test_list_filters_and_cursor(api):
     assert api.get("/api/mcp/activity", params={"from": "nope"}).status_code == 400
     assert api.get("/api/mcp/activity", params={"from": "2026-11-10junk"}).status_code == 400
     assert api.get("/api/mcp/activity", params={"to": "2026-11-10T05:00"}).status_code == 400
+    assert api.get("/api/mcp/activity", params={"from": "2026-11-10T05:00"}).status_code == 400  # no offset
     assert api.get("/api/mcp/activity", params={"cursor": "###"}).status_code == 400
 
 
@@ -197,3 +198,12 @@ async def test_apps_newest_name_wins_one_entry_per_grant(api):
                row("z", _ago(hours=3), grant="g2", app_name="Cursor"))
     apps = api.get("/api/mcp/activity/apps").json()
     assert [(a["grant_id"], a["app_name"]) for a in apps] == [("g1", "New name"), ("g2", "Cursor")]
+
+
+@pytest.mark.asyncio
+async def test_from_accepts_an_instant_with_offset(api):
+    await seed(api.db, row("late", datetime(2026, 11, 10, 23, 59, 59)))
+    ids = lambda f: [i["id"] for i in api.get("/api/mcp/activity", params={"from": f, "to": "2026-11-10"}).json()["items"]]
+    assert ids("2026-11-11T00:00:00+02:00") == ["late"]  # 22:00 UTC on the 10th
+    assert ids("2026-11-10T20:00:00-05:00") == []        # 01:00 UTC on the 11th
+    assert ids("2026-11-10T23:00:00Z") == ["late"]

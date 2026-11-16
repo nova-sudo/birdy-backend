@@ -45,6 +45,20 @@ def _parse_day(value: str, name: str) -> datetime:
         raise HTTPException(status_code=400, detail=f"`{name}` must be an ISO date (YYYY-MM-DD)")
 
 
+def _parse_from(value: str) -> datetime:
+    """`from` is a day (YYYY-MM-DD, UTC) or an exact instant with a UTC offset, such as the browser's
+    local midnight (2026-11-10T00:00:00+02:00), so "last 7 days" starts where the viewer's day starts."""
+    if len(value) == 10:
+        return _parse_day(value, "from")
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        dt = None
+    if dt is None or dt.tzinfo is None:
+        raise HTTPException(status_code=400, detail="`from` must be an ISO date (YYYY-MM-DD) or a timestamp with a UTC offset")
+    return _naive_utc(dt)
+
+
 def _encode_cursor(row: dict) -> str:
     raw = f"{_iso(row['created_at'])}|{row['id']}"
     return base64.urlsafe_b64encode(raw.encode()).decode()
@@ -72,7 +86,7 @@ def _filter(user_id: str, app, kind, client_group_id, date_from, date_to, confir
     if not date_from and not date_to:
         created["$gte"] = _naive_utc(datetime.now(timezone.utc)) - timedelta(days=_DEFAULT_DAYS)
     if date_from:
-        created["$gte"] = _parse_day(date_from, "from")
+        created["$gte"] = _parse_from(date_from)
     if date_to:
         created["$lt"] = _parse_day(date_to, "to") + timedelta(days=1)  # inclusive through the end of that day
     if created:
