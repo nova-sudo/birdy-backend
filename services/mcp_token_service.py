@@ -20,6 +20,7 @@ import jwt as pyjwt
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
+from services import posthog_events
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +87,7 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
     """Mint a new long-lived MCP bearer token and record it for revocation."""
     days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
     minted = await _mint_mcp_token(db, user_id, name, access, days * 86400, kind="manual")
+    posthog_events.capture(user_id, "mcp_connected", {"app_name": name, "access": access, "method": "token"})
     return {k: minted[k] for k in ("id", "name", "token", "created_at", "expires_at")}
 
 
@@ -193,6 +195,8 @@ async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
         {"$set": {"revoked": True, "revoked_at": now}},
     )
     if res.matched_count > 0:
+        doc = await db["mcp_tokens"].find_one({"id": connection_id}, {"name": 1})
+        posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (doc or {}).get("name")})
         return True
     res = await db["oauth_grants"].update_one(
         {"id": connection_id, "user_id": user_id},
@@ -204,4 +208,6 @@ async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
         {"grant_id": connection_id, "user_id": user_id},
         {"$set": {"revoked": True, "revoked_at": now}},
     )
+    grant = await db["oauth_grants"].find_one({"id": connection_id}, {"client_name": 1})
+    posthog_events.capture(user_id, "mcp_disconnected", {"app_name": (grant or {}).get("client_name")})
     return True

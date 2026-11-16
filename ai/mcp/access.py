@@ -29,7 +29,7 @@ from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars, set_outcome, start_activity
-from services import mcp_activity, mcp_billing
+from services import mcp_activity, mcp_billing, posthog_events
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +120,18 @@ async def _app_name(db, claims: dict) -> str:
     return "Unknown app"
 
 
+def _track(user_id, tool, kind, reason, live_ok, failed, credits_total, chars, duration_ms, app_name) -> None:
+    """PostHog events for one external call. Only these fields: never args, results or message text."""
+    posthog_events.capture(user_id, "mcp_tool_called", {
+        "tool": tool, "kind": kind, "result_status": "error" if failed else "ok", "credits_total": credits_total,
+        "response_chars": chars, "duration_ms": duration_ms, "app_name": app_name,
+    })
+    if reason:
+        posthog_events.capture(user_id, "mcp_refused", {"tool": tool, "reason": reason})
+    if live_ok:
+        posthog_events.capture(user_id, "mcp_live_confirmed", {"tool": tool, "app_name": app_name})
+
+
 async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: dict, result, error, started: float) -> None:
     """Charge (when the call earned a charge) and write the activity row, concurrently.
 
@@ -142,10 +154,13 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
         app_name = await _app_name(db, claims)
         app_kind = mcp_activity.app_kind_for(app_name)
         if okind == "refused" and outcome.get("reason") == "rate_limit":
+            posthog_events.capture(claims.get("sub"), "mcp_refused", {"tool": tool_name, "reason": "rate_limit"})
             await mcp_activity.record_rate_limited(db, claims.get("sub"), grant_id, app_name, app_kind)
             return
         credits = _ZERO_CREDITS if free else await mcp_billing.charge_breakdown(db, chars, live)
         reason = outcome.get("reason") if okind == "refused" else okind if okind in _FREE_OUTCOMES else None
+        _track(claims.get("sub"), tool_name, _kind_for(tags, okind), reason, live and not free, free or error is not None,
+               credits["total"], chars, duration_ms, app_name)
         await mcp_activity.record_call(
             db, user_id=claims.get("sub"), grant_id=grant_id, app_name=app_name, app_kind=app_kind,
             access="write" if WRITE_SCOPE in token_scopes(claims) else "read",

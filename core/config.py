@@ -25,6 +25,9 @@ CORS_ORIGINS = [
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")
 # Public URL of this API (OAuth issuer; the MCP server is served at {API_PUBLIC_URL}/mcp).
 API_PUBLIC_URL = os.getenv("API_PUBLIC_URL", "https://birdy-backend.vercel.app").rstrip("/")
+# PostHog server-side events (services/posthog_events.py). Without a key, events are skipped.
+POSTHOG_API_KEY = os.getenv("POSTHOG_API_KEY", "")
+POSTHOG_HOST = os.getenv("POSTHOG_HOST", "https://us.i.posthog.com").rstrip("/")
 # Alert emails (services/email_service.py). Without a key, email sending is skipped.
 RESEND_API_KEY = os.getenv("RESEND_API_KEY", "")
 EMAIL_FROM = os.getenv("EMAIL_FROM", "Birdy <alerts@birdy.ai>")

@@ -16,7 +16,7 @@ from billing_middleware import require_active_subscription
 from core.config import CORS_ORIGINS, FRONTEND_URL
 from core.database import get_db
 from dependencies import get_mongo_client, get_current_claims
-from services import oauth_store
+from services import oauth_store, posthog_events
 
 logger = logging.getLogger(__name__)
 
@@ -67,13 +67,16 @@ async def decide_oauth_request(request_id: str, body: DecisionRequest, claims: d
 
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
-        if not await oauth_store.get_request_view(db, request_id):
+        view = await oauth_store.get_request_view(db, request_id)
+        if not view:
             raise not_found
         try:
             if body.allow:
                 await require_active_subscription(user_id, mongo_client)
                 redirect_to = await oauth_store.approve_request(db, request_id, user_id, body.access)
                 logger.info(f"OAuth request approved by {user_id} (access={body.access})")
+                posthog_events.capture(user_id, "mcp_connected",
+                                       {"app_name": view["client_name"], "access": body.access, "method": "oauth"})
             else:
                 redirect_to = await oauth_store.deny_request(db, request_id)
         except oauth_store.OAuthRequestNotFound:
