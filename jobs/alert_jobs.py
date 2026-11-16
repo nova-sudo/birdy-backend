@@ -89,8 +89,15 @@ async def evaluate_all_alerts():
                         update[EMAILED_FIELD] = sorted(emailed | new_firing if wants_email else emailed)
                         update["status"] = "triggered"
                         update["last_triggered_at"] = datetime.utcnow()
-                        await db["alerts"].update_one({"id": alert["id"]},
-                                                      {"$set": update, "$inc": {"trigger_count": 1}})
+                        # The email claim is conditional on the emailed list we read: of two overlapping
+                        # runs (a cron retry) only the one whose write matches sends the email.
+                        flt = {"id": alert["id"]}
+                        if wants_email:
+                            flt[EMAILED_FIELD] = alert.get(EMAILED_FIELD)
+                        claimed = await db["alerts"].update_one(
+                            flt, {"$set": update, "$inc": {"trigger_count": 1}})
+                        if wants_email and not claimed.matched_count:
+                            continue  # the other run already recorded and emailed this firing
                         note = await db["alert_notifications"].insert_one({
                             "alert_id": alert["id"],
                             "user_id": alert["user_id"],

@@ -188,3 +188,32 @@ async def test_second_client_triggering_emails_once_for_it(mock_db, sent, run_jo
     await run_job(_per_client("beta"))
     await run_job(_per_client("acme", "beta"))
     assert len(sent) == 3
+
+
+async def test_overlapping_runs_email_once(mock_db, mock_mongo_client, sent, monkeypatch):
+    """Two cron runs that both read the alert before either writes: only one sends."""
+    import asyncio
+    import jobs.alert_jobs as jobs
+
+    @asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+
+    arrived = []
+    both_in = asyncio.Event()
+
+    async def barrier_eval(alert, client):
+        arrived.append(1)
+        if len(arrived) == 2:
+            both_in.set()
+        await both_in.wait()
+        return RESULT
+
+    monkeypatch.setattr(jobs, "get_mongo_client", fake_client)
+    monkeypatch.setattr(jobs, "evaluate_alert", barrier_eval)
+    await _alert(mock_db)
+
+    await asyncio.gather(jobs.evaluate_all_alerts(), jobs.evaluate_all_alerts())
+
+    assert len(sent) == 1
+    assert await mock_db["alert_notifications"].count_documents({}) == 1
