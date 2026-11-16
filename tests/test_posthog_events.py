@@ -170,3 +170,31 @@ async def test_events_fire_and_result_returns_when_mongo_lookups_raise(ph, mcp_c
     (ev,) = events(ph, "mcp_tool_called")
     assert ev["properties"]["app_name"] is None and ev["properties"]["credits_total"] is None
     assert set(ev["properties"]) == TOOL_CALLED_KEYS | {"$lib"}
+
+
+@pytest.mark.asyncio
+async def test_concurrent_revokes_fire_one_disconnect_per_connection(ph, mock_db):
+    class _Coll:
+        def __init__(self, real):
+            self._real = real
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        async def find_one(self, *a, **kw):  # both revokes read the live doc before either writes
+            doc = await self._real.find_one(*a, **kw)
+            await asyncio.sleep(0)
+            await asyncio.sleep(0)
+            return doc
+
+    class _Db:
+        def __getitem__(self, name):
+            return _Coll(mock_db[name])
+
+    created = await mcp_token_service.create_mcp_token(mock_db, USER, "Laptop", access="read")
+    await seed_grant(mock_db, "g2", USER, name="Claude", access="write")
+    for cid in (created["id"], "g2"):
+        results = await asyncio.gather(*[mcp_token_service.revoke_connection(_Db(), USER, cid) for _ in range(2)])
+        assert results == [True, True]
+    await drain()
+    assert sorted(e["properties"]["app_name"] for e in events(ph, "mcp_disconnected")) == ["Claude", "Laptop"]

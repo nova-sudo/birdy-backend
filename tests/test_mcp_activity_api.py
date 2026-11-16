@@ -207,3 +207,4 @@ async def test_from_accepts_an_instant_with_offset(api):
     assert ids("2026-11-11T00:00:00+02:00") == ["late"]  # 22:00 UTC on the 10th
     assert ids("2026-11-10T20:00:00-05:00") == []        # 01:00 UTC on the 11th
     assert ids("2026-11-10T23:00:00Z") == ["late"]
+    assert ids("2026-11-11T00:00:00Z") == []

@@ -310,6 +310,10 @@ async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
         if res.matched_count:
             break
         await asyncio.sleep(0)
+    else:
+        # Out of retries: serve the freshly computed balance, but never a rev we did not store.
+        logger.warning(f"credits rollover for {user_id} lost the write race {_CHARGE_RETRIES} times; not persisted")
+        credits["rev"] = rev
     return credits, (user or {}).get("subscription") or {}
 
 

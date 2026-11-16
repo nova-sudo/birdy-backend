@@ -51,7 +51,7 @@ def _parse_from(value: str) -> datetime:
     if len(value) == 10:
         return _parse_day(value, "from")
     try:
-        dt = datetime.fromisoformat(value)
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         dt = None
     if dt is None or dt.tzinfo is None:

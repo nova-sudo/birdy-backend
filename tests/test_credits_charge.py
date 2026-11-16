@@ -114,3 +114,27 @@ async def test_rollover_does_not_overwrite_a_concurrent_topup(mock_db):
     stored = (await mock_db["users"].find_one({"user_id": USER}))["credits"]
     assert stored["topup_balance"] == 27.0 and got["topup_balance"] == 27.0
     assert stored["rev"] == 7 and stored["period_key"] != "2000-01"
+
+
+@pytest.mark.asyncio
+async def test_rollover_out_of_retries_logs_and_returns_stored_rev(mock_db, monkeypatch, caplog):
+    await mock_db["users"].insert_one(_old_period_user(rev=5))
+    real = mock_db["users"]
+
+    class _Users:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        async def update_one(self, flt, upd, **kw):  # every attempt loses the race
+            await real.update_one({"user_id": USER}, {"$inc": {"credits.rev": 1}})
+            return await real.update_one(flt, upd, **kw)
+
+    class _Db:
+        def __getitem__(self, name):
+            return _Users() if name == "users" else mock_db[name]
+
+    monkeypatch.setattr(credits, "_CHARGE_RETRIES", 3)
+    with caplog.at_level("WARNING"):
+        got, _ = await credits._load_and_sync(_Db(), USER)
+    assert "lost the write race" in caplog.text
+    assert got["rev"] == 7  # last stored rev read (5 + 2 bumps), never an unstored one

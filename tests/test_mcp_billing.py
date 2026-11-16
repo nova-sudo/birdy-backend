@@ -245,3 +245,16 @@ def test_admin_config_rejects_out_of_range_mcp_rates(field, value):
         CreditsConfigUpdate(**{field: value})
     assert getattr(CreditsConfigUpdate(**{field: 100}), field) == 100
     assert getattr(CreditsConfigUpdate(**{field: 0}), field) == 0
+
+
+@pytest.mark.parametrize("value", [-1, 100.5])
+def test_admin_config_route_returns_422_for_out_of_range_rate(mock_mongo_client, value):
+    from fastapi.testclient import TestClient
+    from dependencies import require_admin
+    from main import app
+    app.dependency_overrides[require_admin] = lambda: "admin@birdy.ai"
+    try:
+        res = TestClient(app).put("/api/admin/credits/config", json={"mcp_base_fee": value})
+    finally:
+        app.dependency_overrides.pop(require_admin, None)
+    assert res.status_code == 422
