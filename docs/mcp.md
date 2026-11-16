@@ -251,6 +251,10 @@ Logging, charging and events run after the tool returns and never change its res
 | `mcp_live_confirmed` | A live change ran after a valid confirm code. |
 | `mcp_refused` | A refused call (tool and reason). |
 
+### Deploy order
+
+Deploy the backend before the frontend: the admin credits page expects the new MCP rate fields from the backend.
+
 ### Checking it locally
 
 ```bash
