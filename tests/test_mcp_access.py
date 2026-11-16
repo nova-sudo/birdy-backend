@@ -80,26 +80,19 @@ async def test_internal_calls_are_not_rate_limited(mcp_call, mock_db):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("token_type", [None, "refresh"])
-async def test_unknown_or_missing_type_is_treated_as_external(mcp_call, no_subscription, token_type):
+async def test_unknown_or_missing_type_is_refused_even_for_reads(mcp_call, mock_db, token_type):
     res = await mcp_call("get_alerts", {}, token_type=token_type)
-    assert res.is_error and "subscription is inactive" in res.text
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("token_type", [None, "refresh"])
-async def test_unknown_or_missing_type_cannot_write(mcp_call, token_type):
+    assert res.is_error and "does not grant access" in res.text
     res = await mcp_call("create_alert", ALERT_ARGS, token_type=token_type)
-    assert res.is_error and "view-only" in res.text
+    assert res.is_error and "does not grant access" in res.text
+    # Refused before any rate-limit bucket is touched.
+    assert await mock_db["mcp_rate"].count_documents({}) == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("token_type", [None, "refresh"])
-async def test_unknown_or_missing_type_is_rate_limited(mcp_call, pinned_minute, token_type):
-    for _ in range(120):
-        res = await mcp_call("get_alerts", {}, token_type=token_type)
-        assert not res.is_error
-    res = await mcp_call("get_alerts", {}, token_type=token_type)
-    assert res.is_error and "Too many Birdy requests" in res.text
+async def test_scoped_token_without_read_scope_is_refused(mcp_call):
+    res = await mcp_call("get_alerts", {}, token_type="mcp", scope="birdy.write")
+    assert res.is_error and "does not grant access" in res.text
 
 
 def test_token_scopes_unknown_type_gets_nothing():
