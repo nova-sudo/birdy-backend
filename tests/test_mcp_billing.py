@@ -234,3 +234,14 @@ async def test_state_changed_costs_nothing(mcp_call, mock_db, temp_tools):
     res = await mcp_call("zz_live_two_step", {"confirm_code": code}, user=USER, scope=scope, token_type="mcp")
     assert "error" in res.text
     assert len(await _charges(mock_db)) == before
+
+
+@pytest.mark.parametrize("field", ["mcp_base_fee", "mcp_per_10k_chars", "mcp_live_fee", "mcp_max_per_call"])
+@pytest.mark.parametrize("value", [-0.1, 100.5])
+def test_admin_config_rejects_out_of_range_mcp_rates(field, value):
+    from pydantic import ValidationError
+    from routers.admin_console import CreditsConfigUpdate
+    with pytest.raises(ValidationError):
+        CreditsConfigUpdate(**{field: value})
+    assert getattr(CreditsConfigUpdate(**{field: 100}), field) == 100
+    assert getattr(CreditsConfigUpdate(**{field: 0}), field) == 0

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
@@ -780,10 +780,10 @@ class CreditsConfigUpdate(BaseModel):
     markup: float | None = None
     rate_mode: str | None = None
     enforce: bool | None = None
-    mcp_base_fee: float | None = None
-    mcp_per_10k_chars: float | None = None
-    mcp_live_fee: float | None = None
-    mcp_max_per_call: float | None = None
+    mcp_base_fee: float | None = Field(default=None, ge=0, le=100)
+    mcp_per_10k_chars: float | None = Field(default=None, ge=0, le=100)
+    mcp_live_fee: float | None = Field(default=None, ge=0, le=100)
+    mcp_max_per_call: float | None = Field(default=None, ge=0, le=100)
 
 
 @router.put("/api/admin/credits/config")
