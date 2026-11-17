@@ -73,7 +73,18 @@ The connector has 119 tools in the families below. The full list, generated from
 - **Report designer** (`report_designer`): `preview_report` shows a Slack report as the real message with your numbers. `propose_report` saves a draft of the schedule and the whole Slack message. Your live report does not change until you save the draft in Birdy's report designer.
 - **Refresh** (`refresh`): refresh one client's data and check where it stands.
 
-The server also offers ready-made prompts: a weekly client review, "why did CPL jump?", prep for a client call, and the agent's week. **Settings → Connect to AI** has a daily check-in prompt you can paste into a scheduled Claude task.
+The server also offers ready-made prompts, shown in the AI app's prompt menu as **Monday review**, **What changed?**, **Call prep**, **Agent recap**, **Daily check-in** and **Fix my worst client**. **Settings → Connect to AI** has a daily check-in prompt you can paste into a scheduled Claude task.
+
+### How Birdy sounds and looks in the AI app
+
+Set in `ai/mcp/voice.py` (picked from `mocks/mcp-flavour`):
+
+- **Voice.** The server instructions ask the assistant to answer like a senior media buyer who talks straight: at most three opening bullets, several clients sorted worst first as Act / Watch / Fine, a plain reason when a number moved, and at most three numbered next steps the owner can approve with "do 1". Weekly recaps and the daily check-in use a morning brief (headline, The win, The worry, The number).
+- **Icon and website.** The server lists the framed mascot (`{API_PUBLIC_URL}/birdy-mcp-icon.png`) and Birdy's web address, for apps that show them.
+- **Tool titles.** Every tool has a plain-English title taken from its activity label in the present ("Checking alerts"), shown on the tool-call chip. A new label must start with a verb in `voice._ING` (a test checks).
+- **Sign-off.** Each successful external result ends with a text line `Birdy: see it in Birdy <link> · this request cost 0.24 credits (412.1 left)`. It is added after the charge, so it is never charged for. Refused and failed calls get none, and internal calls (Birdy's own chat) never do.
+- **Refusals** say what happened in Birdy's words and that no credits were used.
+- **First hello.** `get_started` returns the active clients Birdy can see, the connection's access, what Birdy can do and three questions to try. The instructions ask the assistant to call it on the first Birdy request in a chat.
 
 ### Changes to live ads need a confirm code
 

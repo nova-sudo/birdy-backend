@@ -23,11 +23,14 @@ from fastapi import HTTPException
 from fastmcp.exceptions import ToolError
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.server.middleware import Middleware
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent
 
 import billing_middleware
 from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from ai.mcp import voice
 from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars, set_outcome, start_activity
 from services import mcp_activity, mcp_billing, posthog_events
 
@@ -81,7 +84,7 @@ async def _enforce_rate_limit(db, user_id: str) -> None:
     )
     if doc["count"] > MCP_RATE_LIMIT_PER_MINUTE:
         set_outcome("refused", reason="rate_limit")
-        raise ToolError("Too many Birdy requests in a minute. Wait a moment and try again.")
+        raise ToolError("Too many Birdy requests in a minute. Wait a moment and try again. No credits were used.")
 
 
 def _expiry():
@@ -207,6 +210,28 @@ async def _finish_call(db, claims, tool_name, tags, args, result, error, started
         logger.warning("MCP charge/activity log did not finish for %s: %r", tool_name, exc)
 
 
+async def _with_signoff(db, tool_name: str, tags: set, args: dict, result, available: float | None):
+    """The result plus Birdy's sign-off line (a "see it in Birdy" link and what the request cost).
+
+    Built after the charge, from the same price formula, so the line never counts toward the size charged.
+    A refused, failed or error result is returned as it is. Never raises: no sign-off is better than no result."""
+    try:
+        outcome = get_outcome() or {}
+        if outcome.get("kind") in _FREE_OUTCOMES or is_error_result(getattr(result, "structured_content", None)):
+            return result
+        live = outcome.get("kind") == "live_executed" and "live" in tags
+        cost = (await mcp_billing.charge_breakdown(db, response_chars(result), live))["total"]
+        left = available - cost if available is not None else None
+        line = voice.signoff(mcp_activity.link_for(tool_name, args), cost, left)
+        if not line:
+            return result
+        return ToolResult(content=[*result.content, TextContent(type="text", text=line)],
+                          structured_content=result.structured_content, meta=result.meta)
+    except Exception as exc:
+        logger.warning("MCP sign-off skipped for %s: %r", tool_name, exc)
+        return result
+
+
 class BirdyAccessMiddleware(Middleware):
     async def on_call_tool(self, context, call_next):
         reset_outcome()
@@ -221,6 +246,7 @@ class BirdyAccessMiddleware(Middleware):
         external = claims.get("type") != "access"
         args = getattr(context.message, "arguments", None) or {}
         db = get_db(get_shared_mongo_client()) if external else None
+        available = None  # the balance before this call, when known (for the sign-off line)
 
         try:
             if external:
@@ -230,12 +256,14 @@ class BirdyAccessMiddleware(Middleware):
             if external and not token_scopes(claims) & {READ_SCOPE, WRITE_SCOPE}:  # a write token also reads
                 # A signed token with no Birdy scope (e.g. some other short-lived JWT) gets nothing, not even reads.
                 set_outcome("refused", reason="no_scope")
-                raise ToolError("This token does not grant access to Birdy. Reconnect Birdy to continue.")
+                raise ToolError("This token does not grant access to Birdy. Reconnect Birdy to continue. No credits were used.")
 
             if "write" in (tool.tags or set()) and WRITE_SCOPE not in token_scopes(claims):
                 set_outcome("refused", reason="view_only")
                 raise ToolError(
-                    'This Birdy connection is view-only. Reconnect with "View and make changes" to do this.'
+                    "Birdy can only look right now: this connection is view-only, so it can't make changes. "
+                    'Reconnect Birdy with "View and make changes" and ask again. You will see a preview before '
+                    "anything changes. No credits were used."
                 )
 
             if external:
@@ -247,9 +275,10 @@ class BirdyAccessMiddleware(Middleware):
                     set_outcome("refused", reason="no_subscription")
                     raise ToolError(
                         f"Your Birdy subscription is inactive. Reactivate it at {FRONTEND_URL}/settings?tab=billing "
-                        "to keep using Birdy here."
+                        "to keep using Birdy here. No credits were used."
                     )
-                if not await mcp_billing.has_credits(db, claims.get("sub")):
+                allowed, available = await mcp_billing.credit_state(db, claims.get("sub"))
+                if not allowed:
                     set_outcome("refused", reason="out_of_credits")
                     raise ToolError(mcp_billing.OUT_OF_CREDITS_MESSAGE)
 
@@ -260,4 +289,5 @@ class BirdyAccessMiddleware(Middleware):
             raise
         if external:
             await _finish_call(db, claims, context.message.name, tool.tags or set(), args, result, None, started, started_at)
+            return await _with_signoff(db, context.message.name, tool.tags or set(), args, result, available)
         return result

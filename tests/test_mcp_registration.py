@@ -39,6 +39,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "report_designer_mcp": {"list_report_clients", "list_report_metrics", "get_report_draft", "preview_report", "propose_report"},
     "refresh_mcp": {"refresh_client_data", "refresh_status"},
     "watch_mcp": {"check_my_accounts", "get_fired_alerts", "explain_alert"},
+    "hello_mcp": {"get_started"},
     "prompts_mcp": set(),  # prompts only, no tools
 }
 

@@ -281,7 +281,7 @@ def mcp_call(mock_db, monkeypatch, subscription_state):
     """Call an MCP tool through the real ASGI app (auth, middleware, tool) as a minted-token user.
 
     await mcp_call("get_alerts", {}, user="alice@example.com", scope="birdy.read", token_type="mcp")
-    -> SimpleNamespace(is_error, text). `scope=None` leaves the scope claim out; `token_type=None` leaves `type` out.
+    -> SimpleNamespace(is_error, text, signoff). `scope=None` leaves the scope claim out; `token_type=None` leaves `type` out.
     """
     import time
     import uuid
@@ -327,7 +327,9 @@ def mcp_call(mock_db, monkeypatch, subscription_state):
         async with app.router.lifespan_context(app):
             async with Client(transport) as client:
                 res = await client.call_tool(name, args or {}, raise_on_error=False)
-        text = "".join(getattr(c, "text", "") for c in res.content)
-        return types.SimpleNamespace(is_error=res.is_error, text=text)
+        blocks = [getattr(c, "text", "") or "" for c in res.content]
+        # External results end with Birdy's sign-off block (ai/mcp/voice.signoff): kept apart from the payload.
+        signoff = blocks.pop() if blocks and blocks[-1].startswith("Birdy: ") and len(blocks) > 1 else None
+        return types.SimpleNamespace(is_error=res.is_error, text="".join(blocks), signoff=signoff)
 
     return _call
