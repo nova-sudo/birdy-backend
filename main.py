@@ -185,6 +185,14 @@ app.include_router(tracking.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py
+@app.get("/birdy-mcp-icon.png", include_in_schema=False)
+async def birdy_mcp_icon():
+    """The connector icon AI apps show next to Birdy (listed in the MCP server's `icons`)."""
+    from fastapi import Response
+    from ai.mcp.icon_png import ICON_PNG
+    return Response(ICON_PNG, media_type="image/png", headers={"Cache-Control": "public, max-age=86400"})
+
+
 app.mount("/mcp", mcp_app)
 # OAuth discovery must sit at the root (RFC 9728 / RFC 8414): clients probe
 # /.well-known/oauth-protected-resource/mcp and /.well-known/oauth-authorization-server.

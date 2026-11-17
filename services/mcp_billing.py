@@ -7,7 +7,8 @@ from credits import _apply_charge, _available, _load_and_sync, get_credits_setti
 logger = logging.getLogger(__name__)
 
 OUT_OF_CREDITS_MESSAGE = (
-    "You're out of Birdy credits. Top up in Settings → Billing to keep using Birdy here."
+    "You're out of Birdy credits. Top up in Settings → Billing to keep using Birdy here. "
+    "Nothing was charged for this request."
 )
 
 
@@ -51,17 +52,22 @@ async def charge_mcp_call(db, user_id: str, *, tool: str, grant_id: str | None, 
     return result
 
 
-async def has_credits(db, user_id: str) -> bool:
-    """True when enforcement is off or the available balance is > 0. Fails open on a read error.
+async def credit_state(db, user_id: str) -> tuple[bool, float | None]:
+    """(allowed, available balance). Allowed when enforcement is off or the balance is > 0.
+    Fails open on a read error, with the balance unknown (None).
 
     Settings come from the short cache (credits._SETTINGS_TTL): an admin toggle reaches every
     instance within that window, and a call no longer costs an extra settings read."""
     try:
         settings = await get_credits_settings(db)
-        if not settings["enforce"]:
-            return True
         credits, _ = await _load_and_sync(db, user_id)
-        return _available(credits) > 0
+        available = _available(credits)
+        return (not settings["enforce"]) or available > 0, available
     except Exception:
         logger.error("MCP credits check failed for %s", user_id, exc_info=True)
-        return True
+        return True, None
+
+
+async def has_credits(db, user_id: str) -> bool:
+    """True when enforcement is off or the available balance is > 0. Fails open on a read error."""
+    return (await credit_state(db, user_id))[0]

@@ -18,25 +18,20 @@ never accepted as a tool argument.
 """
 
 from fastmcp import FastMCP
+from mcp.types import Icon
 from fastmcp.server.dependencies import get_access_token
 
+from ai.mcp import voice
 from ai.mcp.access import BirdyAccessMiddleware
 from ai.mcp.oauth_provider import BirdyOAuthProvider
-
-INSTRUCTIONS = (
-    "Birdy is a marketing analytics and media buying assistant for agencies. Use these tools to read "
-    "the user's clients' Meta ads, GoHighLevel, and lead data, manage alerts, and operate their Birdy "
-    "Media Buying Agent. Client and agent names can be passed as written; if a tool returns candidates, "
-    "ask the user which one they meant. Tools marked as making live changes return a preview first: "
-    "show it and only confirm after the user agrees. Read a client's notes before giving advice about "
-    "that client."
-)
 
 mcp = FastMCP(
     name="Birdy",
     auth=BirdyOAuthProvider(),
     middleware=[BirdyAccessMiddleware()],
-    instructions=INSTRUCTIONS,
+    instructions=voice.INSTRUCTIONS,
+    website_url=voice.WEBSITE_URL,
+    icons=[Icon(src=voice.ICON_URL, mimeType="image/png", sizes=["128x128"])],
 )
 
 # stateless_http=True: required for Vercel — serverless invocations have no

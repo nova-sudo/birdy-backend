@@ -11,7 +11,8 @@ from ai.mcp import mcp
 
 PENDING: set[str] = set()  # tools a prompt names before the tool ships
 
-PROMPT_NAMES = {"weekly_client_review", "why_did_cpl_jump", "prep_client_call", "agent_week", "daily_check_in"}
+PROMPT_NAMES = {"weekly_client_review", "why_did_cpl_jump", "prep_client_call", "agent_week", "daily_check_in",
+                "fix_worst_client"}
 CLIENT_PROMPTS = {"why_did_cpl_jump", "prep_client_call"}
 TOOL_NAME = re.compile(r"\b[a-z]+(?:_[a-z]+)+\b")
 
@@ -40,20 +41,23 @@ async def test_prompts_registered_and_render_client_name():
 async def test_prompt_texts_are_verbatim():
     assert await _render("weekly_client_review") == (
         "Use Birdy's check_my_accounts for the last 7 days. For each client that needs attention, explain what "
-        "changed and why using get_client, compare_periods and the agent's cards, then give me a short action list."
+        "changed and why using get_client, compare_periods and the agent's cards. Answer as Birdy's morning "
+        "brief: a one-line headline, The win, The worry, The number, then numbered next steps."
     )
     assert await _render("prep_client_call", {"client": "Acme Dental"}) == (
         "Prep me for a call with Acme Dental using Birdy: last 30 days results vs target, best and worst ads, "
-        "lead quality from get_unified_lead_stats, open agent cards, and recent notes. Format as a one-page brief."
+        "lead quality from get_unified_lead_stats, open agent cards, and recent notes. Format as a one-page brief "
+        "with three talking points at the end."
     )
     assert await _render("agent_week") == (
         "Using Birdy, summarise what my media buying agent did this week: runs, applied and dismissed cards, "
         "outcomes, and anything waiting for my decision."
     )
     assert await _render("daily_check_in") == (
-        "Use Birdy's check_my_accounts and tell me only what needs my attention today, most urgent first. "
-        "If nothing does, say so in one line."
+        "Use Birdy's check_my_accounts and tell me only what needs my attention today, most urgent first, as "
+        "Birdy's morning brief. If nothing does, say so in one line."
     )
+    assert "pick the one client that most needs help" in await _render("fix_worst_client")
 
 
 async def test_prompts_only_name_registered_tools():
