@@ -95,3 +95,20 @@ def test_impersonating_admin_cannot_mint_an_mcp_token(mock_mongo_client):
     assert _create(_session_token()).status_code == 200
     res = _create(_session_token(imp=True, act="admin@birdy.ai"))
     assert res.status_code == 403 and "viewing as a user" in res.json()["detail"]
+
+
+def test_mint_with_expired_access_token_renews_from_refresh_cookie(mock_mongo_client):
+    """A lapsed login no longer 401s the mint: get_current_user renews from the refresh cookie."""
+    from core.config import JWT_REFRESH_SECRET
+    expired = pyjwt.encode({"sub": ALICE, "exp": int(time.time()) - 60, "type": "access"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    refresh = pyjwt.encode({"sub": ALICE, "exp": int(time.time()) + 600, "type": "refresh"},
+                           JWT_REFRESH_SECRET, algorithm=JWT_ALGORITHM)
+    client = TestClient(app)
+    client.cookies.set("auth_token", expired)
+    client.cookies.set("refresh_token", refresh)
+    assert client.post("/api/mcp/tokens", json={"name": "Laptop"}).status_code == 200
+    # An expired impersonation token is still refused, not minted as the admin.
+    client.cookies.set("auth_token", pyjwt.encode(
+        {"sub": ALICE, "exp": int(time.time()) - 60, "type": "access", "imp": True, "act": "admin@birdy.ai"},
+        JWT_SECRET, algorithm=JWT_ALGORITHM))
+    assert client.post("/api/mcp/tokens", json={"name": "Laptop"}).status_code == 403

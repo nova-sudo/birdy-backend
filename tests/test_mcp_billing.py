@@ -258,3 +258,48 @@ def test_admin_config_route_returns_422_for_out_of_range_rate(mock_mongo_client,
     finally:
         app.dependency_overrides.pop(require_admin, None)
     assert res.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_has_credits_uses_the_cached_settings(mock_db, monkeypatch):
+    calls = []
+    real = credits.get_credits_settings
+
+    async def spy(db, **kw):
+        calls.append(kw)
+        return await real(db, **kw)
+
+    monkeypatch.setattr(mcp_billing, "get_credits_settings", spy)
+    await _give(mock_db, topup=1)
+    await has_credits(mock_db, USER)
+    assert calls == [{}]
+
+
+@pytest.mark.asyncio
+async def test_lost_races_back_off_with_growing_jitter_then_land(mock_db, monkeypatch):
+    """A charge that keeps losing the rev race waits a little longer each time (spreading a burst out)
+    instead of re-colliding immediately, and still lands once it wins."""
+    await _give(mock_db, topup=100)
+    users = mock_db["users"]
+    real_update, lost = type(users).update_one, {"n": 0}
+
+    async def racing_update(self, filt, update, *a, **k):
+        if "credits.rev" in filt and lost["n"] < 5:   # a concurrent charge got there first
+            lost["n"] += 1
+            await real_update(self, {"user_id": USER}, {"$inc": {"credits.rev": 1}})
+        return await real_update(self, filt, update, *a, **k)
+
+    sleeps = []
+    real_sleep = asyncio.sleep
+
+    async def record_sleep(d):
+        sleeps.append(d)
+        await real_sleep(0)
+
+    monkeypatch.setattr(type(users), "update_one", racing_update)
+    monkeypatch.setattr(credits.asyncio, "sleep", record_sleep)
+    monkeypatch.setattr(credits.random, "uniform", lambda lo, hi: hi)  # the top of each window
+    await charge_mcp_call(mock_db, USER, tool="get_alerts", grant_id=None, chars=0, live=False)
+    step = credits._CHARGE_BACKOFF_SECONDS
+    assert sleeps == [pytest.approx(step * n) for n in range(1, 6)]
+    assert (await users.find_one({"user_id": USER}))["credits"]["topup_balance"] == pytest.approx(99.8)

@@ -21,6 +21,13 @@ Merge-base for "pre-existing": `b0a3511`. Commits are in `birdy-backend-mcp` unl
 | Load-more error text (Task 6). Own state and message, rows and button kept. Test. | FE cd8622b |
 | Admin `mcpSaved` effect wiped in-progress edits (Task 7). Merged per field: an untouched field follows a changed saved value, an edited field keeps the edit. Tests (fee kept at 0.7, max_per_call follows 12, Save sends both). | FE a16af6f |
 | Admin save toast omitted MCP rates (Task 7). Test. | FE a16af6f |
+| Deferred (final report): fresh settings read per call. `has_credits` uses the 20 s settings cache; an admin toggle reaches every instance within that window. Test. | this round |
+| Deferred: burst undercharge after 25 lost rev races. Retries back off with growing jitter (5 ms × attempt, ≤ 0.125 s) instead of re-colliding at once. Test forces 5 lost races. | this round |
+| Deferred: manual token mint 401 after the access token lapsed. The mint reads claims without the expiry check after `get_current_user` (which renews from the refresh cookie); an expired impersonation token is still 403. Test. | this round |
+| Deferred: `link_for` placeholders not URL-encoded. Values are `quote(..., safe="")`; booleans skipped. Test. | this round |
+| Deferred: escaped-JSON `confirm_code` in excerpts. The pattern takes escaped quotes, and dict results are masked after `json.dumps` too (a JSON string nested as a value). Test. | this round |
+| Deferred: mobile activity panel had no focus trap. Tab/Shift+Tab wrap inside the full-screen panel. Test. | FE this round |
+| Deferred (pre-existing): admin markup/stopper edits wiped on revalidate. Same per-field rule as the MCP rates. Test. | FE this round |
 
 ## Closed
 
@@ -34,7 +41,7 @@ Merge-base for "pre-existing": `b0a3511`. Commits are in `birdy-backend-mcp` unl
 | Task 5: a Mongo lookup failure drops the activity row | Closed, narrowed. c1280e3 only made the PostHog events survive a failed lookup (`ai/mcp/access.py` `record()`, test `test_events_fire_and_result_returns_when_mongo_lookups_raise`). The activity row is still skipped in that case (the error is re-raised before `record_call`), and logged as a warning. The lookups failing means Mongo is failing, so the insert would fail too. |
 | Task 1: `reset_outcome` unused Token; contextvar holds a replaced dict; no RED run; import order | Harmless / process notes. Not changed. |
 | Task 1: middleware no_subscription / rate_limit untested | Already covered by later tests: `test_external_token_without_subscription_is_refused` and `test_external_calls_rate_limited_per_user` (tests/test_mcp_access.py), `test_no_subscription_refusal_logged` and `test_rate_limited_collapses_to_one_row_per_minute` (tests/test_mcp_activity.py). |
-| Task 2: no 25-retry exhaustion test; `wait_for` cancel can deduct without a ledger row | Test-only gap and an accepted 0.3 s trade-off in the spec. |
+| Task 2: `wait_for` cancel can deduct without a ledger row | Accepted 0.3 s trade-off in the spec (the retry path now has a backoff test, see Fixed). |
 | Task 4 minor: DCR secret plaintext, no IPv6 loopback, no aud binding, code replay not revoking grant, refresh race untested | Final-review triage: OK to leave. |
 | M3 spoofable client names ("unverified app" label) | UI/owner decision. |
 | M5 orphan grants listed before first token | Pre-existing design of the connector flow; list/lifecycle change is a spec decision. |

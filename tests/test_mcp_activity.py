@@ -289,3 +289,15 @@ async def test_rate_limited_row_always_has_an_id(mock_db):
     await mcp_activity.record_rate_limited(mock_db, USER, "g1", "Claude")
     [row] = await mock_db["mcp_activity"].find({}).to_list(None)
     assert isinstance(row["id"], str) and row["id"]
+
+
+def test_link_values_are_url_encoded():
+    assert link_for("post_creative_test", {"test_id": "a/b?c#d e"}) == "/campaigns/creatives/a%2Fb%3Fc%23d%20e/edit"
+
+
+def test_escaped_json_confirm_code_is_masked_in_excerpts():
+    from services.mcp_activity import _excerpt
+    inner = json.dumps({"confirm_code": "SECRET1", "ok": True})
+    for result in (json.dumps({"text": inner}), {"text": inner}, 'confirm_code=SECRET1 then'):
+        out = _excerpt(result)
+        assert "SECRET1" not in out and "••••••" in out

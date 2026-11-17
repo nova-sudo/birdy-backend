@@ -52,9 +52,12 @@ async def charge_mcp_call(db, user_id: str, *, tool: str, grant_id: str | None, 
 
 
 async def has_credits(db, user_id: str) -> bool:
-    """True when enforcement is off or the available balance is > 0. Fails open on a read error."""
+    """True when enforcement is off or the available balance is > 0. Fails open on a read error.
+
+    Settings come from the short cache (credits._SETTINGS_TTL): an admin toggle reaches every
+    instance within that window, and a call no longer costs an extra settings read."""
     try:
-        settings = await get_credits_settings(db, fresh=True)
+        settings = await get_credits_settings(db)
         if not settings["enforce"]:
             return True
         credits, _ = await _load_and_sync(db, user_id)

@@ -24,6 +24,7 @@ via :func:`record_usage`.
 """
 
 import asyncio
+import random
 import logging
 import os
 import time
@@ -397,7 +398,7 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
     read, otherwise we re-read and retry, so concurrent charges (an MCP burst)
     never overwrite each other.
     """
-    for _ in range(_CHARGE_RETRIES):
+    for attempt in range(_CHARGE_RETRIES):
         credits, _ = await _load_and_sync(db, user_id)
         remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
         from_allowance = min(charge, remaining_allowance)
@@ -419,7 +420,9 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
         )
         if res.matched_count:
             break
-        await asyncio.sleep(0)  # lost the race: yield, re-read, retry
+        # Lost the race: back off a little (jittered, growing) so a burst of charges spreads out
+        # instead of colliding again on the same rev, then re-read and retry.
+        await asyncio.sleep(random.uniform(0, _CHARGE_BACKOFF_SECONDS * (attempt + 1)))
     else:
         raise RuntimeError(f"credit charge for {user_id} lost the write race {_CHARGE_RETRIES} times")
 
@@ -432,6 +435,7 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
 
 
 _CHARGE_RETRIES = 25
+_CHARGE_BACKOFF_SECONDS = 0.005  # per attempt; the 25th waits at most 0.125 s
 
 
 # Whisper is priced per audio minute, not per token (OpenAI: $0.006/min).

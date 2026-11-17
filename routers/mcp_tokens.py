@@ -9,7 +9,7 @@ services/mcp_token_service.py and ai/mcp/server.py.
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 
 from core.database import get_db
 from core.models import CreateMcpTokenRequest
@@ -26,11 +26,15 @@ router = APIRouter()
 @router.post("/api/mcp/tokens")
 async def create_token(
     request: CreateMcpTokenRequest,
+    http_request: Request,
     current_user: str = Depends(get_current_user),
-    claims: dict = Depends(get_current_claims),
 ):
     """Mint a new MCP bearer token. The raw token is returned once — it is
     never stored or shown again, only its metadata (name, id, expiry)."""
+    # get_current_user has already checked the session (and renewed an expired access token from the
+    # refresh cookie), so the claims are read without the expiry check: an expired-but-signed token
+    # still says whether this is an impersonation session, and a lapsed login no longer means a 401.
+    claims = await get_current_claims(http_request, verify_exp=False)
     if claims.get("imp"):
         raise HTTPException(status_code=403, detail="Admins can't create AI connections while viewing as a user.")
     async with get_mongo_client() as mongo_client:

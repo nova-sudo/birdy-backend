@@ -8,6 +8,7 @@ Rate-limited refusals do not get a row each: one row per user per minute carries
 import json
 import logging
 import re
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 from ai.mcp.activity_labels import LABELS
@@ -30,7 +31,8 @@ _EMAIL = re.compile(r"([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\.[A-Za
 # unix timestamp looks exactly like a US number.
 _PHONE = re.compile(r"(?<![\w])\+?\(?\d[\d\s().-]{8,}\d(?![\d:])")
 # A confirm_code inside text-only output (JSON text or "confirm_code: abc"): the code value is replaced.
-_CONFIRM_CODE = re.compile(r"""(confirm_code["']?\s*[:=]\s*["']?)[^\s"',}]+""", re.I)
+# Also JSON that was itself turned into a string, where the quotes arrive escaped: confirm_code\": \"abc\"
+_CONFIRM_CODE = re.compile(r"""(confirm_code(?:\\*["'])?\s*[:=]\s*(?:\\*["'])?)[^\s"'\\,}]+""", re.I)
 _PHONE_KEYS = {"phone", "phone_number", "phonenumber", "mobile", "cell", "to_number", "from_number"}
 _EMAIL_KEYS = {"email", "email_address", "emailaddress"}
 
@@ -153,7 +155,9 @@ def link_for(tool: str, args: dict) -> str | None:
     if not template:
         return None
     try:
-        values = {k: v for k, v in (args or {}).items() if isinstance(v, (str, int)) and str(v).strip()}
+        # Encoded, so an id with "/", "?", "#" or spaces can't change which page the link opens.
+        values = {k: quote(str(v), safe="") for k, v in (args or {}).items()
+                  if isinstance(v, (str, int)) and not isinstance(v, bool) and str(v).strip()}
         return template.format(**values)
     except (KeyError, IndexError):
         return None
@@ -162,9 +166,11 @@ def link_for(tool: str, args: dict) -> str | None:
 def _excerpt(result) -> str | None:
     if result is None:
         return None
-    text = result if isinstance(result, str) else json.dumps(redact(result), default=str, ensure_ascii=False)
     if isinstance(result, str):
-        text = _mask_text(_CONFIRM_CODE.sub(r"\1••••••", text))
+        text = _mask_text(_CONFIRM_CODE.sub(r"\1••••••", result))
+    else:
+        # redact() drops confirm_code keys; a JSON string nested as a value still carries one, escaped.
+        text = _CONFIRM_CODE.sub(r"\1••••••", json.dumps(redact(result), default=str, ensure_ascii=False))
     return text[:EXCERPT_CHARS]
 
 
