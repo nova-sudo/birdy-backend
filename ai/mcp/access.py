@@ -222,7 +222,7 @@ async def _with_signoff(db, tool_name: str, tags: set, args: dict, result, avail
         live = outcome.get("kind") == "live_executed" and "live" in tags
         cost = (await mcp_billing.charge_breakdown(db, response_chars(result), live))["total"]
         left = available - cost if available is not None else None
-        line = voice.signoff(mcp_activity.link_for(tool_name, args), cost, left)
+        line = voice.closing_block(mcp_activity.link_for(tool_name, args), cost, left, lookup="write" not in tags)
         if not line:
             return result
         return ToolResult(content=[*result.content, TextContent(type="text", text=line)],

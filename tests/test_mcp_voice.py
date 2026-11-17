@@ -65,6 +65,7 @@ async def test_external_result_ends_with_signoff(mcp_call, mock_db):
     assert not res.is_error
     assert res.signoff.startswith(f"Birdy: see it in Birdy {FRONTEND_URL}/alerts · this request cost ")
     assert "left)" in res.signoff and "Birdy:" not in res.text
+    assert voice.STYLE_REMINDER in res.signoff  # a look-up carries the answer-style reminder
 
 
 @pytest.mark.asyncio
@@ -80,7 +81,7 @@ async def test_internal_and_refused_calls_have_no_signoff(mcp_call, mock_db):
 async def test_signoff_failure_never_loses_the_result(mcp_call, mock_db, monkeypatch):
     def boom(*a, **k):
         raise RuntimeError("bad")
-    monkeypatch.setattr(voice, "signoff", boom)
+    monkeypatch.setattr(voice, "closing_block", boom)
     res = await mcp_call("get_alerts", {}, user=USER, scope=RW, token_type="mcp")
     assert not res.is_error and res.signoff is None
 
@@ -106,3 +107,9 @@ async def test_prompt_menu_titles():
     prompts = await mcp.get_prompts()
     assert {p.title for p in prompts.values()} == {
         "Monday review", "What changed?", "Call prep", "Agent recap", "Daily check-in", "Fix my worst client"}
+
+
+def test_closing_block_reminds_style_on_lookups_only():
+    assert voice.closing_block("/alerts", 0.2, None, lookup=True).endswith(voice.STYLE_REMINDER)
+    assert voice.STYLE_REMINDER not in voice.closing_block("/alerts", 0.2, None, lookup=False)
+    assert voice.closing_block(None, None, None, lookup=True) is None

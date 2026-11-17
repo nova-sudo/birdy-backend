@@ -72,6 +72,16 @@ def apply_titles(server) -> None:
             tool.title = tool_title(label)
 
 
+# Repeated in look-up results: AI apps don't reliably pass server instructions to the model, but it always
+# reads tool results (seen in Claude, 2026-11-18: the answer ignored the format and dropped the sign-off).
+STYLE_REMINDER = (
+    "Birdy answer style: open with at most 3 bullets (headline number, best result, what needs action). "
+    "Label clients Act, Watch or Fine, worst first. Say why a number moved in plain words. End with at most 3 "
+    'numbered next steps the user can approve by replying "do 1", then close with one short line: the Birdy '
+    "links that matter and the credits this turn cost."
+)
+
+
 def signoff(link: str | None, credits: float | None, left: float | None) -> str | None:
     """The "Birdy:" line appended to an external tool result: a deep link and what the request cost."""
     parts = []
@@ -83,3 +93,11 @@ def signoff(link: str | None, credits: float | None, left: float | None) -> str 
             cost += f" ({max(0.0, left):,.1f} left)"
         parts.append(cost)
     return ("Birdy: " + " · ".join(parts)) if parts else None
+
+
+def closing_block(link: str | None, credits: float | None, left: float | None, *, lookup: bool) -> str | None:
+    """What follows an external result: the sign-off, and on look-ups the answer-style reminder."""
+    line = signoff(link, credits, left)
+    if line and lookup:
+        return f"{line}\n{STYLE_REMINDER}"
+    return line
