@@ -227,3 +227,14 @@ def test_server_identity():
     assert mcp.name == "Birdy"
     assert isinstance(mcp.auth, BirdyOAuthProvider)
     assert mcp.instructions.startswith("Birdy is a marketing analytics and media buying assistant for agencies.")
+
+
+@pytest.mark.asyncio
+async def test_bare_connector_link_is_served_without_a_redirect(root_app):
+    """Claude's connector check does not follow redirects: /mcp must answer itself (401 + challenge)."""
+    app, fresh = root_app
+    async with fresh.router.lifespan_context(fresh):
+        async with _http(app) as http:
+            r = await http.post("/mcp", json={}, headers={"accept": "application/json, text/event-stream"})
+    assert r.status_code == 401
+    assert "resource_metadata=" in r.headers.get("www-authenticate", "")
