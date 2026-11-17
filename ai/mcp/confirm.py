@@ -103,6 +103,13 @@ async def consume_code(db, user_id: str, tool: str, args: dict, code: str, state
     return doc is not None and doc.get("state_hash") == _state_hash(state)
 
 
+def _action(tool: str) -> str | None:
+    from ai.mcp.activity_labels import LABELS
+    from ai.mcp.voice import tool_title
+    label = (LABELS.get(tool) or {}).get("label")
+    return tool_title(label) if label else None
+
+
 async def two_step(
     db,
     user_id: str,
@@ -121,6 +128,8 @@ async def two_step(
         return {
             "needs_confirmation": True,
             "preview": await preview(),
+            "tool": tool,  # the confirm card calls it again with confirm_code
+            "action": _action(tool),
             "confirm_code": await issue_code(db, user_id, tool, args, state, activity_id=current_activity_id()),
             "expires_in_seconds": CONFIRM_TTL_SECONDS,
             "next": NEXT_STEP,

@@ -35,3 +35,39 @@ async def test_card_resources_are_not_tools_and_cost_nothing():
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}
     assert not any(n.startswith("birdy_card_") for n in names)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tool,name", [
+    ("check_my_accounts", "accounts"), ("compare_periods", "scorecard"), ("get_account_summary", "summary"),
+    ("explain_alert", "alert"), ("get_fired_alerts", "alert"), ("apply_card", "confirm"), ("send_lead_message", "confirm"),
+])
+async def test_tools_point_at_their_card(tool, name):
+    async with Client(mcp) as c:
+        t = {t.name: t for t in await c.list_tools()}[tool]
+    assert t.meta["ui"]["resourceUri"] == cards.uri(name)
+
+
+@pytest.mark.asyncio
+async def test_every_live_tool_has_the_confirm_card():
+    async with Client(mcp) as c:
+        tools = await c.list_tools()
+    live = [t for t in tools if "live" in (t.meta or {}).get("_fastmcp", {}).get("tags", [])]
+    assert len(live) >= 10
+    assert all(t.meta["ui"]["resourceUri"] == cards.uri("confirm") for t in live)
+
+
+@pytest.mark.asyncio
+async def test_two_step_preview_names_the_tool_for_the_confirm_card(mock_db):
+    from ai.mcp.confirm import two_step
+
+    async def preview():
+        return {"client": "Acme"}
+
+    async def execute():
+        raise AssertionError("not on preview")
+
+    out = await two_step(mock_db, "alice@example.com", "apply_card", {"card_id": "c1"}, None, preview, execute)
+    assert out["tool"] == "apply_card"
+    assert out["action"] == "Applying an agent card"
+    assert out["preview"] == {"client": "Acme"} and out["confirm_code"]

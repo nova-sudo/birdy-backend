@@ -42,8 +42,19 @@ def _register(name: str, title: str, body: str) -> None:
 
 
 CARDS = {
-    "accounts": ("Birdy · all clients", card_views.ACCOUNTS),
+    "accounts": ("Birdy · all clients", card_views.ACCOUNTS),      # #12 check_my_accounts
+    "scorecard": ("Birdy · client scorecard", card_views.SCORECARD),  # #11 compare_periods
+    "alert": ("Birdy · alert", card_views.ALERT),                  # #13 explain_alert, get_fired_alerts
+    "confirm": ("Birdy · live change", card_views.CONFIRM),        # #15 every LIVE tool
+    "summary": ("Birdy · numbers", card_views.SUMMARY),            # #23 get_account_summary
 }
 
 for _name, (_title, _body) in CARDS.items():
     _register(_name, _title, _body)
+
+
+def attach_live_cards(server) -> None:
+    """Every LIVE tool gets the confirm card: its preview (two_step) shows with Confirm and Cancel buttons."""
+    for tool in server._tool_manager._tools.values():
+        if "live" in (tool.tags or set()) and not (tool.meta or {}).get("ui"):
+            tool.meta = {**(tool.meta or {}), **card("confirm")}
