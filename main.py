@@ -122,6 +122,26 @@ app.add_middleware(TokenRefreshMiddleware)
 # say, and rebuilds the headers without losing any of them.
 app.add_middleware(ETagMiddleware)
 
+
+class _McpNoSlashRedirect:
+    """Serve the connector link `/mcp` itself instead of a 307 to `/mcp/`.
+
+    The MCP app is mounted at /mcp, so Starlette would redirect the bare path; Claude's
+    "Add custom connector" check does not follow that redirect and reports the server as
+    not found. Rewriting the path before routing answers /mcp exactly like /mcp/."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/mcp":
+            scope = {**scope, "path": "/mcp/", "raw_path": b"/mcp/"}
+        await self.app(scope, receive, send)
+
+
+# Outermost, so the rewrite happens before any routing.
+app.add_middleware(_McpNoSlashRedirect)
+
 # Routers
 app.include_router(auth.router)
 app.include_router(ghl.router)
