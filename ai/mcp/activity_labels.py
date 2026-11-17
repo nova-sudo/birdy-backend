@@ -24,7 +24,7 @@ LABELS: dict[str, dict] = {
     "update_alert": _l("Updated an alert", _ALERTS),
     "get_fired_alerts": _l("Looked at alerts that fired", _ALERTS),
     "explain_alert": _l("Looked into why an alert fired", _ALERTS),
-    "check_my_accounts": _l("Checked accounts"),
+    "check_my_accounts": _l("Checked accounts", "/clients"),
     "get_started": _l("Checked what Birdy can do", _SUGGESTIONS),
     # Meta and lead data
     "get_campaign_insights": _l("Looked at campaign results"),

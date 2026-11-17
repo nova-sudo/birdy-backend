@@ -17,8 +17,7 @@ def weekly_client_review() -> str:
     """How every client did last week: what needs attention and why, then an action list."""
     return (
         "Use Birdy's check_my_accounts for the last 7 days. For each client that needs attention, explain what "
-        "changed and why using get_client, compare_periods and the agent's cards. Answer as Birdy's morning "
-        "brief: a one-line headline, The win, The worry, The number, then numbered next steps."
+        "changed and why using get_client, compare_periods and the agent's cards, then give me the week's checklist."
     )
 
 
@@ -55,8 +54,8 @@ def agent_week() -> str:
 def daily_check_in() -> str:
     """Only what needs attention today, most urgent first."""
     return (
-        "Use Birdy's check_my_accounts and tell me only what needs my attention today, most urgent first, as "
-        "Birdy's morning brief. If nothing does, say so in one line."
+        "Use Birdy's check_my_accounts and tell me only what needs my attention today, most urgent first. "
+        "If nothing does, say so in one line."
     )
 
 
