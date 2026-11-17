@@ -17,6 +17,7 @@ from core.mongo_client import get_shared_mongo_client
 from ai.tools.derived_metrics import enrich, _safe_float
 from ai.config import MAX_RESULT_ITEMS
 from ai.mcp.access import READ
+from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 # Valid presets for the schema description
@@ -32,7 +33,7 @@ _GET_ACCOUNT_SUMMARY_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_ACCOUNT_SUMMARY_DESCRIPTION, **READ)
+@mcp.tool(description=_GET_ACCOUNT_SUMMARY_DESCRIPTION, **READ, meta=card("summary"))
 async def get_account_summary(preset: str = "last_7d", group_ids: list[str] | None = None) -> dict:
     """
     High-level dashboard summary across all or selected client groups.

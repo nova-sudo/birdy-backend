@@ -40,3 +40,4 @@ from ai.mcp import cards  # noqa: F401  (card resources; tools attach them via c
 from ai.mcp.voice import apply_titles  # noqa: E402
 
 apply_titles(mcp)  # after every tool module has registered
+cards.attach_live_cards(mcp)

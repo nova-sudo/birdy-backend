@@ -49,7 +49,7 @@ async def check_my_accounts(days: int = 7) -> dict:
     return await build_account_check(get_db(client), client, _current_user_id(), days)
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("alert"))
 async def get_fired_alerts(days: int = 7) -> dict:
     """The alerts that fired in the last N days (1-90, default 7), newest first. Use it for "what went off?" and before explain_alert.
 
@@ -68,7 +68,7 @@ async def get_fired_alerts(days: int = 7) -> dict:
     return {"days": days, "fired": await fired_alerts(db, _current_user_id(), days)}
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("alert"))
 async def explain_alert(alert_id: str) -> dict:
     """Explain one alert: why it fired or didn't. Use after get_fired_alerts or get_alerts.
 

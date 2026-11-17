@@ -17,6 +17,7 @@ from core.mongo_client import get_shared_mongo_client
 from ai.tools.derived_metrics import enrich, _safe_float
 from ai.config import MAX_RESULT_ITEMS
 from ai.mcp.access import READ
+from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 _PRESET_LIST = (
@@ -56,7 +57,7 @@ def _compute_changes(a: dict, b: dict) -> dict:
     return changes
 
 
-@mcp.tool(description=_COMPARE_PERIODS_DESCRIPTION, **READ)
+@mcp.tool(description=_COMPARE_PERIODS_DESCRIPTION, **READ, meta=card("scorecard"))
 async def compare_periods(preset_a: str, preset_b: str, group_ids: list[str] | None = None) -> dict:
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())
