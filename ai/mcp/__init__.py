@@ -35,6 +35,7 @@ from ai.mcp import refresh_mcp  # noqa: F401
 from ai.mcp import watch_mcp  # noqa: F401
 from ai.mcp import prompts_mcp  # noqa: F401
 from ai.mcp import hello_mcp  # noqa: F401
+from ai.mcp import cards  # noqa: F401  (card resources; tools attach them via cards.card())
 
 from ai.mcp.voice import apply_titles  # noqa: E402
 

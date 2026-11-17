@@ -10,6 +10,7 @@ import asyncio
 from fastmcp.exceptions import ToolError
 
 from ai.mcp.access import READ
+from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
@@ -21,7 +22,7 @@ from core.utils import mongo_to_dict
 EVAL_TIMEOUT_SECONDS = 20
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("accounts"))
 async def check_my_accounts(days: int = 7) -> dict:
     """One verdict per client: which accounts need the owner's attention right now, and why. Use it first for "how are my clients doing?", the daily check-in and the weekly review, then dig into the flagged ones with get_client, compare_periods and get_agent_cards.
 
