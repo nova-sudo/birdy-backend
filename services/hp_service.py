@@ -4,6 +4,7 @@ services/hp_service.py
 HotProspector helper / service functions extracted from main.py.
 """
 
+import copy
 import hashlib
 import os
 import logging
@@ -652,10 +653,13 @@ async def fetch_and_cache_hp_call_center(
     # pages happened not to include it.
     db_leads = db["hotprospector_leads"]
     leads_by_id = {}
+    stored_leads = {}  # untouched copies, to write only the leads that change
     async for doc in db_leads.find(
         {"user_id": user_id, "ghl_location_id": ghl_location_id}, {"lead_data": 1}
     ):
         lead = doc.get("lead_data") or {}
+        if lead.get("id") is not None:
+            stored_leads[str(lead["id"])] = copy.deepcopy(lead)
         if lead.get("_is_unmatched_bucket") or lead.get("id") is None:
             continue
         leads_by_id[str(lead["id"])] = lead
@@ -675,6 +679,7 @@ async def fetch_and_cache_hp_call_center(
 
     # 2. Call logs, merged into what is already stored — never replacing it.
     existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
+    stored_match = {_call_identity(c): c.get("matched_lead_id") for c in existing}
     windows_done = set(resume.get("windows_done") or [])
     if mode in ("incremental", "live"):
         rec_ok, recent_raw = await integration.fetch_call_logs_for_location(
@@ -736,19 +741,24 @@ async def fetch_and_cache_hp_call_center(
     for lead in normalized_leads:
         lead["call_logs_count"] = len(lead["call_logs"])
 
-    # A live refresh only rewrites what it fetched: the calls, and the leads
-    # (and Unmatched bucket) they landed on. Nothing else changed.
-    fetched_ids = {_call_identity(c) for c in fetched_norm}
+    # Write only what changed: new calls, calls now matched to a different
+    # lead, and leads whose data or calls differ from what is stored.
+    # Re-writing every stored call and lead on each run took clients with
+    # thousands of calls past Vercel's 300s, so the run was killed before it
+    # saved anything (Nov 2026: The Bodi Genie, Sculpt Clinic).
+    def _call_changed(c):
+        ident = _call_identity(c)
+        return ident not in stored_match or stored_match[ident] != c.get("matched_lead_id")
 
-    def _touched(calls):
-        return not live or any(_call_identity(c) in fetched_ids for c in calls)
+    def _lead_changed(lead):
+        return stored_leads.get(str(lead.get("id"))) != lead
 
     # 3c. Persist EVERY call (matched or not) as its own document in the
     #     shared call_logs collection. Sales-Hub doesn't consume this yet
     #     (it reads /api/hotprospector/call-center), but /api/call_logs now
     #     serves HP rows for future unification with the GHL webhook feed.
     await _persist_hp_calls_to_call_logs(
-        [c for c in normalized_calls if _touched([c])],
+        [c for c in normalized_calls if _call_changed(c)],
         user_id=user_id,
         location_id=ghl_location_id,
         mongo_client=mongo_client,
@@ -802,7 +812,7 @@ async def fetch_and_cache_hp_call_center(
     daily_call_series = _compute_daily_call_series(normalized_calls)
 
     # 5. Persist leads (with nested call logs) to the cache collection.
-    to_save = [l for l in normalized_leads if _touched(l["call_logs"])]
+    to_save = [l for l in normalized_leads if _lead_changed(l)]
     if to_save:
         await save_hotprospector_leads_to_collection(user_id, ghl_location_id, to_save, mongo_client)
 
