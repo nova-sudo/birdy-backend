@@ -220,13 +220,14 @@ async def test_create_alert_slack_not_connected_warns(mock_db, set_current_user)
     assert "Slack isn't connected" in r["warning"]
 
 
-async def test_create_alert_slack_connected_no_warning(mock_db, set_current_user):
+async def test_create_alert_old_webhook_alone_is_not_slack(mock_db, set_current_user):
+    """Nothing posts through the old incoming-webhook field; Slack means the bot install plus an alert_fired report."""
     u = "alice@example.com"
     set_current_user(u)
     await mock_db["users"].insert_one({"user_id": u, "integrations": {"slack": {"webhook_url": "https://x"}}})
     r = await alert_mcp.create_alert.fn(name="E", metric="spend", operator="gt", value=1,
                                         notification_channels=["slack"])
-    assert "warning" not in r
+    assert r["warning"] == alert_mcp.SLACK_WARNING
 
 
 async def test_update_alert_channels_and_none_leaves_untouched(mock_db, set_current_user):
