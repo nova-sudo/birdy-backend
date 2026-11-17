@@ -22,7 +22,8 @@ from core.mongo_client import get_shared_mongo_client
 from core.utils import mongo_to_dict
 from fastmcp.exceptions import ToolError
 from services.alert_service import format_condition_display, evaluate_alert, normalize_channels
-from services.slack_service import get_user_webhook
+from services import slack_reports
+from services.slack_bot_service import get_slack_bot_status
 from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
@@ -34,6 +35,29 @@ _VALID_PERIODS = "today, day (yesterday), week (last 7 days), month (last 30 day
 _VALID_TYPES = "win, warning"
 _VALID_FREQUENCIES = "realtime, hourly, daily, weekly"
 SLACK_WARNING = "Slack isn't connected, so this alert will only show in Birdy until you connect it."
+SLACK_RECONNECT = "Slack needs reconnecting in Birdy (Settings), so this alert will only show in Birdy until then."
+SLACK_NEEDS_REPORT = (
+    "Slack is connected, but alerts reach Slack through a Slack report, and none posts this alert yet. To post it, "
+    'call create_slack_report with trigger {{"type": "event", "event": "alert_fired", "alert_id": "{alert_id}"}} '
+    "(it goes to the account's Birdy channel unless you pass channel_id). Until then it only shows in Birdy."
+)
+
+
+async def _slack_note(db, user_id: str, alert_id: str) -> str | None:
+    """Why a "slack" alert won't reach Slack, or None when it will.
+
+    The alert's "slack" channel posts nothing by itself: a Slack report on the alert_fired event does the
+    posting, through the Slack bot install (users.integrations.slack_bot). The old webhook field is unused."""
+    bot = await get_slack_bot_status(db, user_id)
+    if not bot:
+        return SLACK_WARNING
+    if bot.get("needs_reconnect"):
+        return SLACK_RECONNECT
+    report = await db[slack_reports.REPORTS].find_one({
+        "user_id": user_id, "enabled": True, "trigger.type": "event", "trigger.event": "alert_fired",
+        "$or": [{"trigger.alert_id": alert_id}, {"trigger.alert_id": None}, {"trigger.alert_id": {"$exists": False}}],
+    }, {"_id": 1})
+    return None if report else SLACK_NEEDS_REPORT.format(alert_id=alert_id)
 
 
 @mcp.tool(**READ)
@@ -92,7 +116,8 @@ _CREATE_ALERT_DESCRIPTION = (
     f"Valid metrics: {_VALID_METRICS}. Valid operators: {_VALID_OPERATORS}. "
     f"Valid periods: {_VALID_PERIODS}. Valid types: {_VALID_TYPES}. Valid frequencies: {_VALID_FREQUENCIES}. "
     "notification_channels chooses where it notifies: in_app (default), slack, email. "
-    "If slack is chosen but Slack isn't connected, the alert is still created and the result carries a warning."
+    "Slack posting is done by a Slack report on the alert_fired event; if slack is chosen and no such report "
+    "posts this alert (or Slack isn't connected), the alert is still created and the result's warning says what to do."
 )
 
 
@@ -110,7 +135,8 @@ async def create_alert(
     notification_channels: list[Literal["in_app", "slack", "email"]] | None = None,
 ) -> dict:
     """Create an alert. notification_channels picks where it notifies: "in_app" (default), "slack", "email".
-    If "slack" is chosen but Slack isn't connected, the alert is still created and the result has a warning."""
+    A Slack report on the alert_fired event does the Slack posting; if none posts this alert, or Slack isn't
+    connected, the alert is still created and the result's warning says what to do."""
     user_id = _current_user_id()
     try:
         channels = normalize_channels(notification_channels) if notification_channels is not None else ["in_app"]
@@ -199,8 +225,8 @@ async def create_alert(
         "notification_channels": channels,
         "message": f"Alert '{name}' created successfully.{eval_msg}",
     }
-    if "slack" in channels and not await get_user_webhook(user_id, mongo_client):
-        result["warning"] = SLACK_WARNING
+    if "slack" in channels and (note := await _slack_note(db, user_id, alert_id)):
+        result["warning"] = note
     return result
 
 
@@ -313,6 +339,6 @@ async def update_alert(
         "updated_fields": [k for k in update_fields if k != "updated_at"],
         "message": f"Alert '{alert.get('name')}' updated.",
     }
-    if channels and "slack" in channels and not await get_user_webhook(user_id, mongo_client):
-        result["warning"] = SLACK_WARNING
+    if channels and "slack" in channels and (note := await _slack_note(db, user_id, alert_id)):
+        result["warning"] = note
     return result
