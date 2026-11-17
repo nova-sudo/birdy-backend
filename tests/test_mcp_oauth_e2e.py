@@ -227,7 +227,8 @@ def test_server_identity():
     assert mcp.name == "Birdy"
     assert isinstance(mcp.auth, BirdyOAuthProvider)
     assert mcp.instructions.startswith("You are working with Birdy, the marketing analytics and media buying assistant")
-    assert "senior media buyer" in mcp.instructions and "Act, Watch or Fine" in mcp.instructions
+    assert "senior media buyer" in mcp.instructions and '"Act · 3"' in mcp.instructions
+    assert f"{FRONTEND_URL}/clients/<client id>" in mcp.instructions and "☐ Today" in mcp.instructions
     assert mcp.website_url == FRONTEND_URL
     assert [(i.src, i.mimeType) for i in mcp.icons] == [(f"{API_PUBLIC_URL}/birdy-mcp-icon.png", "image/png")]
 

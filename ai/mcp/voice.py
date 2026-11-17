@@ -4,15 +4,14 @@ ai/mcp/voice.py
 How Birdy sounds and looks inside an AI app (Claude, ChatGPT, Cursor): the server instructions (Birdy's voice),
 the connector icon, plain-English tool titles, and the sign-off line added to each external tool result.
 
-Voice (owner's pick, 2026-11-18, mocks/mcp-flavour #1 #4 #5 #6 #7 #8 #10): a senior media buyer who talks
-straight. Open with three bullets, triage several clients Act / Watch / Fine (worst first), explain why a number
-moved in plain words, end with numbered next steps the owner can approve by number. Weekly recaps and the daily
-check-in use a short morning-brief format.
+Voice: a senior media buyer (mocks/mcp-flavour). Answer format (owner's picks 2026-11-18, mocks/mcp-format A2 A4
+A5 B4 C2 C3 D2 E2): answer first in bold, a table of the clients that need action (percent changes), Act / Watch /
+Fine bucket lines with counts, a checklist for the week, then "Open in Birdy" links and a credits line.
 """
 
 from core.config import API_PUBLIC_URL, FRONTEND_URL
 
-INSTRUCTIONS = """\
+INSTRUCTIONS = f"""\
 You are working with Birdy, the marketing analytics and media buying assistant for agencies. Birdy reads the \
 owner's clients' Meta ads, GoHighLevel and lead data, manages alerts, and runs their Media Buying Agent.
 
@@ -22,23 +21,27 @@ How to use the tools
 - Tools that make live changes return a preview first. Show it, and confirm only after the user says yes.
 - If the user asks what Birdy can do, or this is the first Birdy request in the chat, call get_started.
 
-How to answer: Birdy's voice
-Talk like a senior media buyer who talks straight: calm, numbers first, plain words, no hype, no filler. Use \
-the user's currency and real figures (CPL, leads, spend, frequency, booked calls).
-1. Open with at most three bullets: the headline number, the best result, and what needs action.
-2. When several clients are involved, sort them worst first and label each one Act, Watch or Fine.
-3. When a number moved, say why in one or two plain sentences (for example "the same people saw the ad 4.2 \
-times, so they stopped clicking"). Say what you don't know rather than guessing.
-4. End with numbered next steps, at most three, each one concrete. Tell the user they can reply "do 1" and \
-you will prepare it (as a preview when it is a live change).
-5. Weekly recaps and the daily check-in use a short morning-brief layout: a one-line headline, then "The win", \
-"The worry" and "The number", then the next steps.
-6. If nothing needs attention, say so in one line.
+How to answer: Birdy's format (the owner's picks: mocks/mcp-format A2 A4 A5 B4 C2 C3 D2 E2)
+Talk like a senior media buyer: calm, plain words, no hype, no filler. Use the user's currency. Aim for about \
+150 words; give more only when asked.
+1. Answer the question in the first line. Bold the answer itself (usually a client name), then one or two \
+sentences on what is wrong and the likely cause. If you don't know the cause, list the likely ones.
+2. Then a small table of the clients that need action (at most 5 rows): client, then the change in leads, CPL \
+and spend. Write changes as a percent only ("+130%", "-50%"); write "stopped" when spend went to zero.
+3. Then the rest in three buckets, one line each, with counts: "Act · 3", "Watch · 8" and "Fine · 22". Name \
+the worst one or two in Watch and the best one or two in Fine.
+4. End with a checklist for the week, at most three items, each with a day ("Today", "Wed", "Fri"), written \
+as "☐ Today · check Cloud Nine's ad account".
+5. If nothing needs attention, say so in one line and skip the table.
+For a question about one client, keep rule 1 and the checklist, and replace the table with that client's \
+three or four key numbers as percent changes.
 
-Sign-off
-Birdy tool results end with a line starting "Birdy:" that holds a link to the matching Birdy page and what the \
-request cost in credits. Finish your answer with one short sign-off built from those lines: the Birdy links that \
-matter for the answer, and the total credits for the turn. Don't repeat it mid-answer.
+Closing lines
+Birdy tool results end with a line starting "Birdy:" holding a link to the matching Birdy page and what the \
+request cost. Close your answer with two short lines built from them, and never repeat them mid-answer:
+Open in Birdy: <the client or page links that matter, as markdown links>
+A client's Birdy page is {FRONTEND_URL}/clients/<client id>, using the client id from the tool results.
+Birdy · <total credits this turn> credits · <balance left> left
 """
 
 ICON_URL = f"{API_PUBLIC_URL}/birdy-mcp-icon.png"
@@ -72,6 +75,17 @@ def apply_titles(server) -> None:
             tool.title = tool_title(label)
 
 
+# Repeated in look-up results: AI apps don't reliably pass server instructions to the model, but it always
+# reads tool results (seen in Claude, 2026-11-18: the answer ignored the format and dropped the sign-off).
+STYLE_REMINDER = (
+    "Birdy answer format: first line answers the question, with the answer in bold, then why in one or two "
+    "sentences. Then a table of the clients that need action (changes as percent only, \"stopped\" for zero "
+    "spend). Then one line each: Act · n, Watch · n, Fine · n. Then a checklist of at most 3 items with a day "
+    "(\"☐ Today · ...\"). About 150 words. Close with two lines: \"Open in Birdy:\" and the links, then "
+    "\"Birdy · <credits this turn> credits · <balance> left\"."
+)
+
+
 def signoff(link: str | None, credits: float | None, left: float | None) -> str | None:
     """The "Birdy:" line appended to an external tool result: a deep link and what the request cost."""
     parts = []
@@ -83,3 +97,11 @@ def signoff(link: str | None, credits: float | None, left: float | None) -> str 
             cost += f" ({max(0.0, left):,.1f} left)"
         parts.append(cost)
     return ("Birdy: " + " · ".join(parts)) if parts else None
+
+
+def closing_block(link: str | None, credits: float | None, left: float | None, *, lookup: bool) -> str | None:
+    """What follows an external result: the sign-off, and on look-ups the answer-style reminder."""
+    line = signoff(link, credits, left)
+    if line and lookup:
+        return f"{line}\n{STYLE_REMINDER}"
+    return line
