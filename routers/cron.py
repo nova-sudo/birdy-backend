@@ -106,6 +106,10 @@ GHL_FAILURE_BACKOFF_HOURS = 6
 HP_GROUPS_PER_TICK = int(os.getenv("HP_GROUPS_PER_TICK", "3"))
 HP_STALE_CLAIM_MINUTES = 10
 
+# A group whose HP sync failed waits this long before the tick claims it again
+# (same idea as GHL_FAILURE_BACKOFF_HOURS).
+HP_FAILURE_BACKOFF_HOURS = 6
+
 # HotProspector member-dashboard sync (account-level). The current-year backfill is
 # resumable across ticks — a year of per-day getMemberDashboardData calls won't fit one.
 HP_MEMBERS_PER_TICK = 3
@@ -553,16 +557,29 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                                 {"_hp_claimed_at": {"$lt": stale_lock_before}},
                                 {"_hp_claimed_at": {"$exists": False}},
                             ]
-                        }
+                        },
+                        # Not inside a failure back-off (HP_FAILURE_BACKOFF_HOURS).
+                        {
+                            "$or": [
+                                {"_hp_retry_after": None},
+                                {"_hp_retry_after": {"$lte": now}},
+                            ]
+                        },
                     ],
                 },
                 {
                     "$set": {
                         "hp_refresh_status": "running",
                         "_hp_claimed_at": now,
+                        "_hp_last_attempt_at": now,
                     }
                 },
-                sort=[("last_hp_refresh", 1)],  # oldest first
+                # Least recently tried first, then oldest refresh. Sorting on
+                # last_hp_refresh alone let a group that never finishes (killed
+                # by the function timeout, so no refresh stamp and no error)
+                # take its account's one slot on every tick: in Nov 2026 one
+                # new client starved its 24 siblings for 12 days.
+                sort=[("_hp_last_attempt_at", 1), ("last_hp_refresh", 1)],
                 projection={
                     "id": 1, "user_id": 1, "name": 1,
                     "ghl_location_id": 1, "hp_backfill_status": 1, "hp_sync_progress": 1,
@@ -590,7 +607,8 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                     set_fields = {"hp_refresh_status": "complete"}
                     if mode == "backfill":
                         set_fields["hp_backfill_status"] = "complete"
-                    unset = {"_hp_claimed_at": "", "hp_sync_progress": "", "hp_refresh_error": ""}
+                    unset = {"_hp_claimed_at": "", "hp_sync_progress": "", "hp_refresh_error": "",
+                             "_hp_retry_after": ""}
                     state = "OK"
                 else:
                     # Cut short — rate limit or time budget. Not a refresh: the
@@ -599,7 +617,7 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                         "hp_refresh_status": "partial",
                         "hp_sync_progress": result.get("progress") or {},
                     }
-                    unset = {"_hp_claimed_at": ""}
+                    unset = {"_hp_claimed_at": "", "_hp_retry_after": ""}
                     state = "PARTIAL"
                 await client_groups.update_many(
                     {"user_id": user_id, "ghl_location_id": group["ghl_location_id"]},
@@ -619,6 +637,7 @@ async def hp_tick(authorization: str | None = Header(default=None)):
                         "$set": {
                             "hp_refresh_status": "error",
                             "hp_refresh_error": err,
+                            "_hp_retry_after": datetime.utcnow() + timedelta(hours=HP_FAILURE_BACKOFF_HOURS),
                         },
                         "$unset": {"_hp_claimed_at": ""},
                     },

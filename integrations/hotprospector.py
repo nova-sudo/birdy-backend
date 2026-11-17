@@ -946,15 +946,23 @@ class HotProspectorIntegration:
         windows = self.call_windows(lookback_days, window_days)
         all_calls, done, failed = [], [], []
         any_ok = False
+        # Past the deadline, a run still fetches one window it doesn't have yet,
+        # in full. Otherwise a resumed backfill that spent its budget before
+        # reaching the windows saved the same progress every run, forever.
+        progressed = False
         for i, (key, from_d, to_d) in enumerate(windows):
             if i > 0 and key in skip:
                 continue
-            if deadline is not None and time.monotonic() > deadline:
+            past_deadline = deadline is not None and time.monotonic() > deadline
+            if past_deadline and (progressed or key in skip):
                 failed.append(key)
                 continue
+            new_window = key not in skip
             ok, payload = await self.fetch_user_call_logs(
-                ghl_location_id, from_date=from_d, to_date=to_d, deadline=deadline,
+                ghl_location_id, from_date=from_d, to_date=to_d,
+                deadline=None if past_deadline else deadline,
             )
+            progressed = progressed or new_window
             if ok and isinstance(payload, dict):
                 any_ok = True
                 all_calls.extend(payload.get("call_logs", []) or [])

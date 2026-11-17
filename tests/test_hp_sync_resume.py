@@ -298,3 +298,46 @@ async def test_no_live_refresh_while_the_cron_syncs_the_account(mock_db):
     await mock_db["client_groups"].insert_one({"id": "g2", "user_id": USER, "ghl_location_id": "loc2",
                                                "hp_refresh_status": "running", "_hp_claimed_at": now})
     assert await claim_hp_live_refresh(mock_db["client_groups"], "g1", USER, now) is False
+
+
+# ── every resumed run makes progress ─────────────────────────────────────────
+# Nov 2026 (Sculpt Clinic): a resumed backfill re-fetched its last lead page,
+# waited out a rate limit, and by then was past its deadline, so it fetched no
+# call window. It saved the same progress every run and never finished.
+
+async def test_a_finished_lead_walk_is_not_repeated(mock_mongo_client, mock_db):
+    await _group(mock_db)
+    windows = HotProspectorIntegration.call_windows()
+    hp = FakeHP([_raw_lead(n) for n in range(5)], [], failed_windows={windows[2][0]})
+
+    out = await _sync(mock_mongo_client, hp)
+    assert out["complete"] is False and out["progress"]["leads_done"] is True
+
+    again = FakeHP([_raw_lead(n) for n in range(5)], [])
+    out = await _sync(mock_mongo_client, again, resume=out["progress"])
+
+    assert again.lead_offsets == []                      # no lead page re-fetched
+    assert out["complete"] is True
+    g = await mock_db["client_groups"].find_one({"id": "g1"})
+    assert g["hotprospector_cache"]["metrics"]["total_leads"] == 5   # count kept, not zeroed
+
+
+async def test_a_run_past_its_deadline_still_fetches_one_new_window(monkeypatch):
+    import time
+    hp = HotProspectorIntegration("u", "k")
+    asked = []
+
+    async def fake_fetch(loc, from_date=None, to_date=None, deadline=None, **kw):
+        asked.append((from_date, deadline))
+        return True, {"call_logs": [], "complete": True}
+
+    monkeypatch.setattr(hp, "fetch_user_call_logs", fake_fetch)
+    windows = hp.call_windows()
+    have = [k for k, _, _ in windows[:3]]                # newest + two older done
+
+    ok, _calls, meta = await hp.fetch_call_logs_for_location(
+        LOC, skip_windows=have, deadline=time.monotonic() - 1, with_meta=True)
+
+    assert asked == [(windows[3][1], None)]              # the next window, paged in full
+    assert meta["done"] == [windows[3][0]]
+    assert meta["complete"] is False

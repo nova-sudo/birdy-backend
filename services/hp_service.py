@@ -610,13 +610,17 @@ async def fetch_and_cache_hp_call_center(
     # against the stored leads. Re-paging every lead under the rate limit takes
     # minutes, so that stays with the nightly cron.
     live = mode == "live"
+    # A resumed run whose earlier runs already walked every lead page goes
+    # straight to the call windows (re-fetching the last page cost a rate-limit
+    # wait that left no time for them).
+    leads_done = bool(resume.get("leads_done"))
     if live:
         # Someone is waiting on the page: a rate limit gives up, not sleeps.
         integration.max_backoff = min(integration.max_backoff, budget)
 
     # 1. Leads — resuming from where a previous partial run stopped. The save
     #    is an upsert that never deletes, so pages fetched in earlier runs stay.
-    if live:
+    if live or leads_done:
         leads_info = {"leads": [], "total_count": None}
     else:
         success, leads_info = await integration.fetch_all_leads_from_ghl_location(
@@ -659,14 +663,15 @@ async def fetch_and_cache_hp_call_center(
         if lead.get("id") is not None:
             leads_by_id[str(lead["id"])] = lead
     normalized_leads = list(leads_by_id.values())
-    if live:
+    if live or leads_done:
         # HotProspector's own count, from the last lead sync.
         group = await client_groups_collection.find_one(
             {"user_id": user_id, "ghl_location_id": ghl_location_id},
             {"hotprospector_cache.metrics.total_leads": 1},
         )
         stored_total = (((group or {}).get("hotprospector_cache") or {}).get("metrics") or {}).get("total_leads")
-        total_lead_count = stored_total if stored_total is not None else len(normalized_leads)
+        # `or`: a resumed run whose last lead page came back empty stored 0.
+        total_lead_count = stored_total or len(normalized_leads)
 
     # 2. Call logs, merged into what is already stored — never replacing it.
     existing = await _load_stored_calls(user_id, ghl_location_id, mongo_client)
@@ -691,6 +696,7 @@ async def fetch_and_cache_hp_call_center(
     complete = calls_complete and not leads_truncated
     progress = {} if complete else {
         "leads_offset": leads_next_offset if leads_truncated else int(resume.get("leads_offset") or 0),
+        "leads_done": not leads_truncated,
         "windows_done": sorted(windows_done),
     }
 
