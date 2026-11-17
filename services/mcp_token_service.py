@@ -11,6 +11,7 @@ leaked or unwanted token can be revoked without rotating JWT_SECRET and
 invalidating every user's session.
 """
 
+import logging
 import time
 import uuid
 from datetime import datetime, timedelta
@@ -19,8 +20,12 @@ import jwt as pyjwt
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
+from services import posthog_events
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_EXPIRY_DAYS = 365
+LAST_USED_THROTTLE = timedelta(minutes=10)
 
 
 async def create_mcp_tokens_indexes(mongo_client):
@@ -29,22 +34,28 @@ async def create_mcp_tokens_indexes(mongo_client):
     await db["mcp_tokens"].create_index("user_id")
 
 
-async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None) -> dict:
-    """Mint a new long-lived MCP bearer token and record it for revocation."""
-    days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
+def scope_for_access(access: str) -> str:
+    """JWT `scope` claim for an access level: read -> birdy.read; write -> birdy.read birdy.write."""
+    # Lazy: importing ai.mcp at module load is circular (ai.mcp.server imports this module).
+    from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
+
+    return READ_SCOPE if access == "read" else f"{READ_SCOPE} {WRITE_SCOPE}"
+
+
+async def _mint_mcp_token(db, user_id: str, name: str, access: str, lifetime_seconds: int,
+                          kind: str, extra_claims: dict | None = None, extra_fields: dict | None = None) -> dict:
+    """Sign a `type: "mcp"` JWT and record its jti in mcp_tokens (checked on every request)."""
+    access = "read" if access == "read" else "write"
     jti = uuid.uuid4().hex
     now = datetime.utcnow()
-    expires_at = now + timedelta(days=days)
+    expires_at = now + timedelta(seconds=lifetime_seconds)
 
     # time.time() (not datetime.utcnow().timestamp()) — the latter treats the
     # naive UTC value as local time, silently shifting `exp` by the host's UTC
     # offset on any non-UTC machine.
-    exp_epoch = int(time.time()) + days * 86400
-    token = pyjwt.encode(
-        {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp"},
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
-    )
+    exp_epoch = int(time.time()) + lifetime_seconds
+    claims = {"sub": user_id, "jti": jti, "exp": exp_epoch, "type": "mcp", "scope": scope_for_access(access)}
+    token = pyjwt.encode({**claims, **(extra_claims or {})}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
     doc = {
         "id": jti,
@@ -55,6 +66,10 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
         "expires_at": expires_at,
         "revoked": False,
         "revoked_at": None,
+        "access": access,
+        "kind": kind,
+        "last_used_at": None,
+        **(extra_fields or {}),
     }
     await db["mcp_tokens"].insert_one(doc)
 
@@ -62,14 +77,34 @@ async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None 
         "id": jti,
         "name": name,
         "token": token,
+        "scope": claims["scope"],
         "created_at": now,
         "expires_at": expires_at,
     }
 
 
+async def create_mcp_token(db, user_id: str, name: str, expiry_days: int | None = None, access: str = "write") -> dict:
+    """Mint a new long-lived MCP bearer token and record it for revocation."""
+    days = expiry_days if expiry_days and expiry_days > 0 else DEFAULT_EXPIRY_DAYS
+    minted = await _mint_mcp_token(db, user_id, name, access, days * 86400, kind="manual")
+    posthog_events.capture(user_id, "mcp_connected", {"app_name": name, "access": access, "method": "token"})
+    return {k: minted[k] for k in ("id", "name", "token", "created_at", "expires_at")}
+
+
+async def create_oauth_access_token(db, *, user_id: str, grant_id: str, client_id: str,
+                                    client_name: str, access: str, lifetime_seconds: int) -> dict:
+    """Short-lived access token for an OAuth grant. Carries grant_id so revoking the
+    grant (revoke_connection) stops it on the very next request."""
+    return await _mint_mcp_token(
+        db, user_id, client_name, access, lifetime_seconds, kind="oauth",
+        extra_claims={"grant_id": grant_id, "client_id": client_id},
+        extra_fields={"grant_id": grant_id, "client_id": client_id},
+    )
+
+
 async def list_mcp_tokens(db, user_id: str) -> list[dict]:
     """List a user's issued MCP tokens (never the raw secret — that's shown once at creation)."""
-    docs = await db["mcp_tokens"].find({"user_id": user_id}).sort("created_at", -1).to_list(None)
+    docs = await db["mcp_tokens"].find({"user_id": user_id, "kind": {"$ne": "oauth"}}).sort("created_at", -1).to_list(None)
     return [
         {
             "id": d["id"],
@@ -91,12 +126,92 @@ async def revoke_mcp_token(db, user_id: str, token_id: str) -> bool:
     return result.matched_count > 0
 
 
+def _is_fresh(doc: dict | None, cutoff: datetime) -> bool:
+    last = (doc or {}).get("last_used_at")
+    return bool(last and last >= cutoff)
+
+
+async def _touch_last_used(db, doc: dict, grant: dict | None = None) -> None:
+    """Best-effort: record use at most once per LAST_USED_THROTTLE for the token and its grant.
+    Telemetry only, so a failed write must never fail the request."""
+    now = datetime.utcnow()
+    cutoff = now - LAST_USED_THROTTLE
+    stale = {"$or": [{"last_used_at": None}, {"last_used_at": {"$lt": cutoff}}]}
+    try:
+        if not _is_fresh(doc, cutoff):
+            await db["mcp_tokens"].update_one({"jti": doc["jti"], **stale}, {"$set": {"last_used_at": now}})
+        if doc.get("grant_id") and not _is_fresh(grant, cutoff):
+            await db["oauth_grants"].update_one({"id": doc["grant_id"], **stale}, {"$set": {"last_used_at": now}})
+    except Exception as exc:
+        logger.warning("MCP last_used_at update failed: %s", exc)
+
+
 async def is_mcp_token_valid(db, jti: str) -> bool:
     """Belt-and-suspenders check used by the MCP auth verifier: the JWT's own
     `exp` is already checked by JWTVerifier before this runs; this additionally
-    confirms the token hasn't been revoked and its DB record still exists.
+    confirms the token hasn't been revoked (directly, or via its OAuth grant)
+    and its DB record still exists. Also stamps `last_used_at` (throttled).
     """
     doc = await db["mcp_tokens"].find_one({"jti": jti})
     if not doc or doc.get("revoked"):
         return False
+    grant = None
+    if doc.get("grant_id"):
+        grant = await db["oauth_grants"].find_one({"id": doc["grant_id"]})
+        if not grant or grant.get("revoked"):
+            return False
+    await _touch_last_used(db, doc, grant)
+    return True
+
+
+async def list_connections(db, user_id: str) -> list[dict]:
+    """Active manual tokens and OAuth grants for this user, newest first."""
+    rows = []
+    manual = await db["mcp_tokens"].find(
+        {"user_id": user_id, "kind": {"$ne": "oauth"}, "revoked": {"$ne": True}}
+    ).to_list(None)
+    for d in manual:
+        rows.append({
+            "id": d["id"], "kind": "manual", "name": d["name"],
+            "access": d.get("access", "write"),
+            "created_at": d["created_at"], "last_used_at": d.get("last_used_at"),
+            "expires_at": d.get("expires_at"),
+        })
+    grants = await db["oauth_grants"].find({"user_id": user_id, "revoked": {"$ne": True}}).to_list(None)
+    for g in grants:
+        rows.append({
+            "id": g["id"], "kind": "oauth", "name": g["client_name"], "access": g["access"],
+            "created_at": g["created_at"], "last_used_at": g.get("last_used_at"), "expires_at": None,
+        })
+    rows.sort(key=lambda r: r["created_at"], reverse=True)
+    return rows
+
+
+async def revoke_connection(db, user_id: str, connection_id: str) -> bool:
+    """Revoke a manual token or an OAuth grant (and all its tokens) owned by user_id."""
+    now = datetime.utcnow()
+    token_doc = await db["mcp_tokens"].find_one(
+        {"id": connection_id, "user_id": user_id, "kind": {"$ne": "oauth"}}, {"name": 1, "revoked": 1})
+    if token_doc is not None:
+        # Conditional on not-yet-revoked, so of two concurrent revokes only one flips it and fires the event.
+        res = await db["mcp_tokens"].update_one(
+            {"id": connection_id, "user_id": user_id, "kind": {"$ne": "oauth"}, "revoked": {"$ne": True}},
+            {"$set": {"revoked": True, "revoked_at": now}},
+        )
+        if res.modified_count == 1:
+            posthog_events.capture(user_id, "mcp_disconnected", {"app_name": token_doc.get("name")})
+        return True
+    grant_doc = await db["oauth_grants"].find_one({"id": connection_id, "user_id": user_id}, {"client_name": 1, "revoked": 1})
+    if grant_doc is None:
+        return False
+    res = await db["oauth_grants"].update_one(
+        {"id": connection_id, "user_id": user_id, "revoked": {"$ne": True}},
+        {"$set": {"revoked": True, "revoked_at": now}},
+    )
+    await db["mcp_tokens"].update_many(
+        {"grant_id": connection_id, "user_id": user_id},
+        {"$set": {"revoked": True, "revoked_at": now}},
+    )
+    if res.modified_count == 1:
+        posthog_events.capture(user_id, "mcp_disconnected", {"app_name": grant_doc.get("client_name")})
     return True

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta
 
 import jwt as pyjwt
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from core.database import DB_NAME
@@ -763,6 +763,10 @@ async def credits_config(admin_email: str = Depends(require_admin)):
         "markup": s["markup"],
         "rate_mode": s["rate_mode"],
         "enforce": s["enforce"],
+        "mcp_base_fee": s["mcp_base_fee"],
+        "mcp_per_10k_chars": s["mcp_per_10k_chars"],
+        "mcp_live_fee": s["mcp_live_fee"],
+        "mcp_max_per_call": s["mcp_max_per_call"],
         "markup_min": MARKUP_MIN,
         "markup_max": MARKUP_MAX,
         "model": DEFAULT_MODEL,
@@ -776,6 +780,10 @@ class CreditsConfigUpdate(BaseModel):
     markup: float | None = None
     rate_mode: str | None = None
     enforce: bool | None = None
+    mcp_base_fee: float | None = Field(default=None, ge=0, le=100)
+    mcp_per_10k_chars: float | None = Field(default=None, ge=0, le=100)
+    mcp_live_fee: float | None = Field(default=None, ge=0, le=100)
+    mcp_max_per_call: float | None = Field(default=None, ge=0, le=100)
 
 
 @router.put("/api/admin/credits/config")
@@ -787,7 +795,9 @@ async def update_credits_config(body: CreditsConfigUpdate, admin_email: str = De
         db = mongo_client[DB_NAME]
         try:
             s = await set_credits_settings(
-                db, markup=body.markup, rate_mode=body.rate_mode, enforce=body.enforce, admin=admin_email
+                db, markup=body.markup, rate_mode=body.rate_mode, enforce=body.enforce, admin=admin_email,
+                mcp_base_fee=body.mcp_base_fee, mcp_per_10k_chars=body.mcp_per_10k_chars,
+                mcp_live_fee=body.mcp_live_fee, mcp_max_per_call=body.mcp_max_per_call,
             )
         except ValueError as e:
             raise HTTPException(status_code=400, detail=str(e))
@@ -797,6 +807,10 @@ async def update_credits_config(body: CreditsConfigUpdate, admin_email: str = De
             "markup": s["markup"],
             "rate_mode": s["rate_mode"],
             "enforce": s["enforce"],
+            "mcp_base_fee": s["mcp_base_fee"],
+            "mcp_per_10k_chars": s["mcp_per_10k_chars"],
+            "mcp_live_fee": s["mcp_live_fee"],
+            "mcp_max_per_call": s["mcp_max_per_call"],
             "ts": datetime.utcnow(),
         })
     logger.info(f"[admin] {admin_email} set credits config → markup={s['markup']} mode={s['rate_mode']} enforce={s['enforce']}")

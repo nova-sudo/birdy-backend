@@ -604,3 +604,17 @@ async def evaluate_alert(alert: dict, mongo_client) -> dict:
             "threshold":     threshold,
             "message":       str(e),
         }
+
+ALERT_CHANNELS = ("in_app", "slack", "email")
+
+
+def normalize_channels(channels) -> list[str]:
+    """Validate and de-duplicate (order kept) an alert's notification_channels.
+    Raises ValueError naming the allowed values."""
+    allowed = ", ".join(ALERT_CHANNELS)
+    if not isinstance(channels, (list, tuple)):
+        raise ValueError(f"notification_channels must be a list of: {allowed}.")
+    bad = [c for c in channels if c not in ALERT_CHANNELS]
+    if bad:
+        raise ValueError(f"Invalid notification channel(s) {bad}. Allowed values: {allowed}.")
+    return list(dict.fromkeys(channels)) or ["in_app"]

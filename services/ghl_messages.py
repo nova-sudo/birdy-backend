@@ -36,6 +36,14 @@ class MessagingUnconfirmed(Exception):
     """Network error, timeout or GHL 5xx: the message may still have been sent."""
 
 
+class MessageInvalid(Exception):
+    """The lead cannot be sent this message (no address, no subject). `detail` is the user-facing text."""
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
 class RecordingNotFound(Exception):
     """No such call for this lead, or GHL holds no recording for it."""
 
@@ -369,6 +377,27 @@ async def fetch_call_transcript(db, user_id: str, location_id, contact_id: str, 
     rows = [s for s in sentences if isinstance(s, dict) and str(s.get("transcript") or "").strip()]
     rows.sort(key=lambda s: _sentence_index(s.get("sentenceIndex")))
     return "\n".join(str(s["transcript"]).strip() for s in rows) or None
+
+
+MAX_MESSAGE_LENGTH = 1600
+MAX_SUBJECT_LENGTH = 300
+
+
+def check_sendable(contact: dict, channel: str, subject) -> str | None:
+    """The checks before a lead message goes out. Returns the cleaned subject (None for SMS or blank).
+
+    Raises MessageInvalid. Shared by POST /api/leads/contact/{id}/messages and the MCP send tool.
+    """
+    contact = contact or {}
+    subject = (subject or "").strip() or None
+    if channel == "Email":
+        if not subject:
+            raise MessageInvalid("Subject is required for email")
+        if not (contact.get("email") or "").strip():
+            raise MessageInvalid("This lead has no email address")
+    elif not (contact.get("phone") or "").strip():
+        raise MessageInvalid("This lead has no phone number")
+    return subject
 
 
 async def send_lead_message(db, user_id: str, location_id, contact_id: str, channel: str,

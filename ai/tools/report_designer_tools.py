@@ -12,6 +12,7 @@ import logging
 
 from ai.tools.registry import registry
 from services import report_blocks as rt
+from services.report_drafts import load_draft, save_draft, saved_brief
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,6 @@ async def list_report_metrics(db, user_id, **_):
 
 
 async def get_report_draft(db, user_id, **_):
-    from routers.report_designer import load_draft, saved_brief
     draft = await load_draft(db, user_id)
     saved = await saved_brief(db, user_id)
     return {"draft": draft, "saved": saved,
@@ -61,7 +61,6 @@ async def get_report_draft(db, user_id, **_):
 
 
 async def propose_report(db, user_id, template=None, **_):
-    from routers.report_designer import save_draft
     if not isinstance(template, dict):
         return {"ok": False, "errors": ["template is required"]}
     clients = await _clients(db, user_id)

@@ -19,6 +19,7 @@ from calendar import monthrange
 from ai.config import MAX_RESULT_ITEMS
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 _PRESET_LIST = (
@@ -54,7 +55,7 @@ _GET_GHL_CONTACTS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_GHL_CONTACTS_DESCRIPTION)
+@mcp.tool(description=_GET_GHL_CONTACTS_DESCRIPTION, **READ)
 async def get_ghl_contacts(
     limit: int = 50,
     group_ids: list[str] | None = None,
@@ -107,7 +108,7 @@ _GET_GHL_OPPORTUNITY_STATS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_GHL_OPPORTUNITY_STATS_DESCRIPTION)
+@mcp.tool(description=_GET_GHL_OPPORTUNITY_STATS_DESCRIPTION, **READ)
 async def get_ghl_opportunity_stats(
     preset: str = "maximum",
     group_ids: list[str] | None = None,
@@ -202,7 +203,7 @@ _GET_GHL_TAG_BREAKDOWN_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_GHL_TAG_BREAKDOWN_DESCRIPTION)
+@mcp.tool(description=_GET_GHL_TAG_BREAKDOWN_DESCRIPTION, **READ)
 async def get_ghl_tag_breakdown(
     preset: str = "maximum",
     group_ids: list[str] | None = None,
@@ -264,7 +265,7 @@ _GET_TAG_ROLLUP_BY_CAMPAIGN_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_TAG_ROLLUP_BY_CAMPAIGN_DESCRIPTION)
+@mcp.tool(description=_GET_TAG_ROLLUP_BY_CAMPAIGN_DESCRIPTION, **READ)
 async def get_tag_rollup_by_campaign(
     group_ids: list[str] | None = None,
     level: str = "campaign",
@@ -386,7 +387,7 @@ _GET_GHL_OPP_STATS_WINDOWED_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_GHL_OPP_STATS_WINDOWED_DESCRIPTION)
+@mcp.tool(description=_GET_GHL_OPP_STATS_WINDOWED_DESCRIPTION, **READ)
 async def get_ghl_opp_stats_windowed(
     group_id: str,
     start_date: str | None = None,
@@ -415,7 +416,7 @@ _GET_GHL_OPP_STATS_MONTHLY_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_GHL_OPP_STATS_MONTHLY_DESCRIPTION)
+@mcp.tool(description=_GET_GHL_OPP_STATS_MONTHLY_DESCRIPTION, **READ)
 async def get_ghl_opp_stats_monthly(group_id: str, year: int) -> dict:
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())

@@ -23,6 +23,8 @@ lives in ``credits_middleware.py``; metering is recorded from the AI orchestrato
 via :func:`record_usage`.
 """
 
+import asyncio
+import random
 import logging
 import os
 import time
@@ -103,9 +105,16 @@ _settings_cache = {"data": None, "ts": 0.0}
 DEFAULT_MARKUP = float(MODEL_PRICING[DEFAULT_MODEL]["markup"])  # gpt-4o → 4.0
 MARKUP_MIN, MARKUP_MAX = 1.0, 20.0
 
+# External MCP requests are priced per call, not per token (the markup is not applied).
+MCP_PRICING_DEFAULTS = {"mcp_base_fee": 0.2, "mcp_per_10k_chars": 1.0, "mcp_live_fee": 1.0, "mcp_max_per_call": 10.0}
+MCP_PRICING_MIN, MCP_PRICING_MAX = 0.0, 100.0
+
 
 def _default_settings() -> dict:
-    return {"markup": DEFAULT_MARKUP, "rate_mode": DEFAULT_RATE_MODE, "updated_at": None, "updated_by": None}
+    return {
+        "markup": DEFAULT_MARKUP, "rate_mode": DEFAULT_RATE_MODE, "updated_at": None, "updated_by": None,
+        **MCP_PRICING_DEFAULTS,
+    }
 
 
 async def get_credits_settings(db, *, fresh: bool = False) -> dict:
@@ -129,13 +138,17 @@ async def get_credits_settings(db, *, fresh: bool = False) -> dict:
         "enforce": bool(doc["enforce"]) if doc.get("enforce") is not None else CREDITS_ENFORCE,
         "updated_at": doc.get("updated_at"),
         "updated_by": doc.get("updated_by"),
+        **{k: float(doc[k]) if doc.get(k) is not None else d for k, d in MCP_PRICING_DEFAULTS.items()},
     }
     _settings_cache["data"] = data
     _settings_cache["ts"] = now
     return data
 
 
-async def set_credits_settings(db, *, markup=None, rate_mode=None, enforce=None, admin: Optional[str] = None) -> dict:
+async def set_credits_settings(
+    db, *, markup=None, rate_mode=None, enforce=None, admin: Optional[str] = None,
+    mcp_base_fee=None, mcp_per_10k_chars=None, mcp_live_fee=None, mcp_max_per_call=None,
+) -> dict:
     """Update the markup, rate mode, and/or enforcement. Clamps markup to a sane
     range and validates the mode; invalidates the in-process cache so the change
     takes effect on the next charge/check."""
@@ -149,6 +162,15 @@ async def set_credits_settings(db, *, markup=None, rate_mode=None, enforce=None,
         update["rate_mode"] = rate_mode
     if enforce is not None:
         update["enforce"] = bool(enforce)
+    for key, value in (
+        ("mcp_base_fee", mcp_base_fee), ("mcp_per_10k_chars", mcp_per_10k_chars),
+        ("mcp_live_fee", mcp_live_fee), ("mcp_max_per_call", mcp_max_per_call),
+    ):
+        if value is not None:
+            value = float(value)
+            if not (MCP_PRICING_MIN <= value <= MCP_PRICING_MAX):
+                raise ValueError(f"{key} must be between {MCP_PRICING_MIN:g} and {MCP_PRICING_MAX:g}")
+            update[key] = value
     if update:
         update["updated_at"] = datetime.now(timezone.utc)
         if admin:
@@ -266,16 +288,33 @@ async def is_blocked(db, user_id: str) -> bool:
 async def _load_and_sync(db, user_id: str) -> tuple[dict, dict]:
     """Load the user's credits, persisting a period rollover / plan change if
     needed. Returns (credits, subscription)."""
-    user = await db["users"].find_one(
-        {"user_id": user_id}, {"credits": 1, "subscription": 1, "_id": 0}
-    )
-    credits, changed = _effective_credits(user or {})
-    if changed:
-        await db["users"].update_one(
-            {"user_id": user_id},
-            {"$set": {"credits": {**credits, "updated_at": datetime.now(timezone.utc)}}},
-            upsert=True,
+    for _ in range(_CHARGE_RETRIES):
+        user = await db["users"].find_one(
+            {"user_id": user_id}, {"credits": 1, "subscription": 1, "_id": 0}
         )
+        credits, changed = _effective_credits(user or {})
+        if not changed:
+            break
+        stored = (user or {}).get("credits") or {}
+        rev = stored.get("rev")  # missing on balances written before the version field
+        credits["rev"] = (rev or 0) + 1
+        update = {"$set": {"credits": {**credits, "updated_at": datetime.now(timezone.utc)}}}
+        if user is None:
+            await db["users"].update_one({"user_id": user_id}, update, upsert=True)
+            break
+        # Only land the rollover if nobody wrote the balance (a top-up, a charge)
+        # or rolled the period since we read it; otherwise re-read and retry.
+        res = await db["users"].update_one(
+            {"user_id": user_id, "credits.rev": rev, "credits.period_key": stored.get("period_key")},
+            update,
+        )
+        if res.matched_count:
+            break
+        await asyncio.sleep(0)
+    else:
+        # Out of retries: serve the freshly computed balance, but never a rev we did not store.
+        logger.warning(f"credits rollover for {user_id} lost the write race {_CHARGE_RETRIES} times; not persisted")
+        credits["rev"] = rev
     return credits, (user or {}).get("subscription") or {}
 
 
@@ -355,27 +394,37 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
     """Draw `charge` credits from the user's balance and append a ledger row.
 
     Draw from the plan allowance first, then from purchased top-up credits.
-    Read-modify-write is acceptable: in practice a user runs one question
-    at a time, and a lost race only under-charges by a single question.
+    The write is optimistic: it only lands if `credits.rev` is still what we
+    read, otherwise we re-read and retry, so concurrent charges (an MCP burst)
+    never overwrite each other.
     """
-    credits, _ = await _load_and_sync(db, user_id)
-    remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
-    from_allowance = min(charge, remaining_allowance)
-    from_topup = charge - from_allowance
-    new_used = round(credits["used"] + from_allowance, 4)
-    new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
+    for attempt in range(_CHARGE_RETRIES):
+        credits, _ = await _load_and_sync(db, user_id)
+        remaining_allowance = max(0.0, credits["allowance"] - credits["used"])
+        from_allowance = min(charge, remaining_allowance)
+        from_topup = charge - from_allowance
+        new_used = round(credits["used"] + from_allowance, 4)
+        new_topup = round(max(0.0, credits["topup_balance"] - from_topup), 4)
+        rev = credits.get("rev")  # missing on balances written before the version field
 
-    await db["users"].update_one(
-        {"user_id": user_id},
-        {"$set": {
-            "credits.allowance": credits["allowance"],
-            "credits.period_key": credits["period_key"],
-            "credits.used": new_used,
-            "credits.topup_balance": new_topup,
-            "credits.updated_at": datetime.now(timezone.utc),
-        }},
-        upsert=True,
-    )
+        res = await db["users"].update_one(
+            {"user_id": user_id, "credits.rev": rev},
+            {"$set": {
+                "credits.allowance": credits["allowance"],
+                "credits.period_key": credits["period_key"],
+                "credits.used": new_used,
+                "credits.topup_balance": new_topup,
+                "credits.updated_at": datetime.now(timezone.utc),
+                "credits.rev": (rev or 0) + 1,
+            }},
+        )
+        if res.matched_count:
+            break
+        # Lost the race: back off a little (jittered, growing) so a burst of charges spreads out
+        # instead of colliding again on the same rev, then re-read and retry.
+        await asyncio.sleep(random.uniform(0, _CHARGE_BACKOFF_SECONDS * (attempt + 1)))
+    else:
+        raise RuntimeError(f"credit charge for {user_id} lost the write race {_CHARGE_RETRIES} times")
 
     await db["ai_usage"].insert_one({
         "user_id": user_id,
@@ -383,6 +432,10 @@ async def _apply_charge(db, user_id: str, charge: float, *, ledger: dict) -> Non
         "credits": charge,
         "created_at": datetime.now(timezone.utc),
     })
+
+
+_CHARGE_RETRIES = 25
+_CHARGE_BACKOFF_SECONDS = 0.005  # per attempt; the 25th waits at most 0.125 s
 
 
 # Whisper is priced per audio minute, not per token (OpenAI: $0.006/min).
@@ -458,7 +511,7 @@ async def add_topup(db, user_id: str, credits_amount: int, payment_id: str) -> b
         res = await db["users"].update_one(
             {"user_id": user_id, "credits.credited_topup_ids": {"$ne": payment_id}},
             {
-                "$inc": {"credits.topup_balance": float(credits_amount)},
+                "$inc": {"credits.topup_balance": float(credits_amount), "credits.rev": 1},
                 "$addToSet": {"credits.credited_topup_ids": payment_id},
                 "$set": {"credits.updated_at": datetime.now(timezone.utc)},
             },
@@ -495,7 +548,7 @@ async def grant_credits(db, user_id: str, amount: float, admin: str, note: Optio
     res = await db["users"].update_one(
         {"user_id": user_id},
         {
-            "$inc": {"credits.topup_balance": amount},
+            "$inc": {"credits.topup_balance": amount, "credits.rev": 1},
             "$set": {"credits.updated_at": datetime.now(timezone.utc)},
         },
         upsert=False,

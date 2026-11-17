@@ -70,13 +70,23 @@ async def generate_tokens(email: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate tokens: {e}")
 
 
+def _require_session_type(payload: dict) -> dict:
+    """Only browser session tokens (`type: "access"`, minted by generate_tokens,
+    admin impersonation and ai/mcp_client) may act as the auth_token cookie.
+    MCP / OAuth tokens (`type: "mcp"`) share JWT_SECRET but are scoped and
+    revocable only through the MCP server, so REST must refuse them."""
+    if payload.get("type") != "access":
+        raise HTTPException(status_code=401, detail="Invalid authentication token")
+    return payload
+
+
 async def get_current_user(request: Request) -> str:
     token = request.cookies.get("auth_token")
     if not token:
         raise HTTPException(status_code=401, detail="No authentication token provided")
 
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        payload = _require_session_type(pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM]))
         email = payload.get("sub")
         if not email:
             raise HTTPException(status_code=401, detail="Invalid token")
@@ -122,10 +132,10 @@ async def get_current_claims(request: Request, verify_exp: bool = True) -> dict:
     if not token:
         raise HTTPException(status_code=401, detail="No authentication token provided")
     try:
-        return pyjwt.decode(
+        return _require_session_type(pyjwt.decode(
             token, JWT_SECRET, algorithms=[JWT_ALGORITHM],
             options={"verify_exp": verify_exp},
-        )
+        ))
     except pyjwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Access token expired, please log in again")
     except pyjwt.PyJWTError as e:

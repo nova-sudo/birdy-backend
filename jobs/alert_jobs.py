@@ -9,8 +9,42 @@ from services.alert_service import evaluate_alert
 logger = logging.getLogger(__name__)
 
 
+EMAILED_FIELD = "emailed_keys"
+_TOTAL_KEY = "*"
+
+
+def _firing_keys(eval_result: dict) -> set:
+    """What is firing right now: each triggered client of a per-client alert, else the alert as a whole."""
+    per_client = eval_result.get("per_client_results")
+    if per_client:
+        return {str(r.get("group_id") or r.get("group_name")) for r in per_client if r.get("triggered")}
+    return {_TOTAL_KEY} if eval_result.get("triggered") else set()
+
+
+def _channels(alert: dict) -> list:
+    """The alert's channels; stored unvalidated, so anything unknown is simply ignored."""
+    channels = alert.get("notification_channels")
+    return channels if isinstance(channels, list) else []
+
+
+async def _email_owner(db, alert: dict, eval_result: dict, note_id) -> None:
+    """Email the owner once per firing. Never raises, never changes the alert's status;
+    the outcome is recorded on the notification row (email_sent). No retries in v1."""
+    sent = False
+    try:
+        from services import email_service
+        sent = bool(await email_service.send_alert_email(db, alert, eval_result))
+    except Exception as e:
+        logger.error("alert %s: email failed for user %s: %s", alert.get("id"), alert.get("user_id"), type(e).__name__)
+    logger.info("alert %s: email %s for user %s", alert.get("id"), "sent" if sent else "not sent", alert.get("user_id"))
+    try:
+        await db["alert_notifications"].update_one({"_id": note_id}, {"$set": {"email_sent": sent}})
+    except Exception as e:
+        logger.error("alert %s: could not record email_sent: %s", alert.get("id"), e)
+
+
 async def evaluate_all_alerts():
-    """Evaluate all active alerts every 15 minutes."""
+    """Evaluate all active alerts (the cron runs this hourly)."""
     async with get_mongo_client() as mongo_client:
         try:
             db = mongo_client[DB_NAME]
@@ -44,11 +78,27 @@ async def evaluate_all_alerts():
                     await alert_fired(db, alert, eval_result, wait=True)
 
                     if eval_result["triggered"]:
+                        # Email once per firing: per client for a per-client alert, so a second client
+                        # starting to trigger emails too. Tracked on the alert rather than by the status
+                        # transition, because creating an already-firing alert sets "triggered" itself.
+                        firing = _firing_keys(eval_result)
+                        emailed = set(alert.get(EMAILED_FIELD) or []) & firing
+                        new_firing = firing - emailed
+                        wants_email = bool(new_firing) and "email" in _channels(alert)
+                        # One attempt per firing (no retries in v1): marked before sending.
+                        update[EMAILED_FIELD] = sorted(emailed | new_firing if wants_email else emailed)
                         update["status"] = "triggered"
                         update["last_triggered_at"] = datetime.utcnow()
-                        await db["alerts"].update_one({"id": alert["id"]},
-                                                      {"$set": update, "$inc": {"trigger_count": 1}})
-                        await db["alert_notifications"].insert_one({
+                        # The email claim is conditional on the emailed list we read: of two overlapping
+                        # runs (a cron retry) only the one whose write matches sends the email.
+                        flt = {"id": alert["id"]}
+                        if wants_email:
+                            flt[EMAILED_FIELD] = alert.get(EMAILED_FIELD)
+                        claimed = await db["alerts"].update_one(
+                            flt, {"$set": update, "$inc": {"trigger_count": 1}})
+                        if wants_email and not claimed.matched_count:
+                            continue  # the other run already recorded and emailed this firing
+                        note = await db["alert_notifications"].insert_one({
                             "alert_id": alert["id"],
                             "user_id": alert["user_id"],
                             "message": eval_result["message"],
@@ -57,9 +107,12 @@ async def evaluate_all_alerts():
                             "read": False
                         })
                         logger.info(f"🚨 Alert triggered: {alert['name']} — {eval_result['message']}")
+                        if wants_email:
+                            await _email_owner(db, alert, eval_result, note.inserted_id)
                     else:
                         if alert.get("status") == "triggered":
                             update["status"] = "active"
+                        update[EMAILED_FIELD] = []
                         await db["alerts"].update_one({"id": alert["id"]}, {"$set": update})
 
                 except Exception as e:

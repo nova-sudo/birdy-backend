@@ -15,6 +15,7 @@ email/phone match_keys.
 
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 
@@ -25,7 +26,7 @@ _GET_UNIFIED_LEADS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_UNIFIED_LEADS_DESCRIPTION)
+@mcp.tool(description=_GET_UNIFIED_LEADS_DESCRIPTION, **READ)
 async def get_unified_leads(
     group_ids: list[str] | None = None,
     source: str | None = None,
@@ -143,7 +144,7 @@ _GET_UNIFIED_LEAD_STATS_DESCRIPTION = (
 )
 
 
-@mcp.tool(description=_GET_UNIFIED_LEAD_STATS_DESCRIPTION)
+@mcp.tool(description=_GET_UNIFIED_LEAD_STATS_DESCRIPTION, **READ)
 async def get_unified_lead_stats(
     group_ids: list[str] | None = None,
     start_date: str | None = None,

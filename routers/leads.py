@@ -29,10 +29,11 @@ from typing_extensions import Annotated
 from core.database import DB_NAME
 from dependencies import get_mongo_client, get_current_user
 from services.ghl_messages import (
-    MessagingFailed, MessagingReconnect, MessagingUnavailable, MessagingUnconfirmed, RecordingNotFound,
+    MAX_MESSAGE_LENGTH, MAX_SUBJECT_LENGTH, MessageInvalid, MessagingFailed, MessagingReconnect, MessagingUnavailable,
+    MessagingUnconfirmed, RecordingNotFound, check_sendable,
     fetch_call_recording, fetch_call_transcript, fetch_lead_messages, send_lead_message,
 )
-from services.lead_detail import build_lead_detail
+from services.lead_detail import build_lead_detail, find_lead_contact
 from services.lead_journey import build_lead_journey
 from services.lead_summary import get_lead_summary
 
@@ -80,12 +81,12 @@ async def refresh_lead_summary_endpoint(contact_id: str, current_user: str = Dep
 
 class SendMessageBody(BaseModel):
     channel: Literal["SMS", "Email"]
-    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1600)]
-    subject: Optional[str] = Field(default=None, max_length=300)
+    message: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=MAX_MESSAGE_LENGTH)]
+    subject: Optional[str] = Field(default=None, max_length=MAX_SUBJECT_LENGTH)
 
 
 async def _find_contact(db, user_id: str, contact_id: str) -> dict:
-    doc = await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
+    doc = await find_lead_contact(db, user_id, contact_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Lead not found")
     return doc
@@ -106,15 +107,10 @@ async def send_lead_message_endpoint(contact_id: str, body: SendMessageBody,
         db = mongo_client[DB_NAME]
         doc = await _find_contact(db, current_user, contact_id)
 
-        contact = doc.get("contact_data") or {}
-        subject = (body.subject or "").strip() or None
-        if body.channel == "Email":
-            if not subject:
-                raise HTTPException(status_code=422, detail="Subject is required for email")
-            if not (contact.get("email") or "").strip():
-                raise HTTPException(status_code=422, detail="This lead has no email address")
-        elif not (contact.get("phone") or "").strip():
-            raise HTTPException(status_code=422, detail="This lead has no phone number")
+        try:
+            subject = check_sendable(doc.get("contact_data") or {}, body.channel, body.subject)
+        except MessageInvalid as e:
+            raise HTTPException(status_code=422, detail=e.detail)
 
         try:
             message = await send_lead_message(

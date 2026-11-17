@@ -28,6 +28,7 @@ from core.mongo_client import get_shared_mongo_client
 from core.utils import get_result_value
 from integrations.facebook_utils.facebook import get_facebook_token
 from services.meta_campaign_scope import campaign_filter
+from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 
 logger = logging.getLogger(__name__)
@@ -348,7 +349,7 @@ async def _fetch_leads_live(ad_account_id, access_token, start_date, end_date, c
 
 # ── Tools ──────────────────────────────────────────────────────────────────
 
-@mcp.tool
+@mcp.tool(**READ)
 async def get_meta_insights_live(
     start_date: str,
     end_date: str,
@@ -414,7 +415,7 @@ async def get_meta_insights_live(
     return {"groups": all_results, "total_groups": len(all_results)}
 
 
-@mcp.tool
+@mcp.tool(**READ)
 async def get_meta_insights_monthly(
     year: int,
     group_ids: list[str] | None = None,
@@ -474,7 +475,7 @@ async def get_meta_insights_monthly(
     return {"groups": all_results, "total_groups": len(all_results)}
 
 
-@mcp.tool
+@mcp.tool(**READ)
 async def get_meta_leads_live(
     start_date: str,
     end_date: str,

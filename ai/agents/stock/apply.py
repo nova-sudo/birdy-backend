@@ -100,6 +100,7 @@ QUEUE_BATCH = 200                      # cards looked at per cron pass; the rest
 ERROR_MAX = 300
 _RACE_TRIES = 8
 
+APPLY_BUDGET_SECONDS = 20              # the dashboard (and MCP) wait this long for lines in the request; the cron finishes the rest
 MIN_TIME_FOR_LINE_S = 4.0              # a line's 3 or 4 Graph calls usually fit in this
 MIRROR_TRUSTED_FOR = timedelta(minutes=5)
 LEASES = "agent_write_leases"          # one row per agent and client while it is checking and sending

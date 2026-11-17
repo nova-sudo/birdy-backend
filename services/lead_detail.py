@@ -286,8 +286,13 @@ async def _stages_within_budget(db, user_id: str, location_id):
         return {}
 
 
+async def find_lead_contact(db, user_id: str, contact_id: str) -> dict | None:
+    """The user's ghl_contacts row for this contact id, or None (also for another user's contact)."""
+    return await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
+
+
 async def build_lead_detail(db, user_id: str, contact_id: str) -> dict | None:
-    doc = await db["ghl_contacts"].find_one({"user_id": user_id, "contact_data.id": contact_id})
+    doc = await find_lead_contact(db, user_id, contact_id)
     if not doc:
         return None
     contact = doc.get("contact_data") or {}

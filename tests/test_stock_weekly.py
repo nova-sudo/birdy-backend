@@ -777,7 +777,7 @@ async def test_not_built_is_a_404_from_the_route(mock_db, slack, installed, api,
     async def vanished(*a, **k):
         return {"outcome": "not_built"}
 
-    monkeypatch.setattr(agent_stock.stock_weekly, "post_weekly", vanished)
+    monkeypatch.setattr(weekly, "post_weekly", vanished)
     assert api.post(f"/api/agents/{agent['_id']}/runs/w1/weekly/post").status_code == 404
 
 

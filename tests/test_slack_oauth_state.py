@@ -46,4 +46,8 @@ def test_expired_token_rejected():
 def test_tampered_signature_rejected():
     state = _mint_install_state("alice@example.com")
     with pytest.raises(pyjwt.InvalidSignatureError):
-        _verify_install_state(state[:-1] + ("A" if state[-1] != "A" else "B"))
+        # Tamper a middle signature character: the last base64url char carries
+        # padding bits, so changing it can leave the decoded bytes unchanged.
+        h, p, sig = state.split(".")
+        sig = sig[:10] + ("A" if sig[10] != "A" else "B") + sig[11:]
+        _verify_install_state(f"{h}.{p}.{sig}")

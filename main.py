@@ -24,11 +24,11 @@ from jobs.cache_jobs import populate_cache_for_existing_groups
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock
+from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, mcp_activity, mcp_oauth, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock
 from billing import router as billing_router
 from credits import router as credits_router
 
-from ai.mcp import mcp_app
+from ai.mcp import mcp, mcp_app
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -142,6 +142,8 @@ app.include_router(webhooks.router)
 app.include_router(call_logs.router)
 app.include_router(call_analysis.router)
 app.include_router(mcp_tokens.router)
+app.include_router(mcp_activity.router)
+app.include_router(mcp_oauth.router)
 app.include_router(ai_credentials.router)
 app.include_router(slack.router)
 app.include_router(slack_events.router)
@@ -164,3 +166,7 @@ app.include_router(tracking.router)
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py
 app.mount("/mcp", mcp_app)
+# OAuth discovery must sit at the root (RFC 9728 / RFC 8414): clients probe
+# /.well-known/oauth-protected-resource/mcp and /.well-known/oauth-authorization-server.
+for _route in mcp.auth.get_well_known_routes(mcp_path="/mcp"):
+    app.router.routes.append(_route)

@@ -44,6 +44,7 @@ from core.constants import META_ONGOING_PRESETS, META_STATIC_PRESETS
 from core.database import DB_NAME
 from dependencies import get_mongo_client
 from services.attribution_service import run_match_tick
+from services.client_refresh import GHL_CLAIM_HELD_MINUTES
 from services.daily_refresh_slot import daily_due_clauses
 from services.ghl_lead_push import push_pending_for_group
 
@@ -88,7 +89,7 @@ GHL_INCREMENTAL_OVERLAP_MINUTES = 15
 
 # Stale-claim recovery — a group stuck in "running" for longer than this is
 # considered crashed and may be retried.
-GHL_STALE_CLAIM_MINUTES = 10
+GHL_STALE_CLAIM_MINUTES = GHL_CLAIM_HELD_MINUTES  # defined once, in services/client_refresh.py
 
 # A group whose sync failed waits this long before the tick claims it again.
 # A failure leaves last_ghl_refresh untouched, so without a wait the failing
