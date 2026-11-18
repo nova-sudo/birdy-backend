@@ -605,7 +605,7 @@ async def _initial_client_data_load(
                         "ghl_refresh_status": "complete",
                         "last_ghl_refresh": datetime.utcnow(),
                     },
-                     "$unset": {"_ghl_claimed_at": ""}},
+                     "$unset": {"_ghl_claimed_at": "", "ghl_refresh_error": ""}},
                 )
             except Exception as e:
                 logger.error(

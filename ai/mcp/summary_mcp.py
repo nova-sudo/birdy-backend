@@ -104,10 +104,12 @@ async def get_account_summary(preset: str = "last_7d", group_ids: list[str] | No
         totals["ghl_contacts"] += row["ghl_contacts"]
 
     overall = enrich({**totals})
+    per_group.sort(key=lambda r: r["spend"], reverse=True)  # the cut below keeps the biggest spenders
 
     return {
         "overall": overall,
         "groups": per_group[:MAX_RESULT_ITEMS],
         "preset": preset,
         "total_groups": len(per_group),
+        "shown_groups": min(len(per_group), MAX_RESULT_ITEMS),
     }

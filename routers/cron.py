@@ -452,7 +452,8 @@ async def ghl_tick(authorization: str | None = Header(default=None)):
                     stamps["last_ghl_full_refresh"] = finished
                 await client_groups.update_one(
                     {"id": group_id},
-                    {"$set": stamps, "$unset": {"_ghl_claimed_at": "", "_ghl_retry_after": ""}},
+                    {"$set": stamps,
+                     "$unset": {"_ghl_claimed_at": "", "_ghl_retry_after": "", "ghl_refresh_error": ""}},
                 )
                 logger.info(
                     "[ghl-tick] OK '%s' (%s: %s new, %s updated, %s pruned)",

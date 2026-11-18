@@ -75,14 +75,16 @@ async def _watched_targets(db, agent: dict) -> tuple[bool, list[str]]:
         {"user_id": agent["user_id"], "id": {"$in": gids}}).to_list(length=None)}
     lacking = []
     for gid in gids:
-        g = groups.get(gid) or {}
+        if gid not in groups:
+            continue  # the client was deleted: nobody can set a target on it
+        g = groups[gid]
         try:
             cpl = float((g.get("targets") or {}).get("cpl") or 0)
         except (TypeError, ValueError):
             cpl = 0.0
         if cpl <= 0:
             lacking.append(g.get("name") or gid)
-    return not lacking, lacking
+    return bool(groups) and not lacking, lacking
 
 
 async def _rescore_user_right(db, agent: dict, docs: list[dict]) -> None:

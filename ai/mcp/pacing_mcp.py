@@ -45,7 +45,8 @@ def pace_row(spend: float, budget: float | None, today: date) -> dict:
 async def get_budget_pacing() -> dict:
     """This month's budget pacing per client: month-to-date spend against the client's monthly budget (its monthly_spend target), next to how far through the month we are. Use it for "are we on budget?", "who will overspend?" and month-end planning.
 
-    Each client has spend (month to date, the client's ad account currency), budget (null when no monthly_spend
+    Each client has spend (month to date, in the `currency` shown: the owner's own currency, which Birdy converts
+    cached Meta spend to, so a USD ad account can show GBP), budget (null when no monthly_spend
     target is set: set one with set_client_target), used_pct, expected_pct (share of the month gone, the same for
     everyone), projected (month-end spend at the current daily rate), status ("over" more than 10 points ahead,
     "under" more than 15 points behind, "on_pace", or "no_budget"), and runs_out_on (the date the budget is used up

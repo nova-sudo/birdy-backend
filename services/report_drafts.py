@@ -18,7 +18,7 @@ async def _clients(db, user_id: str) -> list[dict]:
     return await db["client_groups"].find(
         {"user_id": user_id, "client_status": {"$ne": "Inactive"}},
         {"_id": 0, "id": 1, "name": 1, "meta_ad_account_id": 1, "ghl_location_id": 1,
-         "hotprospector_group_id": 1},
+         "hotprospector_group_id": 1, "call_log_provider": 1},
     ).to_list(length=1000)
 
 

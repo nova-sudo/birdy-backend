@@ -964,7 +964,9 @@ def sources_connected(groups: list[dict]) -> set[str]:
             out.add("meta")
         if g.get("ghl_location_id") or g.get("ghl_opp_cache"):
             out.add("ghl_opp")
-        if g.get("hotprospector_group_id") or g.get("hotprospector_call_cache"):
+        if (g.get("hotprospector_group_id") or g.get("hotprospector_call_cache")
+                or ((g.get("call_log_provider") or "").strip().lower() == "hotprospector"
+                    and g.get("ghl_location_id"))):
             out.add("hp_call")
     return out
 

@@ -525,6 +525,39 @@ async def claim_hp_live_refresh(client_groups, group_id: str, user_id: str, now:
     return claimed is not None
 
 
+MAX_INCREMENTAL_LOOKBACK_DAYS = 30  # one HotProspector date window
+MIN_HOLE_DAYS = 3  # a weekend is two quiet days; three or more in a row may be a missed sync
+
+
+def incremental_lookback_days(stored_calls, last_complete, today: date, recent_days: int = 3,
+                              cap: int = MAX_INCREMENTAL_LOOKBACK_DAYS) -> int:
+    """How many days back an incremental sync must fetch so nothing is left missing.
+
+    The nightly sync used to fetch the last `recent_days` only. When it did not run for longer
+    than that (Nov 2026: ten days), the days it missed were never fetched again, and every
+    call-centre figure covering them under-counted. So reach back to the last complete sync,
+    and to the start of any run of MIN_HOLE_DAYS+ empty days inside the last `cap` days that
+    has calls on both sides of it. A client that really made no calls then costs one wider
+    request, which returns nothing."""
+    days = recent_days
+    if isinstance(last_complete, datetime):
+        days = max(days, (today - last_complete.date()).days + 1)
+    with_calls = sorted({(c.get("call_time_iso") or "")[:10] for c in stored_calls} - {""})
+    floor = (today - timedelta(days=cap)).isoformat()
+    for earlier, later in zip(with_calls, with_calls[1:]):
+        if later < floor:
+            continue
+        try:
+            gap_start = date.fromisoformat(earlier) + timedelta(days=1)
+            gap = (date.fromisoformat(later) - gap_start).days
+        except ValueError:
+            continue
+        if gap >= MIN_HOLE_DAYS:
+            days = max(days, (today - gap_start).days + 1)
+            break
+    return max(recent_days, min(days, cap))
+
+
 async def fetch_and_cache_hp_call_center(
         user_id: str,
         ghl_location_id: str,
@@ -682,8 +715,16 @@ async def fetch_and_cache_hp_call_center(
     stored_match = {_call_identity(c): c.get("matched_lead_id") for c in existing}
     windows_done = set(resume.get("windows_done") or [])
     if mode in ("incremental", "live"):
+        lookback = recent_days
+        if not live:  # someone is waiting on a live refresh: it stays at the last few days
+            synced = await client_groups_collection.find_one(
+                {"user_id": user_id, "ghl_location_id": ghl_location_id}, {"last_hp_refresh": 1})
+            lookback = incremental_lookback_days(
+                existing, (synced or {}).get("last_hp_refresh"), date.today(), recent_days)
+            if lookback > recent_days:
+                logger.info(f"HP incremental for {ghl_location_id}: reaching back {lookback} days to fill a gap")
         rec_ok, recent_raw = await integration.fetch_call_logs_for_location(
-            ghl_location_id, lookback_days=recent_days, **({"deadline": deadline} if live else {})
+            ghl_location_id, lookback_days=lookback, **({"deadline": deadline} if live else {})
         )
         if not rec_ok:
             logger.warning(f"HP incremental call fetch failed for {ghl_location_id}")

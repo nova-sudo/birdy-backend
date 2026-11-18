@@ -131,11 +131,14 @@ async def get_refresh_status(mongo_client, group_id: str, user_id: str) -> dict 
     from services.meta_refresh_manager import get_refresh_progress
     meta_progress = await get_refresh_progress(group_id, mongo_client)
 
+    ghl_status = group.get("ghl_refresh_status", "idle")
     return {
         "meta_refresh_status": group.get("meta_refresh_status", "idle"),
-        "ghl_refresh_status": group.get("ghl_refresh_status", "idle"),
+        "ghl_refresh_status": ghl_status,
         "meta_refresh_error": group.get("meta_refresh_error"),
-        "ghl_refresh_error": group.get("ghl_refresh_error"),
+        # An error left over from a failure that a later refresh got past is not the
+        # current state: only report it while the refresh is not complete.
+        "ghl_refresh_error": None if ghl_status == "complete" else group.get("ghl_refresh_error"),
         "meta_token_error": group.get("meta_token_error", False),
         "meta_refresh_progress": meta_progress,
     }

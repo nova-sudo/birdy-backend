@@ -597,6 +597,13 @@ async def fetch_and_cache_meta_data(
 # Preset fetching (single + batched)
 # ---------------------------------------------------------------------------
 
+# Meta returns 25 rows of a nested edge unless told otherwise, and the nested
+# pages are not followed. A campaign with more than 25 ads lost the rest: Aura
+# had 78 ads and 53 cached, so an ad that spent in the window had no row at all
+# and every ad-level total came up short of the account's.
+_NESTED_EDGE_LIMIT = 200
+
+
 def _campaigns_fields_for_preset(date_preset: str) -> str:
     """
     Meta Graph API `fields` param for the /act/campaigns endpoint that
@@ -608,7 +615,7 @@ def _campaigns_fields_for_preset(date_preset: str) -> str:
         "name,status,"
         f"insights.date_preset({date_preset})"
         "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr},"
-        "adsets{name,status,"
+        f"adsets.limit({_NESTED_EDGE_LIMIT}){{name,status,"
         f"insights.date_preset({date_preset})"
         "{actions,spend,results,reach,impressions,cpm,clicks,cpc,ctr}},"
         # No `creative{...}` here, deliberately. Expanding creatives three
@@ -624,7 +631,7 @@ def _campaigns_fields_for_preset(date_preset: str) -> str:
         # Creatives don't vary by date window, so they come from a single flat
         # pass over /act_X/ads instead — see _fetch_ad_creatives — and join
         # onto these rows by ad id.
-        "ads{name,adset_id,status,"
+        f"ads.limit({_NESTED_EDGE_LIMIT}){{name,adset_id,status,"
         f"insights.date_preset({date_preset})"
         "{actions,results,reach,spend,impressions,cpm,inline_link_clicks,cpc,clicks}}"
     )
@@ -897,6 +904,13 @@ def _accumulate_campaigns_page(
             "cpc": round(c_spend / c_clicks, 2) if c_clicks > 0 else 0,
             "ctr": round(c_clicks / c_imp * 100, 2) if c_imp > 0 else 0,
         })
+
+        for edge in ("adsets", "ads"):
+            if ((campaign.get(edge) or {}).get("paging") or {}).get("next"):
+                logger.warning(
+                    f"Meta campaign {campaign.get('id')} has more than {_NESTED_EDGE_LIMIT} {edge}; "
+                    "the rest are not cached"
+                )
 
         for adset in campaign.get("adsets", {}).get("data", []):
             a_ins = adset.get("insights", {}).get("data", [])

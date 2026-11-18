@@ -47,7 +47,14 @@ async def fired_alerts(db, user_id: str, days: int) -> list[dict]:
     firings = collapse_firings(rows)
     alert_ids = list({f["alert_id"] for f in firings if f["alert_id"]})
     alerts = {a["id"]: a for a in await db["alerts"].find(
-        {"user_id": user_id, "id": {"$in": alert_ids}}, {"_id": 0, "id": 1, "name": 1, "condition": 1}).to_list(None)}
+        {"user_id": user_id, "id": {"$in": alert_ids}},
+        {"_id": 0, "id": 1, "name": 1, "condition": 1, "target_group_ids": 1}).to_list(None)}
+    for f in firings:
+        # The job logs no client on a row unless the alert is checked per client, so an
+        # alert aimed at exactly one client came back looking account-wide.
+        targets = (alerts.get(f["alert_id"]) or {}).get("target_group_ids") or []
+        if not f["group_id"] and len(targets) == 1:
+            f["group_id"] = targets[0]
     group_ids = list({f["group_id"] for f in firings if f["group_id"]})
     groups = {g["id"]: g.get("name") for g in await db["client_groups"].find(
         {"user_id": user_id, "id": {"$in": group_ids}}, {"_id": 0, "id": 1, "name": 1}).to_list(None)} if group_ids else {}

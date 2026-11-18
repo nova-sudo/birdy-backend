@@ -25,7 +25,8 @@ async def get_alerts(db, user_id, status=None, **_):
     for a in docs:
         d = mongo_to_dict(a)
         d["condition_display"] = format_condition_display(d.get("condition", {}))
-        d["metric_label"] = METRIC_LABELS.get(d.get("condition", {}).get("metric", ""), "Unknown")
+        d["metric_label"] = METRIC_LABELS.get(
+            d.get("condition", {}).get("metric", ""), "Unknown").replace(" ($)", "")
         alerts.append({
             "id": d.get("id"),
             "name": d.get("name"),

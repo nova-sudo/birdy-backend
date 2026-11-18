@@ -61,7 +61,9 @@ async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, *
             "leads_called_rate": round(leads_with_calls / total_leads * 100, 1) if total_leads else 0.0,
         })
 
-    return {"call_center": results[:MAX_RESULT_ITEMS], "total": len(results), "preset": preset}
+    results.sort(key=lambda r: r["total_calls"], reverse=True)  # the cut keeps the busiest clients
+    return {"call_center": results[:MAX_RESULT_ITEMS], "total": len(results),
+            "shown": min(len(results), MAX_RESULT_ITEMS), "preset": preset}
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────

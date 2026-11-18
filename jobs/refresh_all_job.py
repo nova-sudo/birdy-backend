@@ -106,7 +106,7 @@ async def _refresh_single_group(group: dict, user_id: str, mongo_client):
                     "ghl_refresh_status": "complete",
                     "last_ghl_refresh": datetime.utcnow(),
                 },
-                 "$unset": {"_ghl_claimed_at": ""}},
+                 "$unset": {"_ghl_claimed_at": "", "ghl_refresh_error": ""}},
             )
             logger.info(f"[refresh-all] GHL OK for '{group_name}'")
         except Exception as e:

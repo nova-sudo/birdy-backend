@@ -166,7 +166,7 @@ def shape_cached_insights(rows: list) -> dict:
         if isinstance(row.get("creative_title"), str) and len(row["creative_title"]) > 80:
             row["creative_title"] = row["creative_title"][:80] + "…"
         out.append(row)
-    shaped = {"insights": out, "total": len(rows), "sorted_by": "spend"}
+    shaped = {"insights": out, "total": len(rows), "shown": len(out), "sorted_by": "spend"}
     if single and ordered:
         gid, gname = next(iter(groups))
         shaped["client_group"] = {"id": gid, "name": gname}

@@ -55,6 +55,15 @@ async def _notes(db, user_id: str, group: dict, limit: int | None = None) -> lis
     return [{k: v for k, v in r.items() if k not in ("user_id", "group_id")} for r in rows]
 
 
+def hotprospector_connected(group: dict) -> bool:
+    """HotProspector is linked through the client's GHL location and its call_log_provider;
+    hotprospector_group_id is the old link and is empty on every client set up since."""
+    if group.get("hotprospector_group_id"):
+        return True
+    return ((group.get("call_log_provider") or "").strip().lower() == "hotprospector"
+            and bool(group.get("ghl_location_id")))
+
+
 @mcp.tool(**READ)
 async def get_client(client: str) -> dict:
     """One client's profile: id, name, targets (cost per lead and others), ad account currency, which integrations are connected (Meta, GoHighLevel, call center), when its Meta and GoHighLevel data last refreshed, and its latest 10 notes.
@@ -75,7 +84,7 @@ async def get_client(client: str) -> dict:
         "integrations": {
             "meta": bool(group.get("meta_ad_account_id")),
             "ghl": bool(group.get("ghl_location_id")),
-            "hotprospector": bool(group.get("hotprospector_group_id")),
+            "hotprospector": hotprospector_connected(group),
         },
         "last_refreshed": {"meta": _iso(group.get("last_meta_refresh")), "ghl": _iso(group.get("last_ghl_refresh"))},
         "notes": await _notes(db, user_id, group, LATEST_NOTES),
