@@ -29,8 +29,9 @@ def card(name: str) -> dict:
     return {"ui": {"resourceUri": uri(name)}, "ui/resourceUri": uri(name)}
 
 
-# Creative thumbnails are Meta image URLs (www.facebook.com/ads/image and the fbcdn CDN).
-_CSP = {"resourceDomains": [SDK_ORIGIN, API_PUBLIC_URL, "https://www.facebook.com", "https://*.fbcdn.net"]}
+# Only the SDK's CDN and this API. Adding Meta's image hosts (with a *.fbcdn.net wildcard) stopped Claude
+# showing any card ("Rendering widget" forever, 2026-11-18), so creative thumbnails aren't shown in cards.
+_CSP = {"resourceDomains": [SDK_ORIGIN, API_PUBLIC_URL]}
 
 
 def _register(name: str, title: str, body: str) -> None:

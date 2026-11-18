@@ -450,7 +450,7 @@ window.birdyRender = function (data, ui) {
   const cur = sum.currency;
   const kp = (lbl, v) => '<div class="kpi"><i>' + lbl + "</i><strong>" + v + "</strong></div>";
   let html = '<div class="hd">' + F.avatar() + "<b>Test " + E(t.code || "") + '</b><span class="pill ' + cls + '" style="' + (cls ? "" : "background:var(--soft);color:var(--faint)") + '">' + E(word) + "</span></div>" +
-    '<div class="ct">' + (t.thumbnail ? '<div class="th" style="background-image:url(' + E(t.thumbnail) + ')"></div>' : "") +
+    '<div class="ct">' + 
     '<div class="bd"><div class="nm">' + E(t.name) + "</div>" + (t.creative && t.creative.headline ? '<div class="msg" style="margin-top:2px;color:var(--body)">“' + E(t.creative.headline) + "”</div>" : "") + "</div></div>";
   if (sum && (sum.leads != null || sum.spend != null)) {
     html += '<div class="kpis" style="margin-top:10px">' + kp("CPL", E(F.money(sum.cpl, cur)) + (target ? ' <em class="flat">target ' + E(F.money(target, cur)) + "</em>" : "")) +

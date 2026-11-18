@@ -23,7 +23,7 @@ async def test_every_card_is_a_complete_mcp_app_resource(name):
         [content] = await c.read_resource(cards.uri(name))
     res = listed[cards.uri(name)]
     assert res.mimeType == content.mimeType == "text/html;profile=mcp-app"
-    assert res.meta["ui"]["csp"]["resourceDomains"][:2] == ["https://cdn.jsdelivr.net", API_PUBLIC_URL]
+    assert res.meta["ui"]["csp"]["resourceDomains"] == ["https://cdn.jsdelivr.net", API_PUBLIC_URL]
     html = content.text
     assert html.startswith("<!doctype html>") and "__" not in html
     assert cards.SDK_URL in html and "@2.0.4/" in cards.SDK_URL  # pinned SDK
