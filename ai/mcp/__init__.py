@@ -42,3 +42,4 @@ from ai.mcp.voice import apply_titles  # noqa: E402
 
 apply_titles(mcp)  # after every tool module has registered
 cards.attach_live_cards(mcp)
+cards.attach_content_meta(mcp)

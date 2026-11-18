@@ -31,6 +31,26 @@ async def test_every_card_is_a_complete_mcp_app_resource(name):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("name", list(cards.CARDS))
+async def test_card_content_carries_its_csp(name):
+    """Hosts take the sandbox CSP from the content returned by resources/read, not from the list entry.
+    Without it the SDK script is blocked and the card stays on "Rendering widget"."""
+    async with Client(mcp) as c:
+        [content] = await c.read_resource(cards.uri(name))
+    assert content.meta["ui"]["csp"]["resourceDomains"] == ["https://cdn.jsdelivr.net", API_PUBLIC_URL]
+    assert content.meta["ui"]["prefersBorder"] is False
+
+
+@pytest.mark.asyncio
+async def test_other_resources_keep_their_own_meta():
+    async with Client(mcp) as c:
+        others = [r for r in await c.list_resources() if not str(r.uri).startswith("ui://birdy/")]
+        for r in others:
+            for content in await c.read_resource(r.uri):
+                assert "ui" not in (content.meta or {})
+
+
+@pytest.mark.asyncio
 async def test_card_resources_are_not_tools_and_cost_nothing():
     async with Client(mcp) as c:
         names = {t.name for t in await c.list_tools()}

@@ -11,6 +11,8 @@ a pinned version; the CSP below allows that origin and this API (for the mascot 
 strings (ai/mcp/card_views.py) so the serverless bundle always has them.
 """
 
+from mcp.types import ReadResourceRequest
+
 from ai.mcp import card_views
 from ai.mcp.server import mcp
 from core.config import API_PUBLIC_URL
@@ -32,15 +34,34 @@ def card(name: str) -> dict:
 # Only the SDK's CDN and this API. Adding Meta's image hosts (with a *.fbcdn.net wildcard) stopped Claude
 # showing any card ("Rendering widget" forever, 2026-11-18), so creative thumbnails aren't shown in cards.
 _CSP = {"resourceDomains": [SDK_ORIGIN, API_PUBLIC_URL]}
+_UI_META = {"ui": {"csp": _CSP, "prefersBorder": False}}
 
 
 def _register(name: str, title: str, body: str) -> None:
     html = card_views.page(title, body, sdk_url=SDK_URL, icon_url=f"{API_PUBLIC_URL}/birdy-mcp-icon.png")
 
-    @mcp.resource(uri(name), name=f"birdy_card_{name}", title=title, mime_type=MIME,
-                  meta={"ui": {"csp": _CSP, "prefersBorder": False}})
+    @mcp.resource(uri(name), name=f"birdy_card_{name}", title=title, mime_type=MIME, meta=_UI_META)
     def _view() -> str:
         return html
+
+
+def attach_content_meta(server) -> None:
+    """Send each card's `_meta.ui` with its content in resources/read, where hosts read the CSP from.
+
+    The list entry alone isn't enough: without the CSP on the content the sandbox blocks the SDK script, the
+    card never connects and Claude shows "Rendering widget" forever. This FastMCP/mcp version can't return
+    content `_meta` from a resource function, so the read handler's result is filled in here."""
+    handlers = server._mcp_server.request_handlers
+    read = handlers[ReadResourceRequest]
+
+    async def read_with_card_meta(req):
+        result = await read(req)
+        for item in getattr(getattr(result, "root", result), "contents", None) or []:
+            if str(item.uri).startswith("ui://birdy/"):
+                item.meta = {**(item.meta or {}), **_UI_META}
+        return result
+
+    handlers[ReadResourceRequest] = read_with_card_meta
 
 
 CARDS = {
