@@ -151,3 +151,43 @@ def test_cpl_drivers_start_and_end_on_that_same_cpl():
     b = {"spend": 300.21, "impressions": 25306, "clicks": 872, "results": 102, "total_leads": 103}
     out = _cpl_drivers(a, b)
     assert (out["from"], out["to"]) == (round(708.87 / 296, 2), round(300.21 / 102, 2))
+
+
+# ── The MCP tools themselves ────────────────────────────────────────────────
+# The fixes above live in ai/tools; each MCP tool below was changed to call them. Calling only the
+# shared function let a bad edit through: get_ghl_opportunity_stats was left calling the tag breakdown
+# (NameError in production) while get_ghl_tag_breakdown kept its lifetime counts.
+
+async def test_mcp_tools_reach_the_shared_functions(mock_db, set_current_user):
+    from ai.mcp import custom_metrics_mcp, ghl_mcp, group_mcp, meta_mcp, summary_mcp
+    set_current_user(ALICE)
+    await _seed_tags(mock_db)
+    await mock_db["client_groups"].update_one({"id": "g1"}, {"$set": {
+        "call_log_provider": "hotprospector",
+        "ghl_opp_cache": {"last_30d": {"won": 10, "lost": 44, "open": 224, "total_opportunities": 278,
+                                       "won_revenue": 3490}}}})
+    await mock_db["facebook_leads"].insert_one({
+        "user_id": ALICE, "client_group_id": "g1", "client_group_name": "Acme", "lead_id": "111",
+        "lead_data": {"lead_id": "111", "created_time": "2026-11-14T15:52:58+0000",
+                      "field_data": {"first name": "Ann", "phone number": "+447000000001"}}})
+    await mock_db["users"].insert_one({"user_id": ALICE, "custom_metrics": [
+        {"id": "custom_1", "name": "Close Rate", "format_type": "percentage", "formula_parts": []}]})
+
+    opps = await ghl_mcp.get_ghl_opportunity_stats.fn(preset="last_30d", group_ids=["g1"])
+    assert opps["overall"] == {"won": 10, "lost": 44, "open": 224, "abandoned": 0, "total_opportunities": 278,
+                               "won_revenue": 3490.0, "conversion_rate": 3.6}
+
+    tags = await ghl_mcp.get_ghl_tag_breakdown.fn(preset="last_30d", group_ids=["g1"], top_n=5)
+    assert tags["groups"][0]["top_tags"] == {"live lead": 40, "booked": 7}
+
+    summary = await summary_mcp.get_account_summary.fn(preset="last_30d")
+    assert summary["groups"][0]["ghl_top_tags"] == {"live lead": 40, "booked": 7}
+
+    groups = await group_mcp.get_client_groups.fn()
+    assert groups["client_groups"][0]["hotprospector_connected"] is True
+
+    leads = await meta_mcp.get_facebook_leads.fn(group_ids=["g1"])
+    assert (leads["leads"][0]["lead_id"], leads["leads"][0]["full_name"]) == ("111", "Ann")
+
+    metric = await custom_metrics_mcp.compute_custom_metric.fn(metric_id="custom_1", preset="last_30d")
+    assert metric["metric"]["unit"] == "percent"
