@@ -23,7 +23,7 @@ async def test_every_card_is_a_complete_mcp_app_resource(name):
         [content] = await c.read_resource(cards.uri(name))
     res = listed[cards.uri(name)]
     assert res.mimeType == content.mimeType == "text/html;profile=mcp-app"
-    assert res.meta["ui"]["csp"]["resourceDomains"] == ["https://cdn.jsdelivr.net", API_PUBLIC_URL]
+    assert res.meta["ui"]["csp"]["resourceDomains"][:2] == ["https://cdn.jsdelivr.net", API_PUBLIC_URL]
     html = content.text
     assert html.startswith("<!doctype html>") and "__" not in html
     assert cards.SDK_URL in html and "@2.0.4/" in cards.SDK_URL  # pinned SDK
@@ -41,6 +41,7 @@ async def test_card_resources_are_not_tools_and_cost_nothing():
 @pytest.mark.parametrize("tool,name", [
     ("check_my_accounts", "accounts"), ("compare_periods", "scorecard"), ("get_account_summary", "summary"),
     ("explain_alert", "alert"), ("get_fired_alerts", "alert"), ("apply_card", "confirm"), ("send_lead_message", "confirm"),
+    ("get_ad_insights", "ads"), ("get_budget_pacing", "pacing"), ("get_creative_test", "creative_test"), ("funnel", "funnel"),
 ])
 async def test_tools_point_at_their_card(tool, name):
     async with Client(mcp) as c:

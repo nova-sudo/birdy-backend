@@ -12,6 +12,8 @@ that module for the (unchanged, still-registered) fallback path used by the
 orchestrator if the MCP path is unavailable.
 """
 
+import math
+
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.tools.derived_metrics import enrich, _safe_float
@@ -34,8 +36,42 @@ _COMPARE_PERIODS_DESCRIPTION = (
     "Compare two date presets side-by-side with absolute and percentage change for each metric. "
     "preset_a is the baseline (older period), preset_b is the comparison (current period). "
     "Use when the user says 'vs', 'compared to', 'change from', etc. "
+    "Each client and the overall total also have cpl_drivers, which splits the CPL change into what moved it: "
+    "cpm (cost per 1,000 impressions), ctr (clicks per impression) and lead_rate (leads per click). Each step "
+    "has from, to and effect (its share of the CPL change, in money; the effects add up to the change), and "
+    "biggest names the step with the largest effect. cpl_drivers is null when either period has no leads, "
+    "clicks or impressions. Use it to answer 'why did CPL change?'. "
     f"Valid presets: {_PRESET_LIST}."
 )
+
+
+_DRIVERS = (("cpm", "CPM"), ("ctr", "CTR"), ("lead_rate", "Lead rate"))
+
+
+def _cpl_drivers(a: dict, b: dict) -> dict | None:
+    """Split the CPL change from a to b into CPM, CTR and lead-rate steps.
+
+    CPL = spend/impressions x impressions/clicks x clicks/leads, so ln(CPL_b/CPL_a) is the sum of the three
+    factors' log ratios; each step gets that share of the money change (they add up exactly). A higher CTR or
+    lead rate lowers CPL, so those effects have the opposite sign to their own change.
+    """
+    def parts(r):
+        imp, clk, leads, spend = (_safe_float(r.get(k)) or 0 for k in ("impressions", "clicks", "total_leads", "spend"))
+        if min(imp, clk, leads, spend) <= 0:
+            return None
+        return {"cpl": spend / leads, "cpm": spend / imp * 1000, "ctr": clk / imp * 100, "lead_rate": leads / clk * 100}
+
+    pa, pb = parts(a), parts(b)
+    if not pa or not pb:
+        return None
+    total = pb["cpl"] - pa["cpl"]
+    logs = {"cpm": math.log(pb["cpm"] / pa["cpm"]), "ctr": math.log(pa["ctr"] / pb["ctr"]),
+            "lead_rate": math.log(pa["lead_rate"] / pb["lead_rate"])}
+    whole = sum(logs.values())
+    steps = [{"key": k, "label": label, "from": round(pa[k], 2), "to": round(pb[k], 2),
+              "effect": round(total * logs[k] / whole, 2) if abs(whole) > 1e-9 else 0.0} for k, label in _DRIVERS]
+    return {"from": round(pa["cpl"], 2), "to": round(pb["cpl"], 2), "steps": steps,
+            "biggest": max(steps, key=lambda st: abs(st["effect"]))["key"] if abs(total) > 0.005 else None}
 
 
 def _compute_changes(a: dict, b: dict) -> dict:
@@ -108,6 +144,7 @@ async def compare_periods(preset_a: str, preset_b: str, group_ids: list[str] | N
             "period_a": row_a,
             "period_b": row_b,
             "changes": _compute_changes(row_a, row_b),
+            "cpl_drivers": _cpl_drivers(row_a, row_b),
         })
 
         for k in totals_a:
@@ -122,6 +159,7 @@ async def compare_periods(preset_a: str, preset_b: str, group_ids: list[str] | N
             "period_a": overall_a,
             "period_b": overall_b,
             "changes": _compute_changes(overall_a, overall_b),
+            "cpl_drivers": _cpl_drivers(overall_a, overall_b),
         },
         "groups": per_group[:MAX_RESULT_ITEMS],
         "preset_a": preset_a,

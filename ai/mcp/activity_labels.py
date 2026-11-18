@@ -62,6 +62,7 @@ LABELS: dict[str, dict] = {
     # Summaries and comparisons
     "get_account_summary": _l("Looked at the account summary"),
     "compare_periods": _l("Compared two periods"),
+    "get_budget_pacing": _l("Checked budget pacing", "/clients"),
     "get_daily_metrics": _l("Looked at daily numbers"),
     "get_metrics_by_day_windows": _l("Looked at numbers by time window"),
     "get_call_center_stats": _l("Looked at call centre stats"),

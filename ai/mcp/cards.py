@@ -29,7 +29,8 @@ def card(name: str) -> dict:
     return {"ui": {"resourceUri": uri(name)}, "ui/resourceUri": uri(name)}
 
 
-_CSP = {"resourceDomains": [SDK_ORIGIN, API_PUBLIC_URL]}
+# Creative thumbnails are Meta image URLs (www.facebook.com/ads/image and the fbcdn CDN).
+_CSP = {"resourceDomains": [SDK_ORIGIN, API_PUBLIC_URL, "https://www.facebook.com", "https://*.fbcdn.net"]}
 
 
 def _register(name: str, title: str, body: str) -> None:
@@ -47,6 +48,10 @@ CARDS = {
     "alert": ("Birdy · alert", card_views.ALERT),                  # #13 explain_alert, get_fired_alerts
     "confirm": ("Birdy · live change", card_views.CONFIRM),        # #15 every LIVE tool
     "summary": ("Birdy · numbers", card_views.SUMMARY),            # #23 get_account_summary
+    "ads": ("Birdy · ad leaderboard", card_views.LEADERBOARD),     # #16 get_ad_insights
+    "pacing": ("Birdy · budget pacing", card_views.PACING),        # #19 get_budget_pacing
+    "creative_test": ("Birdy · creative test", card_views.CREATIVE_TEST),  # #21 get_creative_test
+    "funnel": ("Birdy · funnel", card_views.FUNNEL),               # #22 funnel
 }
 
 for _name, (_title, _body) in CARDS.items():

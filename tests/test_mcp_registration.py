@@ -40,6 +40,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "refresh_mcp": {"refresh_client_data", "refresh_status"},
     "watch_mcp": {"check_my_accounts", "get_fired_alerts", "explain_alert"},
     "hello_mcp": {"get_started"},
+    "pacing_mcp": {"get_budget_pacing"},
     "prompts_mcp": set(),  # prompts only, no tools
 }
 

@@ -17,6 +17,7 @@ from ai.tools.derived_metrics import enrich
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.access import READ
+from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.tools.meta_tools import _legacy_insights, shape_cached_insights
 from services.facebook_cache_shape import read_preset
@@ -159,7 +160,7 @@ async def get_adset_insights(
     return await _legacy_insights(db, "facebook_adset_insights", user_id, start_date, end_date, group_ids)
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("ads"))
 async def get_ad_insights(
     start_date: str | None = None,
     end_date: str | None = None,
@@ -177,7 +178,12 @@ async def get_ad_insights(
 
     cached = await _get_cached_data(db, user_id, "ads", group_ids, start_date, end_date)
     if cached:
-        return shape_cached_insights(cached)
+        shaped = shape_cached_insights(cached)
+        if shaped.get("client_group"):  # one client: its money is in one currency (for the ad leaderboard card)
+            g = await db["client_groups"].find_one({"id": shaped["client_group"]["id"], "user_id": user_id},
+                                                   {"ad_account_currency": 1, "facebook_cache.currency": 1, "_id": 0}) or {}
+            shaped["currency"] = (g.get("facebook_cache") or {}).get("currency") or g.get("ad_account_currency")
+        return shaped
 
     # Fallback to the per-day insights collection (never for scoped groups).
     return await _legacy_insights(db, "facebook_ad_insights", user_id, start_date, end_date, group_ids)
