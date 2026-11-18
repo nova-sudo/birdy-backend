@@ -371,3 +371,13 @@ async def test_saved_blocks_are_described_for_the_copilot(mock_db):
         {"type": "header", "text": "Hi"},
         {"type": "data_visualization", "title": "Daily", "chart": {"type": "line", "by": "day", "metrics": ["spend"]}}]})
     assert out["saved_blocks"] == ["header", "line chart “Daily” of spend by day"]
+
+
+async def test_total_row_of_a_cut_table_says_what_it_adds_up(mock_db):
+    """The daily brief showed "Total £163" under ten rows while the portfolio spent £375."""
+    await _seed(mock_db, [_group("g1", "Glow Clinic", 120, 12), _group("g2", "Bright Smiles", 60, 3),
+                          _group("g3", "Third", 30, 3)])
+    blocks, _ = await rendered(mock_db,
+        {"type": "data_table", "caption": "Clients",
+         "birdy_data": {"metrics": ["spend"], "sort": "spend", "limit": 2, "total_row": True}})
+    assert [c["text"] for c in blocks[0]["rows"][-1]] == ["Total (top 2 of 3)", "£180"]

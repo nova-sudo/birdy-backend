@@ -11,6 +11,7 @@ Rate limit strategy:
 - Leads still iterate per-ad but with proper throttling
 """
 
+from integrations.facebook_utils.lead_fields import contact_fields
 import asyncio
 import logging
 import random
@@ -727,9 +728,9 @@ def _normalize_leads(
             "platform": lead.get("platform", ""),
             "is_organic": lead.get("is_organic", False),
             "created_time": lead.get("created_time", ""),
-            "full_name": field_data.get("full_name", ""),
-            "email": field_data.get("email", ""),
-            "phone_number": field_data.get("phone_number", ""),
+            "full_name": contact_fields(field_data)[0],
+            "email": contact_fields(field_data)[1],
+            "phone_number": contact_fields(field_data)[2],
             "field_data": field_data,
             "client_group_id": client_group_id,
             "client_group_name": client_group_name,

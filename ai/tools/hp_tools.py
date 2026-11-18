@@ -42,6 +42,10 @@ async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, *
         total_leads = stats.get("total_leads", 0) or 0
         leads_with_calls = stats.get("leads_with_calls", 0) or 0
 
+        # The cache holds one lead count per client, all time, under every preset. Dividing a window's
+        # called leads by it gave a coverage rate that meant nothing (47 called this week / 915 ever),
+        # so the rate is only given where both sides cover the same period.
+        all_time = preset == "maximum"
         results.append({
             "client_group_id": g.get("id"),
             "client_group_name": g.get("name"),
@@ -52,18 +56,21 @@ async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, *
             "transfers": stats.get("transfers", 0),
             "answered_calls": answered,
             "total_talk_min": stats.get("total_talk_min", 0),
-            "total_leads": total_leads,
+            "total_leads_all_time": total_leads,
             "leads_with_calls": leads_with_calls,
-            # % of placed calls that connected (talk time > 0) — lead reachability.
+            # % of placed calls with talk time > 0.
             "connect_rate": round(answered / total_calls * 100, 1) if total_calls else 0.0,
             # % of leads that got >= 1 call — call-center coverage. Low coverage is
             # an operations gap, not a lead-quality problem.
-            "leads_called_rate": round(leads_with_calls / total_leads * 100, 1) if total_leads else 0.0,
+            "leads_called_rate": (round(leads_with_calls / total_leads * 100, 1) if total_leads else 0.0)
+                                 if all_time else None,
         })
 
     results.sort(key=lambda r: r["total_calls"], reverse=True)  # the cut keeps the busiest clients
     return {"call_center": results[:MAX_RESULT_ITEMS], "total": len(results),
-            "shown": min(len(results), MAX_RESULT_ITEMS), "preset": preset}
+            "shown": min(len(results), MAX_RESULT_ITEMS), "preset": preset,
+            "note": "total_leads_all_time is every lead the client has in HotProspector, not the leads of "
+                    "this period; leads_called_rate is given for preset=maximum only."}
 
 
 # ── Schema ──────────────────────────────────────────────────────────────────

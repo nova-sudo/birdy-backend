@@ -76,7 +76,7 @@ def _blank(group: dict) -> dict:
         "target_cpl": (group.get("targets") or {}).get("cpl"),
         "prior": {"spend": None, "leads": None, "cpl": None},
         "change_pct": {"spend": None, "leads": None, "cpl": None},
-        "alerts_fired": 0, "open_agent_cards": 0,
+        "alerts_fired": 0, "win_alerts_fired": 0, "open_agent_cards": 0,
     }
 
 
@@ -108,23 +108,28 @@ async def _load_metrics(group: dict, token, sem, since, prev_since, until) -> di
     return row
 
 
-async def _alerts_fired(db, user_id: str, since: datetime) -> dict[str, int]:
-    """client id -> distinct alerts that fired since `since`. A firing that names its client counts for that
-    client; otherwise it counts for each client the alert targets."""
+async def _alerts_fired(db, user_id: str, since: datetime) -> tuple[dict[str, int], dict[str, int]]:
+    """(problems, wins): client id -> distinct alerts that fired since `since`, split by the alert's type.
+    A win alert ("CPL below 3.50") is good news and must not raise a client's attention level.
+    A firing that names its client counts for that client; otherwise it counts for each client the alert targets."""
     notes = await db["alert_notifications"].find(
         {"user_id": user_id, "triggered_at": {"$gte": since}}, {"alert_id": 1, "group_id": 1, "_id": 0},
     ).to_list(None)
     if not notes:
-        return {}
+        return {}, {}
     alert_ids = list({n["alert_id"] for n in notes if n.get("alert_id")})
-    targets = {a["id"]: a.get("target_group_ids") or [] for a in await db["alerts"].find(
-        {"user_id": user_id, "id": {"$in": alert_ids}}, {"id": 1, "target_group_ids": 1, "_id": 0}).to_list(None)}
+    alerts = {a["id"]: a for a in await db["alerts"].find(
+        {"user_id": user_id, "id": {"$in": alert_ids}},
+        {"id": 1, "target_group_ids": 1, "type": 1, "_id": 0}).to_list(None)}
     fired: dict[str, set] = {}
+    wins: dict[str, set] = {}
     for n in notes:
-        gids = [n["group_id"]] if n.get("group_id") else targets.get(n.get("alert_id"), [])
+        alert = alerts.get(n.get("alert_id")) or {}
+        gids = [n["group_id"]] if n.get("group_id") else alert.get("target_group_ids") or []
+        bucket = wins if alert.get("type") == "win" else fired
         for gid in gids:
-            fired.setdefault(gid, set()).add(n.get("alert_id"))
-    return {gid: len(ids) for gid, ids in fired.items()}
+            bucket.setdefault(gid, set()).add(n.get("alert_id"))
+    return ({gid: len(ids) for gid, ids in fired.items()}, {gid: len(ids) for gid, ids in wins.items()})
 
 
 async def _open_cards(db, user_id: str) -> dict[str, int]:
@@ -153,7 +158,7 @@ async def build_account_check(db, mongo_client, user_id: str, days: int = 7) -> 
         token = ((await mw.get_facebook_token(user_id, mongo_client)) or {}).get("access_token")
 
     sem = asyncio.Semaphore(MAX_CONCURRENCY)
-    rows, fired, cards = await asyncio.gather(
+    rows, (fired, wins), cards = await asyncio.gather(
         asyncio.gather(*(_load_metrics(g, token, sem, since, prev_since, until) for g in groups)),
         _alerts_fired(db, user_id, datetime.combine(date.fromisoformat(since), datetime.min.time())),
         _open_cards(db, user_id),
@@ -163,6 +168,7 @@ async def build_account_check(db, mongo_client, user_id: str, days: int = 7) -> 
     for c in rows:
         gid = c["client"]["id"]
         c["alerts_fired"], c["open_agent_cards"] = fired.get(gid, 0), cards.get(gid, 0)
+        c["win_alerts_fired"] = wins.get(gid, 0)
         error, note = c.pop("_error", None), c.pop("_note", None)
         c["attention"], c["reasons"] = _attention(c)  # alerts and cards apply even with no metrics
         if error:

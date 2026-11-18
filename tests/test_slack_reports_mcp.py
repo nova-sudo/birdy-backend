@@ -249,3 +249,13 @@ async def test_send_code_refused_when_channel_changed_after_preview(mock_db, ali
     await t.update_slack_report.fn(report_id=rep["id"], channel_id="C0NEW", channel_name="new")
     out = await t.send_test_slack_report.fn(report_id=rep["id"], confirm_code=first["confirm_code"])
     assert "changed since the preview" in out["error"] and posts == []
+
+
+async def test_list_says_where_each_report_is_sent(mock_db, alice):
+    """A report with no channel of its own goes to the default Birdy channel; the list showed null."""
+    await _connect(mock_db)
+    own = await _make()
+    default = await _make(name="Default one", channel_id=None, channel_name=None)
+    by_id = {r["id"]: r["sends_to"] for r in (await t.list_slack_reports.fn())["reports"]}
+    assert by_id[own["id"]] == {"channel_id": "C0OPS", "channel_name": "ops", "default_channel": False}
+    assert by_id[default["id"]] == {"channel_id": "C_BIRDY", "channel_name": "birdy-alerts", "default_channel": True}

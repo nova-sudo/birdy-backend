@@ -138,8 +138,8 @@ async def get_ghl_opportunity_stats(db, user_id, preset="maximum", group_ids=Non
 
 async def get_ghl_tag_breakdown(db, user_id, preset="maximum", group_ids=None, top_n=20):
     """
-    Get tag breakdown (tag -> contact count) per client group from the cached
-    gohighlevel_cache.metrics.tag_breakdown.
+    Tag breakdown (tag -> contact count) per client group for the preset's window: contacts added in
+    it, from the per-preset tag cache (services/ghl_tag_cache.py).
     """
     from core.constants import PRESET_ALIAS
     resolved = PRESET_ALIAS.get(preset or "maximum", "maximum")
@@ -153,11 +153,16 @@ async def get_ghl_tag_breakdown(db, user_id, preset="maximum", group_ids=None, t
         {"id": 1, "name": 1, "gohighlevel_cache.metrics.tag_breakdown": 1, "_id": 0},
     ).to_list(None)
 
+    from services.ghl_tag_cache import windowed_tags
+    lifetime = {g.get("id"): (g.get("gohighlevel_cache", {}).get("metrics", {}).get("tag_breakdown", {}) or {})
+                for g in groups}
+    by_group = await windowed_tags(db, user_id, resolved, lifetime)
+
     results = []
     global_tag_totals = {}
 
     for g in groups:
-        tag_breakdown = g.get("gohighlevel_cache", {}).get("metrics", {}).get("tag_breakdown", {}) or {}
+        tag_breakdown = by_group.get(g.get("id")) or {}
         sorted_tags = sorted(tag_breakdown.items(), key=lambda x: x[1], reverse=True)[:top_n]
 
         for tag, count in tag_breakdown.items():

@@ -211,7 +211,7 @@ window.birdyRender = function (data, ui) {
     const g = groups[0], b = g.period_b || {}, cplUp = ch(g, "cpl");
     const pill = cplUp == null ? "" : cplUp <= 0 ? '<span class="pill fine">On track</span>' : cplUp >= 25 ? '<span class="pill act">Needs a look</span>' : "";
     html = head(g.group_name || "Client").replace("</b>", "</b>" + pill) + '<div class="kpis">' +
-      '<div class="kpi"><i>Leads</i><strong>' + F.num(b.total_leads, 0) + "</strong>" + F.chg(ch(g, "total_leads")) + "</div>" +
+      '<div class="kpi"><i>Leads</i><strong>' + F.num(b.results != null ? b.results : b.total_leads, 0) + "</strong>" + F.chg(ch(g, "results") != null ? ch(g, "results") : ch(g, "total_leads")) + "</div>" +
       '<div class="kpi"><i>CPL</i><strong>' + E(F.money(b.cpl, g.currency)) + "</strong>" + F.chg(cplUp, "cost") + "</div>" +
       '<div class="kpi"><i>Spend</i><strong>' + E(F.money(b.spend, g.currency)) + "</strong>" + F.chg(ch(g, "spend"), "neutral") + "</div>" +
       '<div class="kpi"><i>CTR</i><strong>' + F.num(b.ctr) + "%</strong>" + F.chg(ch(g, "ctr")) + "</div></div>" +
@@ -220,7 +220,7 @@ window.birdyRender = function (data, ui) {
       encodeURIComponent(g.group_id) + '">Open in Birdy →</button></div>';
   } else {
     const rows = groups.slice(0, 10).map(g => '<div class="rowl"><button class="link nm" data-open="/clients/' + encodeURIComponent(g.group_id) +
-      '" style="color:var(--ink);font-weight:600">' + E(g.group_name) + '</button><span class="chip">Leads ' + F.chg(ch(g, "total_leads")) +
+      '" style="color:var(--ink);font-weight:600">' + E(g.group_name) + '</button><span class="chip">Leads ' + F.chg(ch(g, "results") != null ? ch(g, "results") : ch(g, "total_leads")) +
       '</span><span class="chip">CPL ' + F.chg(ch(g, "cpl"), "cost") + "</span></div>").join("");
     const more = (data.total_groups || groups.length) - Math.min(groups.length, 10);
     html = head((data.total_groups || groups.length) + " clients") + rows + '<div class="ft"><span>' + (more > 0 ? "and " + more + " more" : "Change vs " +
@@ -244,7 +244,7 @@ window.birdyRender = function (data, ui) {
   const curs = [...new Set(groups.map(g => g.currency).filter(Boolean))], cur = curs.length === 1 ? curs[0] : null;
   const money = (v) => cur ? F.money(v, cur) : F.num(v);
   const who = groups.length === 1 ? groups[0].group_name : (data.total_groups || groups.length) + " clients";
-  const leads = o.total_leads || 0, cpl = o.cpl != null ? o.cpl : (leads ? o.spend / leads : null);
+  const leads = (o.results != null ? o.results : o.total_leads) || 0, cpl = o.cpl != null ? o.cpl : (leads ? o.spend / leads : null);
   let html = '<div class="strip">' + F.avatar() + '<span class="chip"><b>' + E(who) + "</b></span>" +
     '<span class="chip">' + E(F.preset(data.preset)) + "</span>" +
     '<span class="chip">Spend <b>' + E(money(o.spend)) + "</b></span>" +
@@ -379,7 +379,7 @@ LEADERBOARD = ("""
 """, r"""
 window.birdyRender = function (data, ui) {
   const F = birdyFmt, E = F.esc, rows = data.insights || [], g = data.client_group;
-  const leads = (r) => r.total_leads != null ? r.total_leads : (r.results || 0);
+  const leads = (r) => r.results != null ? r.results : (r.total_leads || 0);
   const scored = rows.filter(r => leads(r) > 0 && r.cpl != null).sort((a, b) => a.cpl - b.cpl);
   const dead = rows.filter(r => !leads(r) && (r.spend || 0) > 0).sort((a, b) => b.spend - a.spend);
   const cur = data.currency || (rows[0] && rows[0].currency);

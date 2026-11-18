@@ -1,3 +1,4 @@
+from integrations.facebook_utils.lead_fields import contact_fields
 from ai.tools.registry import registry
 from ai.tools.derived_metrics import enrich
 from ai.config import MAX_RESULT_ITEMS
@@ -263,18 +264,22 @@ async def get_facebook_leads(db, user_id, start_date=None, end_date=None, limit=
 
     cursor = db["facebook_leads"].find(
         query,
-        {"lead_data": 1, "client_group_name": 1, "client_group_id": 1},
+        {"lead_data": 1, "lead_id": 1, "client_group_name": 1, "client_group_id": 1},
     ).sort("lead_data.created_time", -1).limit(limit)
 
     docs = await cursor.to_list(length=limit)
     leads = []
     for doc in docs:
         ld = doc.get("lead_data", {})
+        # Leads stored before the sync read a form's own question labels have the name and phone only
+        # in field_data.
+        name, email, phone = contact_fields(ld.get("field_data"))
         leads.append({
-            "lead_id": ld.get("id"),
-            "full_name": ld.get("full_name", ""),
-            "email": ld.get("email", ""),
-            "phone_number": ld.get("phone_number", ""),
+            # The sync stores Meta's lead id as lead_id (on the row and in lead_data), never as "id".
+            "lead_id": doc.get("lead_id") or ld.get("lead_id") or ld.get("id"),
+            "full_name": ld.get("full_name") or name,
+            "email": ld.get("email") or email,
+            "phone_number": ld.get("phone_number") or phone,
             "ad_name": ld.get("ad_name", ""),
             "campaign_name": ld.get("campaign_name", ""),
             "created_time": ld.get("created_time", ""),

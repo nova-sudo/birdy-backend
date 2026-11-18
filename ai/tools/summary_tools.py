@@ -34,6 +34,11 @@ async def get_account_summary(db, user_id, preset="last_7d", group_ids=None):
         },
     ).to_list(None)
 
+    # Top tags for the same window as the rest of the row, not all time.
+    from services.ghl_tag_cache import windowed_tags
+    tags_by_group = await windowed_tags(db, user_id, preset, {
+        g.get("id"): (g.get("gohighlevel_cache", {}).get("metrics", {}).get("tag_breakdown") or {}) for g in groups})
+
     per_group = []
     totals = {
         "spend": 0, "impressions": 0, "clicks": 0, "reach": 0,
@@ -63,8 +68,7 @@ async def get_account_summary(db, user_id, preset="last_7d", group_ids=None):
             "ctr": _safe_float(insights.get("ctr")),
             "ghl_contacts": ghl.get("total_contacts", 0),
             "ghl_top_tags": dict(
-                sorted(ghl.get("tag_breakdown", {}).items(), key=lambda x: x[1], reverse=True)[:5]
-            ) if ghl.get("tag_breakdown") else {},
+                sorted((tags_by_group.get(g.get("id")) or {}).items(), key=lambda x: x[1], reverse=True)[:5]),
         }
         enrich(row)
         per_group.append(row)

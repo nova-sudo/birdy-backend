@@ -803,7 +803,8 @@ def _cell(metric, value, ctx):
 
 def _table_rows(ctx, bd) -> list[list[dict]] | None:
     preset = ctx.preset({"period": bd.get("period")})
-    rows = _rank_clients(ctx, bd, preset)[: bd["limit"]]
+    ranked = _rank_clients(ctx, bd, preset)
+    rows = ranked[: bd["limit"]]
     if not rows:
         return None
     out = [[{"type": "raw_text", "text": "Client"}] +
@@ -818,7 +819,10 @@ def _table_rows(ctx, bd) -> list[list[dict]] | None:
                 return ctx.value(m, None, preset)
             return core._value(m, [ctx.views(preset)[g] for g in ids], preset)
 
-        out.append([{"type": "raw_text", "text": "Total"}] + [_cell(m, total(m), ctx) for m in bd["metrics"]])
+        # The row adds up the clients shown. When the table is cut, say so: a bare "Total" under the
+        # top ten reads as the whole portfolio.
+        label = "Total" if len(rows) == len(ranked) else f"Total (top {len(rows)} of {len(ranked)})"
+        out.append([{"type": "raw_text", "text": label}] + [_cell(m, total(m), ctx) for m in bd["metrics"]])
     return out
 
 

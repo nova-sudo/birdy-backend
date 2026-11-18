@@ -29,7 +29,8 @@ async def check_my_accounts(days: int = 7) -> dict:
     Compares the last N days (ending yesterday) with the N days before. Each client has: spend, leads and cpl for
     the period; prior (the same three for the earlier period); change_pct (percent change, null when there is
     nothing to compare); target_cpl (the owner's cost-per-lead goal, null if unset); alerts_fired (distinct
-    alerts that fired in the period); open_agent_cards (agent suggestions waiting for a decision); attention
+    alerts that fired in the period, win alerts left out); win_alerts_fired (distinct win alerts that fired:
+    good news, never a reason for attention); open_agent_cards (agent suggestions waiting for a decision); attention
     ("high", "medium" or "ok"); and reasons, plain-English lines saying why. Money is in that client's ad account
     currency. Clients are sorted high first, then medium, then ok, biggest spend first. summary counts each level.
 

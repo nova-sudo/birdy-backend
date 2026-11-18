@@ -174,6 +174,10 @@ async def compute_custom_metric(db, user_id, metric_id, preset="last_7d", group_
         },
     ).to_list(None)
 
+    # A percentage metric's formula gives a ratio (won / leads = 0.045); the app shows it times 100.
+    # Rounding the ratio to 2dp first turned 4.5% into 0.05, so scale before rounding and name the unit.
+    scale = 100 if format_type == "percentage" else 1
+
     # Evaluate per group via the orchestrator. Pass the full custom_metrics list
     # so formulas can reference other custom metrics (e.g. ROAS uses CPA).
     per_group = []
@@ -182,23 +186,27 @@ async def compute_custom_metric(db, user_id, metric_id, preset="last_7d", group_
         per_group.append({
             "group_id": g.get("id"),
             "group_name": g.get("name"),
-            "value": round(value, 2),
+            "value": round(value * scale, 2),
         })
 
     # Aggregate — "recompute" for ratio metrics, "total" for sums
     agg_mode = "recompute" if metric_aggregation == "average" or format_type == "percentage" else "total"
     overall = evaluate_formula_aggregated(
         formula_parts, groups, resolved, aggregation=agg_mode, custom_metrics=metrics
-    )
+    ) * scale
     valid_count = len([g for g in per_group if g["value"] is not None])
 
+    info = {
+        "id": metric_id,
+        "name": metric.get("name"),
+        "formula": metric.get("formula_display", ""),
+        "format_type": format_type,
+    }
+    if format_type == "percentage":
+        info["unit"] = "percent"
+
     return {
-        "metric": {
-            "id": metric_id,
-            "name": metric.get("name"),
-            "formula": metric.get("formula_display", ""),
-            "format_type": format_type,
-        },
+        "metric": info,
         "per_group": per_group[:MAX_RESULT_ITEMS],
         "overall_total": round(overall, 2),
         "overall_average": round(overall / valid_count, 2) if valid_count else 0,

@@ -30,6 +30,7 @@ from services.metric_orchestrator import (
 )
 from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
+from ai.tools import custom_metrics_tools
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Formula parsing (unchanged from ai/tools/custom_metrics_tools.py)
@@ -187,67 +188,8 @@ async def compute_custom_metric(
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())
 
-    resolved = resolve_preset(preset or "last_7d")
-
-    # Look up the metric definition
-    user_doc = await db["users"].find_one({"user_id": user_id}, {"custom_metrics": 1})
-    metrics = (user_doc or {}).get("custom_metrics", []) or []
-    metric = next((m for m in metrics if m.get("id") == metric_id), None)
-    if not metric:
-        return {"error": f"Custom metric '{metric_id}' not found"}
-
-    formula_parts = metric.get("formula_parts", [])
-    format_type = metric.get("format_type", "integer")
-    metric_aggregation = metric.get("aggregation", "total")
-
-    # Fetch client groups (pull the caches the orchestrator knows how to read)
-    query = {"user_id": user_id}
-    if group_ids:
-        query["id"] = {"$in": group_ids}
-
-    groups = await db["client_groups"].find(
-        query,
-        {
-            "id": 1, "name": 1,
-            "facebook_cache": 1,
-            "ghl_opp_cache": 1,
-            "gohighlevel_cache.metrics": 1,
-            "_id": 0,
-        },
-    ).to_list(None)
-
-    # Evaluate per group via the orchestrator. Pass the full custom_metrics list
-    # so formulas can reference other custom metrics (e.g. ROAS uses CPA).
-    per_group = []
-    for g in groups:
-        value = evaluate_formula(formula_parts, g, resolved, custom_metrics=metrics)
-        per_group.append({
-            "group_id": g.get("id"),
-            "group_name": g.get("name"),
-            "value": round(value, 2),
-        })
-
-    # Aggregate — "recompute" for ratio metrics, "total" for sums
-    agg_mode = "recompute" if metric_aggregation == "average" or format_type == "percentage" else "total"
-    overall = evaluate_formula_aggregated(
-        formula_parts, groups, resolved, aggregation=agg_mode, custom_metrics=metrics
-    )
-    valid_count = len([g for g in per_group if g["value"] is not None])
-
-    return {
-        "metric": {
-            "id": metric_id,
-            "name": metric.get("name"),
-            "formula": metric.get("formula_display", ""),
-            "format_type": format_type,
-        },
-        "per_group": per_group[:MAX_RESULT_ITEMS],
-        "overall_total": round(overall, 2),
-        "overall_average": round(overall / valid_count, 2) if valid_count else 0,
-        "aggregation_mode": agg_mode,
-        "preset": resolved,
-        "groups_evaluated": valid_count,
-    }
+    return await custom_metrics_tools.compute_custom_metric(
+        db, user_id, metric_id, preset=preset, group_ids=group_ids)
 
 
 _LIST_AVAILABLE_METRIC_FIELDS_DESCRIPTION = (

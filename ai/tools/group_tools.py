@@ -2,6 +2,15 @@ from ai.tools.registry import registry
 from core.utils import mongo_to_dict
 
 
+def hotprospector_connected(group: dict) -> bool:
+    """HotProspector is linked through the client's GHL location and its call_log_provider;
+    hotprospector_group_id is the old link and is empty on every client set up since."""
+    if group.get("hotprospector_group_id"):
+        return True
+    return ((group.get("call_log_provider") or "").strip().lower() == "hotprospector"
+            and bool(group.get("ghl_location_id")))
+
+
 async def get_client_groups(db, user_id, **kwargs):
     cursor = db["client_groups"].find(
         {"user_id": user_id},
@@ -11,6 +20,7 @@ async def get_client_groups(db, user_id, **kwargs):
             "meta_ad_account_id": 1,
             "ghl_location_id": 1,
             "hotprospector_group_id": 1,
+            "call_log_provider": 1,
             "ad_account_currency": 1,
             "notes": 1,
             "status": 1,
@@ -24,7 +34,7 @@ async def get_client_groups(db, user_id, **kwargs):
             "name": doc.get("name"),
             "meta_ad_account_id": doc.get("meta_ad_account_id"),
             "ghl_location_id": doc.get("ghl_location_id"),
-            "hotprospector_group_id": doc.get("hotprospector_group_id"),
+            "hotprospector_connected": hotprospector_connected(doc),
             "currency": doc.get("ad_account_currency"),
             "notes": doc.get("notes", ""),
             "status": doc.get("status"),

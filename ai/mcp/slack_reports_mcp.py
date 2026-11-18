@@ -83,11 +83,23 @@ async def _channel_label(db, user_id: str, report: dict, channel_id: str) -> str
 
 @mcp.tool(**READ)
 async def list_slack_reports() -> dict:
-    """The owner's Slack reports, the default daily/weekly brief first: each one's id, name, whether it is on, when it sends (a schedule or an event), its Slack channel, its content template and a one-line summary of each block. Also returns `max`, how many reports an account can have.
+    """The owner's Slack reports, the default daily/weekly brief first: each one's id, name, whether it is on, when it sends (a schedule or an event), where it is sent (`sends_to`: the report's own channel, or the account's default Birdy channel when channel_id is empty), its content template and a one-line summary of each block. Also returns `max`, how many reports an account can have.
 
     Use it to find a report's id before update_slack_report, delete_slack_report or send_test_slack_report, or to answer "what do I get in Slack and when?".
     """
-    return await ops.list_reports(_db(), _current_user_id())
+    db, user_id = _db(), _current_user_id()
+    out = await ops.list_reports(db, user_id)
+    # A report with no channel of its own goes to the account's default Birdy channel; its channel_id
+    # is empty, which read as "sent nowhere".
+    user = await db["users"].find_one({"user_id": user_id}, {"integrations.slack_bot.notify_channel_id": 1,
+                                                             "integrations.slack_bot.notify_channel_name": 1}) or {}
+    bot = (user.get("integrations") or {}).get("slack_bot") or {}
+    for report in out["reports"]:
+        own = report.get("channel_id")
+        report["sends_to"] = {"channel_id": own or bot.get("notify_channel_id"),
+                              "channel_name": report.get("channel_name") if own else bot.get("notify_channel_name"),
+                              "default_channel": not own}
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -145,3 +145,19 @@ async def get_tag_breakdowns(user_id: str, preset: str, mongo_client) -> dict:
     ):
         out[doc["group_id"]] = doc.get("tags") or {}
     return out
+
+
+async def windowed_tags(db, user_id: str, preset: str, lifetime: dict) -> dict:
+    """{group_id: {tag: count}} for a preset, for tools that used to read the lifetime
+    `gohighlevel_cache.metrics.tag_breakdown` whatever window was asked for.
+
+    `lifetime` is {group_id: that lifetime breakdown}. It answers "maximum" for a group with no cached
+    row yet (not refreshed since this cache was added). A windowed preset with no row is empty: showing
+    lifetime counts under "last 30 days" is the bug this replaces.
+    """
+    cached = {doc["group_id"]: doc.get("tags") or {} async for doc in db[COLLECTION].find(
+        {"user_id": user_id, "preset": preset, "group_id": {"$in": list(lifetime)}},
+        {"group_id": 1, "tags": 1, "_id": 0})}
+    if preset == "maximum":
+        return {gid: cached.get(gid) or (tags or {}) for gid, tags in lifetime.items()}
+    return {gid: cached.get(gid, {}) for gid in lifetime}

@@ -1,3 +1,4 @@
+from integrations.facebook_utils.lead_fields import contact_fields
 import asyncio
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo import UpdateOne
@@ -649,9 +650,9 @@ async def fetch_all_facebook_leads_staged(
             "created_time":   lead.get("created_time", ""),
 
             # Parsed contact fields
-            "full_name":      field_data.get("full_name", ""),
-            "email":          field_data.get("email", ""),
-            "phone_number":   field_data.get("phone_number", ""),
+            "full_name":      contact_fields(field_data)[0],
+            "email":          contact_fields(field_data)[1],
+            "phone_number":   contact_fields(field_data)[2],
 
             # Raw field_data and context
             "field_data":         field_data,

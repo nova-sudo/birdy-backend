@@ -13,6 +13,7 @@ from fastmcp.exceptions import ToolError
 from ai.mcp.access import READ, WRITE
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.tools.agent_tools import _match_client
+from ai.tools.group_tools import hotprospector_connected  # noqa: F401  (also imported from here)
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from services import client_notes, client_targets
@@ -53,15 +54,6 @@ def _iso(value):
 async def _notes(db, user_id: str, group: dict, limit: int | None = None) -> list[dict]:
     rows = await client_notes.list_notes(db, user_id, group["id"], limit=limit or client_notes.MAX_NOTES_RETURNED)
     return [{k: v for k, v in r.items() if k not in ("user_id", "group_id")} for r in rows]
-
-
-def hotprospector_connected(group: dict) -> bool:
-    """HotProspector is linked through the client's GHL location and its call_log_provider;
-    hotprospector_group_id is the old link and is empty on every client set up since."""
-    if group.get("hotprospector_group_id"):
-        return True
-    return ((group.get("call_log_provider") or "").strip().lower() == "hotprospector"
-            and bool(group.get("ghl_location_id")))
 
 
 @mcp.tool(**READ)

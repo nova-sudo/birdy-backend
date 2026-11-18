@@ -337,3 +337,13 @@ async def test_tool_returns_the_check_and_validates_days(mock_db, meta, set_curr
 async def test_tool_requires_authentication(mock_db, no_current_user):
     with pytest.raises(ValueError, match="Unauthenticated"):
         await watch_mcp.check_my_accounts.fn()
+
+
+async def test_a_win_alert_is_good_news_not_a_reason_for_attention(mock_db, meta):
+    """Filthy Gorgeous was ranked high because "CPL below £3.50" (type win) fired."""
+    await _client(mock_db)
+    meta["act_g1"] = {"cur": (50, 5), "prior": (50, 5)}
+    await mock_db["alerts"].insert_one({"id": "w1", "user_id": "u1", "type": "win", "target_group_ids": ["g1"]})
+    await mock_db["alert_notifications"].insert_one({"alert_id": "w1", "user_id": "u1", "triggered_at": _utcnow()})
+    c = _one(await _check(mock_db))
+    assert (c["alerts_fired"], c["win_alerts_fired"], c["attention"], c["reasons"]) == (0, 1, "ok", [])

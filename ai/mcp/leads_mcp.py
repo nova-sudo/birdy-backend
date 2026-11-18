@@ -53,6 +53,9 @@ async def get_lead(contact_id: str) -> dict:
 
     Use it for "tell me about this lead", "what did Ada do before she booked?" or "where did this lead come from?".
     Returns {lead, journey, summary}; summary.status is ok, generating, unavailable, blocked or failed.
+    lead.calls and lead.engagement count the calls Birdy has logged (call center and webhook calls). Calls that
+    exist only in the GoHighLevel conversation are not in them: get_lead_messages returns those, so read both
+    before saying a lead was never called.
 
     Args:
         contact_id: The GoHighLevel contact id, as returned by get_ghl_contacts or get_unified_leads.

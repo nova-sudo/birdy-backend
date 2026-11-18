@@ -19,6 +19,7 @@ from core.mongo_client import get_shared_mongo_client
 from ai.mcp.access import READ
 from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
+from ai.tools import meta_tools
 from ai.tools.meta_tools import _legacy_insights, shape_cached_insights
 from services.facebook_cache_shape import read_preset
 
@@ -207,35 +208,5 @@ async def get_facebook_leads(
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())
 
-    limit = min(int(limit), 200)
-    query = {"user_id": user_id}
-    if group_ids:
-        query["client_group_id"] = {"$in": group_ids}
-    if start_date or end_date:
-        date_filter = {}
-        if start_date:
-            date_filter["$gte"] = start_date
-        if end_date:
-            date_filter["$lte"] = end_date + "T23:59:59+9999"
-        query["lead_data.created_time"] = date_filter
-
-    cursor = db["facebook_leads"].find(
-        query,
-        {"lead_data": 1, "client_group_name": 1, "client_group_id": 1},
-    ).sort("lead_data.created_time", -1).limit(limit)
-
-    docs = await cursor.to_list(length=limit)
-    leads = []
-    for doc in docs:
-        ld = doc.get("lead_data", {})
-        leads.append({
-            "lead_id": ld.get("id"),
-            "full_name": ld.get("full_name", ""),
-            "email": ld.get("email", ""),
-            "phone_number": ld.get("phone_number", ""),
-            "ad_name": ld.get("ad_name", ""),
-            "campaign_name": ld.get("campaign_name", ""),
-            "created_time": ld.get("created_time", ""),
-            "group_name": doc.get("client_group_name", ""),
-        })
-    return {"leads": leads, "total": len(leads)}
+    return await meta_tools.get_facebook_leads(
+        db, user_id, start_date=start_date, end_date=end_date, limit=limit, group_ids=group_ids)

@@ -36,6 +36,8 @@ _COMPARE_PERIODS_DESCRIPTION = (
     "Compare two date presets side-by-side with absolute and percentage change for each metric. "
     "preset_a is the baseline (older period), preset_b is the comparison (current period). "
     "Use when the user says 'vs', 'compared to', 'change from', etc. "
+    "cpl is spend / results (Meta's lead count), the same CPL every other tool gives; total_leads is the "
+    "leads Birdy collected, which can differ by a few. "
     "Each client and the overall total also have cpl_drivers, which splits the CPL change into what moved it: "
     "cpm (cost per 1,000 impressions), ctr (clicks per impression) and lead_rate (leads per click). Each step "
     "has from, to and effect (its share of the CPL change, in money; the effects add up to the change), and "
@@ -56,7 +58,9 @@ def _cpl_drivers(a: dict, b: dict) -> dict | None:
     lead rate lowers CPL, so those effects have the opposite sign to their own change.
     """
     def parts(r):
-        imp, clk, leads, spend = (_safe_float(r.get(k)) or 0 for k in ("impressions", "clicks", "total_leads", "spend"))
+        # Meta's results, the same lead count the CPL itself is built on (see derived_metrics.enrich).
+        leads_key = "results" if r.get("results") is not None else "total_leads"
+        imp, clk, leads, spend = (_safe_float(r.get(k)) or 0 for k in ("impressions", "clicks", leads_key, "spend"))
         if min(imp, clk, leads, spend) <= 0:
             return None
         return {"cpl": spend / leads, "cpm": spend / imp * 1000, "ctr": clk / imp * 100, "lead_rate": leads / clk * 100}

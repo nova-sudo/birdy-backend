@@ -34,7 +34,10 @@ def enrich(record: dict) -> dict:
     results = _safe_float(record.get("results"))
     total_leads = _safe_float(record.get("total_leads"))
 
-    leads = total_leads if total_leads else results
+    # One CPL across every tool: spend / Meta's results, the figure Ads Manager shows. total_leads (the
+    # leads Birdy collected) usually differs by a lead or two, which gave the same client two CPLs
+    # depending on the tool asked. It stands in only for a row that carries no results figure.
+    leads = results if results is not None else total_leads
 
     # CPL — cost per lead
     if "cpl" not in record or record["cpl"] is None:

@@ -21,6 +21,7 @@ from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp.access import READ
 from ai.mcp.server import mcp, current_user_id as _current_user_id
+from ai.tools import ghl_tools
 
 _PRESET_LIST = (
     "maximum, today, yesterday, this_week_mon_today, last_7d, last_14d, "
@@ -123,78 +124,13 @@ async def get_ghl_opportunity_stats(
     user_id = _current_user_id()
     db = get_db(get_shared_mongo_client())
 
-    from core.constants import PRESET_ALIAS
-    resolved = PRESET_ALIAS.get(preset or "maximum", "maximum")
-
-    query = {"user_id": user_id, "ghl_location_id": {"$exists": True, "$ne": None}}
-    if group_ids:
-        query["id"] = {"$in": group_ids}
-
-    groups = await db["client_groups"].find(
-        query,
-        {
-            "id": 1, "name": 1, "ghl_location_id": 1,
-            f"ghl_opp_cache.{resolved}": 1,
-            "ghl_opp_cache.maximum": 1,
-            "gohighlevel_cache.metrics.opportunity_stats": 1,
-            "_id": 0,
-        },
-    ).to_list(None)
-
-    results = []
-    totals = {
-        "won": 0, "lost": 0, "open": 0, "abandoned": 0,
-        "total_opportunities": 0, "won_revenue": 0.0,
-    }
-
-    for g in groups:
-        opp_cache = g.get("ghl_opp_cache") or {}
-        # Prefer the requested preset, fall back to "maximum", then to legacy cache
-        stats = opp_cache.get(resolved) or opp_cache.get("maximum") or \
-                (g.get("gohighlevel_cache", {}).get("metrics", {}).get("opportunity_stats") or {})
-
-        won = stats.get("won", 0)
-        lost = stats.get("lost", 0)
-        opened = stats.get("open", 0)
-        abandoned = stats.get("abandoned", 0)
-        total_opps = stats.get("total_opportunities", won + lost + opened + abandoned)
-        won_rev = float(stats.get("won_revenue", 0) or 0)
-        conversion = (won / total_opps * 100) if total_opps > 0 else 0
-
-        results.append({
-            "group_id": g.get("id"),
-            "group_name": g.get("name"),
-            "won": won,
-            "lost": lost,
-            "open": opened,
-            "abandoned": abandoned,
-            "total_opportunities": total_opps,
-            "won_revenue": round(won_rev, 2),
-            "conversion_rate": round(conversion, 2),
-        })
-
-        totals["won"] += won
-        totals["lost"] += lost
-        totals["open"] += opened
-        totals["abandoned"] += abandoned
-        totals["total_opportunities"] += total_opps
-        totals["won_revenue"] += won_rev
-
-    overall_conv = (totals["won"] / totals["total_opportunities"] * 100) if totals["total_opportunities"] > 0 else 0
-    totals["conversion_rate"] = round(overall_conv, 2)
-    totals["won_revenue"] = round(totals["won_revenue"], 2)
-
-    return {
-        "overall": totals,
-        "groups": results[:MAX_RESULT_ITEMS],
-        "preset": resolved,
-        "total_groups": len(results),
-    }
+    return await ghl_tools.get_ghl_tag_breakdown(db, user_id, preset=preset, group_ids=group_ids, top_n=top_n)
 
 
 _GET_GHL_TAG_BREAKDOWN_DESCRIPTION = (
     "Get tag breakdown per client group — shows which GHL tags are applied to contacts "
-    "and how many contacts each tag has. Returns per-group top tags plus a global ranking "
+    "and how many contacts each tag has. Counts cover contacts added in the preset's window "
+    "(maximum = all time). Returns per-group top tags plus a global ranking "
     "across all groups. Use this to answer questions about tag distribution, lead qualification tags, etc.\n\n"
     "Args:\n"
     f"    preset: Date range preset. Valid values: {_PRESET_LIST}. Default: maximum.\n"
