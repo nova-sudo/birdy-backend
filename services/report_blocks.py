@@ -49,7 +49,8 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from services import report_template as core
 from services.report_template import (  # re-exported: the report's public API lives here
-    CATALOG, FREQUENCIES, LEGACY_ITEM_KEYS, PERIODS, PLACEHOLDER_GUIDE, SECTION_PERIODS, WEEKDAYS,
+    CATALOG, FREQUENCIES, LEGACY_ITEM_KEYS, PERIODS, PLACEHOLDER_GUIDE, SECTION_PERIODS, SOURCE_LABELS,
+    WEEKDAYS,
     TemplateError, catalog_for, periods_for_ui, previous_for, sources_connected,
 )
 

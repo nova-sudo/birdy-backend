@@ -52,6 +52,21 @@ async def test_tools_delegate(mock_db, alice, monkeypatch, tool, target, args, e
     assert seen == {"user_id": ALICE, "kw": expected}
 
 
+async def test_list_report_clients_real(mock_db, alice):
+    """Undelegated: the tool must run end to end (it once crashed on a missing re-export)."""
+    await mock_db["client_groups"].insert_many([
+        {"id": "g1", "user_id": ALICE, "name": "Acme", "meta_ad_account_id": "act_1",
+         "ghl_location_id": "loc1", "targets": {"cpl": 20}},
+        {"id": "g2", "user_id": ALICE, "name": "Gone", "client_status": "Inactive", "meta_ad_account_id": "act_2"},
+        {"id": "g3", "user_id": BOB, "name": "Bobs", "meta_ad_account_id": "act_3"},
+    ])
+    out = await t.list_report_clients.fn()
+    assert out["total"] == 1
+    row = out["clients"][0]
+    assert (row["id"], row["name"], row["has_targets"]) == ("g1", "Acme", True)
+    assert "Meta Ads" in row["connected"] and "CRM pipeline" in row["connected"]
+
+
 async def test_preview_delegates(mock_db, alice, monkeypatch):
     seen = {}
 
