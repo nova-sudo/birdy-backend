@@ -10,6 +10,7 @@ from typing import Literal
 from fastmcp.exceptions import ToolError
 
 from ai.mcp.access import READ
+from ai.mcp.cards import card
 from ai.mcp.client_mcp import resolve_client
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.tools import attribution_tools
@@ -95,7 +96,7 @@ async def leads_by_ad(client: str, start_date: str | None = None, end_date: str 
         raise _bad_input(e)
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("funnel"))
 async def funnel(client: str, start_date: str | None = None, end_date: str | None = None) -> dict:
     """One client's landing-page funnel: views, form starts and opt-ins with the drop-off between stages, the previous period for comparison, and per-day rows. Returns {applicable, ...}; applicable is false, with a reason, for clients whose leads come from Meta Instant Forms or a form tool that sends straight to GoHighLevel (they have no landing page of ours to measure).
 

@@ -49,7 +49,7 @@ async def test_mcp_tool_names_matches_server_registration():
     registered = set((await mcp.get_tools()).keys())
     # Tools built for external MCP clients only: the orchestrator keeps its internal paths for them, so
     # they are deliberately absent from MCP_TOOL_NAMES.
-    external_only = {"get_started", "list_agents", "set_default_agent",
+    external_only = {"get_started", "get_budget_pacing", "list_agents", "set_default_agent",
                      "get_agent_overview", "get_agent_runs", "get_agent_run", "get_agent_month", "get_agent_cards", "get_agent_card", "get_agent_lessons", "get_agent_outcomes", "get_agent_slack_template",
                      "apply_card", "apply_all_cards", "undo_card_line", "post_weekly_report", "dismiss_card", "edit_card",
                      "add_agent_lesson", "update_agent_settings", "set_agent_slack_template", "reset_agent_slack_template",

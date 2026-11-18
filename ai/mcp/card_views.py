@@ -54,6 +54,9 @@ button.chip{cursor:pointer;font:inherit;font-size:12px;color:var(--ink)}
 .btn:disabled{opacity:.55;cursor:default}
 .btn:focus-visible,button.chip:focus-visible{outline:2px solid var(--primary);outline-offset:2px}
 .msg{font-size:12.5px;margin-top:8px}
+.bar{position:relative;height:8px;border-radius:999px;background:var(--divider);overflow:hidden}
+.bar>span{position:absolute;inset:0 auto 0 0;border-radius:999px;background:var(--primary)}
+.sec{display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-size:11px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
 @media (prefers-reduced-motion:reduce){*{transition:none!important}}
 __CSS__
 </style></head>
@@ -95,6 +98,7 @@ const ui = {
   open(path) { const url = BIRDY.frontend + path; app.openLink({url}).catch(() => window.open(url, "_blank")); },
   call(name, args) { return app.callServerTool({name, arguments: args || {}}); },
   tell(text) { return app.updateModelContext({content: [{type: "text", text}]}).catch(() => {}); },
+  say(text) { return app.sendMessage({role: "user", content: [{type: "text", text}]}).catch(() => {}); },
 };
 app.ontoolinput = (p) => { ui.args = (p && p.arguments) || {}; };
 app.onhostcontextchanged = theme;
@@ -129,7 +133,6 @@ ACCOUNTS = ("""
 .tile .sub{font-size:11px;color:var(--faint);margin-top:1px}
 .tile .why{font-size:11px;color:var(--body);margin-top:5px;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .sec button.link{text-transform:none;letter-spacing:0;font-size:11.5px}
-.sec{display:flex;align-items:center;gap:8px;margin:12px 0 6px;font-size:11px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.05em}
 .ft{display:flex;justify-content:space-between;gap:8px;margin-top:12px;padding-top:8px;border-top:1px solid var(--divider);font-size:11.5px;color:var(--faint);flex-wrap:wrap}
 """, r"""
 window.birdyRender = function (data, ui) {
@@ -169,8 +172,35 @@ window.birdyRender = function (data, ui) {
 """)
 
 
-# ── #11 Client scorecard (compare_periods): one client as a scorecard, several as rows ─────────────────────────
-SCORECARD = ("", r"""
+# ── #11 Client scorecard + #14 CPL waterfall (compare_periods): one client as a scorecard, several as rows ─────────────────────────
+SCORECARD = ("""
+.wf{display:grid;grid-template-columns:auto 1fr auto;gap:6px 10px;align-items:center;font-size:12px}
+.wf .lb{color:var(--body);white-space:nowrap}
+.wf .tr{position:relative;height:18px}
+.wf .tr span{position:absolute;top:2px;bottom:2px;border-radius:4px}
+.wf .tr span.end{background:var(--pale)}.wf .tr span.upb{background:var(--bad)}.wf .tr span.dnb{background:var(--good)}
+.wf .v{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.wf small{color:var(--faint);font-size:11px}
+""", r"""
+window.birdyWaterfall = function (d, cur) {
+  const F = birdyFmt, E = F.esc;
+  if (!d || !d.steps) return "";
+  let run = d.from, lo = Math.min(d.from, d.to), hi = Math.max(d.from, d.to);
+  const pts = d.steps.map(st => { const a = run; run += st.effect; lo = Math.min(lo, a, run); hi = Math.max(hi, a, run); return [a, run, st]; });
+  const pad = (hi - lo) * 0.08 || 1, min = Math.max(0, lo - pad), span = (hi + pad) - min;
+  const bar = (a, b, cls) => { const l = (Math.min(a, b) - min) / span * 100, w = Math.max(Math.abs(b - a) / span * 100, 0.8);
+    return '<div class="tr"><span class="' + cls + '" style="left:' + l + '%;width:' + w + '%"></span></div>'; };
+  const sign = (v) => (v > 0 ? "+" : v < 0 ? "−" : "") + F.money(Math.abs(v), cur);
+  const rows = ['<span class="lb">Before</span>' + bar(min, d.from, "end") + '<span class="v">' + E(F.money(d.from, cur)) + "</span>"];
+  pts.forEach(([a, b, st]) => rows.push('<span class="lb">' + E(st.label) + ' <small>' + F.num(st.from) + (st.key === "cpm" ? "" : "%") + " → " +
+    F.num(st.to) + (st.key === "cpm" ? "" : "%") + "</small></span>" + bar(a, b, st.effect > 0 ? "upb" : "dnb") +
+    '<span class="v ' + (st.effect > 0 ? "dn" : st.effect < 0 ? "up" : "flat") + '">' + E(sign(st.effect)) + "</span>"));
+  rows.push('<span class="lb"><b>Now</b></span>' + bar(min, d.to, "end") + '<span class="v"><b>' + E(F.money(d.to, cur)) + "</b></span>");
+  const big = d.steps.find(st => st.key === d.biggest);
+  const why = big ? "Biggest driver: " + big.label + (big.effect > 0 ? " (pushed CPL up)" : " (brought CPL down)") : "CPL barely moved.";
+  return '<div class="sec">Why CPL moved</div><div class="wf">' + rows.join("") + '</div><div class="msg" style="color:var(--body)">' + E(why) + "</div>";
+};
+
 window.birdyRender = function (data, ui) {
   const F = birdyFmt, E = F.esc, groups = data.groups || [];
   const head = (title) => '<div class="hd">' + F.avatar() + "<b>" + E(title) + "</b><small>" + E(F.preset(data.preset_b)) +
@@ -185,6 +215,7 @@ window.birdyRender = function (data, ui) {
       '<div class="kpi"><i>CPL</i><strong>' + E(F.money(b.cpl, g.currency)) + "</strong>" + F.chg(cplUp, "cost") + "</div>" +
       '<div class="kpi"><i>Spend</i><strong>' + E(F.money(b.spend, g.currency)) + "</strong>" + F.chg(ch(g, "spend"), "neutral") + "</div>" +
       '<div class="kpi"><i>CTR</i><strong>' + F.num(b.ctr) + "%</strong>" + F.chg(ch(g, "ctr")) + "</div></div>" +
+      birdyWaterfall(g.cpl_drivers, g.currency) +
       '<div class="ft"><span>Change vs ' + E(F.preset(data.preset_a).toLowerCase()) + '</span><button class="link" data-open="/clients/' +
       encodeURIComponent(g.group_id) + '">Open in Birdy →</button></div>';
   } else {
@@ -334,5 +365,135 @@ window.birdyRender = function (data, ui) {
       yes.disabled = no.disabled = false; yes.textContent = "Confirm"; out.innerHTML = '<span class="dn">' + E(e.message) + "</span>";
     }
   };
+};
+""")
+
+
+# ── #16 Ad leaderboard (get_ad_insights): best and worst ads by CPL ────────────────────────────────────────────
+LEADERBOARD = ("""
+.rk{width:20px;height:20px;border-radius:50%;display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex:none}
+.rk.good{background:var(--good-bg);color:var(--good)}.rk.bad{background:var(--bad-bg);color:var(--bad)}
+.rowl .sub{display:block;font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.rowl .v{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+.rowl .v small{display:block;font-size:11px;color:var(--faint)}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, rows = data.insights || [], g = data.client_group;
+  const leads = (r) => r.total_leads != null ? r.total_leads : (r.results || 0);
+  const scored = rows.filter(r => leads(r) > 0 && r.cpl != null).sort((a, b) => a.cpl - b.cpl);
+  const dead = rows.filter(r => !leads(r) && (r.spend || 0) > 0).sort((a, b) => b.spend - a.spend);
+  const cur = data.currency || (rows[0] && rows[0].currency);
+  const money = (v) => cur ? F.money(v, cur) : F.num(v);
+  const line = (r, i, cls) => '<div class="rowl"><span class="rk ' + cls + '">' + i + '</span><span class="nm"><b>' + E(r.creative_title || r.name) +
+    '</b><span class="sub">' + E(r.name) + (r.client_group_name ? " · " + E(r.client_group_name) : "") + (r.status ? " · " + E(r.status) : "") +
+    '</span></span><span class="v">' + (leads(r) ? E(money(r.cpl)) + "<small>" + F.num(leads(r), 0) + " leads · " + E(money(r.spend)) + "</small>"
+      : '<span class="dn">No leads</span><small>' + E(money(r.spend)) + " spent</small>") + "</span></div>";
+  const best = scored.slice(0, 3);
+  const worst = scored.length > 3 ? scored.slice(-Math.min(2, scored.length - 3)).reverse() : [];
+  let html = '<div class="hd">' + F.avatar() + "<b>" + (g ? E(g.name) + " · " : "") + "Top ads by CPL</b><small>" + (data.total || rows.length) + " ads</small></div>";
+  html += best.length ? best.map((r, i) => line(r, i + 1, "good")).join("") : '<div class="empty">No ads with leads in this period.</div>';
+  const bad = dead.slice(0, 2).concat(worst).slice(0, 3);
+  if (bad.length) html += '<div class="sec">Weakest</div>' + bad.map(r => line(r, "!", "bad")).join("");
+  html += '<div class="ft"><span>' + (data.sorted_by ? "Of the " + rows.length + " biggest spenders" : "") + '</span><button class="link" data-open="' +
+    (g ? "/clients/" + encodeURIComponent(g.id) : "/clients") + '">All ads →</button></div>';
+  document.getElementById("root").innerHTML = html;
+  document.querySelectorAll("[data-open]").forEach(b => b.onclick = () => ui.open(b.dataset.open));
+};
+""")
+
+
+# ── #19 Budget pacing (get_budget_pacing) ──────────────────────────────────────────────────────────────────────
+PACING = ("""
+.pc{display:grid;grid-template-columns:minmax(90px,30%) 1fr auto;gap:8px 10px;align-items:center;font-size:12.5px}
+.pc .nm{all:unset;cursor:pointer;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-width:0}
+.pc .trk{position:relative}
+.pc .mark{position:absolute;top:-3px;bottom:-3px;width:2px;background:var(--ink);opacity:.55;border-radius:1px}
+.pc .v{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.bar>span.over{background:var(--bad)}.bar>span.under{background:var(--warn)}.bar>span.on_pace{background:var(--good)}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, cl = data.clients || [], s = data.summary || {};
+  const withB = cl.filter(c => c.budget), none = cl.filter(c => !c.budget);
+  const fmtDay = (d) => { if (d === "already") return "budget used up"; try { return "runs out ~" + new Date(d + "T00:00:00Z").toLocaleDateString(undefined, {month: "short", day: "numeric", timeZone: "UTC"}); } catch (e) { return d; } };
+  const row = (c) => '<button class="nm" data-open="/clients/' + encodeURIComponent(c.client.id) + '" title="' + E(c.client.name) + '">' + E(c.client.name) +
+    '</button><div class="trk"><div class="bar"><span class="' + c.status + '" style="width:' + Math.min(c.used_pct || 0, 100) + '%"></span></div><span class="mark" style="left:' +
+    data.expected_pct + '%"></span></div><span class="v ' + (c.status === "over" ? "dn" : "") + '">' + Math.round(c.used_pct) + "%</span>";
+  const warn = withB.filter(c => c.runs_out_on).slice(0, 2).map(c => E(c.client.name) + " " + E(fmtDay(c.runs_out_on))).join(" · ");
+  let html = '<div class="hd">' + F.avatar() + "<b>Pacing · day " + data.day + " of " + data.days_in_month + '</b>' +
+    (s.over ? '<span class="pill act">Over · ' + s.over + "</span>" : "") + (s.under ? '<span class="pill watch">Under · ' + s.under + "</span>" : "") +
+    '<span class="pill fine">On pace · ' + (s.on_pace || 0) + "</span></div>";
+  html += withB.length ? '<div class="pc">' + withB.slice(0, 12).map(row).join("") + "</div>" :
+    '<div class="empty">No client has a monthly budget yet. Set one with a monthly spend target.</div>';
+  html += '<div class="msg" style="color:var(--faint)">Line = where spend should be today (' + Math.round(data.expected_pct) + "%)" + (warn ? '</div><div class="msg"><b class="dn">' + warn + "</b>" : "") + "</div>";
+  if (none.length) html += '<div class="msg" style="color:var(--faint)">No budget set: ' + none.slice(0, 4).map(c => E(c.client.name)).join(", ") + (none.length > 4 ? " and " + (none.length - 4) + " more" : "") + "</div>";
+  html += '<div class="ft"><span>Month to date</span><button class="link" data-open="/clients">Open in Birdy →</button></div>';
+  document.getElementById("root").innerHTML = html;
+  document.querySelectorAll("[data-open]").forEach(b => b.onclick = () => ui.open(b.dataset.open));
+};
+""")
+
+
+# ── #21 Creative test result (get_creative_test) ───────────────────────────────────────────────────────────────
+CREATIVE_TEST = ("""
+.ct{display:flex;gap:12px;align-items:flex-start}
+.ct .th{width:72px;height:72px;border-radius:10px;background:var(--soft) center/cover no-repeat;flex:none;border:1px solid var(--border)}
+.ct .bd{flex:1;min-width:0}
+.ct .nm{font-weight:700;font-size:14.5px;overflow-wrap:anywhere}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, t = data, sum = t.summary || {}, ads = t.ads || [];
+  if (t.error) { document.getElementById("root").innerHTML = '<div class="hd">' + F.avatar() + "<b>Creative test</b></div><div class=\"msg\">" + E(t.error) + "</div>"; return; }
+  const V = {winner: ["fine", "Winner"], loser: ["act", "Loser"], inconclusive: ["watch", "Inconclusive"], testing: ["watch", "Testing"],
+    posting: ["watch", "Posting"], draft: ["", "Draft"], archived: ["", "Archived"]};
+  const [cls, word] = V[t.verdict || t.status] || ["", String(t.verdict || t.status || "")];
+  const target = (((t.targets || {}).metrics || {}).cpl || {}).value;
+  const cur = sum.currency;
+  const kp = (lbl, v) => '<div class="kpi"><i>' + lbl + "</i><strong>" + v + "</strong></div>";
+  let html = '<div class="hd">' + F.avatar() + "<b>Test " + E(t.code || "") + '</b><span class="pill ' + cls + '" style="' + (cls ? "" : "background:var(--soft);color:var(--faint)") + '">' + E(word) + "</span></div>" +
+    '<div class="ct">' + (t.thumbnail ? '<div class="th" style="background-image:url(' + E(t.thumbnail) + ')"></div>' : "") +
+    '<div class="bd"><div class="nm">' + E(t.name) + "</div>" + (t.creative && t.creative.headline ? '<div class="msg" style="margin-top:2px;color:var(--body)">“' + E(t.creative.headline) + "”</div>" : "") + "</div></div>";
+  if (sum && (sum.leads != null || sum.spend != null)) {
+    html += '<div class="kpis" style="margin-top:10px">' + kp("CPL", E(F.money(sum.cpl, cur)) + (target ? ' <em class="flat">target ' + E(F.money(target, cur)) + "</em>" : "")) +
+      kp("Leads", F.num(sum.leads, 0)) + kp("Spend", E(F.money(sum.spend, cur))) + "</div>";
+  } else if (target) html += '<div class="msg">Target CPL ' + E(F.money(target, cur)) + "</div>";
+  if (ads.length) html += '<div class="sec">Ads</div>' + ads.slice(0, 5).map(a => '<div class="rowl"><span class="nm">' + E(a.adset_name || a.ad_account_id) +
+    '</span><small style="color:var(--faint)">' + E(a.meta_status || a.post_state || "") + "</small>" +
+    ((a.score || {}).leads != null ? '<span class="chip">' + F.num(a.score.leads, 0) + " leads</span>" : "") + "</div>").join("");
+  html += '<div class="ft"><span></span><span style="display:flex;gap:8px">' + ((t.verdict || t.status) === "winner" ? '<button class="btn pr" id="scale">Scale it</button>' : "") +
+    '<button class="btn" data-open="/campaigns/creatives">Open in Birdy</button></span></div>';
+  document.getElementById("root").innerHTML = html;
+  document.querySelectorAll("[data-open]").forEach(b => b.onclick = () => ui.open(b.dataset.open));
+  const sc = document.getElementById("scale");
+  if (sc) sc.onclick = () => { sc.disabled = true; sc.textContent = "Asked Birdy";
+    ui.say("Scale the winning creative test " + (t.code || t.id) + " with Birdy. Show me the preview first."); };
+};
+""")
+
+
+# ── #22 Lead funnel (funnel): landing page views to opt-ins ────────────────────────────────────────────────────
+FUNNEL = ("""
+.fn{display:grid;grid-template-columns:minmax(80px,auto) 1fr auto;gap:8px 10px;align-items:center;font-size:12.5px}
+.fn .v{font-variant-numeric:tabular-nums;text-align:right;white-space:nowrap}
+.fn .v small{color:var(--faint);font-size:11px;margin-left:4px}
+.bar{height:14px;border-radius:5px}.bar>span{border-radius:5px}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, root = document.getElementById("root");
+  const head = '<div class="hd">' + F.avatar() + "<b>" + E(data.group_name || "Client") + " funnel</b><small>" + E(data.start || "") + (data.end ? " to " + E(data.end) : "") + "</small></div>";
+  if (data.applicable === false) {
+    root.innerHTML = head + '<div class="msg">' + E(data.reason || "No funnel for this client.") + '</div><div class="ft"><span></span><button class="link" id="open">Open in Birdy →</button></div>';
+  } else {
+    const st = (data.stages || []).filter(x => x.key !== "ad_views");
+    const top = Math.max(1, ...st.map(x => x.count || 0));
+    let drop = null;
+    for (let i = 1; i < st.length; i++) { const a = st[i - 1].count || 0, b = st[i].count || 0;
+      if (a > 0) { const lost = (a - b) / a; if (!drop || lost > drop.lost) drop = {lost, from: st[i - 1].label, to: st[i].label}; } }
+    const chg = (x) => x.delta == null ? "" : '<small class="' + (x.direction === "up" ? "up" : "dn") + '">' + (x.direction === "up" ? "+" : "−") + Math.round(x.delta) + "%</small>";
+    root.innerHTML = head + '<div class="fn">' + st.map(x => '<span>' + E(x.label) + '</span><div class="bar"><span style="width:' + ((x.count || 0) / top * 100) +
+      '%"></span></div><span class="v">' + F.num(x.count, 0) + (x.share != null ? "<small>" + Math.round(x.share) + "%</small>" : "") + chg(x) + "</span>").join("") + "</div>" +
+      (drop && drop.lost > 0 ? '<div class="msg">Biggest drop: <b>' + E(drop.from) + " → " + E(drop.to) + "</b> (" + Math.round(drop.lost * 100) + "% lost)</div>" : "") +
+      '<div class="ft"><span>Change vs the period before</span><button class="link" id="open">Open in Birdy →</button></div>';
+  }
+  document.getElementById("open").onclick = () => ui.open("/clients/" + encodeURIComponent(data.group_id || ""));
 };
 """)

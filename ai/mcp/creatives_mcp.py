@@ -9,6 +9,7 @@ ai/tools/creative_tools.py, the same code Ask Birdy uses; user_id always comes f
 from typing import Literal
 
 from ai.mcp.access import LIVE, READ, WRITE
+from ai.mcp.cards import card
 from ai.mcp.confirm import two_step
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.tools import creative_tools
@@ -75,7 +76,7 @@ async def list_creative_tests(status: str | None = None) -> dict:
                                                     status=status)
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("creative_test"))
 async def get_creative_test(code_or_id: str) -> dict:
     """One creative test in full: its targets, creative and per-account ads with post state, Meta status and score.
 
