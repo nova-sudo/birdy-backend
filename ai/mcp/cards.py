@@ -11,6 +11,9 @@ a pinned version; the CSP below allows that origin and this API (for the mascot 
 strings (ai/mcp/card_views.py) so the serverless bundle always has them.
 """
 
+import hashlib
+import json
+
 from mcp.types import ReadResourceRequest
 
 from ai.mcp import card_views
@@ -22,8 +25,16 @@ SDK_ORIGIN = "https://cdn.jsdelivr.net"
 SDK_URL = f"{SDK_ORIGIN}/npm/@modelcontextprotocol/ext-apps@2.0.4/dist/src/app-with-deps.js"
 
 
+def version() -> str:
+    """A short fingerprint of everything a host caches for a card: the HTML of every card and the CSP."""
+    blob = json.dumps([card_views._SHELL, CARDS, SDK_URL, API_PUBLIC_URL, _UI_META], sort_keys=True)
+    return hashlib.sha256(blob.encode()).hexdigest()[:8]
+
+
 def uri(name: str) -> str:
-    return f"ui://birdy/{name}.html"
+    """The card's address. It carries version(): hosts cache a card (and its CSP) by address, and a cached bad
+    CSP kept every card on "Rendering widget" after the server was fixed (2026-11-18)."""
+    return f"ui://birdy/{name}.{version()}.html"
 
 
 def card(name: str) -> dict:

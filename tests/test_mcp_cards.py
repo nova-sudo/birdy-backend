@@ -11,8 +11,17 @@ from core.config import API_PUBLIC_URL, FRONTEND_URL
 async def test_check_my_accounts_points_at_the_accounts_card():
     async with Client(mcp) as c:
         tool = {t.name: t for t in await c.list_tools()}["check_my_accounts"]
-    assert tool.meta["ui"]["resourceUri"] == "ui://birdy/accounts.html"
-    assert tool.meta["ui/resourceUri"] == "ui://birdy/accounts.html"  # older hosts
+    assert tool.meta["ui"]["resourceUri"] == cards.uri("accounts")
+    assert tool.meta["ui/resourceUri"] == cards.uri("accounts")  # older hosts
+
+
+def test_card_address_changes_when_the_card_or_its_csp_changes(monkeypatch):
+    """Hosts cache a card by its address, so a changed card (or CSP) must get a new one: a cached bad CSP
+    otherwise keeps every card on "Rendering widget" (2026-11-18)."""
+    before = cards.uri("accounts")
+    assert before.startswith("ui://birdy/accounts.") and before.endswith(".html") and before == cards.uri("accounts")
+    monkeypatch.setattr(cards, "_UI_META", {"ui": {"csp": {"resourceDomains": ["https://example.com"]}}})
+    assert cards.version() != before.split(".")[-2]
 
 
 @pytest.mark.asyncio
