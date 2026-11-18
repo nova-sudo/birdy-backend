@@ -52,6 +52,9 @@ CARDS = {
     "pacing": ("Birdy · budget pacing", card_views.PACING),        # #19 get_budget_pacing
     "creative_test": ("Birdy · creative test", card_views.CREATIVE_TEST),  # #21 get_creative_test
     "funnel": ("Birdy · funnel", card_views.FUNNEL),               # #22 funnel
+    "leads": ("Birdy · leads", card_views.LEADS),                  # #17 get_unified_leads
+    "report": ("Birdy · report preview", card_views.REPORT),       # #18 preview_report
+    "agent_week": ("Birdy · agent's week", card_views.AGENT_WEEK), # #20 get_agent_cards
 }
 
 for _name, (_title, _body) in CARDS.items():

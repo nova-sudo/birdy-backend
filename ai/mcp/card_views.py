@@ -497,3 +497,140 @@ window.birdyRender = function (data, ui) {
   document.getElementById("open").onclick = () => ui.open("/clients/" + encodeURIComponent(data.group_id || ""));
 };
 """)
+
+
+# ── #17 Lead list (get_unified_leads): newest leads with a Reply action, phones hidden ─────────────────────────
+LEADS = ("""
+.ld .ini{width:28px;height:28px;border-radius:50%;background:var(--tint);color:var(--primary);display:inline-flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;flex:none}
+.ld .sub{display:block;font-size:11px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ld .btn{padding:4px 10px;font-size:12px}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, leads = data.leads || [];
+  const ago = (t) => { if (!t) return ""; const m = Math.round((Date.now() - new Date(t)) / 60000);
+    return m < 60 ? Math.max(m, 1) + "m ago" : m < 1440 ? Math.round(m / 60) + "h ago" : Math.round(m / 1440) + "d ago"; };
+  const ini = (n) => String(n || "?").split(/\s+/).filter(Boolean).slice(0, 2).map(w => w[0].toUpperCase()).join("");
+  const short = (n) => { const p = String(n || "").split(/\s+/).filter(Boolean); return p.length > 1 ? p[0] + " " + p[p.length - 1][0] + "." : (p[0] || "Lead"); };
+  const state = (l) => {
+    const tags = (l.tags || []).join(" ").toLowerCase(), op = (l.opportunity || {}).status;
+    if (op === "won") return '<span class="pill fine">Won</span>';
+    if (/book/.test(tags)) return '<span class="pill fine">Booked</span>';
+    if (op === "lost") return '<span class="pill" style="background:var(--soft);color:var(--faint)">Lost</span>';
+    return "";
+  };
+  const groups = [...new Set(leads.map(l => l.group_name).filter(Boolean))];
+  const title = leads.length + " lead" + (leads.length === 1 ? "" : "s") + (groups.length === 1 ? " · " + groups[0] : "");
+  const rows = leads.slice(0, 8).map((l, i) => '<div class="rowl ld"><span class="ini">' + E(ini(l.name)) + '</span><span class="nm"><b>' + E(short(l.name)) +
+    "</b>" + '<span class="sub">' + (groups.length > 1 ? E(l.group_name) + " · " : "") + E(ago(l.date_added)) + ((l.sources || []).length ? " · " + E(l.sources.map(x => ({meta: "Meta", ghl: "GHL", hp: "Calls", hotprospector: "Calls"})[x] || x).sort().reverse().join(" + ")) : "") +
+    "</span></span>" + state(l) + (l.contact_id ? '<button class="btn" data-reply="' + i + '">Reply</button>' : "") + "</div>").join("");
+  document.getElementById("root").innerHTML = '<div class="hd">' + F.avatar() + "<b>" + E(title) + "</b></div>" +
+    (rows || '<div class="empty">No leads in this period.</div>') +
+    (leads.length > 8 ? '<div class="msg" style="color:var(--faint)">and ' + (leads.length - 8) + " more</div>" : "") +
+    '<div class="ft"><span>Phones and emails hidden</span><button class="link" id="open">Open contacts →</button></div>';
+  document.getElementById("open").onclick = () => ui.open("/contacts");
+  document.querySelectorAll("[data-reply]").forEach(b => b.onclick = () => {
+    const l = leads[+b.dataset.reply]; b.disabled = true; b.textContent = "Asked";
+    ui.say("Draft a text reply from Birdy to " + short(l.name) + " (contact " + l.contact_id + "), then show me the preview before sending.");
+  });
+  document.querySelectorAll(".ld .nm").forEach((n, i) => { const l = leads[i]; if (l && l.contact_id) { n.style.cursor = "pointer"; n.onclick = () => ui.open("/contacts/" + encodeURIComponent(l.contact_id)); } });
+};
+""")
+
+
+# ── #18 Report preview (preview_report): the Slack message as it will look ─────────────────────────────────────
+REPORT = ("""
+.sl{border:1px solid var(--border);border-radius:10px;padding:12px;background:var(--bg)}
+.sl h3{margin:0 0 8px;font-size:15px}
+.sl .blk{margin:0 0 10px}
+.sl .ctx{font-size:12px;color:var(--body)}
+.sl table{border-collapse:collapse;width:100%;font-size:12px}
+.sl th,.sl td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--divider);white-space:nowrap}
+.sl td.n,.sl th.n{text-align:right;font-variant-numeric:tabular-nums}
+.sl .tw{overflow-x:auto}
+.sl .cards{display:flex;gap:8px;overflow-x:auto;padding-bottom:2px}
+.sl .cards>div{min-width:150px;background:var(--soft);border-radius:8px;padding:8px;font-size:12px}
+.sl .chart{display:grid;grid-template-columns:minmax(80px,32%) 1fr auto;gap:4px 8px;align-items:center;font-size:11.5px}
+.sl .chart .bar{height:8px}
+.sl .ttl{font-weight:600;font-size:12.5px;margin-bottom:4px}
+.sl .acts .btn{padding:5px 10px;font-size:12px}
+.sample{background:var(--warn-bg);color:var(--warn);border-radius:8px;padding:6px 10px;font-size:12px;margin-bottom:8px}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, blocks = data.blocks || [], t = data.template || {};
+  const md = (s) => E(s).replace(/&amp;amp;/g, "&amp;").replace(/&amp;lt;/g, "&lt;").replace(/&amp;gt;/g, "&gt;")
+    .replace(/\*([^*\n]+)\*/g, "<b>$1</b>").replace(/_([^_\n]+)_/g, "<i>$1</i>").replace(/\n/g, "<br>");
+  const txt = (o) => !o ? "" : o.type === "mrkdwn" ? md(o.text || "") : E(o.text || "");
+  const block = (b) => {
+    switch (b.type) {
+      case "header": return "<h3>" + txt(b.text) + "</h3>";
+      case "section": return '<div class="blk">' + txt(b.text) + ((b.fields || []).length ? "<br>" + b.fields.map(txt).join(" · ") : "") + "</div>";
+      case "context": return '<div class="blk ctx">' + (b.elements || []).map(e => e.type === "image" ? "" : txt(e)).join(" ") + "</div>";
+      case "divider": return '<hr style="border:0;border-top:1px solid var(--divider);margin:8px 0">';
+      case "data_table": {
+        const rows = b.rows || [], head = rows[0] || [], cap = Math.min(b.page_size || 10, 8), body = rows.slice(1, 1 + cap), extra = rows.length - 1 - body.length;
+        const num = (c) => c && c.type === "raw_number";
+        return '<div class="blk">' + (b.caption ? '<div class="ttl">' + E(b.caption) + "</div>" : "") + '<div class="tw"><table><tr>' +
+          head.map((c, i) => '<th class="' + (i && body[0] && num(body[0][i]) ? "n" : "") + '">' + E(c.text) + "</th>").join("") + "</tr>" +
+          body.map(r => "<tr>" + r.map(c => '<td class="' + (num(c) ? "n" : "") + '">' + E(c.text != null ? c.text : c.value) + "</td>").join("") + "</tr>").join("") + "</table></div>" + (extra > 0 ? '<div class="ctx" style="margin-top:4px">+' + extra + " more rows in Slack</div>" : "") + "</div>";
+      }
+      case "carousel": return '<div class="blk cards">' + (b.elements || []).map(c => "<div>" + txt(c.title) + '<div style="color:var(--faint);font-size:11px">' + txt(c.subtitle) + "</div>" + txt(c.body) + "</div>").join("") + "</div>";
+      case "data_visualization": {
+        const s = ((b.chart || {}).series || [])[0];
+        if (!s) return "";
+        const top = Math.max(1e-9, ...s.data.map(d => Math.abs(d.value || 0)));
+        return '<div class="blk"><div class="ttl">' + E(b.title || s.name) + '</div><div class="chart">' + s.data.slice(0, 8).map(d => "<span>" + E(d.label) +
+          '</span><div class="bar"><span style="width:' + Math.abs(d.value || 0) / top * 100 + '%"></span></div><span class="n">' + F.num(d.value) + "</span>").join("") + "</div>" +
+          ((b.chart.series || []).length > 1 ? '<div class="ctx" style="margin-top:4px">+ ' + E(b.chart.series.slice(1).map(x => x.name).join(", ")) + " in Slack</div>" : "") + "</div>";
+      }
+      case "image": return '<div class="blk ctx">[image' + (b.alt_text ? ": " + E(b.alt_text) : "") + "]</div>";
+      case "actions": return '<div class="blk acts" style="display:flex;gap:6px;flex-wrap:wrap">' + (b.elements || []).filter(e => e.type === "button")
+        .map(e => '<span class="btn">' + txt(e.text) + "</span>").join("") + "</div>";
+      default: return "";
+    }
+  };
+  const when = [t.frequency, t.day, t.time].filter(Boolean).join(" · ");
+  document.getElementById("root").innerHTML = '<div class="hd">' + F.avatar() + "<b>Report preview</b><small>" + E(when || "Slack") + "</small></div>" +
+    (data.sample ? '<div class="sample">Sample numbers: your real ones show once there is data.</div>' : "") +
+    (blocks.length ? '<div class="sl">' + blocks.map(block).join("") + "</div>" : '<div class="empty">No saved report yet.</div>') +
+    '<div class="ft"><span>Nothing has been sent</span><span style="display:flex;gap:8px"><button class="btn" id="edit">Edit in Birdy</button>' +
+    '<button class="btn pr" id="send">Send me a test</button></span></div>';
+  document.getElementById("edit").onclick = () => ui.open("/hub");
+  const send = document.getElementById("send");
+  send.onclick = () => { send.disabled = true; send.textContent = "Asked Birdy";
+    ui.say("Send me a test of this Birdy report in Slack. Show me the preview first."); };
+};
+""")
+
+
+# ── #20 Agent's week (get_agent_cards): what the Media Buying Agent did, by day ────────────────────────────────
+AGENT_WEEK = ("""
+.tl{position:relative;padding-left:16px}
+.tl:before{content:"";position:absolute;left:4px;top:6px;bottom:6px;width:2px;background:var(--divider);border-radius:1px}
+.tl .day{font-size:11px;font-weight:600;color:var(--faint);text-transform:uppercase;letter-spacing:.05em;margin:10px 0 2px;position:relative}
+.tl .day:before{content:"";position:absolute;left:-16px;top:3px;width:10px;height:10px;border-radius:50%;background:var(--pale);border:2px solid var(--bg)}
+.tl .rowl .sub{display:block;font-size:11px;color:var(--faint)}
+.zn{width:8px;height:8px;border-radius:50%;flex:none}
+.zn.red{background:var(--bad)}.zn.yellow{background:var(--warn)}.zn.green{background:var(--good)}
+""", r"""
+window.birdyRender = function (data, ui) {
+  const F = birdyFmt, E = F.esc, cards = data.cards || [];
+  const PILL = {applied: ["fine", "Applied"], partly_applied: ["fine", "Partly applied"], open: ["watch", "Waiting"], flagged: ["watch", "Flagged"],
+    dismissed: ["", "Dismissed"], superseded: ["", "Replaced"]};
+  const what = (c) => c.tag === "changes" ? c.lines + " change" + (c.lines === 1 ? "" : "s") + " proposed" : c.tag === "green" ? "On target: no change" : "Checked: no change";
+  const days = {};
+  cards.forEach(c => { const d = c.created_at ? new Date(c.created_at) : null; const k = d ? d.toLocaleDateString(undefined, {weekday: "short", month: "short", day: "numeric"}) : "Earlier";
+    (days[k] = days[k] || []).push(c); });
+  const applied = cards.filter(c => /applied/.test(c.status)).length, waiting = cards.filter(c => c.status === "open" || c.status === "flagged").length;
+  const row = (c) => { const [cls, word] = PILL[c.status] || ["", c.status || ""];
+    return '<div class="rowl"><span class="zn ' + E(c.zone || "") + '"></span><span class="nm"><b>' + E(c.client_name || "Client") + '</b><span class="sub">' + E(what(c)) +
+      (c.current_cpl != null ? " · CPL " + E(F.money(c.current_cpl, c.currency)) : "") + '</span></span><span class="pill ' + cls + '"' +
+      (cls ? "" : ' style="background:var(--soft);color:var(--faint)"') + ">" + E(word) + "</span></div>"; };
+  let html = '<div class="hd">' + F.avatar() + "<b>Media Buying Agent</b>" + (applied ? '<span class="pill fine">Applied · ' + applied + "</span>" : "") +
+    (waiting ? '<span class="pill watch">Waiting · ' + waiting + "</span>" : "") + "</div>";
+  html += cards.length ? '<div class="tl">' + Object.entries(days).slice(0, 7).map(([d, cs]) => '<div class="day">' + E(d) + "</div>" + cs.slice(0, 6).map(row).join("")).join("") + "</div>"
+    : '<div class="empty">No ' + (data.status && data.status !== "all" ? E(data.status) + " " : "") + "cards.</div>";
+  html += '<div class="ft"><span>' + (data.more ? "Older cards not shown" : "") + '</span><button class="link" id="open">Review in Birdy →</button></div>';
+  document.getElementById("root").innerHTML = html;
+  document.getElementById("open").onclick = () => ui.open("/hub/agents/media-buying");
+};
+""")

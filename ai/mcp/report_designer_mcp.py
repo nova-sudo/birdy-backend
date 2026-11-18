@@ -9,6 +9,7 @@ ai/tools/report_designer_tools.py; user_id always comes from the token. Nothing 
 from typing import Literal
 
 from ai.mcp.access import READ, WRITE
+from ai.mcp.cards import card
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.tools import report_designer_tools as tools
 from core.database import get_db
@@ -47,7 +48,7 @@ async def get_report_draft() -> dict:
     return await tools.get_report_draft(_db(), _current_user_id())
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("report"))
 async def preview_report(source: Literal["draft", "saved"] = "draft") -> dict:
     """Render a report as the real Slack message with the owner's own numbers (sample figures when they have none yet). Nothing is sent to Slack.
 

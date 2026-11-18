@@ -21,6 +21,7 @@ from ai.agents.stock import runner as stock_runner
 from ai.agents.stock import templates as stock_templates
 from ai.agents.stock.apply import APPLY_BUDGET_SECONDS
 from ai.mcp.access import LIVE, READ, WRITE
+from ai.mcp.cards import card
 from ai.mcp.agent_mcp import resolve_agent
 from ai.mcp.confirm import two_step
 from ai.mcp.server import mcp, current_user_id as _current_user_id
@@ -56,7 +57,8 @@ def _card_summary(card: dict) -> dict:
     return {"id": card["id"], "client_name": card.get("client_name"), "status": card.get("status"), "tag": card.get("tag"),
             "can_apply": card.get("can_apply"), "zone": card.get("zone"), "leads": card.get("leads"),
             "spend": card.get("spend"), "current_cpl": card.get("current_cpl"), "currency": card.get("currency"),
-            "lines": len(card.get("lines") or []), "run_id": card.get("run_id"), "created_at": card.get("created_at")}
+            "lines": len(card.get("lines") or []), "run_id": card.get("run_id"), "created_at": card.get("created_at"),
+            "decision": card.get("decision"), "decided_at": card.get("decided_at")}
 
 
 @mcp.tool(**READ)
@@ -128,7 +130,7 @@ async def get_agent_month(month: str, agent: str | None = None) -> dict:
         raise ToolError({"bad_month": "month must look like 2026-10", "future_month": "That month hasn't happened yet"}.get(e.detail, e.detail))
 
 
-@mcp.tool(**READ)
+@mcp.tool(**READ, meta=card("agent_week"))
 async def get_agent_cards(status: Literal["open", "applied", "dismissed", "all"] = "open", agent: str | None = None) -> dict:
     """The agent's cards (proposed changes per client), newest first, summarised. Returns up to 50; `more` is true when there are older ones not shown.
 

@@ -42,6 +42,7 @@ async def test_card_resources_are_not_tools_and_cost_nothing():
     ("check_my_accounts", "accounts"), ("compare_periods", "scorecard"), ("get_account_summary", "summary"),
     ("explain_alert", "alert"), ("get_fired_alerts", "alert"), ("apply_card", "confirm"), ("send_lead_message", "confirm"),
     ("get_ad_insights", "ads"), ("get_budget_pacing", "pacing"), ("get_creative_test", "creative_test"), ("funnel", "funnel"),
+    ("get_unified_leads", "leads"), ("preview_report", "report"), ("get_agent_cards", "agent_week"),
 ])
 async def test_tools_point_at_their_card(tool, name):
     async with Client(mcp) as c:
