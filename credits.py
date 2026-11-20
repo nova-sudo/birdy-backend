@@ -358,9 +358,18 @@ async def record_usage(
     source: str = "birdy",
     feature: str = "ask_birdy",
     session_id: Optional[str] = None,
+    agent: Optional[str] = None,
+    depth: Optional[int] = None,
+    agents: Optional[list] = None,
 ) -> float:
     """Charge a question's token usage to the user's balance and append to the
-    ``ai_usage`` ledger. Best-effort: never raises into the AI request path."""
+    ``ai_usage`` ledger. Best-effort: never raises into the AI request path.
+
+    A team-agent reply (ai/team) passes `agent` (the agent the user addressed),
+    `depth` (0) and `agents`, one entry per agent involved
+    ({agent, depth, prompt_tokens, completion_tokens, model_calls, credits});
+    the tokens passed are already the sum of all of them, so the reply is
+    charged once. The three fields are stored only when `agent` is set."""
     try:
         settings = await get_credits_settings(db)
         mode = mode or settings["rate_mode"]
@@ -377,6 +386,7 @@ async def record_usage(
             "prompt_tokens": int(prompt_tokens or 0),
             "completion_tokens": int(completion_tokens or 0),
             "model_calls": int(model_calls or 1),
+            **({"agent": agent, "depth": int(depth or 0), "agents": list(agents or [])} if agent else {}),
         })
 
         logger.info(

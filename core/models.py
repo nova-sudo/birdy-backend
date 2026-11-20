@@ -240,6 +240,9 @@ class ChatRequest(BaseModel):
     # Hub table column lists the browser has seen, keyed by saved-view page
     # ({label, path, columns: [{id, label, source}]}), for create_saved_view.
     view_catalogues: Optional[dict] = None
+    # The team agent this message is addressed to (ai/team). Absent = the chat
+    # works exactly as before, by page.
+    agent: Optional[Literal["birdy", "media_buyer", "sales_coach"]] = None
 
 
 class ChatResponse(BaseModel):
@@ -260,6 +263,10 @@ class ChatResponse(BaseModel):
     page_view_ops: list = []
     # {tool, changed} for each agent training tool that changed the playbook.
     agent_changes: list = []
+    # Team agents (CHAT ROUTE CONTRACT v1): the agents this reply went through,
+    # null when no other agent was involved, and changes they proposed.
+    route: Optional[dict] = None
+    proposals: list = []
 
 
 # ── Capabilities (per-user agent toggles) ─────────────────────────────────────

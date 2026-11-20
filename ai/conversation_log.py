@@ -46,15 +46,24 @@ async def log_message(
     agent_id: str | None = None,
     card_id: str | None = None,
     agent_changes: list | None = None,
+    agent: str | None = None,
+    route: dict | None = None,
+    proposals: list | None = None,
 ) -> None:
     """Append a single conversation message. Best-effort; never raises.
 
     `agent_id` / `card_id` tie a turn to the agent chat it came from (the
     stock card, Teach Birdy and agent setup chats) and `agent_changes` keeps
     what that turn changed, so the chat can be shown again after a reload.
-    Each is stored only when set."""
+    Each is stored only when set.
+
+    `agent` is the team agent the chat was addressed to ("birdy" |
+    "media_buyer" | "sales_coach"); `route` and `proposals` are that reply's
+    route map and pending proposals (ai/team), kept so the map can be shown
+    again and an approved proposal found later."""
     extra = {k: v for k, v in (("agent_id", agent_id), ("card_id", card_id),
-                               ("agent_changes", agent_changes)) if v}
+                               ("agent_changes", agent_changes), ("agent", agent),
+                               ("route", route), ("proposals", proposals)) if v}
     try:
         await db[_COLLECTION].insert_one({
             "user_id": user_id,
