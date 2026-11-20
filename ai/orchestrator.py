@@ -671,10 +671,15 @@ def _only_client(result: str, client_group_id: str) -> str:
 
 async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
     if frame.sub is not None:
+        try:
+            from ai.agents.stock.lessons import lessons_for_prompt
+            lessons = await lessons_for_prompt(db, frame.sub.id, client_group_id)
+        except Exception:
+            lessons = []
         return team_defs.sub_agent_instructions(
             frame.sub, team_defs.NAMES.get(frame.parent_main, "your main agent"),
             client_group_id=client_group_id, client_name=client_name,
-            context=await team_defs.context_block(db, user_id, client_group_id))
+            context=await team_defs.context_block(db, user_id, client_group_id), lessons=lessons)
     asked_by = None
     if frame.nested:
         asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])

@@ -74,6 +74,10 @@ class SubAgentError(OpError):
         self.code = code
 
 
+def _iso_dt(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
+
+
 def _not_found() -> SubAgentError:
     return SubAgentError(404, "not_found", "Sub-agent not found")
 
@@ -590,7 +594,16 @@ def _to_api(sub: dict, names: dict) -> dict:
         "approved_at": sub.get("approved_at"),
         "paused_at": sub.get("paused_at"),
         "last_run_at": sub.get("last_run_at"),
+        "last_run": _last_run_api(sub.get("last_run")),
     }
+
+
+def _last_run_api(last) -> dict | None:
+    """{status, at, summary, credits} of the latest run, or None."""
+    if not isinstance(last, dict):
+        return None
+    return {"status": last.get("status"), "at": last.get("at"), "summary": last.get("summary"),
+            "credits": last.get("credits")}
 
 
 async def to_api_many(db, user_id: str, subs: list[dict]) -> list[dict]:

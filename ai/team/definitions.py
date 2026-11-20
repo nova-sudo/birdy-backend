@@ -292,15 +292,17 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
 
 
 def sub_agent_instructions(sub, parent_name: str, *, client_group_id: str | None, client_name: str | None,
-                           context: str = "") -> str:
-    """The system prompt for a sub-agent run (always delegated, by its main agent). `context` is the
-    agency Context block its main agent has (context_block), so a sub-agent knows what its parent knows."""
+                           context: str = "", lessons: list[str] | None = None) -> str:
+    """The system prompt for a sub-agent run (always delegated, by its main agent, or its own schedule).
+    `context` is the agency Context block its main agent has (context_block), so a sub-agent knows what
+    its parent knows. `lessons` are its own (private) lessons, given as delimited data."""
     parts = [
         f"You are {sub.name}, a sub-agent working for {parent_name} in this agency's Birdy workspace.\n"
         f"Today's date is {date.today().isoformat()}.\n",
         "\n## Your instructions (written for you by your main agent)\n"
         "<<<\n" + (sub.instructions or "Answer the question with your tools.") + "\n>>>\n",
     ]
+    parts.append(_data_block("Your lessons (your own memory)", "lessons", list(lessons or [])))
     parts.append(context or "")
     if client_group_id:
         parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))

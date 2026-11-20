@@ -119,6 +119,35 @@ async def delete(sub_agent_id: str, current_user: str = Depends(get_current_user
     return await _act(sub_core.delete_sub_agent, current_user, sub_agent_id)
 
 
+@router.post("/{sub_agent_id}/run")
+async def run_now(sub_agent_id: str, current_user: str = Depends(get_current_user)):
+    """Run an active sub-agent now: the same run as its schedule (ai/team/scheduled.run_one). Returns
+    the finished run. 409 wrong_status / managed_elsewhere / already_running, 402 out_of_credits."""
+    from ai.agents.sub_agents import schedule
+    from ai.team import scheduled
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            return await schedule.start_manual_run(db, mongo_client, current_user, sub_agent_id,
+                                                   run_one=scheduled.run_one,
+                                                   budget_seconds=scheduled.RUN_BUDGET_SECONDS)
+        except sub_core.SubAgentError as e:
+            return _err(e)
+
+
+@router.get("/{sub_agent_id}/runs")
+async def list_runs(sub_agent_id: str, limit: int = 20, current_user: str = Depends(get_current_user)):
+    """{"runs": [{id, status, trigger, started_at, finished_at, summary, answer, credits, proposals}]},
+    newest first."""
+    from ai.agents.sub_agents import schedule
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            return {"runs": await schedule.list_runs(db, current_user, sub_agent_id, limit)}
+        except sub_core.SubAgentError as e:
+            return _err(e)
+
+
 @router.get("/{sub_agent_id}/lessons")
 async def list_lessons(sub_agent_id: str, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
