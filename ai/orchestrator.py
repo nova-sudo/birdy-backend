@@ -669,7 +669,8 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
     if frame.sub is not None:
         return team_defs.sub_agent_instructions(
             frame.sub, team_defs.NAMES.get(frame.parent_main, "your main agent"),
-            client_group_id=client_group_id, client_name=client_name)
+            client_group_id=client_group_id, client_name=client_name,
+            context=await team_defs.context_block(db, user_id, client_group_id))
     asked_by = None
     if frame.nested:
         asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])

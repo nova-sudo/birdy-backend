@@ -75,6 +75,19 @@ async def create_note(db, user_id: str, group_id: str, body: str, author: Option
     return _iso(note)
 
 
+async def update_note(db, user_id: str, note_id: str, body: str) -> dict:
+    """Rewrite one note's text (the Context page's Edit). Scoped by user: another account's note
+    is not found. Returns the note with `updated_at` set."""
+    body = clean_body(body)
+    q = {"id": note_id, "user_id": user_id}
+    res = await db[COLLECTION].update_one(q, {"$set": {"body": body, "updated_at": datetime.utcnow()}})
+    if res.matched_count == 0:
+        raise NoteError(404, "Note not found")
+    row = await db[COLLECTION].find_one(q, {"_id": 0})
+    updated = row.get("updated_at")
+    return {**_iso(row), "updated_at": updated.isoformat() if hasattr(updated, "isoformat") else updated}
+
+
 async def delete_note(db, user_id: str, group_id: str, note_id: str) -> None:
     """Remove one note. Scoped by user and client, so neither another account's
     nor another client's note can be removed."""
