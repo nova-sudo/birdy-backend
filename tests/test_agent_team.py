@@ -804,3 +804,19 @@ def test_only_sales_coach_has_the_call_trend_tool():
     assert "get_call_trend" in defs.tool_names("sales_coach", nested=True)
     assert "get_call_trend" not in defs.tool_names("birdy", nested=False)
     assert "get_call_trend" not in defs.tool_names("media_buyer", nested=False)
+
+
+async def test_an_agents_instructions_are_rebuilt_every_turn(mock_db, registry, monkeypatch):
+    import ai.orchestrator as orch
+    versions = iter(["instructions v1", "instructions v2"])
+
+    async def prompt(*a, **k):
+        return next(versions)
+    monkeypatch.setattr(orch, "_agent_system_prompt", prompt)
+    p = TeamProvider({"default": [say("one"), say("two")]})   # the stub prompt names no agent
+    first = await chat(p, registry, mock_db, agent="birdy")
+    await chat(p, registry, mock_db, agent="birdy", session_id=first["session_id"])
+    systems = [m["content"] for m in p.calls[-1][2] if m["role"] == "system"]
+    assert systems == ["instructions v2"]
+    # the earlier turn is still in the conversation
+    assert [m["content"] for m in p.calls[-1][2] if m["role"] == "assistant"][0] == "one"
