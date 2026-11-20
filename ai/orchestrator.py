@@ -920,7 +920,11 @@ async def run_chat(
         """The finished route and proposals for a top-level agent turn."""
         turn = frame.turn
         step = frame.step
-        step.update(status="done", answer=reply, summary=team_route.summarize(reply) or "Answered",
+        # The first agent's answer is the reply itself, shown right below the map, so its box says
+        # what it looked at instead of repeating the reply's opening words.
+        looked = list(dict.fromkeys(t["label"] for t in step.get("tools") or [] if t.get("name") not in delegation.TOOL_NAMES))
+        own = team_route.clip("Looked at " + ", ".join(lbl[0].lower() + lbl[1:] for lbl in looked), team_route.SUMMARY_MAX) if looked else ""
+        step.update(status="done", answer=reply, summary=own or team_route.summarize(reply) or "Answered",
                     seconds=round(turn.elapsed(), 1), credits=turn.credits_for(frame.usage))
         turn.status = "done"
         if charge is not None:

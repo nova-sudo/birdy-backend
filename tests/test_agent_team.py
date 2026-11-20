@@ -761,8 +761,9 @@ async def test_parent_loop_skips_tools_once_out_of_time(mock_db, registry, monke
     assert p.calls[-1][1] == []
 
 
-async def test_call_trend_compares_a_period_with_the_one_before(mock_db):
+async def test_call_trend_compares_periods_and_stays_small(mock_db):
     from datetime import date, timedelta
+    from ai.config import MAX_RESULT_CHARS
     from ai.tools.hp_tools import get_call_center_stats, get_call_trend
 
     def day(n):
@@ -771,20 +772,24 @@ async def test_call_trend_compares_a_period_with_the_one_before(mock_db):
     rows = [{"date": day(n), "calls": 10, "answered": 8, "transfers": 1, "inbound": 2, "outbound": 8, "talk_time": 5}
             for n in range(1, 8)]
     rows += [{"date": day(n), "calls": 20, "answered": 10, "transfers": 4, "inbound": 4, "outbound": 16, "talk_time": 9}
-             for n in range(8, 15)]
+             for n in range(8, 29)]
     rows.append({"date": day(0), "calls": 99, "answered": 99})  # today is left out
-    await mock_db["client_groups"].insert_many([
-        {"user_id": "u1", "id": "g1", "name": "Aura", "hp_daily_calls": rows},
-        {"user_id": "u1", "id": "g2", "name": "No calls"},
-        {"user_id": "other", "id": "g9", "name": "Theirs", "hp_daily_calls": rows},
-    ])
-    out = await get_call_trend(mock_db, "u1", days=7)
-    assert out["current_period"]["calls"] == 70 and out["previous_period"]["calls"] == 140
-    assert out["change_pct"]["calls"] == -50.0 and out["current_period"]["connect_rate"] == 80.0
-    assert [c["client_group_name"] for c in out["clients"]] == ["Aura"]
-    assert len(out["daily"]) == 14
-    assert "error" in await get_call_trend(mock_db, "u1", days=0)
-    assert "error" in await get_call_trend(mock_db, "u1", group_ids=["g2"])
+    await mock_db["client_groups"].insert_many(
+        [{"user_id": "u1", "id": f"g{i}", "name": f"A fairly long client name number {i}", "hp_daily_calls": rows}
+         for i in range(40)]
+        + [{"user_id": "u1", "id": "none", "name": "No calls"},
+           {"user_id": "other", "id": "g9x", "name": "Theirs", "hp_daily_calls": rows}])
+    out = await get_call_trend(mock_db, "u1", days=7, group_ids=["g1"])
+    assert [p["calls"] for p in out["periods"]] == [70, 140]
+    assert out["change_pct_latest_vs_previous"]["calls"] == -50.0 and out["periods"][0]["connect_rate"] == 80.0
+    assert out["clients"][0]["calls"] == [70, 140]
+    # the last month, week by week, across 40 clients, fits inside what a tool result may be
+    month = await get_call_trend(mock_db, "u1", days=7, periods=4)
+    assert [p["calls"] for p in month["periods"]] == [2800, 5600, 5600, 5600]
+    assert month["total_clients"] == 40 and month["shown_clients"] == 10
+    assert len(json.dumps(month)) < MAX_RESULT_CHARS / 2
+    for bad in ({"days": 0}, {"periods": 1}, {"periods": 99}, {"days": 90, "periods": 12}, {"group_ids": ["none"]}):
+        assert "error" in await get_call_trend(mock_db, "u1", **bad)
     # an unknown window is an error that names the valid ones, not an empty result
     bad = await get_call_center_stats(mock_db, "u1", preset="last_week")
     assert "last_7d" in bad["error"] and "get_call_trend" in bad["error"]
