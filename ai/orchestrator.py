@@ -28,6 +28,9 @@ from ai import session_store
 from ai import conversation_log
 from services.query_classifier import classify_query
 from services import capabilities_service
+from ai.team import definitions as team_defs
+from ai.team import delegation
+from ai.team import route as team_route
 
 logger = logging.getLogger(__name__)
 
@@ -200,6 +203,19 @@ _CLIENT_PINNED_GROUP_TOOLS = {"get_call_recordings_summary", "analyze_call_recor
 # The same guarantee for tools that take a group_ids list: omitting it means
 # "every client", which on a client page would chart other clients' numbers.
 _CLIENT_PINNED_GROUP_IDS_TOOLS = {"get_daily_metrics", CLOSES_BY_AD_TOOL}
+# Agent runs (a chat addressed to an agent, and every delegated run) pin every
+# client-filtered read the same way, so an ask about one client can only read
+# that client (design section 8). Plain page chats keep the four tools above.
+_AGENT_PINNED_GROUP_TOOLS = _CLIENT_PINNED_GROUP_TOOLS | {
+    "get_ghl_opp_stats_windowed", "get_ghl_opp_stats_monthly"}
+_AGENT_PINNED_GROUP_IDS_TOOLS = _CLIENT_PINNED_GROUP_IDS_TOOLS | {
+    "get_campaign_insights", "get_adset_insights", "get_ad_insights", "get_facebook_leads",
+    "get_ghl_contacts", "get_ghl_opportunity_stats", "get_ghl_tag_breakdown", "get_tag_rollup_by_campaign",
+    "get_account_summary", "compare_periods", "get_meta_insights_live", "get_meta_insights_monthly",
+    "get_meta_leads_live", "compute_custom_metric", "get_unified_leads", "get_unified_lead_stats",
+    "get_metrics_by_day_windows", "get_call_center_stats"}
+# Client lists in a one-client agent run are cut down to that client.
+_AGENT_FILTERED_CLIENT_LISTS = {"get_client_groups"}
 
 # ── Alerts page system prompt ─────────────────────────────────────────────────
 
@@ -629,6 +645,48 @@ def _vision_parts(message: str, attachments: list[dict]) -> list[dict]:
     return parts
 
 
+def _pin_agent_args(name: str, args: dict, client_group_id: str) -> None:
+    """An agent run's server-side client pin (see _AGENT_PINNED_GROUP_TOOLS)."""
+    if name in _AGENT_PINNED_GROUP_TOOLS:
+        args["group_id"] = client_group_id
+    if name in _AGENT_PINNED_GROUP_IDS_TOOLS:
+        args["group_ids"] = [client_group_id]
+
+
+def _only_client(result: str, client_group_id: str) -> str:
+    """get_client_groups' result with every other client removed."""
+    try:
+        parsed = json.loads(result)
+    except (json.JSONDecodeError, TypeError):
+        return result
+    if isinstance(parsed, dict) and isinstance(parsed.get("client_groups"), list):
+        groups = [g for g in parsed["client_groups"] if isinstance(g, dict) and g.get("id") == client_group_id]
+        return json.dumps({**parsed, "client_groups": groups, "total": len(groups)}, default=str)
+    return result
+
+
+async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
+    if frame.sub is not None:
+        return team_defs.sub_agent_instructions(
+            frame.sub, team_defs.NAMES.get(frame.parent_main, "your main agent"),
+            client_group_id=client_group_id, client_name=client_name)
+    asked_by = None
+    if frame.nested:
+        asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])
+    return await team_defs.build_instructions(
+        frame.agent, db, user_id, client_group_id=client_group_id, client_name=client_name,
+        asked_by=asked_by, source=source)
+
+
+def _agent_tool_names(frame) -> list:
+    """The registry/MCP tools one agent run may use. A sub-agent's list is cut to its main
+    agent's read tools: never more than the main agent has, never a write."""
+    if frame.sub is not None:
+        parent = set(team_defs.tool_names(frame.parent_main, nested=True))
+        return [n for n in frame.sub.tools if n in parent]
+    return team_defs.tool_names(frame.agent, nested=frame.nested)
+
+
 async def run_chat(
     provider: BaseLLMProvider,
     tool_registry: ToolRegistry,
@@ -647,11 +705,39 @@ async def run_chat(
     attachments: Optional[list[dict]] = None,
     agent_id: Optional[str] = None,
     card_id: Optional[str] = None,
+    agent: Optional[str] = None,
+    on_route=None,
+    _frame=None,
 ) -> dict:
+    """One chat turn.
+
+    `agent` ("birdy" | "media_buyer" | "sales_coach") addresses a team agent
+    (ai/team): its instructions and tools replace the page's, it gets the ask
+    tools, and the result carries `route` and `proposals`. Without it the turn
+    runs exactly as before. `on_route(route_dict)` is called whenever the route
+    changes (the stream endpoint). `_frame` is internal: a delegated run passes
+    its frame, and then no session is saved, nothing is archived and nothing is
+    debited (the top-level run debits the whole reply once).
+    """
+    frame = _frame
+    if frame is None and agent is not None:
+        if not team_defs.is_agent(agent):
+            raise ValueError(f"Unknown agent: {agent}")
+        frame = team_route.new_turn(agent, client_group_id=client_group_id, client_name=client_name,
+                                    on_change=on_route, model=getattr(provider, "model", None))
+        await frame.turn.load_rates(db)
+    nested = frame is not None and frame.nested
     # Agent chats are archived with their agent/card (see conversation_log).
     archive_ids = {"agent_id": agent_id, "card_id": card_id}
-    # Restore or create session (get_or_create only resumes sessions this user owns)
-    session_id, history = await session_store.get_or_create(db, session_id, user_id)
+    if frame is not None and not nested:
+        archive_ids["agent"] = frame.agent
+    if nested:
+        # A delegated run has no session of its own: fresh working memory, never saved.
+        history = []
+        attachments = None
+    else:
+        # Restore or create session (get_or_create only resumes sessions this user owns)
+        session_id, history = await session_store.get_or_create(db, session_id, user_id)
 
     # Persist attachments only after validation, and only on this owner's session.
     attachments = [dict(a) for a in (attachments or [])]
@@ -673,7 +759,10 @@ async def run_chat(
     history[:] = session_store.sanitize_history(history)
 
     # Inject system prompt once per session
-    if not history:
+    if not history and frame is not None:
+        history.append({"role": "system", "content": await _agent_system_prompt(
+            frame, db, user_id, client_group_id, client_name, source)})
+    elif not history:
         if page == "client_detail" and client_group_id and client_name:
             system_content = _build_client_detail_prompt(client_name, client_group_id)
         elif page in _ASYNC_PAGE_PROMPTS:
@@ -705,8 +794,8 @@ async def run_chat(
     # Durable archive (Admin console + analytics). Skip internal [UI_RESPONSE]
     # submissions — those are form answers, not real user questions, and the
     # frontend already filters them out of the visible transcript. Best-effort:
-    # conversation_log never raises.
-    if not message.lstrip().startswith("[UI_RESPONSE]"):
+    # conversation_log never raises. A delegated run is never archived.
+    if not nested and not message.lstrip().startswith("[UI_RESPONSE]"):
         await conversation_log.log_message(
             db,
             user_id=user_id,
@@ -786,6 +875,16 @@ async def run_chat(
     async def _debit_credits():
         try:
             from credits import record_usage
+            if frame is not None:
+                # The whole reply, every agent it involved, debited once; the
+                # ledger row says which agent spent what (design section 8).
+                totals = frame.turn.totals()
+                return await record_usage(
+                    db, user_id, model=_model, source=source, feature="ask_birdy", session_id=session_id,
+                    prompt_tokens=totals["prompt_tokens"], completion_tokens=totals["completion_tokens"],
+                    model_calls=totals["model_calls"],
+                    agent=frame.agent, depth=0, agents=frame.turn.breakdown(),
+                )
             await record_usage(
                 db,
                 user_id,
@@ -799,8 +898,66 @@ async def run_chat(
             )
         except Exception:
             logger.debug("Credit metering skipped", exc_info=True)
+        return None
 
-    allowed = _PAGE_TOOLS.get(page) if page else None
+    def _close_route(reply: str, charge) -> tuple:
+        """The finished route and proposals for a top-level agent turn."""
+        turn = frame.turn
+        step = frame.step
+        step.update(status="done", answer=reply, summary=team_route.summarize(reply) or "Answered",
+                    seconds=round(turn.elapsed(), 1), credits=turn.credits_for(frame.usage))
+        turn.status = "done"
+        if charge is not None:
+            turn.credits_total = round(float(charge), 4)
+        return turn.to_route(), list(turn.proposals)
+
+    async def _finish(reply: str) -> dict:
+        """Save, archive, debit and answer — or, for a delegated run, only answer."""
+        if nested:
+            return {"reply": reply, "tools_used": tools_used}
+        history.append({"role": "assistant", "content": reply})
+        await session_store.save_messages(db, session_id, history)
+        await _guard_setup()
+        route = proposals = None
+        if frame is not None:
+            charge = await _debit_credits()
+            route, proposals = _close_route(reply, charge)
+            frame.turn.changed()
+        await conversation_log.log_message(
+            db,
+            user_id=user_id,
+            session_id=session_id,
+            source=source,
+            role="assistant",
+            content=reply,
+            page=page,
+            client_group_id=client_group_id,
+            tools_used=tools_used,
+            agent_changes=agent_changes,
+            **({"route": route, "proposals": proposals} if frame is not None else {}),
+            **archive_ids,
+        )
+        if frame is None:
+            await _debit_credits()
+        result = {
+            "reply": reply,
+            "tools_used": tools_used,
+            "session_id": session_id,
+            "dashboard_ops": dashboard_ops,
+            "page_view_ops": page_view_ops,
+            "agent_changes": agent_changes,
+            **(await _resolve_turn_scope()),
+        }
+        if frame is not None:
+            result["route"] = route
+            result["proposals"] = proposals
+        return result
+
+    if frame is not None:
+        allowed = _agent_tool_names(frame)
+    else:
+        allowed = _PAGE_TOOLS.get(page) if page else None
+    max_iterations = team_route.NESTED_MAX_TOOL_ITERATIONS if nested else MAX_TOOL_ITERATIONS
 
     async with contextlib.AsyncExitStack() as stack:
         mcp = None
@@ -827,13 +984,23 @@ async def run_chat(
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
         tool_schemas = registry_schemas + mcp_schemas
+        delegation_ctx = None
+        if frame is not None:
+            # The ask / propose tools, and every tool name this run may call:
+            # an agent run never executes a tool it was not offered.
+            subs = await delegation.subs_for(db, frame, user_id)
+            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs)
+            delegation_ctx = {"provider": provider, "tool_registry": tool_registry, "db": db,
+                              "user_id": user_id, "mongo_client": mongo_client, "source": source,
+                              "session_id": session_id, "subs": subs}
+        offered = {s["function"]["name"] for s in tool_schemas}
         excluded = _SLACK_EXCLUDED_TOOLS if source == conversation_log.SOURCE_SLACK else frozenset()
         if excluded:
             tool_schemas = [s for s in tool_schemas if s["function"]["name"] not in excluded]
         logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
-        for iteration in range(MAX_TOOL_ITERATIONS + 1):
-            is_final_iteration = iteration == MAX_TOOL_ITERATIONS
+        for iteration in range(max_iterations + 1):
+            is_final_iteration = iteration == max_iterations
             call_messages = history
             if is_final_iteration:
                 # Forced final turn — no more tool calls allowed (tools=None below).
@@ -881,38 +1048,15 @@ async def run_chat(
             model_calls += 1
             usage_in += getattr(response.usage, "input_tokens", 0) or 0
             usage_out += getattr(response.usage, "output_tokens", 0) or 0
+            if frame is not None:
+                frame.usage.add(response)
 
             if not response.tool_calls:
                 reply = response.content or "I wasn't able to generate a response."
                 reply = reply.strip() or "I wasn't able to generate a response."
                 reply = materialize_ui(reply, ui_blocks)
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
-                history.append({"role": "assistant", "content": reply})
-                await session_store.save_messages(db, session_id, history)
-                await _guard_setup()
-                await conversation_log.log_message(
-                    db,
-                    user_id=user_id,
-                    session_id=session_id,
-                    source=source,
-                    role="assistant",
-                    content=reply,
-                    page=page,
-                    client_group_id=client_group_id,
-                    tools_used=tools_used,
-                    agent_changes=agent_changes,
-                    **archive_ids,
-                )
-                await _debit_credits()
-                return {
-                    "reply": reply,
-                    "tools_used": tools_used,
-                    "session_id": session_id,
-                    "dashboard_ops": dashboard_ops,
-            "page_view_ops": page_view_ops,
-            "agent_changes": agent_changes,
-                    **(await _resolve_turn_scope()),
-                }
+                return await _finish(reply)
 
             # Mistral rejects null content — use empty string when model omits it
             assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -958,11 +1102,20 @@ async def run_chat(
                             f"(model passed {args.get('group_ids')!r})"
                         )
                     args["group_ids"] = [client_group_id]
+                if frame is not None and client_group_id:
+                    _pin_agent_args(tc.name, args, client_group_id)
 
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))
 
-                if tc.name in excluded:
+                if frame is not None and (tc.name not in offered
+                                          or (nested and tc.name in team_defs.WRITE_TOOLS)):
+                    result = json.dumps({"error": (
+                        f"{tc.name} isn't available to {team_defs.NAMES.get(frame.agent, 'this agent')} "
+                        "here. Use only the tools you were given.")})
+                elif frame is not None and tc.name in delegation.TOOL_NAMES:
+                    result = await delegation.handle(tc.name, args, frame, delegation_ctx)
+                elif tc.name in excluded:
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available in Slack. Creative tests are drafted, "
                         "posted and paused from the Birdy app.")})
@@ -997,7 +1150,17 @@ async def run_chat(
                         **call_args,
                     )
 
+                if frame is not None and client_group_id and tc.name in _AGENT_FILTERED_CLIENT_LISTS:
+                    result = _only_client(result, client_group_id)
+
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
+
+                if frame is not None:
+                    detail = (team_route.clip(str(args.get("question") or ""), team_route.SUMMARY_MAX) or None
+                              if tc.name in delegation.TOOL_NAMES else team_route.tool_detail(args))
+                    frame.step["tools"].append({"name": tc.name, "label": team_route.tool_label(tc.name),
+                                                "detail": detail})
+                    frame.turn.changed()
 
                 changes_before = len(agent_changes)
                 if tc.name in AGENT_TOOL_NAMES and not bad_args:
@@ -1030,29 +1193,4 @@ async def run_chat(
         # mid-stream fragment, not a complete/honest answer. Always use the safe
         # fallback rather than risk surfacing a partial/fabricated reply.
         reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
-        history.append({"role": "assistant", "content": reply})
-        await session_store.save_messages(db, session_id, history)
-        await _guard_setup()
-        await conversation_log.log_message(
-            db,
-            user_id=user_id,
-            session_id=session_id,
-            source=source,
-            role="assistant",
-            content=reply,
-            page=page,
-            client_group_id=client_group_id,
-            tools_used=tools_used,
-            agent_changes=agent_changes,
-            **archive_ids,
-        )
-        await _debit_credits()
-        return {
-            "reply": reply,
-            "tools_used": tools_used,
-            "session_id": session_id,
-            "dashboard_ops": dashboard_ops,
-            "page_view_ops": page_view_ops,
-            "agent_changes": agent_changes,
-            **(await _resolve_turn_scope()),
-        }
+        return await _finish(reply)

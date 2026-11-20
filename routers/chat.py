@@ -1,6 +1,9 @@
+import asyncio
+import json
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
 
 from core.models import ChatRequest, ChatResponse
 from core.database import get_db
@@ -29,6 +32,7 @@ from ai.tools.render_ui_tools import register_render_ui_tools
 from ai.tools.page_view_tools import register_page_view_tools
 from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
+from ai.team import definitions as team_defs
 from ai.tools.agent_tools import current_training_agent
 from ai.tools.stock_card_tools import (current_card_read_only, current_stock_card, load_chat_card,
                                       register_stock_card_tools)
@@ -97,6 +101,59 @@ async def _onboarding_complete(db, user_id: str) -> bool:
     return bool((user.get("onboarding") or {}).get("completed"))
 
 
+async def _checks(db, current_user: str, request: ChatRequest, mongo_client) -> tuple:
+    """Owner checks, the credit gate and the provider: everything that answers with an
+    HTTP status before a turn starts. Returns (provider, stock_card_id, lessons_agent_id)."""
+    stock_card_id = await _stock_card_id(db, current_user, request)
+    lessons_agent_id = await _lessons_agent_id(db, current_user, request)
+    # Stopper: block when the user is out of Birdy Credits (raises 402
+    # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
+    # Except the report copilot during onboarding: it runs before
+    # billing, and a new account must be able to finish setting up.
+    if not (request.page == "report_designer"
+            and not await _onboarding_complete(db, current_user)):
+        await check_credits(current_user, mongo_client)
+    provider = await get_provider_for_user(current_user, db)
+    if lessons_agent_id is None and request.agent == team_defs.MEDIA_BUYER:
+        # Media Buyer's own chat works on its lessons (the stock agent's memory).
+        lessons_agent_id = await team_defs.stock_agent_id(db, current_user)
+    return provider, stock_card_id, lessons_agent_id
+
+
+async def _run_turn(db, mongo_client, current_user: str, request: ChatRequest, provider,
+                    stock_card_id, lessons_agent_id, on_route=None) -> dict:
+    """One chat turn with this request's ContextVars set, and reset afterwards."""
+    agent_token = current_training_agent.set(
+        request.agent_id if request.page in AGENT_CHAT_PAGES else None)
+    card_token = current_stock_card.set(stock_card_id)
+    read_only_token = current_card_read_only.set(bool(stock_card_id and request.card_read_only))
+    lessons_token = current_lessons_agent.set(lessons_agent_id)
+    try:
+        return await run_chat(
+            provider=provider,
+            tool_registry=registry,
+            db=db,
+            user_id=current_user,
+            message=request.message,
+            session_id=request.session_id,
+            page=request.page,
+            mongo_client=mongo_client,
+            client_group_id=request.client_group_id,
+            client_name=request.client_name,
+            dashboard_id=request.dashboard_id,
+            dashboard_summary=request.summary,
+            view_catalogues=request.view_catalogues,
+            attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
+            **({"agent": request.agent, "on_route": on_route} if request.agent else {}),
+            **_archive_ids(request),
+        )
+    finally:
+        current_lessons_agent.reset(lessons_token)
+        current_card_read_only.reset(read_only_token)
+        current_stock_card.reset(card_token)
+        current_training_agent.reset(agent_token)
+
+
 @router.post("/api/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -105,44 +162,9 @@ async def chat(
     async with get_mongo_client() as mongo_client:
         try:
             db = get_db(mongo_client)
-            stock_card_id = await _stock_card_id(db, current_user, request)
-            lessons_agent_id = await _lessons_agent_id(db, current_user, request)
-            # Stopper: block when the user is out of Birdy Credits (raises 402
-            # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
-            # Except the report copilot during onboarding: it runs before
-            # billing, and a new account must be able to finish setting up.
-            if not (request.page == "report_designer"
-                    and not await _onboarding_complete(db, current_user)):
-                await check_credits(current_user, mongo_client)
-            provider = await get_provider_for_user(current_user, db)
-            agent_token = current_training_agent.set(
-                request.agent_id if request.page in AGENT_CHAT_PAGES else None)
-            card_token = current_stock_card.set(stock_card_id)
-            read_only_token = current_card_read_only.set(bool(stock_card_id and request.card_read_only))
-            lessons_token = current_lessons_agent.set(lessons_agent_id)
-            try:
-                result = await run_chat(
-                    provider=provider,
-                    tool_registry=registry,
-                    db=db,
-                    user_id=current_user,
-                    message=request.message,
-                    session_id=request.session_id,
-                    page=request.page,
-                    mongo_client=mongo_client,
-                    client_group_id=request.client_group_id,
-                    client_name=request.client_name,
-                    dashboard_id=request.dashboard_id,
-                    dashboard_summary=request.summary,
-                    view_catalogues=request.view_catalogues,
-                    attachments=[a.model_dump(exclude_none=True) for a in request.attachments or []] or None,
-                    **_archive_ids(request),
-                )
-            finally:
-                current_lessons_agent.reset(lessons_token)
-                current_card_read_only.reset(read_only_token)
-                current_stock_card.reset(card_token)
-                current_training_agent.reset(agent_token)
+            provider, stock_card_id, lessons_agent_id = await _checks(db, current_user, request, mongo_client)
+            result = await _run_turn(db, mongo_client, current_user, request, provider,
+                                     stock_card_id, lessons_agent_id)
             return ChatResponse(**result)
         except HTTPException:
             # Preserve deliberate status codes (e.g. 402 OUT_OF_CREDITS) instead
@@ -155,6 +177,86 @@ async def chat(
         except Exception as e:
             logger.error(f"Chat error: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail="Failed to process chat message")
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Streaming (CHAT ROUTE CONTRACT v1)
+#
+# Same request as /api/chat. Events, as text/event-stream:
+#   event: route   data = the whole current route object, every time it changes
+#   event: final   data = exactly the JSON /api/chat would return
+#   event: error   data = {"message": string}
+# Checks that answer with a status (402 out of credits, 404 card/agent, 412 no
+# AI key, 422 bad body) still do so before the stream opens. While a turn runs
+# with nothing new to say, a comment line (": keep-alive") goes out every
+# KEEPALIVE_SECONDS so proxies don't close an idle connection.
+# ──────────────────────────────────────────────────────────────────────────
+
+KEEPALIVE_SECONDS = 15
+
+
+def _sse(event: str, data) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str, separators=(',', ':'))}\n\n"
+
+
+async def _event_stream(db, mongo_client, current_user: str, request: ChatRequest, provider,
+                        stock_card_id, lessons_agent_id):
+    queue: asyncio.Queue = asyncio.Queue()
+    last = {"route": None}
+
+    def on_route(route: dict) -> None:
+        if route != last["route"]:
+            last["route"] = route
+            queue.put_nowait(("route", route))
+
+    async def work():
+        try:
+            result = await _run_turn(db, mongo_client, current_user, request, provider,
+                                     stock_card_id, lessons_agent_id, on_route=on_route)
+            queue.put_nowait(("final", ChatResponse(**result).model_dump(mode="json")))
+        except NoAiCredentialError:
+            queue.put_nowait(("error", {"message": "no_ai_credentials"}))
+        except Exception as e:
+            logger.error(f"Chat stream error: {e}", exc_info=True)
+            queue.put_nowait(("error", {"message": "Failed to process chat message"}))
+
+    task = asyncio.create_task(work())
+    try:
+        while True:
+            try:
+                event, data = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
+            except asyncio.TimeoutError:
+                yield ": keep-alive\n\n"
+                continue
+            yield _sse(event, data)
+            if event in ("final", "error"):
+                break
+    finally:
+        if not task.done():
+            # The client went away: stop the turn rather than spend credits on nobody.
+            task.cancel()
+
+
+@router.post("/api/chat/stream")
+async def chat_stream(
+    request: ChatRequest,
+    current_user: str = Depends(get_current_user),
+):
+    async with get_mongo_client() as mongo_client:
+        db = get_db(mongo_client)
+        try:
+            provider, stock_card_id, lessons_agent_id = await _checks(db, current_user, request, mongo_client)
+        except HTTPException:
+            raise
+        except NoAiCredentialError:
+            raise HTTPException(status_code=412, detail="no_ai_credentials")
+    # The Motor client is a process-wide singleton (dependencies.get_mongo_client),
+    # so it stays usable after the context above has exited.
+    return StreamingResponse(
+        _event_stream(db, mongo_client, current_user, request, provider, stock_card_id, lessons_agent_id),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
+    )
 
 
 # ──────────────────────────────────────────────────────────────────────────
