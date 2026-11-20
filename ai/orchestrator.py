@@ -30,6 +30,7 @@ from services.query_classifier import classify_query
 from services import capabilities_service
 from ai.team import definitions as team_defs
 from ai.team import delegation
+from ai.team import lesson_tools as team_lesson_tools
 from ai.team import pinning as team_pinning
 from ai.team import route as team_route
 
@@ -687,7 +688,8 @@ def _agent_tool_names(frame) -> list:
     agent's read tools: never more than the main agent has, never a write."""
     if frame.sub is not None:
         parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
-        return [n for n in frame.sub.tools if n in parent]
+        from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
+        return [n for n in frame.sub.tools if n in parent and n not in NOT_FOR_SUB_AGENTS]
     return team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
 
 
@@ -998,7 +1000,7 @@ async def run_chat(
             # The ask / propose tools, and every tool name this run may call:
             # an agent run never executes a tool it was not offered.
             subs = await delegation.subs_for(db, frame, user_id)
-            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs)
+            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs) + team_lesson_tools.tool_schemas(frame)
             delegation_ctx = {"provider": provider, "tool_registry": tool_registry, "db": db,
                               "user_id": user_id, "mongo_client": mongo_client, "source": source,
                               "session_id": session_id, "subs": subs}
@@ -1142,6 +1144,8 @@ async def run_chat(
                         "here. Use only the tools you were given.")})
                 elif frame is not None and tc.name in delegation.TOOL_NAMES:
                     result = await delegation.handle(tc.name, args, frame, delegation_ctx)
+                elif frame is not None and tc.name in team_lesson_tools.TOOL_NAMES:
+                    result = await team_lesson_tools.handle(tc.name, args, frame, db=db, user_id=user_id)
                 elif tc.name in excluded:
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available in Slack. Creative tests are drafted, "

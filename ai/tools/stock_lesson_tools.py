@@ -41,7 +41,17 @@ async def load_lessons_agent(db, user_id: str, agent_id: str | None) -> dict | N
 
 
 async def _agent(db, user_id) -> dict | None:
-    return await load_lessons_agent(db, user_id, current_lessons_agent.get())
+    """The agent these tools work on: the user's stock agent (Teach Birdy, and Media Buyer's own chat),
+    or the user's Sales Coach (ai/team/memory.py) in Sales Coach's own chat."""
+    from ai.team import memory as team_memory
+    agent_id = current_lessons_agent.get()
+    if team_memory.is_sales_coach_id(user_id, agent_id):
+        return team_memory.sales_coach_view(user_id)
+    return await load_lessons_agent(db, user_id, agent_id)
+
+
+def _is_sales_coach(agent: dict) -> bool:
+    return agent.get("key") == "sales_coach"
 
 
 async def _groups(db, agent: dict) -> list[dict]:
@@ -92,7 +102,17 @@ async def save_lesson(db, user_id, mongo_client=None, text=None, client_name=Non
         if err:
             return err
         gid, name = group["id"], group.get("name") or group["id"]
-    lesson = await stock_lessons.lesson_from_text(db, agent, text, source=SOURCE, author=user_id, client_group_id=gid)
+    if _is_sales_coach(agent):
+        # Sales Coach's lessons are kept as the person said them; its record is written on the first one.
+        from ai.agents.learning import MEMORY_TEXT_MAX
+        from ai.team import memory as team_memory
+        await team_memory.ensure_sales_coach(db, user_id)
+        lesson = await store.add_memory(db, agent["_id"], text=" ".join(text.split())[:MEMORY_TEXT_MAX], kind="fact",
+                                        source=SOURCE, author=user_id, client_group_id=gid,
+                                        status=stock_lessons.ACTIVE)
+    else:
+        lesson = await stock_lessons.lesson_from_text(db, agent, text, source=SOURCE, author=user_id,
+                                                      client_group_id=gid)
     if lesson is None:
         return _fail("empty_lesson")
     return {"ok": True, "changed": "lesson", "lesson": {"id": lesson["_id"], "text": lesson.get("text"), "client": name}}

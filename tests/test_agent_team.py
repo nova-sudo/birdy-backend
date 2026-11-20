@@ -174,7 +174,8 @@ def test_chat_models_default_and_validate():
 def test_sales_coach_only_has_call_tools():
     names = set(defs.tool_names(defs.SALES_COACH, nested=False))
     assert names == {"get_client_groups", "get_call_center_stats", "get_call_recordings_summary",
-                     "analyze_call_recordings", "render_ui"}
+                     "analyze_call_recordings", "render_ui",
+                     "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
 
 
 def test_media_buyer_has_no_call_or_pipeline_tools():

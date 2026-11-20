@@ -78,8 +78,8 @@ MEDIA_BUYER_READ = (
 )
 MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remove_lesson")
 
-SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary")
-SALES_COACH_WRITE = ("analyze_call_recordings",)
+SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary", "list_lessons")
+SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
 
 BIRDY_READ = (
     *_COMMON,
@@ -220,6 +220,16 @@ async def _media_buyer_lessons(db, user_id: str, gid: str | None) -> list[str]:
         return []
 
 
+async def _sales_coach_lessons(db, user_id: str, gid: str | None) -> list[str]:
+    """Sales Coach's active lessons for this client and the whole agency (ai/team/memory.py)."""
+    try:
+        from ai.agents.stock.lessons import lessons_for_prompt
+        from ai.team.memory import sales_coach_id
+        return await lessons_for_prompt(db, sales_coach_id(user_id), gid)
+    except Exception:
+        return []
+
+
 async def stock_agent_id(db, user_id: str) -> str | None:
     """The user's Media Buying (stock) agent id: Media Buyer's lessons live there."""
     try:
@@ -267,6 +277,9 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
             parts.append(CREATIVE_TESTS_GUIDE)
         parts.append(_data_block("Your lessons (Media Buyer's memory)", "lessons",
                                  await _media_buyer_lessons(db, user_id, client_group_id)))
+    if agent == SALES_COACH:
+        parts.append(_data_block("Your lessons (Sales Coach's memory)", "lessons",
+                                 await _sales_coach_lessons(db, user_id, client_group_id)))
     parts.append(await context_block(db, user_id, client_group_id))
     if client_group_id:
         parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))

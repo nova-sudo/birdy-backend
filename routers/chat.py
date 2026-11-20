@@ -114,9 +114,11 @@ async def _checks(db, current_user: str, request: ChatRequest, mongo_client) -> 
             and not await _onboarding_complete(db, current_user)):
         await check_credits(current_user, mongo_client)
     provider = await get_provider_for_user(current_user, db)
-    if lessons_agent_id is None and request.agent == team_defs.MEDIA_BUYER:
-        # Media Buyer's own chat works on its lessons (the stock agent's memory).
-        lessons_agent_id = await team_defs.stock_agent_id(db, current_user)
+    if lessons_agent_id is None and request.agent in team_defs.MAIN_AGENTS:
+        # A main agent's own chat works on its own lessons: Media Buyer's are the stock agent's
+        # memory, Sales Coach's are under its per-user record (ai/team/memory.py).
+        from ai.team import memory as team_memory
+        lessons_agent_id = await team_memory.main_agent_id(db, current_user, request.agent)
     return provider, stock_card_id, lessons_agent_id
 
 

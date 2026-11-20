@@ -67,6 +67,11 @@ TOOL_LABELS = {
     "list_creative_tests": "Creative tests",
     "get_creative_test": "Creative test",
     "list_lessons": "Lessons",
+    "save_lesson": "Saved a lesson",
+    "edit_lesson": "Edited a lesson",
+    "remove_lesson": "Removed a lesson",
+    "list_agent_lessons": "Agent's lessons",
+    "list_sub_agent_lessons": "Sub-agents' lessons",
     "render_ui": "Chart",
     "propose_action": "Proposed a change",
 }

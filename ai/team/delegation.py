@@ -350,9 +350,9 @@ async def _run_child(child: rt.Frame, question: str, ctx: dict) -> dict:
     from ai.tools.stock_card_tools import current_card_read_only, current_stock_card
     from ai.tools.stock_lesson_tools import current_lessons_agent
 
-    lessons_agent = None
-    if child.agent == defs.MEDIA_BUYER or child.parent_main == defs.MEDIA_BUYER:
-        lessons_agent = await defs.stock_agent_id(ctx["db"], ctx["user_id"])
+    from ai.team import memory as team_memory
+    main = child.agent if child.agent in defs.MAIN_AGENTS else child.parent_main
+    lessons_agent = await team_memory.main_agent_id(ctx["db"], ctx["user_id"], main) if main else None
     # Not inherited from the request: no card, read-only, no training/setup agent.
     current_stock_card.set(None)
     current_card_read_only.set(True)
