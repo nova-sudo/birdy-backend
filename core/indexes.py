@@ -38,6 +38,7 @@ def _load_creators():
     thing this file exists to keep clear.
     """
     from ai.agents.store import create_agent_indexes
+    from ai.agents.sub_agents.core import create_sub_agent_indexes
     from ai.conversation_log import create_conversation_log_indexes
     from ai.session_store import create_ai_session_indexes
     from ai.suggestions.store import create_suggestion_indexes
@@ -89,6 +90,7 @@ def _load_creators():
         create_ai_session_indexes,
         create_suggestion_indexes,
         create_agent_indexes,
+        create_sub_agent_indexes,
         create_conversation_log_indexes,
         create_note_indexes,
         create_ai_usage_indexes,
