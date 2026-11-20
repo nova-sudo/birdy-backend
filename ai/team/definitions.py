@@ -103,6 +103,12 @@ BIRDY_WRITE = (
     "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
     "add_client_note", "delete_client_note", "set_client_target",
 )
+# Birdy's tools that only the MCP server implements (ai/mcp/client_mcp.py, slack_reports_mcp.py). An agent
+# run calls them through MCP; a registry tool of the same name (agent_tools.set_client_target, which
+# edits a custom agent in training) is never offered in their place.
+MCP_HOSTED = frozenset({"get_client", "get_client_notes", "add_client_note", "delete_client_note",
+                        "set_client_target", "list_slack_reports", "create_slack_report",
+                        "update_slack_report", "delete_slack_report", "send_test_slack_report"})
 # Agency-wide configuration with no client of its own: not offered in a one-client run.
 AGENCY_ONLY_TOOLS = frozenset({"list_slack_reports", "create_slack_report", "update_slack_report",
                                "delete_slack_report", "send_test_slack_report"})

@@ -160,10 +160,39 @@ def _stub(registry, name, result=None):
     registry.register(name=name, description="stub", parameters={"type": "object", "properties": {}}, executor=run)
 
 
-async def test_birdy_keeps_agency_writes_in_its_own_chat_only(mock_db, registry, data):
+@pytest.fixture
+def mcp(monkeypatch, registry):
+    """A stand-in MCP server: it hosts the MCP tool names and Birdy's MCP-only tools, and runs each call
+    on the registry stub of that name (recorded in registry.seen) or answers {"ok": true}."""
+    import contextlib
+
+    import ai.orchestrator as orch
+    from ai.mcp_client import MCP_TOOL_NAMES
     from ai.team import definitions as defs
-    for name in defs.BIRDY_WRITE + ("list_slack_reports", "get_client"):
-        _stub(registry, name)
+    hosted = set(MCP_TOOL_NAMES) | set(defs.MCP_HOSTED)
+    calls = []
+
+    @contextlib.asynccontextmanager
+    async def fake_client(user_id):
+        yield object()
+
+    async def schemas(client, allowed):
+        return [{"type": "function", "function": {"name": n, "description": "", "parameters": {"type": "object"}}}
+                for n in sorted(hosted) if allowed is None or n in allowed]
+
+    async def call_tool(client, name, args):
+        calls.append((name, dict(args)))
+        registry.seen.setdefault(name, []).append(dict(args))
+        return json.dumps({"ok": True})
+    monkeypatch.setattr(orch.mcp_client, "needs_mcp", lambda allowed: True)
+    monkeypatch.setattr(orch.mcp_client, "mcp_client_for", fake_client)
+    monkeypatch.setattr(orch.mcp_client, "get_mcp_schemas", schemas)
+    monkeypatch.setattr(orch.mcp_client, "call_mcp_tool", call_tool)
+    return calls
+
+
+async def test_birdy_keeps_agency_writes_in_its_own_chat_only(mock_db, registry, data, mcp):
+    from ai.team import definitions as defs
     p = TeamProvider({"media_buyer": [call("ask_birdy", question="q", client="agency"), say("ok")],
                       "birdy": [say("Birdy here.")]})
     await chat(p, registry, mock_db, agent="birdy")
@@ -177,10 +206,8 @@ async def test_birdy_keeps_agency_writes_in_its_own_chat_only(mock_db, registry,
     assert not asked & set(defs.BIRDY_WRITE) and "get_client" in asked
 
 
-async def test_one_client_birdy_has_no_agency_wide_config_and_pins_its_writes(mock_db, registry, data):
+async def test_one_client_birdy_has_no_agency_wide_config_and_pins_its_writes(mock_db, registry, data, mcp):
     from ai.team import definitions as defs
-    for name in defs.BIRDY_WRITE + ("list_slack_reports",):
-        _stub(registry, name)
     p = TeamProvider({"birdy": [call("add_client_note", client="Beaulea", text="Called them"),
                                 call("set_client_target", client=G2, cpl=40),
                                 tool_call("create_alert", {"name": "CPL", "metric": "cpl", "operator": "gt",
@@ -199,30 +226,16 @@ async def test_one_client_birdy_has_no_agency_wide_config_and_pins_its_writes(mo
     assert registry.seen["update_alert"][-1]["target_group_ids"] == [G1]
 
 
-async def test_birdy_calls_mcp_only_tools_through_mcp(mock_db, registry, monkeypatch):
-    """add_client_note lives on the MCP server only; an agent run calls it through MCP, the general chat
-    keeps its old routing."""
-    import contextlib
-
-    import ai.orchestrator as orch
-    called = []
-
-    @contextlib.asynccontextmanager
-    async def fake_client(user_id):
-        yield object()
-
-    async def schemas(client, allowed):
-        names = ["add_client_note", "get_client_groups"]
-        return [{"type": "function", "function": {"name": n, "description": "", "parameters": {"type": "object"}}}
-                for n in names if allowed is None or n in allowed]
-
-    async def call_tool(client, name, args):
-        called.append((name, args))
-        return json.dumps({"ok": True})
-    monkeypatch.setattr(orch.mcp_client, "needs_mcp", lambda allowed: True)
-    monkeypatch.setattr(orch.mcp_client, "mcp_client_for", fake_client)
-    monkeypatch.setattr(orch.mcp_client, "get_mcp_schemas", schemas)
-    monkeypatch.setattr(orch.mcp_client, "call_mcp_tool", call_tool)
-    p = TeamProvider({"birdy": [call("add_client_note", client="Aura", text="x"), say("Saved.")]})
+async def test_birdy_calls_mcp_only_tools_through_mcp(mock_db, registry, mcp):
+    """add_client_note and set_client_target live on the MCP server only; an agent run calls them through
+    MCP, and the registry's set_client_target (a custom-agent training tool) is never offered instead."""
+    async def training_tool(**kw):
+        raise AssertionError("the training tool ran")
+    registry.register(name="set_client_target", description="training", parameters={"type": "object"},
+                      executor=training_tool)
+    p = TeamProvider({"birdy": [call("add_client_note", client="Aura", text="x"),
+                                call("set_client_target", client="Aura", cpl=30), say("Saved.")]})
     await chat(p, registry, mock_db, agent="birdy")
-    assert called == [("add_client_note", {"client": "Aura", "text": "x"})]
+    assert mcp == [("add_client_note", {"client": "Aura", "text": "x"}),
+                   ("set_client_target", {"client": "Aura", "cpl": 30})]
+    assert p.offered("birdy").count("set_client_target") == 1

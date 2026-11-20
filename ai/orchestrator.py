@@ -988,6 +988,7 @@ async def run_chat(
             s for s in tool_registry.get_schemas(allowed=allowed)
             if s["function"]["name"] not in mcp_client.MCP_TOOL_NAMES
             and (allowed is not None or s["function"]["name"] not in _PAGE_ONLY_TOOLS)
+            and not (frame is not None and s["function"]["name"] in team_defs.MCP_HOSTED)
         ]
         mcp_schemas = await mcp_client.get_mcp_schemas(mcp, allowed) if mcp else None
         if mcp_schemas is None:
