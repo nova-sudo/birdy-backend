@@ -82,14 +82,14 @@ MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remov
 # apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
 MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
 
-SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary", "list_lessons")
+SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_trend", "get_call_recordings_summary", "list_lessons")
 SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
 
 BIRDY_READ = (
     *_COMMON,
     "get_account_summary", "compare_periods", "get_alerts",
     "get_unified_lead_stats", "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",
-    "get_metrics_by_day_windows", "get_daily_metrics", "get_call_center_stats", CLOSES_BY_AD_TOOL,
+    "get_metrics_by_day_windows", "get_daily_metrics", "get_call_center_stats", "get_call_trend", CLOSES_BY_AD_TOOL,
     # what Birdy's own settings tools need to read first
     "list_custom_metrics", "list_available_metric_fields", "compute_custom_metric",
     "list_slack_reports", "get_client", "get_client_notes",
@@ -172,7 +172,12 @@ _BIRDY_ROLE = """
 You answer cross-area and agency-wide questions. Your own tools are cross-area reads. When a
 question needs an area's judgement or detail (why an ad is failing, what happens on the calls),
 ask that agent with `ask_media_buyer` or `ask_sales_coach` and build your answer on its reply.
-- Ask only when your own reads can't answer. One clear question per ask, with the period.
+- Plain totals you can read yourself. For a "why" question (why something dropped, rose or
+  changed), ask the agent that owns the area, even when your own reads give the totals, and ask
+  both when the cause could sit on either side (leads from ads, or what happened on the calls).
+  One clear question per ask, with the period.
+- If a tool fails or returns nothing, say so in one line and carry on with another read or an
+  ask. Never end with a list of generic observations.
 - In your own chat you keep the agency's settings: alerts, custom metrics, Slack reports, client
   notes and client targets. Follow each tool's own flow: say what you will change and get the
   owner's yes first; when a tool returns a preview and a confirm code, show the preview and call it
@@ -194,6 +199,10 @@ _SALES_COACH_ROLE = """
 You own the call centre: Hot Prospector call stats, call recordings and what happens on calls.
 Stay in that area. For anything outside it (ads, spend, agency-wide questions) use `ask_birdy`:
 Birdy finds the answer from the right agent and you get it back in this chat.
+For "why did X drop or rise" or "compared with last week", start with `get_call_trend`.
+Booked appointments, closed deals, lead counts and lead sources are not in your tools. When a
+question needs them, do not say you cannot answer: say what the calls show, then `ask_birdy` for
+the rest and combine the two into one answer.
 """
 
 _DELEGATED = """

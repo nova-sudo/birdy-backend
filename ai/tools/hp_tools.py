@@ -12,14 +12,25 @@ and worked (coverage), so a cheap CPL with a low connect rate is exposed as a
 zombie-lead source rather than a win.
 """
 
+from datetime import date, timedelta
+
 from ai.tools.registry import registry
 from ai.config import MAX_RESULT_ITEMS
+from core.constants import META_CACHE_PRESETS
+
+MAX_TREND_DAYS = 90
+_SUMMED = ("calls", "inbound", "outbound", "answered", "transfers")
 
 
 async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, **_):
     """Per-client HotProspector call stats for a date-window preset, read from the
     `hotprospector_call_cache` on client_groups. Adds derived connect_rate
     (answered / total calls) and leads_called_rate (leads worked / total leads)."""
+    if preset not in META_CACHE_PRESETS:
+        # An unknown window used to come back empty, which read as "no data" (e.g. "last_week").
+        return {"error": f"Unknown preset {preset!r}. Use one of: {', '.join(META_CACHE_PRESETS)}. "
+                         "To compare a period with the one before it (this week against last week), "
+                         "use get_call_trend instead."}
     query = {"user_id": user_id}
     if group_ids:
         query["id"] = {"$in": group_ids}
@@ -73,6 +84,85 @@ async def get_call_center_stats(db, user_id, preset="last_7d", group_ids=None, *
                     "this period; leads_called_rate is given for preset=maximum only."}
 
 
+def _window_totals(rows, since: str, until: str) -> dict:
+    out = {k: 0 for k in _SUMMED}
+    talk = 0.0
+    for r in rows:
+        day = r.get("date") or ""
+        if since <= day <= until:
+            for k in _SUMMED:
+                out[k] += r.get(k) or 0
+            talk += r.get("talk_time") or r.get("talk_min") or 0
+    out["talk_min"] = round(talk, 1)
+    out["connect_rate"] = round(out["answered"] / out["calls"] * 100, 1) if out["calls"] else None
+    return out
+
+
+def _change(now, before):
+    if not before or now is None:
+        return None
+    return round((now - before) / before * 100, 1)
+
+
+async def get_call_trend(db, user_id, days=7, group_ids=None, **_):
+    """Call-centre activity for the last `days` full days against the `days` before them, per client
+    and in total, plus the total per day. Read from the per-day call rows on client_groups
+    (`hp_daily_calls`), the same rows the Sales Coach charts draw."""
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        return {"error": "days must be a whole number of days, e.g. 7"}
+    if days < 1 or days > MAX_TREND_DAYS:
+        return {"error": f"days must be between 1 and {MAX_TREND_DAYS}"}
+
+    query = {"user_id": user_id}
+    if group_ids:
+        query["id"] = {"$in": group_ids}
+    groups = await db["client_groups"].find(query, {"id": 1, "name": 1, "hp_daily_calls": 1, "_id": 0}).to_list(None)
+
+    today = date.today()
+    until = (today - timedelta(days=1)).isoformat()            # today is still filling in
+    since = (today - timedelta(days=days)).isoformat()
+    prev_until = (today - timedelta(days=days + 1)).isoformat()
+    prev_since = (today - timedelta(days=2 * days)).isoformat()
+
+    clients, all_rows = [], []
+    for g in groups:
+        rows = g.get("hp_daily_calls")
+        if not isinstance(rows, list) or not rows:
+            continue  # no call centre data for this client: left out, not shown as zeros
+        now, before = _window_totals(rows, since, until), _window_totals(rows, prev_since, prev_until)
+        all_rows.extend(rows)
+        clients.append({
+            "client_group_id": g.get("id"), "client_group_name": g.get("name"),
+            "current": now, "previous": before,
+            "calls_change_pct": _change(now["calls"], before["calls"]),
+            "answered_change_pct": _change(now["answered"], before["answered"]),
+        })
+    if not clients:
+        return {"error": "No call centre data is stored for these clients yet."}
+
+    now, before = _window_totals(all_rows, since, until), _window_totals(all_rows, prev_since, prev_until)
+    by_day = {}
+    for r in all_rows:
+        day = r.get("date") or ""
+        if prev_since <= day <= until:
+            d = by_day.setdefault(day, {"date": day, "calls": 0, "answered": 0, "transfers": 0})
+            for k in ("calls", "answered", "transfers"):
+                d[k] += r.get(k) or 0
+
+    clients.sort(key=lambda c: c["current"]["calls"], reverse=True)
+    return {
+        "current_period": {"since": since, "until": until, **now},
+        "previous_period": {"since": prev_since, "until": prev_until, **before},
+        "change_pct": {k: _change(now[k], before[k]) for k in (*_SUMMED, "talk_min")},
+        "clients": clients[:MAX_RESULT_ITEMS], "total_clients": len(clients),
+        "daily": [by_day[d] for d in sorted(by_day)],
+        "note": "Full days only; today is left out. These are calls and what happened on them. Booked "
+                "appointments, closed deals and lead counts are not call-centre data and are not here.",
+    }
+
+
 # ── Schema ──────────────────────────────────────────────────────────────────
 
 _CALL_CENTER_PARAMS = {
@@ -110,4 +200,23 @@ def register_hp_tools():
         ),
         parameters=_CALL_CENTER_PARAMS,
         executor=get_call_center_stats,
+    )
+    registry.register(
+        name="get_call_trend",
+        description=(
+            "Compare call-centre activity over the last N full days with the N days before them "
+            "(e.g. this week against last week): calls, answered calls, connect rate, transfers, "
+            "talk time, in total and per client, plus the total per day. Use this for any "
+            "'why did X drop / rise' or 'compared with last week' question about calls."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "days": {"type": "integer", "description": f"Length of each period in days, 1 to {MAX_TREND_DAYS}. Default 7."},
+                "group_ids": {"type": "array", "items": {"type": "string"},
+                              "description": "Optional client group ids to filter to (from get_client_groups)."},
+            },
+            "required": [],
+        },
+        executor=get_call_trend,
     )
