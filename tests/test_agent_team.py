@@ -687,3 +687,14 @@ async def test_stream_is_not_buffered_by_the_app_middleware(mock_mongo_client, m
     first_route = next(t for t, c in chunks if c.startswith("event: route"))
     final = next(t for t, c in chunks if c.startswith("event: final"))
     assert final - first_route >= 0.25     # Birdy's last model call (0.3 s) came after the first route event
+
+
+def test_main_agent_is_offered_propose_sub_agent_only_in_its_own_chat():
+    from ai.team import delegation, route as rt
+
+    def names(agent):
+        return {t["function"]["name"] for t in delegation.tool_schemas(rt.new_turn(agent), [])}
+
+    assert delegation.PROPOSE_SUB_AGENT in names("media_buyer")
+    assert delegation.PROPOSE_SUB_AGENT in names("sales_coach")
+    assert delegation.PROPOSE_SUB_AGENT not in names("birdy")

@@ -48,8 +48,14 @@ class SubAgent:
 
 
 async def _source(db, parent: str, user_id: str) -> list:
-    """Stub until feat/sub-agents merges: no records."""
-    return []
+    """The owner's active specialist sub-agents, from the sub-agent store."""
+    from ai.agents.sub_agents import list_sub_agents as _list
+    rows = await _list(db, user_id, parent, status="active", kind="specialist")
+    out = []
+    for r in rows:
+        clients = r.get("clients")
+        out.append({**r, "client_group_ids": [] if clients == "all" else list(clients or [])})
+    return out
 
 
 def _get(rec, name, default=None):

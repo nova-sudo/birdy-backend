@@ -37,7 +37,8 @@ ASK_SUB_AGENT = "ask_sub_agent"
 PROPOSE_ACTION = "propose_action"
 
 ASK_TOOLS = {ASK_MEDIA_BUYER: defs.MEDIA_BUYER, ASK_SALES_COACH: defs.SALES_COACH, ASK_BIRDY: defs.BIRDY}
-TOOL_NAMES = frozenset({*ASK_TOOLS, ASK_SUB_AGENT, PROPOSE_ACTION})
+PROPOSE_SUB_AGENT = "propose_sub_agent"
+TOOL_NAMES = frozenset({*ASK_TOOLS, ASK_SUB_AGENT, PROPOSE_ACTION, PROPOSE_SUB_AGENT})
 
 AGENCY = "agency"
 ANSWER_MAX_CHARS = 4000      # how much of a child's answer goes back into the parent's context
@@ -120,6 +121,10 @@ def tool_schemas(frame: rt.Frame, subs: list) -> list[dict]:
             out.append(_SCHEMAS[ASK_BIRDY])
         if subs:
             out.append(_sub_schema(subs))
+        if not frame.nested:
+            # Only in the main agent's own chat: the owner is there to approve the card.
+            from ai.agents.sub_agents import propose_tool
+            out.append(propose_tool.tool_schema(frame.agent))
     if frame.nested:
         owner = owner_of(frame)
         if owner:
@@ -174,6 +179,8 @@ async def handle(name: str, args: dict, frame: rt.Frame, ctx: dict) -> str:
     """Run one delegation tool call and return its result for the asking agent."""
     if name == PROPOSE_ACTION:
         return _propose(args, frame)
+    if name == PROPOSE_SUB_AGENT:
+        return await _propose_sub_agent(args, frame, ctx)
 
     turn = frame.turn
     subs = ctx.get("subs") or []
@@ -279,6 +286,32 @@ def _skipped(turn: rt.Turn, key: str, display: str, question: str, asked_by: str
         step = turn.add_step(key, display, question=question, asked_by=asked_by, status="skipped")
         step["summary"] = summary
     turn.changed()
+
+
+async def _propose_sub_agent(args: dict, frame: rt.Frame, ctx: dict) -> str:
+    """A main agent proposes a sub-agent in its own chat. Stored as an inert proposal; the owner
+    approves or rejects it from the card (POST /api/agents/sub/{id}/approve | /reject)."""
+    if frame.nested or frame.agent not in defs.MAIN_AGENTS:
+        return _result(False, error="Only a main agent can propose a sub-agent, in its own chat.")
+    from ai.agents.sub_agents import propose_tool
+    args = {k: v for k, v in (args or {}).items() if k != "parent"}
+    res = await propose_tool.execute(ctx["db"], ctx["user_id"], frame.agent, **args)
+    if not res.get("ok"):
+        return json.dumps(res)
+    sub = res["sub_agent"]
+    frame.turn.proposals.append({
+        "id": "sub_" + str(sub["id"]),
+        "agent": frame.agent,
+        "title": f"New sub-agent: {sub['name']}",
+        "detail": sub.get("purpose") or "",
+        "kind": "sub_agent",
+        "payload": {"sub_agent": sub, "approval": res["approval"]},
+        "status": "pending",
+        "proposed_by": frame.agent,
+        "client_group_id": frame.client_group_id,
+    })
+    frame.turn.changed()
+    return json.dumps({"ok": True, "id": sub["id"], "note": res["note"]})
 
 
 def _propose(args: dict, frame: rt.Frame) -> str:

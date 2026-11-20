@@ -73,7 +73,9 @@ def parent_tool_names(parent: str) -> set[str]:
     Raises ValueError for anything but media_buyer / sales_coach."""
     if parent not in _PARENT_PAGE:
         raise ValueError(f"unknown parent agent: {parent!r}")
-    return set(_page_tools()[_PARENT_PAGE[parent]]) - _ui_only_tools()
+    # A sub-agent only ever reads and proposes, so it may be given its main agent's read tools.
+    from ai.team import definitions as team_defs
+    return set(team_defs.tool_names(parent, nested=True)) - _ui_only_tools()
 
 
 @lru_cache(maxsize=None)

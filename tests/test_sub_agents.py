@@ -42,11 +42,13 @@ async def propose(db, user=U, **over):
 # The tool lists (merge point)
 # ---------------------------------------------------------------------------
 
-def test_parent_tool_lists_come_from_todays_pages():
+def test_parent_tool_lists_are_the_main_agents_read_tools():
     mb, sc = parent_tool_names("media_buyer"), parent_tool_names("sales_coach")
     assert {"get_ad_insights", "get_campaign_insights", "compare_periods"} <= mb
-    assert {"get_call_center_stats", "get_call_recordings_summary", "analyze_call_recordings"} <= sc
-    assert "analyze_call_recordings" not in mb and "get_ad_insights" not in sc
+    assert {"get_call_center_stats", "get_call_recordings_summary"} <= sc
+    assert "get_call_center_stats" not in mb and "get_ad_insights" not in sc
+    # a sub-agent only reads and proposes, so no write tool is on offer
+    assert "analyze_call_recordings" not in sc and "draft_creative_test" not in mb
     assert "render_ui" not in mb | sc  # browser-only tools are left out
     with pytest.raises(ValueError):
         parent_tool_names("birdy")
@@ -107,9 +109,10 @@ async def test_write_tool_refusal_says_the_parent_cant(mock_db):
     assert "can't make the change" in e.value.body["detail"]
 
 
-async def test_a_write_tool_the_parent_has_is_allowed(mock_db):
-    s = await propose(mock_db, tools=["draft_creative_test"])  # on Media Buyer's (campaigns) list
-    assert s["tools"] == ["draft_creative_test"]
+async def test_a_write_tool_is_refused_even_if_the_parent_has_it(mock_db):
+    with pytest.raises(sub.SubAgentError) as e:
+        await propose(mock_db, tools=["draft_creative_test"])
+    assert e.value.code == "tool_not_allowed"
 
 
 async def test_clients_must_be_the_users(mock_db):
