@@ -31,6 +31,7 @@ TURN_BUDGET_SECONDS = 250        # the whole reply, including the parent's last 
 PARENT_RESERVE_SECONDS = 40      # kept back for the parent to answer after its last ask
 ASK_TIMEOUT_SECONDS = 100        # one ask, at most
 MIN_ASK_SECONDS = 15             # less time left than this: don't start an ask
+FINAL_ANSWER_SECONDS = 30        # less time left than this: no more tools, the agent answers now
 NESTED_MAX_TOOL_ITERATIONS = 6   # a delegated run's tool loop (the top level keeps 12)
 
 LIMIT_ASKS, LIMIT_DEPTH, LIMIT_REPEAT = "asks", "depth", "repeat"
@@ -153,7 +154,7 @@ class Turn:
     """Everything shared by the runs of one user reply."""
     root_agent: str
     on_change: Optional[Callable[[dict], None]] = None
-    t0: float = field(default_factory=time.monotonic)
+    t0: float = field(default_factory=lambda: time.monotonic())
     steps: list = field(default_factory=list)
     usages: list = field(default_factory=list)
     proposals: list = field(default_factory=list)
@@ -163,14 +164,25 @@ class Turn:
     status: str = "working"
     credits_total: Optional[float] = None   # the charge actually debited, once known
     _rates: Optional[dict] = None           # credit settings, loaded once per reply
+    budget: Optional[float] = None          # seconds for the whole reply; None = TURN_BUDGET_SECONDS
 
     # time
     def elapsed(self) -> float:
         return time.monotonic() - self.t0
 
+    def budget_seconds(self) -> float:
+        return TURN_BUDGET_SECONDS if self.budget is None else self.budget
+
+    def time_left(self) -> float:
+        return self.budget_seconds() - self.elapsed()
+
+    def must_answer(self) -> bool:
+        """Too little time left for another tool round: every agent in the reply answers now."""
+        return self.time_left() <= FINAL_ANSWER_SECONDS
+
     def ask_timeout(self) -> float:
         """Seconds the next ask may run; <= 0 when no ask may start."""
-        left = TURN_BUDGET_SECONDS - PARENT_RESERVE_SECONDS - self.elapsed()
+        left = self.budget_seconds() - PARENT_RESERVE_SECONDS - self.elapsed()
         t = min(ASK_TIMEOUT_SECONDS, left)
         return t if t >= MIN_ASK_SECONDS else 0
 

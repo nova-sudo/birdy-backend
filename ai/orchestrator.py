@@ -1001,7 +1001,10 @@ async def run_chat(
         logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
         for iteration in range(max_iterations + 1):
-            is_final_iteration = iteration == max_iterations
+            # An agent run also stops on time: with too little of the reply's budget
+            # left for another tool round, it answers now with what it has.
+            out_of_time = frame is not None and frame.turn.must_answer()
+            is_final_iteration = iteration == max_iterations or out_of_time
             call_messages = history
             if is_final_iteration:
                 # Forced final turn — no more tool calls allowed (tools=None below).
@@ -1028,6 +1031,13 @@ async def run_chat(
                     "correct; a complete-looking fabricated one is never "
                     "acceptable, even under repeated pushback.]"
                 )
+                if out_of_time and iteration < max_iterations:
+                    final_turn_notice = (
+                        "\n\n---\n[RUNTIME NOTICE: This reply is out of time and you cannot call any "
+                        "more tools. Answer now with what you have: say plainly which parts you verified "
+                        "with a tool call and which you could not check in time. Do NOT guess or fill any "
+                        "gap with a plausible-looking number.]"
+                    )
                 if history and history[0].get("role") == "system":
                     call_messages = [
                         {**history[0], "content": history[0]["content"] + final_turn_notice},
@@ -1058,6 +1068,10 @@ async def run_chat(
                 reply = materialize_ui(reply, ui_blocks)
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 return await _finish(reply)
+
+            if out_of_time:
+                # Tools were not offered; a model that calls one anyway is not run.
+                break
 
             # Mistral rejects null content — use empty string when model omits it
             assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1109,8 +1123,12 @@ async def run_chat(
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))
 
-                if frame is not None and (tc.name not in offered
-                                          or (nested and tc.name in team_defs.WRITE_TOOLS)):
+                if frame is not None and frame.turn.must_answer():
+                    result = json.dumps({"error": (
+                        "No time is left in this reply to run more tools. Answer with what you have "
+                        "and say what you could not check.")})
+                elif frame is not None and (tc.name not in offered
+                                            or (nested and tc.name in team_defs.WRITE_TOOLS)):
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available to {team_defs.NAMES.get(frame.agent, 'this agent')} "
                         "here. Use only the tools you were given.")})
@@ -1194,4 +1212,7 @@ async def run_chat(
         # mid-stream fragment, not a complete/honest answer. Always use the safe
         # fallback rather than risk surfacing a partial/fabricated reply.
         reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
+        if frame is not None and frame.turn.must_answer():
+            reply = ("I ran out of time before I could finish checking this. Ask again for the part you need "
+                     "most and I'll start there.")
         return await _finish(reply)

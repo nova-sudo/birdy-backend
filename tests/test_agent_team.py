@@ -396,7 +396,8 @@ async def test_ask_timeout_degrades(mock_db, registry, monkeypatch):
 
 
 async def test_no_ask_starts_without_time_left(mock_db, registry, monkeypatch):
-    monkeypatch.setattr(rt, "TURN_BUDGET_SECONDS", 0)
+    # Time left for the parent's own loop, none for an ask.
+    monkeypatch.setattr(rt, "PARENT_RESERVE_SECONDS", rt.TURN_BUDGET_SECONDS)
     p = TeamProvider({"birdy": [call("ask_sales_coach", question="q", client="agency"), say("ok")]})
     out = await chat(p, registry, mock_db, agent="birdy")
     assert out["route"]["steps"][1]["status"] == "failed"
@@ -701,3 +702,47 @@ def test_main_agent_is_offered_propose_sub_agent_only_in_its_own_chat():
     assert delegation.PROPOSE_SUB_AGENT in names("media_buyer")
     assert delegation.PROPOSE_SUB_AGENT in names("sales_coach")
     assert delegation.PROPOSE_SUB_AGENT not in names("birdy")
+
+
+# ── 11. the top-level agent's own loop stops on time ──────────────────────────
+
+async def test_parent_loop_answers_when_the_reply_is_out_of_time(mock_db, registry, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(rt.time, "monotonic", lambda: clock["t"])
+
+    class Slow(TeamProvider):
+        async def chat_completion(self, messages, tools=None, **kw):
+            clock["t"] += 100       # every model call takes 100 s
+            return await super().chat_completion(messages, tools=tools, **kw)
+
+    p = Slow({"birdy": [call("get_account_summary"), call("get_account_summary"), call("get_account_summary"),
+                        say("Here is what I have.")]})
+    out = await chat(p, registry, mock_db, agent="birdy")
+    assert out["reply"] == "Here is what I have."
+    birdy_calls = [c for c in p.calls if c[0] == "birdy"]
+    # before the calls at 0 s, 100 s, 200 s tools are offered; the third call ends at 300 s, past the
+    # 250 s budget, so its tool is not run and the fourth call answers without tools
+    assert [bool(t) for _, t, _ in birdy_calls] == [True, True, True, False]
+    assert "out of time" in birdy_calls[-1][2][0]["content"]
+    assert len(registry.seen["get_account_summary"]) == 2
+
+
+async def test_parent_loop_skips_tools_once_out_of_time(mock_db, registry, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(rt.time, "monotonic", lambda: clock["t"])
+
+    async def slow_tool(db, user_id, mongo_client=None, **kw):
+        clock["t"] += 230
+        return {"spend": 1}
+    registry.register(name="get_account_summary", description="stub",
+                      parameters={"type": "object", "properties": {}}, executor=slow_tool)
+    p = TeamProvider({"birdy": [ProviderResponse(content=None, tool_calls=[
+        ToolCall(id="a", name="get_account_summary", arguments="{}"),
+        ToolCall(id="b", name="get_call_center_stats", arguments="{}")], usage=Usage(1, 1)),
+        say("Partial.")]})
+    out = await chat(p, registry, mock_db, agent="birdy")
+    assert out["reply"] == "Partial."
+    assert "get_call_center_stats" not in registry.seen       # no time left for the second tool
+    skipped = [m for m in p.calls[-1][2] if m["role"] == "tool"][1]
+    assert "No time is left" in json.loads(skipped["content"])["error"]
+    assert p.calls[-1][1] == []
