@@ -188,7 +188,11 @@ def test_media_buyer_has_no_call_or_pipeline_tools():
 
 def test_birdy_reads_across_areas_and_writes_only_agency_settings():
     names = set(defs.tool_names(defs.BIRDY, nested=False))
-    assert {"get_account_summary", "get_call_center_stats", "get_campaign_insights"} - names == {"get_campaign_insights"}
+    assert {"get_account_summary", "get_unified_lead_stats", "get_ghl_opp_stats_windowed"} <= names
+    # no call or ad tool of its own: those questions are always asked of the agent that owns them
+    assert not names & {"get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
+                        "get_campaign_insights", "get_ad_insights", "compare_periods", "get_daily_metrics",
+                        "get_metrics_by_day_windows"}
     assert names & defs.WRITE_TOOLS == set(defs.BIRDY_WRITE)
     # never an ads or a call-centre write
     assert not names & (set(defs.MEDIA_BUYER_WRITE) | set(defs.SALES_COACH_WRITE))
@@ -795,8 +799,8 @@ async def test_call_trend_compares_periods_and_stays_small(mock_db):
     assert "last_7d" in bad["error"] and "get_call_trend" in bad["error"]
 
 
-def test_sales_coach_and_birdy_have_the_call_trend_tool():
+def test_only_sales_coach_has_the_call_trend_tool():
     from ai.team import definitions as defs
     assert "get_call_trend" in defs.tool_names("sales_coach", nested=True)
-    assert "get_call_trend" in defs.tool_names("birdy", nested=True)
+    assert "get_call_trend" not in defs.tool_names("birdy", nested=False)
     assert "get_call_trend" not in defs.tool_names("media_buyer", nested=False)
