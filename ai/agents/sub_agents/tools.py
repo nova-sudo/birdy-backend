@@ -91,6 +91,10 @@ def known_tool_names() -> frozenset:
     names = set(MCP_TOOL_NAMES)
     for page_names in _page_tools().values():
         names.update(page_names)
+    # Tools that only the team's agents have (no page lists them), e.g. get_call_trend.
+    from ai.team import definitions as team_defs
+    for agent in team_defs.AGENT_KEYS:
+        names.update(team_defs.tool_names(agent, nested=False))
     return frozenset(names)
 
 

@@ -820,3 +820,49 @@ async def test_an_agents_instructions_are_rebuilt_every_turn(mock_db, registry, 
     assert systems == ["instructions v2"]
     # the earlier turn is still in the conversation
     assert [m["content"] for m in p.calls[-1][2] if m["role"] == "assistant"][0] == "one"
+
+
+async def test_agents_read_the_owners_chats_with_each_other(mock_db, registry, groups):
+    # the owner tells Birdy something, then goes to Sales Coach and points back at it
+    first = await chat(TeamProvider({"birdy": [say("Noted: a watcher for weekly call drops.")]}), registry, mock_db,
+                       agent="birdy", message="can we make an agent that watches call trends per week?")
+    await chat(TeamProvider({"media_buyer": [say("other client")]}), registry, mock_db, agent="media_buyer",
+               message="about Beaulea only", client_group_id=G2, client_name="Beaulea")
+    p = TeamProvider({"sales_coach": [call("recall_conversations", agent="birdy"), say("Found it.")]})
+    out = await chat(p, registry, mock_db, agent="sales_coach", message="find the chat I just had with Agency Ops")
+    body = json.loads(next(m for m in p.calls[-1][2] if m["role"] == "tool")["content"])
+    conv, = body["conversations"]
+    assert conv["agent"] == "birdy" and conv["with"] == "Birdy"
+    assert sorted(m["from"] for m in conv["messages"]) == ["Birdy", "owner"]
+    assert any("watches call trends per week" in m["text"] for m in conv["messages"])
+    assert out["route"]["steps"][0]["tools"][0]["label"] == "Earlier chats"
+    # never the conversation in hand, never another user's, and inside a client only that client's
+    again = TeamProvider({"sales_coach": [call("recall_conversations"), say("ok")]})
+    await chat(again, registry, mock_db, agent="sales_coach", session_id=out["session_id"], message="again")
+    seen = json.loads([m for m in again.calls[-1][2] if m["role"] == "tool"][-1]["content"])["conversations"]
+    assert out["session_id"] not in {first["session_id"]} and len(seen) == 2
+    scoped = TeamProvider({"sales_coach": [call("recall_conversations"), say("ok")]})
+    await chat(scoped, registry, mock_db, agent="sales_coach", client_group_id=G2, client_name="Beaulea")
+    only = json.loads(next(m for m in scoped.calls[-1][2] if m["role"] == "tool")["content"])["conversations"]
+    assert [c["agent"] for c in only] == ["media_buyer"]
+
+
+async def test_birdy_has_a_main_agent_propose_a_sub_agent(mock_db, registry, groups):
+    p = TeamProvider({
+        "birdy": [call("ask_sales_coach", question="Set up a sub-agent that watches weekly call volume.", client="agency"),
+                  say("Sales Coach proposed it. Its card is below.")],
+        "sales_coach": [ProviderResponse(content=None, tool_calls=[ToolCall(
+                            id="tc-propose", name="propose_sub_agent", arguments=json.dumps({
+                                "name": "Call trend watcher", "purpose": "Flags weekly drops in calls",
+                                "instructions": "Every Monday compare the last 7 days of calls with the 7 before.",
+                                "tools": ["get_call_trend"], "clients": "all"}))], finish_reason="tool_calls", usage=Usage(10, 5)),
+                        say("Proposed.\nSUMMARY: proposed a call trend watcher")],
+    })
+    out = await chat(p, registry, mock_db, agent="birdy", message="make an agent that watches that")
+    assert "propose_sub_agent" in p.offered("sales_coach")
+    prop, = out["proposals"]
+    assert prop["kind"] == "sub_agent" and prop["agent"] == "sales_coach"
+    assert prop["payload"]["sub_agent"]["status"] == "proposed" and prop["payload"]["sub_agent"]["parent"] == "sales_coach"
+    # a main agent asked by another main agent's request (through Birdy) still cannot be told to by a sub-agent,
+    # and Birdy itself is never offered the tool
+    assert "propose_sub_agent" not in p.offered("birdy")
