@@ -408,6 +408,8 @@ async def list_conversations(
                     # the orchestrator's _conversation_scope: exactly one →
                     # a client conversation; zero or several → global.
                     "group_ids": {"$addToSet": "$client_group_id"},
+                    # The team agent this chat is with, if any ($max skips the rows without one).
+                    "agent": {"$max": "$agent"},
                 }},
                 {"$sort": {"updated_at": -1}},
                 {"$limit": MAX_CONVERSATIONS},
@@ -451,6 +453,7 @@ async def list_conversations(
                     "scope": "client" if gid else "global",
                     "client_group_id": gid,
                     "client_name": names.get(gid),
+                    "agent": r.get("agent"),
                     "message_count": r.get("message_count", 0),
                     "created_at": (r.get("created_at") or "").isoformat()
                         if hasattr(r.get("created_at"), "isoformat") else r.get("created_at"),

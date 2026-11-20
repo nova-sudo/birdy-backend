@@ -626,6 +626,9 @@ def test_apply_proposal_runs_the_owner_agent(api, monkeypatch, registry, mock_db
     assert client.post(f"/api/chat/proposals/{pid}/apply").status_code == 404
     convs = client.get("/api/chat/conversations", params={"agent": "sales_coach"}).json()["conversations"]
     assert [c["session_id"] for c in convs] == [out["session_id"]]
+    # the unfiltered list says which agent each chat is with, so each section can show its own
+    every = client.get("/api/chat/conversations").json()["conversations"]
+    assert {c["session_id"]: c["agent"] for c in every}[out["session_id"]] == "sales_coach"
     msgs = client.get(f"/api/chat/conversations/{first['session_id']}").json()["messages"]
     assert msgs[-1]["proposals"][0]["status"] == "approved" and msgs[-1]["route"]["steps"]
 
