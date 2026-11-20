@@ -144,3 +144,88 @@ async def test_main_agent_reads_its_sub_agents_lessons_only(mock_db, registry):
 def test_sub_agents_never_get_their_main_agents_lessons():
     from ai.agents.sub_agents.tools import parent_tool_names
     assert "list_lessons" not in parent_tool_names("media_buyer") | parent_tool_names("sales_coach")
+
+
+# ── the app's lessons API ─────────────────────────────────────────────────────
+
+import contextlib  # noqa: E402
+
+import pytest  # noqa: E402
+from fastapi.testclient import TestClient  # noqa: E402
+
+OTHER = "other@example.com"
+
+
+@pytest.fixture
+def api(mock_mongo_client, monkeypatch):
+    import routers.team as team_router
+    from dependencies import get_current_user
+    from main import app
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+    monkeypatch.setattr(team_router, "get_mongo_client", fake_client)
+    state = {"user": U}
+    app.dependency_overrides[get_current_user] = lambda: state["user"]
+    client = TestClient(app)
+    client.state = state
+    yield client
+    app.dependency_overrides.pop(get_current_user, None)
+
+
+LESSON_KEYS = {"id", "text", "client_group_id", "client_name", "source", "created_at", "updated_at"}
+
+
+async def test_lessons_api_media_buyer_is_the_stock_agents_store(api, mock_db):
+    await _groups(mock_db)
+    r = api.post("/api/team/media_buyer/lessons", json={"text": "x"})
+    assert r.status_code == 404 and r.json() == {"detail": "Media Buyer is not set up yet", "code": "agent_not_found"}
+    assert api.get("/api/team/media_buyer/lessons").json() == {"lessons": []}
+    await mock_db[AGENTS].insert_one({"_id": "stock1", "user_id": U, "type": TYPE_STOCK})
+    from ai.agents.store import add_memory
+    await add_memory(mock_db, "stock1", text="From Teach Birdy", kind="fact", source="chat")
+
+    r = api.post("/api/team/media_buyer/lessons", json={"text": "  Keep  Aura's promo ", "client_group_id": G1})
+    assert r.status_code == 200, r.text
+    made = r.json()
+    assert set(made) == LESSON_KEYS
+    assert made["text"] == "Keep Aura's promo" and made["client_name"] == "Aura" and made["source"] == "app"
+    assert (await mock_db[MEMORY].find_one({"_id": made["id"]}))["agent_id"] == "stock1"   # not a fork
+    await add_memory(mock_db, "stock1", text="Beaulea only", kind="fact", source="chat", client_group_id=G2)
+
+    listed = api.get("/api/team/media_buyer/lessons").json()["lessons"]
+    assert [l["text"] for l in listed] == ["Beaulea only", "Keep Aura's promo", "From Teach Birdy"]
+    aura = api.get("/api/team/media_buyer/lessons", params={"client_group_id": G1}).json()["lessons"]
+    assert [l["text"] for l in aura] == ["Keep Aura's promo", "From Teach Birdy"]
+
+    r = api.patch(f"/api/team/media_buyer/lessons/{made['id']}", json={"text": "Keep the promo"})
+    assert r.status_code == 200 and r.json()["text"] == "Keep the promo"
+    assert r.json()["updated_at"] >= r.json()["created_at"]
+    assert api.delete(f"/api/team/media_buyer/lessons/{made['id']}").json() == {"deleted": True, "id": made["id"]}
+    assert api.delete(f"/api/team/media_buyer/lessons/{made['id']}").json()["code"] == "not_found"
+    assert api.patch(f"/api/team/media_buyer/lessons/{made['id']}", json={"text": "y"}).status_code == 404
+    # Sales Coach's lessons are a different store
+    assert api.get("/api/team/sales_coach/lessons").json() == {"lessons": []}
+
+
+async def test_lessons_api_sales_coach_and_refusals(api, mock_db):
+    await _groups(mock_db)
+    r = api.post("/api/team/sales_coach/lessons", json={"text": "Book within 5 minutes"})
+    assert r.status_code == 200, r.text
+    assert (await mock_db[MEMORY].find_one({"_id": r.json()["id"]}))["agent_id"] == SC_ID
+    assert await mock_db[team_memory.TEAM_AGENTS].count_documents({"_id": SC_ID}) == 1
+    for body, code in [({"text": ""}, "bad_lesson"), ({"text": "x" * 281}, "bad_lesson"), ({"text": 5}, "bad_lesson"),
+                       ({"text": "ok", "client_group_id": "grp-nope"}, "unknown_client")]:
+        r = api.post("/api/team/sales_coach/lessons", json=body)
+        assert (r.status_code, r.json()["code"]) == (400, code), body
+    r = api.get("/api/team/birdy/lessons")
+    assert r.status_code == 400 and r.json()["code"] == "bad_agent"
+    assert api.get("/api/team/sales_coach/lessons", params={"client_group_id": "grp-nope"}).json()["code"] == \
+        "unknown_client"
+    # another user sees none of it and can't touch it
+    lid = api.get("/api/team/sales_coach/lessons").json()["lessons"][0]["id"]
+    api.state["user"] = OTHER
+    assert api.get("/api/team/sales_coach/lessons").json() == {"lessons": []}
+    assert api.patch(f"/api/team/sales_coach/lessons/{lid}", json={"text": "mine"}).status_code == 404
+    assert api.delete(f"/api/team/sales_coach/lessons/{lid}").status_code == 404
