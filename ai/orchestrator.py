@@ -741,6 +741,7 @@ async def run_chat(
         frame = team_route.new_turn(agent, client_group_id=client_group_id, client_name=client_name,
                                     on_change=on_route, model=getattr(provider, "model", None))
         await frame.turn.load_rates(db)
+        frame.turn.changed()   # the stream's first route event: the agent has started
     nested = frame is not None and frame.nested
     # Agent chats are archived with their agent/card (see conversation_log).
     archive_ids = {"agent_id": agent_id, "card_id": card_id}
@@ -1109,6 +1110,9 @@ async def run_chat(
             for tc in response.tool_calls:
                 tools_used.append(tc.name)
                 bad_args = False
+                if frame is not None and tc.name not in delegation.TOOL_NAMES:
+                    frame.step["doing"] = team_route.tool_label(tc.name)
+                    frame.turn.changed()
                 try:
                     args = json.loads(tc.arguments) if tc.arguments else {}
                     if not isinstance(args, dict):
@@ -1210,6 +1214,7 @@ async def run_chat(
                               if tc.name in delegation.TOOL_NAMES else team_route.tool_detail(args))
                     frame.step["tools"].append({"name": tc.name, "label": team_route.tool_label(tc.name),
                                                 "detail": detail})
+                    frame.step["doing"] = None
                     frame.turn.changed()
 
                 changes_before = len(agent_changes)

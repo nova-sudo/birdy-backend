@@ -8,7 +8,7 @@ field of the chat response (CHAT ROUTE CONTRACT v1) and the payload of every
 
 A `Turn` lives for one user reply. The agent the user addressed gets the first
 step; every agent asked during the reply gets the next one, in the order it was
-first involved. `route` stays null until a second agent is involved.
+first involved. A reply an agent wrote alone has a one-step route.
 """
 
 import re
@@ -210,6 +210,7 @@ class Turn:
             "question": question,
             "asked_by": asked_by,
             "tools": [],
+            "doing": None,      # the tool in hand right now, in plain words; null between tools
             "answer": None,
             "credits": 0.0,
             "seconds": 0.0,
@@ -253,8 +254,8 @@ class Turn:
 
     # output
     def to_route(self) -> Optional[dict]:
-        if not self.involved:
-            return None
+        # Always given for an agent's reply, even when it worked alone: the owner sees what the
+        # agent is doing (its step, the tool in hand, the tools used) from the first moment.
         step_credits = [s["credits"] for s in self.steps]
         total = self.credits_total if self.credits_total is not None else round(sum(step_credits), 4)
         return {
@@ -267,7 +268,7 @@ class Turn:
 
     def changed(self) -> None:
         """Tell the stream the route changed (agent started, tool finished, agent answered)."""
-        if self.on_change is None or not self.involved:
+        if self.on_change is None:
             return
         try:
             self.on_change(self.to_route())

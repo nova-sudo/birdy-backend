@@ -30,7 +30,7 @@ G1, G2 = "grp-aura", "grp-beaulea"
 
 ROUTE_KEYS = {"status", "seconds", "credits", "limit_hit", "steps"}
 STEP_KEYS = {"id", "agent", "name", "kind", "status", "summary", "question", "asked_by", "tools",
-             "answer", "credits", "seconds"}
+             "doing", "answer", "credits", "seconds"}
 TOOL_KEYS = {"name", "label", "detail"}
 PROPOSAL_KEYS = {"id", "agent", "title", "detail", "kind", "payload", "status"}
 
@@ -258,13 +258,19 @@ async def test_main_agents_cannot_ask_each_other(mock_db, registry):
     out = await chat(p, registry, mock_db, agent="media_buyer")
     tool_msg = next(m for m in p.calls[-1][2] if m["role"] == "tool")
     assert "isn't available" in json.loads(tool_msg["content"])["error"]
-    assert out["route"] is None
+    assert [s["agent"] for s in out["route"]["steps"]] == ["media_buyer"]
 
 
-async def test_no_route_when_no_other_agent_involved(mock_db, registry):
+async def test_an_agent_working_alone_still_reports_its_step(mock_db, registry):
+    seen = []
     p = TeamProvider({"sales_coach": [call("get_call_center_stats"), say("212 calls.")]})
-    out = await chat(p, registry, mock_db, agent="sales_coach")
-    assert out["route"] is None and out["proposals"] == []
+    out = await chat(p, registry, mock_db, agent="sales_coach", on_route=seen.append)
+    step, = out["route"]["steps"]
+    assert step["agent"] == "sales_coach" and step["status"] == "done" and step["doing"] is None
+    assert [t["name"] for t in step["tools"]] == ["get_call_center_stats"] and out["proposals"] == []
+    # live: it starts, then names the tool in hand, before the reply
+    assert seen[0]["status"] == "working" and seen[0]["steps"][0]["tools"] == []
+    assert any(r["steps"][0]["doing"] == "Call stats" for r in seen)
 
 
 # ── 4. nested runs save, archive and debit once ───────────────────────────────
@@ -437,7 +443,7 @@ async def test_agency_ask_carries_one_client(mock_db, registry, groups):
 async def test_ask_with_unknown_client_is_refused(mock_db, registry, groups):
     p = TeamProvider({"birdy": [call("ask_sales_coach", question="q", client="grp-not-mine"), say("ok")]})
     out = await chat(p, registry, mock_db, agent="birdy")
-    assert out["route"] is None
+    assert [s["agent"] for s in out["route"]["steps"]] == ["birdy"]
     body = json.loads(next(m for m in p.calls[-1][2] if m["role"] == "tool")["content"])
     assert body["ok"] is False and "get_client_groups" in body["error"]
 
@@ -570,7 +576,8 @@ def test_stream_event_order(api, monkeypatch, registry):
     for rte in routes:
         assert_route_shape(rte)
     # agent starts -> tool finishes -> agent answers -> reply done
-    assert routes[0]["steps"][1]["status"] == "working"
+    assert len(routes[0]["steps"]) == 1 and routes[0]["status"] == "working"   # Birdy alone, just started
+    assert next(r for r in routes if len(r["steps"]) > 1)["steps"][1]["status"] == "working"
     assert any(r["steps"][1]["tools"] for r in routes if len(r["steps"]) > 1)
     assert routes[-1]["status"] == "done"
     final = events[-1][1]
@@ -588,7 +595,8 @@ def test_stream_error_event(api, monkeypatch, registry):
     _use(monkeypatch, chat_router, Broken({}), registry)
     with TestClient(app).stream("POST", "/api/chat/stream", json={"message": "x", "agent": "birdy"}) as r:
         events = _events(r.read().decode())
-    assert events == [("error", {"message": "Failed to process chat message"})]
+    assert events[-1] == ("error", {"message": "Failed to process chat message"})
+    assert {e for e, _ in events[:-1]} <= {"route"}
 
 
 def test_stream_keeps_status_codes(api, monkeypatch, registry):
