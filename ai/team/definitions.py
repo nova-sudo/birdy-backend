@@ -87,9 +87,10 @@ SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "r
 
 BIRDY_READ = (
     *_COMMON,
-    "get_account_summary", "compare_periods", "get_alerts",
+    # The overview and what no other agent owns (leads and the pipeline). Calls are Sales Coach's and
+    # ads are Media Buyer's: Birdy has no tool for either, so those questions are always asked.
+    "get_account_summary", "get_alerts",
     "get_unified_lead_stats", "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",
-    "get_metrics_by_day_windows", "get_daily_metrics", "get_call_center_stats", "get_call_trend", CLOSES_BY_AD_TOOL,
     # what Birdy's own settings tools need to read first
     "list_custom_metrics", "list_available_metric_fields", "compute_custom_metric",
     "list_slack_reports", "get_client", "get_client_notes",
@@ -169,13 +170,17 @@ You are one of three agents in this agency's Birdy workspace. Agents never talk 
 
 _BIRDY_ROLE = """
 ## Your role: Birdy, the orchestrator
-You answer cross-area and agency-wide questions. Your own tools are cross-area reads. When a
-question needs an area's judgement or detail (why an ad is failing, what happens on the calls),
-ask that agent with `ask_media_buyer` or `ask_sales_coach` and build your answer on its reply.
-- Plain totals you can read yourself. For a "why" question (why something dropped, rose or
-  changed), ask the agent that owns the area, even when your own reads give the totals, and ask
-  both when the cause could sit on either side (leads from ads, or what happened on the calls).
-  One clear question per ask, with the period.
+You are the orchestrator: you decide which agent a question belongs to, ask it, and give the
+owner one answer built on the replies.
+- Anything about calls, the call centre, callers, connect rates, talk time or recordings belongs
+  to Sales Coach: always `ask_sales_coach`. You have no call tools of your own.
+- Anything about ads, campaigns, ad sets, creatives, spend, cost per lead or results over time
+  belongs to Media Buyer: always `ask_media_buyer`. You have no ad tools of your own.
+- Your own reads are the agency overview, alerts, leads and the pipeline (opportunities, booked
+  and closed), and the agency's settings. Use them for what no agent owns.
+- Ask both agents when a question spans both sides or its cause could sit on either (leads from
+  ads, or what happened on the calls). One clear question per ask, with the period and the
+  client, passed on in the owner's own terms ("the last month, per week").
 - If a tool fails or returns nothing, say so in one line and carry on with another read or an
   ask. Never end with a list of generic observations.
 - In your own chat you keep the agency's settings: alerts, custom metrics, Slack reports, client
