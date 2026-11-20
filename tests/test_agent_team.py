@@ -185,10 +185,14 @@ def test_media_buyer_has_no_call_or_pipeline_tools():
                         "get_ghl_opp_stats_windowed", "get_unified_leads"}
 
 
-def test_birdy_reads_across_areas_and_writes_nothing():
+def test_birdy_reads_across_areas_and_writes_only_agency_settings():
     names = set(defs.tool_names(defs.BIRDY, nested=False))
     assert {"get_account_summary", "get_call_center_stats", "get_campaign_insights"} - names == {"get_campaign_insights"}
-    assert not names & defs.WRITE_TOOLS
+    assert names & defs.WRITE_TOOLS == set(defs.BIRDY_WRITE)
+    # never an ads or a call-centre write
+    assert not names & (set(defs.MEDIA_BUYER_WRITE) | set(defs.SALES_COACH_WRITE))
+    # asked by another agent, Birdy only reads
+    assert not set(defs.tool_names(defs.BIRDY, nested=True)) & defs.WRITE_TOOLS
 
 
 async def test_offered_tools_per_agent(mock_db, registry):
@@ -200,7 +204,7 @@ async def test_offered_tools_per_agent(mock_db, registry):
     assert "ask_birdy" in mb and "ask_sales_coach" not in mb and "ask_media_buyer" not in mb
     assert "ask_birdy" in sc and "ask_media_buyer" not in sc and "ask_sales_coach" not in sc
     assert "get_call_center_stats" in sc and "get_call_center_stats" not in mb
-    assert "create_alert" not in birdy + mb + sc
+    assert "create_alert" in birdy and "create_alert" not in mb + sc
 
 
 # ── 3. ask down, ask up ───────────────────────────────────────────────────────

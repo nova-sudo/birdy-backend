@@ -686,9 +686,9 @@ def _agent_tool_names(frame) -> list:
     """The registry/MCP tools one agent run may use. A sub-agent's list is cut to its main
     agent's read tools: never more than the main agent has, never a write."""
     if frame.sub is not None:
-        parent = set(team_defs.tool_names(frame.parent_main, nested=True))
+        parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
         return [n for n in frame.sub.tools if n in parent]
-    return team_defs.tool_names(frame.agent, nested=frame.nested)
+    return team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
 
 
 async def run_chat(
@@ -988,6 +988,11 @@ async def run_chat(
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
         tool_schemas = registry_schemas + mcp_schemas
+        # An agent run may be offered MCP-hosted tools the orchestrator has no copy of (Birdy's client
+        # note, target and Slack report tools); those are called through MCP. The general chat is unchanged.
+        registry_names = {s["function"]["name"] for s in registry_schemas}
+        mcp_only = ({s["function"]["name"] for s in mcp_schemas} - registry_names - mcp_client.MCP_TOOL_NAMES
+                    if frame is not None and mcp is not None else set())
         delegation_ctx = None
         if frame is not None:
             # The ask / propose tools, and every tool name this run may call:
@@ -1147,12 +1152,16 @@ async def run_chat(
                     result = json.dumps({"error": (
                         "Your arguments for this tool were not valid JSON — most likely cut off because they "
                         "were too long. Call it again with a shorter payload (fewer or simpler blocks).")})
+                elif frame is not None and client_group_id and (
+                        refusal := await team_pinning.guard_write(tc.name, args, db=db, user_id=user_id,
+                                                                  client_group_id=client_group_id)):
+                    result = refusal
                 elif frame is not None and client_group_id and tc.name in team_pinning.PINNED_TOOLS:
                     # No client argument to overwrite: run the client-scoped version.
                     result = await team_pinning.run_pinned(tc.name, args, db=db, user_id=user_id,
                                                            client_group_id=client_group_id,
                                                            mongo_client=mongo_client)
-                elif tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
+                elif (tc.name in mcp_client.MCP_TOOL_NAMES or tc.name in mcp_only) and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:
                     call_args = args

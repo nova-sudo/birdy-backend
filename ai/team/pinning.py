@@ -21,6 +21,9 @@ or filters everything else.
 
 Client-named tools (Birdy's client note and target tools) take the client's id instead:
 CLIENT_ARG_TOOLS have their `client` argument overwritten, the same way group ids are.
+
+Birdy's alert writes in a one-client run (`guard_write`): a new alert targets only this client, and
+an alert that also covers other clients can't be changed from here.
 """
 
 import json
@@ -227,3 +230,19 @@ async def run_pinned(name: str, args: dict, *, db, user_id: str, client_group_id
 def pin_client_arg(name: str, args: dict, client_group_id: str) -> None:
     if name in CLIENT_ARG_TOOLS:
         args["client"] = client_group_id
+
+
+async def guard_write(name: str, args: dict, *, db, user_id: str, client_group_id: str) -> str | None:
+    """A one-client run's alert writes stay on that client. Returns a refusal (the tool result), or None
+    to run the tool with `args` as pinned here."""
+    if name == "create_alert":
+        args["target_group_ids"] = [client_group_id]
+    elif name == "update_alert":
+        alert = await db["alerts"].find_one({"user_id": user_id, "id": str(args.get("alert_id") or "")},
+                                            {"target_group_ids": 1})
+        if alert is None or list(alert.get("target_group_ids") or []) != [client_group_id]:
+            return _refuse("That alert covers other clients too (or is not this client's), so it can't be "
+                           "changed from this client's chat. Change it from the agency chat.")
+        if "target_group_ids" in args:
+            args["target_group_ids"] = [client_group_id]
+    return None

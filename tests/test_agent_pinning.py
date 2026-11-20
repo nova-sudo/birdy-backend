@@ -141,3 +141,88 @@ async def test_agency_runs_are_not_pinned(mock_db, data, registry):
     p = TeamProvider({"media_buyer": [call("list_ad_accounts"), say("ok")]})
     await chat(p, registry, mock_db, agent="media_buyer")
     assert seen == [1]
+
+
+# ── Birdy's own agency-level write tools ──────────────────────────────────────
+
+def tool_call(name, args):
+    from ai.providers.base import ProviderResponse, ToolCall, Usage
+    return ProviderResponse(content=None, tool_calls=[ToolCall(id=f"tc-{name}", name=name, arguments=json.dumps(args))],
+                            finish_reason="tool_calls", usage=Usage(1, 1))
+
+
+def _stub(registry, name, result=None):
+    seen = registry.seen.setdefault(name, [])
+
+    async def run(db, user_id, mongo_client=None, **kw):
+        seen.append(kw)
+        return result or {"ok": True}
+    registry.register(name=name, description="stub", parameters={"type": "object", "properties": {}}, executor=run)
+
+
+async def test_birdy_keeps_agency_writes_in_its_own_chat_only(mock_db, registry, data):
+    from ai.team import definitions as defs
+    for name in defs.BIRDY_WRITE + ("list_slack_reports", "get_client"):
+        _stub(registry, name)
+    p = TeamProvider({"media_buyer": [call("ask_birdy", question="q", client="agency"), say("ok")],
+                      "birdy": [say("Birdy here.")]})
+    await chat(p, registry, mock_db, agent="birdy")
+    own = set(p.offered("birdy"))
+    assert set(defs.BIRDY_WRITE) <= own
+    assert not own & {"draft_creative_test", "post_creative_test", "apply_card_lines", "analyze_call_recordings",
+                      "create_saved_view", "propose_report"}
+    p.calls.clear()
+    await chat(p, registry, mock_db, agent="media_buyer")
+    asked = set(p.offered("birdy"))          # Birdy asked by Media Buyer: read only
+    assert not asked & set(defs.BIRDY_WRITE) and "get_client" in asked
+
+
+async def test_one_client_birdy_has_no_agency_wide_config_and_pins_its_writes(mock_db, registry, data):
+    from ai.team import definitions as defs
+    for name in defs.BIRDY_WRITE + ("list_slack_reports",):
+        _stub(registry, name)
+    p = TeamProvider({"birdy": [call("add_client_note", client="Beaulea", text="Called them"),
+                                call("set_client_target", client=G2, cpl=40),
+                                tool_call("create_alert", {"name": "CPL", "metric": "cpl", "operator": "gt",
+                                                           "value": 50, "target_group_ids": [G1, G2]}),
+                                call("update_alert", alert_id="al2", status="paused"),
+                                call("update_alert", alert_id="al1", status="paused", target_group_ids=[G2]),
+                                say("Done.")]})
+    await chat(p, registry, mock_db, agent="birdy", client_group_id=G1, client_name="Aura")
+    offered = set(p.offered("birdy"))
+    assert not offered & defs.AGENCY_ONLY_TOOLS and "add_client_note" in offered
+    assert registry.seen["add_client_note"][-1]["client"] == G1
+    assert registry.seen["set_client_target"][-1]["client"] == G1
+    assert registry.seen["create_alert"][-1]["target_group_ids"] == [G1]
+    # al2 covers Beaulea too: refused; al1 is Aura's alone: changed, and kept on Aura
+    assert [c["alert_id"] for c in registry.seen["update_alert"]] == ["al1"]
+    assert registry.seen["update_alert"][-1]["target_group_ids"] == [G1]
+
+
+async def test_birdy_calls_mcp_only_tools_through_mcp(mock_db, registry, monkeypatch):
+    """add_client_note lives on the MCP server only; an agent run calls it through MCP, the general chat
+    keeps its old routing."""
+    import contextlib
+
+    import ai.orchestrator as orch
+    called = []
+
+    @contextlib.asynccontextmanager
+    async def fake_client(user_id):
+        yield object()
+
+    async def schemas(client, allowed):
+        names = ["add_client_note", "get_client_groups"]
+        return [{"type": "function", "function": {"name": n, "description": "", "parameters": {"type": "object"}}}
+                for n in names if allowed is None or n in allowed]
+
+    async def call_tool(client, name, args):
+        called.append((name, args))
+        return json.dumps({"ok": True})
+    monkeypatch.setattr(orch.mcp_client, "needs_mcp", lambda allowed: True)
+    monkeypatch.setattr(orch.mcp_client, "mcp_client_for", fake_client)
+    monkeypatch.setattr(orch.mcp_client, "get_mcp_schemas", schemas)
+    monkeypatch.setattr(orch.mcp_client, "call_mcp_tool", call_tool)
+    p = TeamProvider({"birdy": [call("add_client_note", client="Aura", text="x"), say("Saved.")]})
+    await chat(p, registry, mock_db, agent="birdy")
+    assert called == [("add_client_note", {"client": "Aura", "text": "x"})]
