@@ -104,16 +104,26 @@ def _change(now, before):
     return round((now - before) / before * 100, 1)
 
 
-async def get_call_trend(db, user_id, days=7, group_ids=None, **_):
-    """Call-centre activity for the last `days` full days against the `days` before them, per client
-    and in total, plus the total per day. Read from the per-day call rows on client_groups
-    (`hp_daily_calls`), the same rows the Sales Coach charts draw."""
+MAX_TREND_PERIODS = 12
+TREND_CLIENTS = 10
+
+
+async def get_call_trend(db, user_id, days=7, periods=2, group_ids=None, **_):
+    """Call-centre activity in consecutive periods of `days` full days, newest first: the last
+    `days` days, the `days` before them, and so on for `periods` periods (7 x 4 = the last four
+    weeks, week by week). Totals per period, plus the busiest clients' calls per period. Read from
+    the per-day call rows on client_groups (`hp_daily_calls`), the rows the Sales Coach charts draw.
+    Kept small on purpose: a tool result is cut at a few thousand characters."""
     try:
-        days = int(days)
+        days, periods = int(days), int(periods)
     except (TypeError, ValueError):
-        return {"error": "days must be a whole number of days, e.g. 7"}
+        return {"error": "days and periods must be whole numbers, e.g. days=7, periods=4"}
     if days < 1 or days > MAX_TREND_DAYS:
         return {"error": f"days must be between 1 and {MAX_TREND_DAYS}"}
+    if periods < 2 or periods > MAX_TREND_PERIODS:
+        return {"error": f"periods must be between 2 and {MAX_TREND_PERIODS}"}
+    if days * periods > 366:
+        return {"error": "That reaches back more than a year. Use fewer or shorter periods."}
 
     query = {"user_id": user_id}
     if group_ids:
@@ -121,45 +131,36 @@ async def get_call_trend(db, user_id, days=7, group_ids=None, **_):
     groups = await db["client_groups"].find(query, {"id": 1, "name": 1, "hp_daily_calls": 1, "_id": 0}).to_list(None)
 
     today = date.today()
-    until = (today - timedelta(days=1)).isoformat()            # today is still filling in
-    since = (today - timedelta(days=days)).isoformat()
-    prev_until = (today - timedelta(days=days + 1)).isoformat()
-    prev_since = (today - timedelta(days=2 * days)).isoformat()
+    # windows[0] is the newest: the `days` full days ending yesterday (today is still filling in).
+    windows = [((today - timedelta(days=days * (n + 1))).isoformat(),
+                (today - timedelta(days=days * n + 1)).isoformat()) for n in range(periods)]
 
     clients, all_rows = [], []
     for g in groups:
         rows = g.get("hp_daily_calls")
         if not isinstance(rows, list) or not rows:
             continue  # no call centre data for this client: left out, not shown as zeros
-        now, before = _window_totals(rows, since, until), _window_totals(rows, prev_since, prev_until)
+        per = [_window_totals(rows, since, until) for since, until in windows]
         all_rows.extend(rows)
         clients.append({
             "client_group_id": g.get("id"), "client_group_name": g.get("name"),
-            "current": now, "previous": before,
-            "calls_change_pct": _change(now["calls"], before["calls"]),
-            "answered_change_pct": _change(now["answered"], before["answered"]),
+            "calls": [p["calls"] for p in per], "answered": [p["answered"] for p in per],
+            "calls_change_pct": _change(per[0]["calls"], per[1]["calls"]),
         })
     if not clients:
         return {"error": "No call centre data is stored for these clients yet."}
 
-    now, before = _window_totals(all_rows, since, until), _window_totals(all_rows, prev_since, prev_until)
-    by_day = {}
-    for r in all_rows:
-        day = r.get("date") or ""
-        if prev_since <= day <= until:
-            d = by_day.setdefault(day, {"date": day, "calls": 0, "answered": 0, "transfers": 0})
-            for k in ("calls", "answered", "transfers"):
-                d[k] += r.get(k) or 0
-
-    clients.sort(key=lambda c: c["current"]["calls"], reverse=True)
+    totals = [{"since": since, "until": until, **_window_totals(all_rows, since, until)} for since, until in windows]
+    clients.sort(key=lambda c: c["calls"][0], reverse=True)
     return {
-        "current_period": {"since": since, "until": until, **now},
-        "previous_period": {"since": prev_since, "until": prev_until, **before},
-        "change_pct": {k: _change(now[k], before[k]) for k in (*_SUMMED, "talk_min")},
-        "clients": clients[:MAX_RESULT_ITEMS], "total_clients": len(clients),
-        "daily": [by_day[d] for d in sorted(by_day)],
-        "note": "Full days only; today is left out. These are calls and what happened on them. Booked "
-                "appointments, closed deals and lead counts are not call-centre data and are not here.",
+        "days_per_period": days,
+        "periods": totals,                                   # newest first
+        "change_pct_latest_vs_previous": {k: _change(totals[0][k], totals[1][k]) for k in (*_SUMMED, "talk_min")},
+        "clients": clients[:TREND_CLIENTS], "total_clients": len(clients), "shown_clients": min(len(clients), TREND_CLIENTS),
+        "note": "Periods and each client's calls/answered lists are newest first. Full days only; today is "
+                "left out. Clients are the busiest in the newest period; pass group_ids for others. These "
+                "are calls and what happened on them: booked appointments, closed deals and lead counts "
+                "are not call-centre data and are not here.",
     }
 
 
@@ -204,15 +205,17 @@ def register_hp_tools():
     registry.register(
         name="get_call_trend",
         description=(
-            "Compare call-centre activity over the last N full days with the N days before them "
-            "(e.g. this week against last week): calls, answered calls, connect rate, transfers, "
-            "talk time, in total and per client, plus the total per day. Use this for any "
+            "Call-centre activity in consecutive periods, newest first: calls, answered calls, connect "
+            "rate, transfers and talk time per period, plus the busiest clients' calls per period. "
+            "This week against last week is days=7, periods=2; the last month week by week is days=7, "
+            "periods=4; month against month is days=30, periods=2. Use this for any 'trend', 'per week', "
             "'why did X drop / rise' or 'compared with last week' question about calls."
         ),
         parameters={
             "type": "object",
             "properties": {
                 "days": {"type": "integer", "description": f"Length of each period in days, 1 to {MAX_TREND_DAYS}. Default 7."},
+                "periods": {"type": "integer", "description": f"How many consecutive periods, 2 to {MAX_TREND_PERIODS}. Default 2."},
                 "group_ids": {"type": "array", "items": {"type": "string"},
                               "description": "Optional client group ids to filter to (from get_client_groups)."},
             },
