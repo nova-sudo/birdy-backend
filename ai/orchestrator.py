@@ -774,10 +774,16 @@ async def run_chat(
     # Defensive clean-up: remove malformed history that causes Mistral 400s
     history[:] = session_store.sanitize_history(history)
 
-    # Inject system prompt once per session
-    if not history and frame is not None:
-        history.append({"role": "system", "content": await _agent_system_prompt(
-            frame, db, user_id, client_group_id, client_name, source)})
+    # Inject system prompt once per session. An agent's is rebuilt every turn instead: its
+    # instructions, the agency Context and its lessons change between turns, and a conversation
+    # that began under older instructions must not keep them.
+    if frame is not None:
+        fresh = {"role": "system", "content": await _agent_system_prompt(
+            frame, db, user_id, client_group_id, client_name, source)}
+        if history and history[0].get("role") == "system":
+            history[0] = fresh
+        else:
+            history.insert(0, fresh)
     elif not history:
         if page == "client_detail" and client_group_id and client_name:
             system_content = _build_client_detail_prompt(client_name, client_group_id)
