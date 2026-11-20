@@ -586,3 +586,96 @@ def test_stream_keeps_status_codes(api, monkeypatch, registry):
     monkeypatch.setattr(chat_router, "check_credits", out_of_credits)
     _use(monkeypatch, chat_router, _script(), registry)
     assert TestClient(app).post("/api/chat/stream", json={"message": "x", "agent": "birdy"}).status_code == 402
+
+
+# ── 10. approving a proposal hands it to the owning agent ─────────────────────
+
+def _proposing_script():
+    return TeamProvider({
+        "birdy": [call("ask_sales_coach", question="Analyze Aura's calls", client="agency"), say("See the card.")],
+        "sales_coach": [call("propose_action", title="Analyze 10 Aura calls", detail="38 recorded",
+                             kind="analyze_call_recordings", payload={"group_id": G1, "limit": 10}),
+                        say("Proposed it.")],
+    })
+
+
+def test_apply_proposal_runs_the_owner_agent(api, monkeypatch, registry, mock_db):
+    chat_router, app = api
+    p = _proposing_script()
+    _use(monkeypatch, chat_router, p, registry)
+    client = TestClient(app)
+    first = client.post("/api/chat", json={"message": "calls?", "agent": "birdy"}).json()
+    pid = first["proposals"][0]["id"]
+    p.scripts["sales_coach"] = [say("This shows a preview first: 10 calls, about 25 credits. Go ahead?")]
+    out = client.post(f"/api/chat/proposals/{pid}/apply").json()
+    owner_call = [c for c in p.calls if c[0] == "sales_coach"][-1]
+    # a top-level Sales Coach turn: its own write tool is offered, with its own confirm flow
+    assert "analyze_call_recordings" in owner_call[1] and "propose_action" not in owner_call[1]
+    user_turn = next(m for m in owner_call[2] if m["role"] == "user")
+    assert user_turn["content"].startswith("[APPROVED_PROPOSAL]") and '"limit": 10' in user_turn["content"]
+    assert out["session_id"] != first["session_id"] and out["reply"].endswith("Go ahead?")
+    # approved once only
+    assert client.post(f"/api/chat/proposals/{pid}/apply").status_code == 404
+    convs = client.get("/api/chat/conversations", params={"agent": "sales_coach"}).json()["conversations"]
+    assert [c["session_id"] for c in convs] == [out["session_id"]]
+    msgs = client.get(f"/api/chat/conversations/{first['session_id']}").json()["messages"]
+    assert msgs[-1]["proposals"][0]["status"] == "approved" and msgs[-1]["route"]["steps"]
+
+
+def test_dismiss_proposal(api, monkeypatch, registry):
+    chat_router, app = api
+    _use(monkeypatch, chat_router, _proposing_script(), registry)
+    client = TestClient(app)
+    pid = client.post("/api/chat", json={"message": "calls?", "agent": "birdy"}).json()["proposals"][0]["id"]
+    assert client.post(f"/api/chat/proposals/{pid}/dismiss").json()["status"] == "dismissed"
+    assert client.post(f"/api/chat/proposals/{pid}/apply").status_code == 404
+    assert client.post("/api/chat/proposals/p_nope/dismiss").status_code == 404
+
+
+async def test_stream_is_not_buffered_by_the_app_middleware(mock_mongo_client, monkeypatch, registry):
+    """Through main.app's whole middleware stack (CORS, token refresh, ETag), route
+    events reach the client while the turn is still running, not all at the end."""
+    import time
+
+    import main
+    import routers.chat as chat_router
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+
+    async def no_gate(user, client):
+        return None
+    p = _script()
+    p.delays = {"birdy": 0.3}
+    monkeypatch.setattr(chat_router, "get_mongo_client", fake_client)
+    monkeypatch.setattr(chat_router, "check_credits", no_gate)
+    _use(monkeypatch, chat_router, p, registry)
+    main.app.dependency_overrides[chat_router.get_current_user] = lambda: U
+    body = json.dumps({"message": "calls?", "agent": "birdy"}).encode()
+    scope = {"type": "http", "asgi": {"version": "3.0"}, "http_version": "1.1", "method": "POST",
+             "scheme": "http", "path": "/api/chat/stream", "raw_path": b"/api/chat/stream", "query_string": b"",
+             "headers": [(b"content-type", b"application/json"), (b"host", b"test")],
+             "client": ("t", 1), "server": ("test", 80), "root_path": ""}
+    sent = [False]
+
+    async def receive():
+        if not sent[0]:
+            sent[0] = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await asyncio.sleep(10)
+        return {"type": "http.disconnect"}
+
+    chunks = []
+    t0 = time.monotonic()
+
+    async def send(message):
+        if message["type"] == "http.response.body" and message.get("body"):
+            chunks.append((time.monotonic() - t0, message["body"].decode()))
+    try:
+        await main.app(scope, receive, send)
+    finally:
+        main.app.dependency_overrides.pop(chat_router.get_current_user, None)
+    first_route = next(t for t, c in chunks if c.startswith("event: route"))
+    final = next(t for t, c in chunks if c.startswith("event: final"))
+    assert final - first_route >= 0.25     # Birdy's last model call (0.3 s) came after the first route event
