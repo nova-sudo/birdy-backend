@@ -77,6 +77,10 @@ MEDIA_BUYER_READ = (
     "list_lessons",
 )
 MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remove_lesson")
+# One stock agent card's tools: offered to Media Buyer's own chat only for the turn that applies an
+# approved proposal naming that card (routers/chat.apply_proposal pins the card, after an owner check).
+# apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
+MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
 
 SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary", "list_lessons")
 SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
@@ -142,6 +146,8 @@ def tool_names(agent: str, *, nested: bool, one_client: bool = False) -> list[st
 
 def write_tools(agent: str) -> tuple:
     """The write tools this agent owns, which proposals can name as their kind."""
+    if agent == MEDIA_BUYER:
+        return _WRITE[agent] + ("apply_card_lines",)
     return _WRITE.get(agent, ())
 
 

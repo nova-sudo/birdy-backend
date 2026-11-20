@@ -695,7 +695,11 @@ def _agent_tool_names(frame) -> list:
         parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
         from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
         return [n for n in frame.sub.tools if n in parent and n not in NOT_FOR_SUB_AGENTS]
-    return team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
+    names = team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
+    if frame.agent == team_defs.MEDIA_BUYER and not frame.nested and stock_card_tools.current_stock_card.get():
+        # Applying an approved proposal that names one card (routers/chat.apply_proposal).
+        names = names + list(team_defs.MEDIA_BUYER_CARD_TOOLS)
+    return names
 
 
 async def run_chat(
