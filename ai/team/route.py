@@ -60,6 +60,8 @@ TOOL_LABELS = {
     "get_ghl_opp_stats_windowed": "Pipeline for a period",
     "get_call_center_stats": "Call stats",
     "get_call_trend": "Calls against the period before",
+    "recall_conversations": "Earlier chats",
+    "propose_sub_agent": "A new sub-agent",
     "get_call_recordings_summary": "Call recordings",
     "analyze_call_recordings": "Call analysis",
     "find_ads": "Ad search",
@@ -289,6 +291,10 @@ class Frame:
     client_name: Optional[str] = None
     sub: object = None          # the SubAgent record, for "sub:<id>" frames
     parent_main: Optional[str] = None   # for a sub-agent: its main agent's key
+
+    def parent_is_birdy(self) -> bool:
+        """Asked directly by Birdy (the chain ends ..., birdy, this agent)."""
+        return len(self.chain) >= 2 and self.chain[-2] == defs.BIRDY
 
     @property
     def nested(self) -> bool:
