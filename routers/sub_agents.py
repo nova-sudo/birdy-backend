@@ -42,6 +42,20 @@ async def list_sub_agents(parent: Optional[Parent] = None, status: Optional[Stat
         return await sub_core.to_api_many(db, current_user, subs)
 
 
+# Declared before /{sub_agent_id}, so "tools" is never read as a sub-agent id.
+@router.get("/tools")
+async def parent_tools(parent: Optional[str] = None, current_user: str = Depends(get_current_user)):
+    """The tools a main agent can give its sub-agents (exactly the set the editor's save accepts):
+    {"tools": [{name, label}]}, sorted by label."""
+    try:
+        sub_core.check_parent(parent)
+    except sub_core.SubAgentError as e:
+        return _err(e)
+    from ai.agents.sub_agents.tools import parent_tool_names, tool_label
+    tools = [{"name": t, "label": tool_label(t)} for t in parent_tool_names(parent)]
+    return {"tools": sorted(tools, key=lambda t: (t["label"].casefold(), t["name"]))}
+
+
 @router.get("/{sub_agent_id}")
 async def get_sub_agent(sub_agent_id: str, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:

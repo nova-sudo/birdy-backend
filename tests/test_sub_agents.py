@@ -496,3 +496,48 @@ async def test_agents_routes_unaffected(api, mock_db):
     assert {x["kind"] for x in listed} == {"custom", "specialist"}
     assert api.post(f"/api/agents/sub/{aid}/pause").json()["code"] == "managed_elsewhere"
     assert api.delete(f"/api/agents/{aid}").json() == {"deleted": aid}  # its own delete still works
+
+
+# ---------------------------------------------------------------------------
+# The editor's tool list, and proposals that lapse
+# ---------------------------------------------------------------------------
+
+def test_tools_route_lists_what_validation_allows(api):
+    for parent in ("media_buyer", "sales_coach"):
+        r = api.get("/api/agents/sub/tools", params={"parent": parent})
+        assert r.status_code == 200, r.text
+        tools = r.json()["tools"]
+        assert {t["name"] for t in tools} == parent_tool_names(parent)
+        assert all(set(t) == {"name", "label"} and t["label"] for t in tools)
+    assert {"name": "get_ad_insights", "label": "Ad results"} in api.get(
+        "/api/agents/sub/tools", params={"parent": "media_buyer"}).json()["tools"]
+    for params in ({}, {"parent": "birdy"}):
+        r = api.get("/api/agents/sub/tools", params=params)
+        assert r.status_code == 400 and r.json()["code"] == "bad_parent"
+
+
+async def _age(db, sub_id, days):
+    await db[sub.SUB_AGENTS].update_one({"_id": sub_id},
+                                        {"$set": {"created_at": datetime.utcnow() - timedelta(days=days)}})
+
+
+async def test_a_lapsed_proposal_frees_its_name_and_is_hidden(mock_mongo_client, mock_db):
+    await sub.create_sub_agent_indexes(mock_mongo_client)
+    old = await propose(mock_db)
+    fresh = await propose(mock_db, name="Fresh one")
+    await _age(mock_db, old["id"], 31)
+    await _age(mock_db, fresh["id"], 29)
+    assert [s["id"] for s in await sub.list_sub_agents(mock_db, U, "media_buyer")] == [fresh["id"]]
+    with pytest.raises(sub.SubAgentError) as e:
+        await sub.approve_sub_agent(mock_db, U, old["id"])
+    assert e.value.code == "expired"
+    with pytest.raises(sub.SubAgentError) as e:      # a fresh proposal still holds its name
+        await propose(mock_db, name="Fresh one")
+    assert e.value.code == "duplicate_name"
+    again = await propose(mock_db)                     # the lapsed one no longer does
+    assert again["id"] != old["id"] and again["status"] == "proposed"
+    assert await mock_db[sub.SUB_AGENTS].find_one({"_id": old["id"]}) is None
+    # an approved sub-agent never lapses
+    await sub.approve_sub_agent(mock_db, U, again["id"])
+    await _age(mock_db, again["id"], 90)
+    assert again["id"] in [s["id"] for s in await sub.list_sub_agents(mock_db, U, "media_buyer")]
