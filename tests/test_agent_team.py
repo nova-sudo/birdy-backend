@@ -173,7 +173,7 @@ def test_chat_models_default_and_validate():
 
 def test_sales_coach_only_has_call_tools():
     names = set(defs.tool_names(defs.SALES_COACH, nested=False))
-    assert names == {"get_client_groups", "get_call_center_stats", "get_call_recordings_summary",
+    assert names == {"get_client_groups", "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
                      "analyze_call_recordings", "render_ui",
                      "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
 
@@ -751,3 +751,39 @@ async def test_parent_loop_skips_tools_once_out_of_time(mock_db, registry, monke
     skipped = [m for m in p.calls[-1][2] if m["role"] == "tool"][1]
     assert "No time is left" in json.loads(skipped["content"])["error"]
     assert p.calls[-1][1] == []
+
+
+async def test_call_trend_compares_a_period_with_the_one_before(mock_db):
+    from datetime import date, timedelta
+    from ai.tools.hp_tools import get_call_center_stats, get_call_trend
+
+    def day(n):
+        return (date.today() - timedelta(days=n)).isoformat()
+
+    rows = [{"date": day(n), "calls": 10, "answered": 8, "transfers": 1, "inbound": 2, "outbound": 8, "talk_time": 5}
+            for n in range(1, 8)]
+    rows += [{"date": day(n), "calls": 20, "answered": 10, "transfers": 4, "inbound": 4, "outbound": 16, "talk_time": 9}
+             for n in range(8, 15)]
+    rows.append({"date": day(0), "calls": 99, "answered": 99})  # today is left out
+    await mock_db["client_groups"].insert_many([
+        {"user_id": "u1", "id": "g1", "name": "Aura", "hp_daily_calls": rows},
+        {"user_id": "u1", "id": "g2", "name": "No calls"},
+        {"user_id": "other", "id": "g9", "name": "Theirs", "hp_daily_calls": rows},
+    ])
+    out = await get_call_trend(mock_db, "u1", days=7)
+    assert out["current_period"]["calls"] == 70 and out["previous_period"]["calls"] == 140
+    assert out["change_pct"]["calls"] == -50.0 and out["current_period"]["connect_rate"] == 80.0
+    assert [c["client_group_name"] for c in out["clients"]] == ["Aura"]
+    assert len(out["daily"]) == 14
+    assert "error" in await get_call_trend(mock_db, "u1", days=0)
+    assert "error" in await get_call_trend(mock_db, "u1", group_ids=["g2"])
+    # an unknown window is an error that names the valid ones, not an empty result
+    bad = await get_call_center_stats(mock_db, "u1", preset="last_week")
+    assert "last_7d" in bad["error"] and "get_call_trend" in bad["error"]
+
+
+def test_sales_coach_and_birdy_have_the_call_trend_tool():
+    from ai.team import definitions as defs
+    assert "get_call_trend" in defs.tool_names("sales_coach", nested=True)
+    assert "get_call_trend" in defs.tool_names("birdy", nested=True)
+    assert "get_call_trend" not in defs.tool_names("media_buyer", nested=False)

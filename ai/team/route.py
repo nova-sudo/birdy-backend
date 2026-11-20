@@ -59,6 +59,7 @@ TOOL_LABELS = {
     "get_ghl_opportunity_stats": "Pipeline totals",
     "get_ghl_opp_stats_windowed": "Pipeline for a period",
     "get_call_center_stats": "Call stats",
+    "get_call_trend": "Calls against the period before",
     "get_call_recordings_summary": "Call recordings",
     "analyze_call_recordings": "Call analysis",
     "find_ads": "Ad search",

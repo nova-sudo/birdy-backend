@@ -215,7 +215,7 @@ _AGENT_PINNED_GROUP_IDS_TOOLS = _CLIENT_PINNED_GROUP_IDS_TOOLS | {
     "get_ghl_contacts", "get_ghl_opportunity_stats", "get_ghl_tag_breakdown", "get_tag_rollup_by_campaign",
     "get_account_summary", "compare_periods", "get_meta_insights_live", "get_meta_insights_monthly",
     "get_meta_leads_live", "compute_custom_metric", "get_unified_leads", "get_unified_lead_stats",
-    "get_metrics_by_day_windows", "get_call_center_stats"}
+    "get_metrics_by_day_windows", "get_call_center_stats", "get_call_trend"}
 # Client lists in a one-client agent run are cut down to that client.
 _AGENT_FILTERED_CLIENT_LISTS = {"get_client_groups"}
 
