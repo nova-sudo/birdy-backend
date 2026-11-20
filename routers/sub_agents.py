@@ -42,6 +42,20 @@ async def list_sub_agents(parent: Optional[Parent] = None, status: Optional[Stat
         return await sub_core.to_api_many(db, current_user, subs)
 
 
+# Declared before /{sub_agent_id}, so "tools" is never read as a sub-agent id.
+@router.get("/tools")
+async def parent_tools(parent: Optional[str] = None, current_user: str = Depends(get_current_user)):
+    """The tools a main agent can give its sub-agents (exactly the set the editor's save accepts):
+    {"tools": [{name, label}]}, sorted by label."""
+    try:
+        sub_core.check_parent(parent)
+    except sub_core.SubAgentError as e:
+        return _err(e)
+    from ai.agents.sub_agents.tools import parent_tool_names, tool_label
+    tools = [{"name": t, "label": tool_label(t)} for t in parent_tool_names(parent)]
+    return {"tools": sorted(tools, key=lambda t: (t["label"].casefold(), t["name"]))}
+
+
 @router.get("/{sub_agent_id}")
 async def get_sub_agent(sub_agent_id: str, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
@@ -103,6 +117,35 @@ async def patch(sub_agent_id: str, body: SubAgentPatch, current_user: str = Depe
 async def delete(sub_agent_id: str, current_user: str = Depends(get_current_user)):
     """Deletes the sub-agent with its lessons, schedule and run records. The UI confirms first."""
     return await _act(sub_core.delete_sub_agent, current_user, sub_agent_id)
+
+
+@router.post("/{sub_agent_id}/run")
+async def run_now(sub_agent_id: str, current_user: str = Depends(get_current_user)):
+    """Run an active sub-agent now: the same run as its schedule (ai/team/scheduled.run_one). Returns
+    the finished run. 409 wrong_status / managed_elsewhere / already_running, 402 out_of_credits."""
+    from ai.agents.sub_agents import schedule
+    from ai.team import scheduled
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            return await schedule.start_manual_run(db, mongo_client, current_user, sub_agent_id,
+                                                   run_one=scheduled.run_one,
+                                                   budget_seconds=scheduled.RUN_BUDGET_SECONDS)
+        except sub_core.SubAgentError as e:
+            return _err(e)
+
+
+@router.get("/{sub_agent_id}/runs")
+async def list_runs(sub_agent_id: str, limit: int = 20, current_user: str = Depends(get_current_user)):
+    """{"runs": [{id, status, trigger, started_at, finished_at, summary, answer, credits, proposals}]},
+    newest first."""
+    from ai.agents.sub_agents import schedule
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        try:
+            return {"runs": await schedule.list_runs(db, current_user, sub_agent_id, limit)}
+        except sub_core.SubAgentError as e:
+            return _err(e)
 
 
 @router.get("/{sub_agent_id}/lessons")

@@ -434,3 +434,27 @@ async def test_sub_agent_run_and_plain_chat(mock_db, seeded, monkeypatch):
     plain = TeamProvider({"default": [say("All good.")]})
     await run_chat(provider=plain, tool_registry=reg, db=mock_db, user_id=U, message="hi")
     assert "<agency_context>" not in plain.calls[0][2][0]["content"]
+
+
+async def test_deleting_a_client_deletes_its_context_lines(mock_mongo_client, mock_db, monkeypatch):
+    import contextlib
+
+    import routers.client_groups as cg
+    from services import agency_context as ctx_svc
+
+    @contextlib.asynccontextmanager
+    async def fake_client():
+        yield mock_mongo_client
+    monkeypatch.setattr(cg, "get_mongo_client", fake_client)
+    owner, other = "ctx-owner@example.com", "ctx-other@example.com"
+    await mock_db["client_groups"].insert_many([{"user_id": owner, "id": "gx", "name": "X"},
+                                                {"user_id": owner, "id": "gy", "name": "Y"}])
+    gone = await ctx_svc.add_item(mock_db, owner, "client", "X pays late", client_group_id="gx")
+    kept = await ctx_svc.add_item(mock_db, owner, "client", "Y likes video", client_group_id="gy")
+    agency = await ctx_svc.add_item(mock_db, owner, "agency", "We are a dental agency")
+    await mock_db[ctx_svc.COLLECTION].insert_one({"id": "o1", "user_id": other, "card": "client", "text": "t",
+                                                  "client_group_id": "gx"})
+    out = await cg.delete_client_group("gx", current_user=owner)
+    assert out["deleted"]["context_lines_removed"] == 1
+    ids = {d["id"] async for d in mock_db[ctx_svc.COLLECTION].find({})}
+    assert gone["id"] not in ids and {kept["id"], agency["id"], "o1"} <= ids

@@ -30,6 +30,8 @@ from services.query_classifier import classify_query
 from services import capabilities_service
 from ai.team import definitions as team_defs
 from ai.team import delegation
+from ai.team import lesson_tools as team_lesson_tools
+from ai.team import pinning as team_pinning
 from ai.team import route as team_route
 
 logger = logging.getLogger(__name__)
@@ -646,7 +648,9 @@ def _vision_parts(message: str, attachments: list[dict]) -> list[dict]:
 
 
 def _pin_agent_args(name: str, args: dict, client_group_id: str) -> None:
-    """An agent run's server-side client pin (see _AGENT_PINNED_GROUP_TOOLS)."""
+    """An agent run's server-side client pin (see _AGENT_PINNED_GROUP_TOOLS; tools with no group
+    argument are run client-scoped by ai/team/pinning.py instead)."""
+    team_pinning.pin_client_arg(name, args, client_group_id)
     if name in _AGENT_PINNED_GROUP_TOOLS:
         args["group_id"] = client_group_id
     if name in _AGENT_PINNED_GROUP_IDS_TOOLS:
@@ -667,10 +671,15 @@ def _only_client(result: str, client_group_id: str) -> str:
 
 async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
     if frame.sub is not None:
+        try:
+            from ai.agents.stock.lessons import lessons_for_prompt
+            lessons = await lessons_for_prompt(db, frame.sub.id, client_group_id)
+        except Exception:
+            lessons = []
         return team_defs.sub_agent_instructions(
             frame.sub, team_defs.NAMES.get(frame.parent_main, "your main agent"),
             client_group_id=client_group_id, client_name=client_name,
-            context=await team_defs.context_block(db, user_id, client_group_id))
+            context=await team_defs.context_block(db, user_id, client_group_id), lessons=lessons)
     asked_by = None
     if frame.nested:
         asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])
@@ -683,9 +692,14 @@ def _agent_tool_names(frame) -> list:
     """The registry/MCP tools one agent run may use. A sub-agent's list is cut to its main
     agent's read tools: never more than the main agent has, never a write."""
     if frame.sub is not None:
-        parent = set(team_defs.tool_names(frame.parent_main, nested=True))
-        return [n for n in frame.sub.tools if n in parent]
-    return team_defs.tool_names(frame.agent, nested=frame.nested)
+        parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
+        from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
+        return [n for n in frame.sub.tools if n in parent and n not in NOT_FOR_SUB_AGENTS]
+    names = team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
+    if frame.agent == team_defs.MEDIA_BUYER and not frame.nested and stock_card_tools.current_stock_card.get():
+        # Applying an approved proposal that names one card (routers/chat.apply_proposal).
+        names = names + list(team_defs.MEDIA_BUYER_CARD_TOOLS)
+    return names
 
 
 async def run_chat(
@@ -974,6 +988,7 @@ async def run_chat(
             s for s in tool_registry.get_schemas(allowed=allowed)
             if s["function"]["name"] not in mcp_client.MCP_TOOL_NAMES
             and (allowed is not None or s["function"]["name"] not in _PAGE_ONLY_TOOLS)
+            and not (frame is not None and s["function"]["name"] in team_defs.MCP_HOSTED)
         ]
         mcp_schemas = await mcp_client.get_mcp_schemas(mcp, allowed) if mcp else None
         if mcp_schemas is None:
@@ -985,12 +1000,17 @@ async def run_chat(
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
         tool_schemas = registry_schemas + mcp_schemas
+        # An agent run may be offered MCP-hosted tools the orchestrator has no copy of (Birdy's client
+        # note, target and Slack report tools); those are called through MCP. The general chat is unchanged.
+        registry_names = {s["function"]["name"] for s in registry_schemas}
+        mcp_only = ({s["function"]["name"] for s in mcp_schemas} - registry_names - mcp_client.MCP_TOOL_NAMES
+                    if frame is not None and mcp is not None else set())
         delegation_ctx = None
         if frame is not None:
             # The ask / propose tools, and every tool name this run may call:
             # an agent run never executes a tool it was not offered.
             subs = await delegation.subs_for(db, frame, user_id)
-            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs)
+            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs) + team_lesson_tools.tool_schemas(frame)
             delegation_ctx = {"provider": provider, "tool_registry": tool_registry, "db": db,
                               "user_id": user_id, "mongo_client": mongo_client, "source": source,
                               "session_id": session_id, "subs": subs}
@@ -1001,7 +1021,10 @@ async def run_chat(
         logger.info(f"Page: {page} | tools: {[s['function']['name'] for s in tool_schemas]}")
 
         for iteration in range(max_iterations + 1):
-            is_final_iteration = iteration == max_iterations
+            # An agent run also stops on time: with too little of the reply's budget
+            # left for another tool round, it answers now with what it has.
+            out_of_time = frame is not None and frame.turn.must_answer()
+            is_final_iteration = iteration == max_iterations or out_of_time
             call_messages = history
             if is_final_iteration:
                 # Forced final turn — no more tool calls allowed (tools=None below).
@@ -1028,6 +1051,13 @@ async def run_chat(
                     "correct; a complete-looking fabricated one is never "
                     "acceptable, even under repeated pushback.]"
                 )
+                if out_of_time and iteration < max_iterations:
+                    final_turn_notice = (
+                        "\n\n---\n[RUNTIME NOTICE: This reply is out of time and you cannot call any "
+                        "more tools. Answer now with what you have: say plainly which parts you verified "
+                        "with a tool call and which you could not check in time. Do NOT guess or fill any "
+                        "gap with a plausible-looking number.]"
+                    )
                 if history and history[0].get("role") == "system":
                     call_messages = [
                         {**history[0], "content": history[0]["content"] + final_turn_notice},
@@ -1058,6 +1088,10 @@ async def run_chat(
                 reply = materialize_ui(reply, ui_blocks)
                 logger.info(f"Final reply length: {len(reply)} | preview: {reply[:120]!r}")
                 return await _finish(reply)
+
+            if out_of_time:
+                # Tools were not offered; a model that calls one anyway is not run.
+                break
 
             # Mistral rejects null content — use empty string when model omits it
             assistant_msg = {"role": "assistant", "content": response.content or ""}
@@ -1109,13 +1143,19 @@ async def run_chat(
                 logger.info(f"Tool call: {tc.name} | Args: {args}")
                 groups_touched.update(_group_ids_in_args(args))
 
-                if frame is not None and (tc.name not in offered
-                                          or (nested and tc.name in team_defs.WRITE_TOOLS)):
+                if frame is not None and frame.turn.must_answer():
+                    result = json.dumps({"error": (
+                        "No time is left in this reply to run more tools. Answer with what you have "
+                        "and say what you could not check.")})
+                elif frame is not None and (tc.name not in offered
+                                            or (nested and tc.name in team_defs.WRITE_TOOLS)):
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available to {team_defs.NAMES.get(frame.agent, 'this agent')} "
                         "here. Use only the tools you were given.")})
                 elif frame is not None and tc.name in delegation.TOOL_NAMES:
                     result = await delegation.handle(tc.name, args, frame, delegation_ctx)
+                elif frame is not None and tc.name in team_lesson_tools.TOOL_NAMES:
+                    result = await team_lesson_tools.handle(tc.name, args, frame, db=db, user_id=user_id)
                 elif tc.name in excluded:
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available in Slack. Creative tests are drafted, "
@@ -1126,7 +1166,16 @@ async def run_chat(
                     result = json.dumps({"error": (
                         "Your arguments for this tool were not valid JSON — most likely cut off because they "
                         "were too long. Call it again with a shorter payload (fewer or simpler blocks).")})
-                elif tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
+                elif frame is not None and client_group_id and (
+                        refusal := await team_pinning.guard_write(tc.name, args, db=db, user_id=user_id,
+                                                                  client_group_id=client_group_id)):
+                    result = refusal
+                elif frame is not None and client_group_id and tc.name in team_pinning.PINNED_TOOLS:
+                    # No client argument to overwrite: run the client-scoped version.
+                    result = await team_pinning.run_pinned(tc.name, args, db=db, user_id=user_id,
+                                                           client_group_id=client_group_id,
+                                                           mongo_client=mongo_client)
+                elif (tc.name in mcp_client.MCP_TOOL_NAMES or tc.name in mcp_only) and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:
                     call_args = args
@@ -1194,4 +1243,7 @@ async def run_chat(
         # mid-stream fragment, not a complete/honest answer. Always use the safe
         # fallback rather than risk surfacing a partial/fabricated reply.
         reply = "I ran into complexity limits processing that — it needs more data lookups than I could complete in one turn. Try breaking it into smaller questions (e.g. one time period at a time)."
+        if frame is not None and frame.turn.must_answer():
+            reply = ("I ran out of time before I could finish checking this. Ask again for the part you need "
+                     "most and I'll start there.")
         return await _finish(reply)

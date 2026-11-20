@@ -174,7 +174,8 @@ def test_chat_models_default_and_validate():
 def test_sales_coach_only_has_call_tools():
     names = set(defs.tool_names(defs.SALES_COACH, nested=False))
     assert names == {"get_client_groups", "get_call_center_stats", "get_call_recordings_summary",
-                     "analyze_call_recordings", "render_ui"}
+                     "analyze_call_recordings", "render_ui",
+                     "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
 
 
 def test_media_buyer_has_no_call_or_pipeline_tools():
@@ -185,10 +186,14 @@ def test_media_buyer_has_no_call_or_pipeline_tools():
                         "get_ghl_opp_stats_windowed", "get_unified_leads"}
 
 
-def test_birdy_reads_across_areas_and_writes_nothing():
+def test_birdy_reads_across_areas_and_writes_only_agency_settings():
     names = set(defs.tool_names(defs.BIRDY, nested=False))
     assert {"get_account_summary", "get_call_center_stats", "get_campaign_insights"} - names == {"get_campaign_insights"}
-    assert not names & defs.WRITE_TOOLS
+    assert names & defs.WRITE_TOOLS == set(defs.BIRDY_WRITE)
+    # never an ads or a call-centre write
+    assert not names & (set(defs.MEDIA_BUYER_WRITE) | set(defs.SALES_COACH_WRITE))
+    # asked by another agent, Birdy only reads
+    assert not set(defs.tool_names(defs.BIRDY, nested=True)) & defs.WRITE_TOOLS
 
 
 async def test_offered_tools_per_agent(mock_db, registry):
@@ -200,7 +205,7 @@ async def test_offered_tools_per_agent(mock_db, registry):
     assert "ask_birdy" in mb and "ask_sales_coach" not in mb and "ask_media_buyer" not in mb
     assert "ask_birdy" in sc and "ask_media_buyer" not in sc and "ask_sales_coach" not in sc
     assert "get_call_center_stats" in sc and "get_call_center_stats" not in mb
-    assert "create_alert" not in birdy + mb + sc
+    assert "create_alert" in birdy and "create_alert" not in mb + sc
 
 
 # ── 3. ask down, ask up ───────────────────────────────────────────────────────
@@ -396,7 +401,8 @@ async def test_ask_timeout_degrades(mock_db, registry, monkeypatch):
 
 
 async def test_no_ask_starts_without_time_left(mock_db, registry, monkeypatch):
-    monkeypatch.setattr(rt, "TURN_BUDGET_SECONDS", 0)
+    # Time left for the parent's own loop, none for an ask.
+    monkeypatch.setattr(rt, "PARENT_RESERVE_SECONDS", rt.TURN_BUDGET_SECONDS)
     p = TeamProvider({"birdy": [call("ask_sales_coach", question="q", client="agency"), say("ok")]})
     out = await chat(p, registry, mock_db, agent="birdy")
     assert out["route"]["steps"][1]["status"] == "failed"
@@ -701,3 +707,47 @@ def test_main_agent_is_offered_propose_sub_agent_only_in_its_own_chat():
     assert delegation.PROPOSE_SUB_AGENT in names("media_buyer")
     assert delegation.PROPOSE_SUB_AGENT in names("sales_coach")
     assert delegation.PROPOSE_SUB_AGENT not in names("birdy")
+
+
+# ── 11. the top-level agent's own loop stops on time ──────────────────────────
+
+async def test_parent_loop_answers_when_the_reply_is_out_of_time(mock_db, registry, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(rt.time, "monotonic", lambda: clock["t"])
+
+    class Slow(TeamProvider):
+        async def chat_completion(self, messages, tools=None, **kw):
+            clock["t"] += 100       # every model call takes 100 s
+            return await super().chat_completion(messages, tools=tools, **kw)
+
+    p = Slow({"birdy": [call("get_account_summary"), call("get_account_summary"), call("get_account_summary"),
+                        say("Here is what I have.")]})
+    out = await chat(p, registry, mock_db, agent="birdy")
+    assert out["reply"] == "Here is what I have."
+    birdy_calls = [c for c in p.calls if c[0] == "birdy"]
+    # before the calls at 0 s, 100 s, 200 s tools are offered; the third call ends at 300 s, past the
+    # 250 s budget, so its tool is not run and the fourth call answers without tools
+    assert [bool(t) for _, t, _ in birdy_calls] == [True, True, True, False]
+    assert "out of time" in birdy_calls[-1][2][0]["content"]
+    assert len(registry.seen["get_account_summary"]) == 2
+
+
+async def test_parent_loop_skips_tools_once_out_of_time(mock_db, registry, monkeypatch):
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(rt.time, "monotonic", lambda: clock["t"])
+
+    async def slow_tool(db, user_id, mongo_client=None, **kw):
+        clock["t"] += 230
+        return {"spend": 1}
+    registry.register(name="get_account_summary", description="stub",
+                      parameters={"type": "object", "properties": {}}, executor=slow_tool)
+    p = TeamProvider({"birdy": [ProviderResponse(content=None, tool_calls=[
+        ToolCall(id="a", name="get_account_summary", arguments="{}"),
+        ToolCall(id="b", name="get_call_center_stats", arguments="{}")], usage=Usage(1, 1)),
+        say("Partial.")]})
+    out = await chat(p, registry, mock_db, agent="birdy")
+    assert out["reply"] == "Partial."
+    assert "get_call_center_stats" not in registry.seen       # no time left for the second tool
+    skipped = [m for m in p.calls[-1][2] if m["role"] == "tool"][1]
+    assert "No time is left" in json.loads(skipped["content"])["error"]
+    assert p.calls[-1][1] == []

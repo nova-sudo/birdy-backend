@@ -2955,6 +2955,7 @@ async def delete_client_group(
     Permanently delete a client group and all associated data:
       1. GHL contacts (ghl_contacts collection)
       2. The client group document itself
+      3. Its own lines on the agency Context (agency_context)
     """
     async with get_mongo_client() as mongo_client:
         try:
@@ -2997,6 +2998,15 @@ async def delete_client_group(
             )
             logger.info(f"Deleted client group {group_id} ('{group_name}') for user {current_user}")
 
+            # 3. Its own lines on the agency Context (services/agency_context.py). The group is
+            # already gone, so a failure here is logged, never a 500.
+            context_removed = 0
+            try:
+                from services.agency_context import delete_client_lines
+                context_removed = await delete_client_lines(db, current_user, group_id)
+            except Exception as e:
+                logger.error(f"Context clean-up after deleting {group_id} failed: {e}", exc_info=True)
+
             # Its Meta leads go to whichever sibling owns their campaigns now,
             # or become unassigned. The siblings keep their own selections.
             # The group is already gone, so a failure here must not turn a
@@ -3019,6 +3029,7 @@ async def delete_client_group(
                 "deleted": {
                     "group_id": group_id,
                     "ghl_contacts_removed": contacts_result.deleted_count,
+                    "context_lines_removed": context_removed,
                 },
             }
 

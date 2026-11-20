@@ -54,6 +54,10 @@ TOOL_LABELS = {
 }
 
 
+# A main agent's own lessons are private to it (design section 8): its sub-agents get their own.
+NOT_FOR_SUB_AGENTS = frozenset({"list_lessons"})
+
+
 def _ui_only_tools() -> set[str]:
     from ai.tools.page_view_tools import PAGE_VIEW_TOOL_NAMES
     from ai.tools.render_ui_tools import RENDER_UI_TOOL_NAME
@@ -75,7 +79,7 @@ def parent_tool_names(parent: str) -> set[str]:
         raise ValueError(f"unknown parent agent: {parent!r}")
     # A sub-agent only ever reads and proposes, so it may be given its main agent's read tools.
     from ai.team import definitions as team_defs
-    return set(team_defs.tool_names(parent, nested=True)) - _ui_only_tools()
+    return set(team_defs.tool_names(parent, nested=True)) - _ui_only_tools() - NOT_FOR_SUB_AGENTS
 
 
 @lru_cache(maxsize=None)

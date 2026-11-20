@@ -329,6 +329,15 @@ async def run_agents_tick() -> dict:
         except Exception as e:
             logger.error("[agents-tick] stock agents raised: %s", e, exc_info=True)
             stock = {"error": str(e)}
+        try:
+            # Sub-agents' own scheduled runs, inside the same deadline (ai/team/scheduled.py).
+            from ai.agents.sub_agents.schedule import run_due_sub_agents
+            from ai.team.scheduled import run_one as run_sub_agent
+            subs = await run_due_sub_agents(mongo_client, now_utc=datetime.now(timezone.utc),
+                                            run_one=run_sub_agent, deadline=deadline)
+        except Exception as e:
+            logger.error("[agents-tick] sub-agents raised: %s", e, exc_info=True)
+            subs = {"error": str(e)}
         posted_late = 0
         try:
             posted_late = await retry_unposted_runs(mongo_client[DB_NAME], datetime.now(timezone.utc),
@@ -339,7 +348,7 @@ async def run_agents_tick() -> dict:
             await retry_weeklies(mongo_client[DB_NAME], datetime.now(timezone.utc), deadline)
         except Exception as e:
             logger.error("[agents-tick] weekly retries raised: %s", e, exc_info=True)
-        return {**out, "stock": stock, "slack_posted_late": posted_late}
+        return {**out, "stock": stock, "sub_agents": subs, "slack_posted_late": posted_late}
 
 
 async def run_outcomes(mongo_client, now_utc: datetime) -> dict:

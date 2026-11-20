@@ -561,6 +561,15 @@ async def context_block(db, user_id: str, client_group_id=None) -> str:
             + json_block("agency_context", payload) + "\n")
 
 
+async def delete_client_lines(db, user_id: str, client_group_id: str) -> int:
+    """A deleted client's own Context lines go with it (routers/client_groups.delete_client_group).
+    Returns how many were removed. Agency lines and notes are untouched; client notes have their own home."""
+    if not client_group_id:
+        return 0
+    res = await db[COLLECTION].delete_many({"user_id": user_id, "client_group_id": client_group_id})
+    return res.deleted_count
+
+
 async def create_context_indexes(mongo_client) -> None:
     from core.database import DB_NAME
     db = mongo_client[DB_NAME]

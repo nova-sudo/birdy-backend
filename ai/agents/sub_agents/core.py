@@ -31,7 +31,7 @@ readable by its parent through `list_parent_lessons`.
 
 import re
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from ai.agents import store as agent_store
@@ -61,6 +61,10 @@ _TIME_RE = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 PATCH_FIELDS = ("name", "purpose", "instructions", "tools", "clients", "schedule")
 
+# A proposal nobody approved within this long has lapsed: it no longer holds its name and is left out of
+# every list. Checked lazily on read and on the name check; no job deletes it.
+PROPOSAL_TTL = timedelta(days=30)
+
 
 class SubAgentError(OpError):
     """A refusal with an HTTP status and a body {detail, code} (the agents router's OpError shape)."""
@@ -68,6 +72,10 @@ class SubAgentError(OpError):
     def __init__(self, status: int, code: str, detail: str):
         super().__init__(status, {"detail": detail, "code": code})
         self.code = code
+
+
+def _iso_dt(v):
+    return v.isoformat() if hasattr(v, "isoformat") else v
 
 
 def _not_found() -> SubAgentError:
@@ -195,12 +203,32 @@ def clean_schedule(schedule):
     return {"time": time, "timezone": tz, "days": [d for d in DAYS if d in picked]}
 
 
+def lapsed(doc: dict, now: datetime | None = None) -> bool:
+    """A proposal older than PROPOSAL_TTL that was never approved."""
+    created = doc.get("created_at")
+    if doc.get("status") != PROPOSED or not isinstance(created, datetime):
+        return False
+    if created.tzinfo is not None:
+        created = created.replace(tzinfo=None) - (created.utcoffset() or timedelta(0))
+    return created < (now or _now()) - PROPOSAL_TTL
+
+
+def _live_query(q: dict) -> dict:
+    """`q` without lapsed proposals."""
+    return {"$and": [q, {"$or": [{"status": {"$ne": PROPOSED}}, {"created_at": {"$gte": _now() - PROPOSAL_TTL}}]}]}
+
+
 async def _check_name_free(db, user_id: str, parent: str, name: str, *, exclude_id: str | None = None):
     key = name_key(name)
     q = {"user_id": user_id, "parent": parent, "name_key": key}
     if exclude_id:
         q["_id"] = {"$ne": exclude_id}
-    clash = await db[SUB_AGENTS].find_one(q, {"status": 1})
+    clash = await db[SUB_AGENTS].find_one(q, {"status": 1, "created_at": 1})
+    if clash is not None and lapsed(clash):
+        # A lapsed proposal no longer holds the name; it goes, so the unique index lets the new one in.
+        await db[SUB_AGENTS].delete_one({"_id": clash["_id"], "status": PROPOSED})
+        await db[agent_store.MEMORY].delete_many({"agent_id": clash["_id"]})
+        clash = None
     if clash is None and parent == sub_tools.MEDIA_BUYER:
         # Today's custom agents are Media Buyer's sub-agents too.
         async for a in db[agent_store.AGENTS].find(
@@ -290,7 +318,7 @@ async def list_sub_agents(db, user_id: str, parent: str | None = None, *, status
             q["parent"] = parent
         if status is not None:
             q["status"] = status
-        out += [_normalize(d) for d in await db[SUB_AGENTS].find(q).to_list(length=None)]
+        out += [_normalize(d) for d in await db[SUB_AGENTS].find(_live_query(q)).to_list(length=None)]
     if kind in (None, KIND_CUSTOM) and parent in (None, sub_tools.MEDIA_BUYER):
         for a in await db[agent_store.AGENTS].find(
                 {"user_id": user_id, "type": agent_store.TYPE_CUSTOM}).to_list(length=None):
@@ -390,7 +418,11 @@ async def _move(db, user_id: str, sub_agent_id: str, *, from_status: str, to_sta
 
 
 async def approve_sub_agent(db, user_id: str, sub_agent_id: str) -> dict:
-    """The owner says yes: proposed -> active. Approving an active one returns it unchanged."""
+    """The owner says yes: proposed -> active. Approving an active one returns it unchanged. A proposal
+    older than PROPOSAL_TTL has lapsed: 409 expired (the main agent proposes it again)."""
+    doc = await _specialist_or_raise(db, user_id, sub_agent_id)
+    if lapsed(doc):
+        raise SubAgentError(409, "expired", "This proposal is more than 30 days old. Ask for it again in the chat.")
     return await _move(db, user_id, sub_agent_id, from_status=PROPOSED, to_status=ACTIVE,
                        stamp={"approved_at": 1}, wrong="Only a proposed sub-agent can be approved")
 
@@ -562,7 +594,16 @@ def _to_api(sub: dict, names: dict) -> dict:
         "approved_at": sub.get("approved_at"),
         "paused_at": sub.get("paused_at"),
         "last_run_at": sub.get("last_run_at"),
+        "last_run": _last_run_api(sub.get("last_run")),
     }
+
+
+def _last_run_api(last) -> dict | None:
+    """{status, at, summary, credits} of the latest run, or None."""
+    if not isinstance(last, dict):
+        return None
+    return {"status": last.get("status"), "at": last.get("at"), "summary": last.get("summary"),
+            "credits": last.get("credits")}
 
 
 async def to_api_many(db, user_id: str, subs: list[dict]) -> list[dict]:

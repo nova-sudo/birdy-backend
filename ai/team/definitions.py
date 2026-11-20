@@ -58,6 +58,9 @@ WRITE_TOOLS = frozenset({
     *CREATIVE_WRITE_TOOLS,
     # call analysis: Whisper costs credits and the owner must confirm the batch size
     "analyze_call_recordings",
+    # agency-level settings Birdy keeps in its own chat
+    "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
+    "add_client_note", "delete_client_note",
 })
 
 # ── Tool lists ─────────────────────────────────────────────────────────────────
@@ -74,17 +77,41 @@ MEDIA_BUYER_READ = (
     "list_lessons",
 )
 MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remove_lesson")
+# One stock agent card's tools: offered to Media Buyer's own chat only for the turn that applies an
+# approved proposal naming that card (routers/chat.apply_proposal pins the card, after an owner check).
+# apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
+MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
 
-SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary")
-SALES_COACH_WRITE = ("analyze_call_recordings",)
+SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_recordings_summary", "list_lessons")
+SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
 
 BIRDY_READ = (
     *_COMMON,
     "get_account_summary", "compare_periods", "get_alerts",
     "get_unified_lead_stats", "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",
     "get_metrics_by_day_windows", "get_daily_metrics", "get_call_center_stats", CLOSES_BY_AD_TOOL,
+    # what Birdy's own settings tools need to read first
+    "list_custom_metrics", "list_available_metric_fields", "compute_custom_metric",
+    "list_slack_reports", "get_client", "get_client_notes",
 )
-BIRDY_WRITE = ()
+# Agency-level settings, in Birdy's own (top-level) chat only, each with its tool's own confirm flow:
+# alerts, custom metrics, Slack reports, client notes, client targets. Ads changes stay Media Buyer's
+# and call-centre work Sales Coach's; Birdy reaches them by asking, and they propose.
+BIRDY_WRITE = (
+    "create_alert", "update_alert",
+    "create_custom_metric", "update_custom_metric", "delete_custom_metric",
+    "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
+    "add_client_note", "delete_client_note", "set_client_target",
+)
+# Birdy's tools that only the MCP server implements (ai/mcp/client_mcp.py, slack_reports_mcp.py). An agent
+# run calls them through MCP; a registry tool of the same name (agent_tools.set_client_target, which
+# edits a custom agent in training) is never offered in their place.
+MCP_HOSTED = frozenset({"get_client", "get_client_notes", "add_client_note", "delete_client_note",
+                        "set_client_target", "list_slack_reports", "create_slack_report",
+                        "update_slack_report", "delete_slack_report", "send_test_slack_report"})
+# Agency-wide configuration with no client of its own: not offered in a one-client run.
+AGENCY_ONLY_TOOLS = frozenset({"list_slack_reports", "create_slack_report", "update_slack_report",
+                               "delete_slack_report", "send_test_slack_report"})
 
 _READ = {BIRDY: BIRDY_READ, MEDIA_BUYER: MEDIA_BUYER_READ, SALES_COACH: SALES_COACH_READ}
 _WRITE = {BIRDY: BIRDY_WRITE, MEDIA_BUYER: MEDIA_BUYER_WRITE, SALES_COACH: SALES_COACH_WRITE}
@@ -93,6 +120,8 @@ assert not (set(MEDIA_BUYER_READ) & WRITE_TOOLS)
 assert not (set(SALES_COACH_READ) & WRITE_TOOLS)
 assert not (set(BIRDY_READ) & WRITE_TOOLS)
 assert set(MEDIA_BUYER_WRITE) <= WRITE_TOOLS and set(SALES_COACH_WRITE) <= WRITE_TOOLS
+assert set(BIRDY_WRITE) <= WRITE_TOOLS
+assert not set(BIRDY_WRITE) & (set(MEDIA_BUYER_WRITE) | set(SALES_COACH_WRITE))
 
 
 def is_agent(key) -> bool:
@@ -107,18 +136,24 @@ def kind_of(key: str) -> str:
     return KIND_SUB
 
 
-def tool_names(agent: str, *, nested: bool) -> list[str]:
+def tool_names(agent: str, *, nested: bool, one_client: bool = False) -> list[str]:
     """The registry/MCP tools this agent is offered. A delegated (nested) run
     gets reads only and no render_ui (its answer goes to another agent, not a
-    screen)."""
+    screen). A one-client run never gets the agency-wide configuration tools."""
     names = list(_READ[agent])
     if nested:
-        return [n for n in names if n not in WRITE_TOOLS]
-    return names + list(_WRITE[agent]) + [RENDER_UI_TOOL_NAME]
+        names = [n for n in names if n not in WRITE_TOOLS]
+    else:
+        names = names + list(_WRITE[agent]) + [RENDER_UI_TOOL_NAME]
+    if one_client:
+        names = [n for n in names if n not in AGENCY_ONLY_TOOLS]
+    return names
 
 
 def write_tools(agent: str) -> tuple:
     """The write tools this agent owns, which proposals can name as their kind."""
+    if agent == MEDIA_BUYER:
+        return _WRITE[agent] + ("apply_card_lines",)
     return _WRITE.get(agent, ())
 
 
@@ -138,8 +173,12 @@ You answer cross-area and agency-wide questions. Your own tools are cross-area r
 question needs an area's judgement or detail (why an ad is failing, what happens on the calls),
 ask that agent with `ask_media_buyer` or `ask_sales_coach` and build your answer on its reply.
 - Ask only when your own reads can't answer. One clear question per ask, with the period.
-- You never change live accounts. If an agent proposes a change, tell the owner it is waiting for
-  their approval on the card below your answer.
+- In your own chat you keep the agency's settings: alerts, custom metrics, Slack reports, client
+  notes and client targets. Follow each tool's own flow: say what you will change and get the
+  owner's yes first; when a tool returns a preview and a confirm code, show the preview and call it
+  again with the code only after the owner says yes.
+- You never change ads or call-centre work yourself. Ask Media Buyer or Sales Coach; they propose,
+  and the owner approves on the card below your answer.
 - Say which agent found what ("Sales Coach checked 212 calls: ...").
 """
 
@@ -193,6 +232,16 @@ async def _media_buyer_lessons(db, user_id: str, gid: str | None) -> list[str]:
         return []
 
 
+async def _sales_coach_lessons(db, user_id: str, gid: str | None) -> list[str]:
+    """Sales Coach's active lessons for this client and the whole agency (ai/team/memory.py)."""
+    try:
+        from ai.agents.stock.lessons import lessons_for_prompt
+        from ai.team.memory import sales_coach_id
+        return await lessons_for_prompt(db, sales_coach_id(user_id), gid)
+    except Exception:
+        return []
+
+
 async def stock_agent_id(db, user_id: str) -> str | None:
     """The user's Media Buying (stock) agent id: Media Buyer's lessons live there."""
     try:
@@ -240,6 +289,9 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
             parts.append(CREATIVE_TESTS_GUIDE)
         parts.append(_data_block("Your lessons (Media Buyer's memory)", "lessons",
                                  await _media_buyer_lessons(db, user_id, client_group_id)))
+    if agent == SALES_COACH:
+        parts.append(_data_block("Your lessons (Sales Coach's memory)", "lessons",
+                                 await _sales_coach_lessons(db, user_id, client_group_id)))
     parts.append(await context_block(db, user_id, client_group_id))
     if client_group_id:
         parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))
@@ -252,15 +304,17 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
 
 
 def sub_agent_instructions(sub, parent_name: str, *, client_group_id: str | None, client_name: str | None,
-                           context: str = "") -> str:
-    """The system prompt for a sub-agent run (always delegated, by its main agent). `context` is the
-    agency Context block its main agent has (context_block), so a sub-agent knows what its parent knows."""
+                           context: str = "", lessons: list[str] | None = None) -> str:
+    """The system prompt for a sub-agent run (always delegated, by its main agent, or its own schedule).
+    `context` is the agency Context block its main agent has (context_block), so a sub-agent knows what
+    its parent knows. `lessons` are its own (private) lessons, given as delimited data."""
     parts = [
         f"You are {sub.name}, a sub-agent working for {parent_name} in this agency's Birdy workspace.\n"
         f"Today's date is {date.today().isoformat()}.\n",
         "\n## Your instructions (written for you by your main agent)\n"
         "<<<\n" + (sub.instructions or "Answer the question with your tools.") + "\n>>>\n",
     ]
+    parts.append(_data_block("Your lessons (your own memory)", "lessons", list(lessons or [])))
     parts.append(context or "")
     if client_group_id:
         parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))
