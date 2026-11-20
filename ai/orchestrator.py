@@ -30,6 +30,7 @@ from services.query_classifier import classify_query
 from services import capabilities_service
 from ai.team import definitions as team_defs
 from ai.team import delegation
+from ai.team import pinning as team_pinning
 from ai.team import route as team_route
 
 logger = logging.getLogger(__name__)
@@ -646,7 +647,9 @@ def _vision_parts(message: str, attachments: list[dict]) -> list[dict]:
 
 
 def _pin_agent_args(name: str, args: dict, client_group_id: str) -> None:
-    """An agent run's server-side client pin (see _AGENT_PINNED_GROUP_TOOLS)."""
+    """An agent run's server-side client pin (see _AGENT_PINNED_GROUP_TOOLS; tools with no group
+    argument are run client-scoped by ai/team/pinning.py instead)."""
+    team_pinning.pin_client_arg(name, args, client_group_id)
     if name in _AGENT_PINNED_GROUP_TOOLS:
         args["group_id"] = client_group_id
     if name in _AGENT_PINNED_GROUP_IDS_TOOLS:
@@ -1144,6 +1147,11 @@ async def run_chat(
                     result = json.dumps({"error": (
                         "Your arguments for this tool were not valid JSON — most likely cut off because they "
                         "were too long. Call it again with a shorter payload (fewer or simpler blocks).")})
+                elif frame is not None and client_group_id and tc.name in team_pinning.PINNED_TOOLS:
+                    # No client argument to overwrite: run the client-scoped version.
+                    result = await team_pinning.run_pinned(tc.name, args, db=db, user_id=user_id,
+                                                           client_group_id=client_group_id,
+                                                           mongo_client=mongo_client)
                 elif tc.name in mcp_client.MCP_TOOL_NAMES and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:

@@ -64,12 +64,17 @@ def _view(m: dict, names: dict) -> dict:
 # Tools
 # ---------------------------------------------------------------------------
 
-async def list_lessons(db, user_id, mongo_client=None, **_):
+async def list_lessons(db, user_id, mongo_client=None, *, only_client: str | None = None, **_):
+    """`only_client` (set by the server in a one-client agent run, ai/team/pinning.py): that client's
+    lessons and the agency-wide ones, never another client's."""
     agent = await _agent(db, user_id)
     if agent is None:
         return _fail(NOT_FOUND)
     names = {g["id"]: g.get("name") or g["id"] for g in await _groups(db, agent)}
-    rows = await db[MEMORY].find({"agent_id": agent["_id"], "active": True}).sort("created_at", -1).to_list(length=None)
+    q = {"agent_id": agent["_id"], "active": True}
+    if only_client:
+        q["$or"] = [{"client_group_id": None}, {"client_group_id": only_client}]
+    rows = await db[MEMORY].find(q).sort("created_at", -1).to_list(length=None)
     return {"ok": True, "lessons": [_view(m, names) for m in rows]}
 
 
