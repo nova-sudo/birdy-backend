@@ -193,6 +193,7 @@ async def chat(
 # ──────────────────────────────────────────────────────────────────────────
 
 KEEPALIVE_SECONDS = 15
+_RUNNING: set = set()   # strong references to running stream turns
 
 
 def _sse(event: str, data) -> str:
@@ -220,21 +221,21 @@ async def _event_stream(db, mongo_client, current_user: str, request: ChatReques
             logger.error(f"Chat stream error: {e}", exc_info=True)
             queue.put_nowait(("error", {"message": "Failed to process chat message"}))
 
+    # The turn runs in its own task. If the client goes away mid-turn the task
+    # is left to finish, so the reply is still saved, archived and debited once
+    # (cancelling it would lose tokens already spent) and shows on reload.
     task = asyncio.create_task(work())
-    try:
-        while True:
-            try:
-                event, data = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
-            except asyncio.TimeoutError:
-                yield ": keep-alive\n\n"
-                continue
-            yield _sse(event, data)
-            if event in ("final", "error"):
-                break
-    finally:
-        if not task.done():
-            # The client went away: stop the turn rather than spend credits on nobody.
-            task.cancel()
+    _RUNNING.add(task)
+    task.add_done_callback(_RUNNING.discard)
+    while True:
+        try:
+            event, data = await asyncio.wait_for(queue.get(), timeout=KEEPALIVE_SECONDS)
+        except asyncio.TimeoutError:
+            yield ": keep-alive\n\n"
+            continue
+        yield _sse(event, data)
+        if event in ("final", "error"):
+            break
 
 
 @router.post("/api/chat/stream")

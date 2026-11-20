@@ -150,6 +150,14 @@ async def test_without_agent_nothing_changes(mock_db, registry):
     assert "agent" not in row and "route" not in row
 
 
+async def test_without_agent_the_ledger_row_is_unchanged(mock_db, registry):
+    await mock_db["users"].insert_one({"user_id": U, "credits": {**credits._effective_credits({})[0],
+                                                                  "topup_balance": 1000.0}})
+    await chat(TeamProvider({"default": [say("ok")]}), registry, mock_db)
+    row = await mock_db["ai_usage"].find_one({})
+    assert row["feature"] == "ask_birdy" and not {"agent", "depth", "agents"} & set(row)
+
+
 def test_chat_models_default_and_validate():
     from pydantic import ValidationError
     from core.models import ChatRequest, ChatResponse
