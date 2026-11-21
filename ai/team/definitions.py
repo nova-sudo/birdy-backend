@@ -322,9 +322,11 @@ async def context_block(db, user_id: str, client_group_id: str | None) -> str:
     return await _block(db, user_id, client_group_id)
 
 
-async def build_instructions(agent: str, db, user_id: str, *, client_group_id: str | None,
-                             client_name: str | None, asked_by: str | None, source: str | None = None) -> str:
-    """The system prompt for one run of `agent`. `asked_by` (an agent name) marks a delegated run."""
+async def instruction_parts(agent: str, db, user_id: str, *, client_group_id: str | None,
+                            client_name: str | None, asked_by: str | None,
+                            source: str | None = None) -> list[tuple[str, str]]:
+    """The system prompt for one run of `agent`, as (part name, text) in order. `asked_by` (an agent
+    name) marks a delegated run. scripts/measure_agent_prompt.py reports each part's size."""
     nested = asked_by is not None
     if agent == SALES_COACH:
         from ai.orchestrator import _CALL_CENTER_SYSTEM_PROMPT
@@ -333,27 +335,38 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
             base = with_rich_output(base)
         role = _SALES_COACH_ROLE
     else:
-        base = get_system_prompt()
+        # Only the guide lines for this run's own tools; a delegated run's answer goes to another agent,
+        # so it gets no screen blocks (status, forms, visuals), as Sales Coach's delegated runs already don't.
+        offered = tool_names(agent, nested=nested, one_client=bool(client_group_id))
+        base = get_system_prompt(offered, for_screen=not nested)
         role = _BIRDY_ROLE if agent == BIRDY else _MEDIA_BUYER_ROLE
-    parts = [base, _TEAM, role]
+    parts = [("base prompt", base), ("team notes", _TEAM), ("role prompt", role)]
     if agent == MEDIA_BUYER:
-        parts.append("\n" + get_media_buying_module())
+        parts.append(("media buying module", "\n" + get_media_buying_module()))
         if not nested and source != "slack":
-            parts.append(CREATIVE_TESTS_GUIDE)
-        parts.append(_data_block("Your lessons (Media Buyer's memory)", "lessons",
-                                 await _media_buyer_lessons(db, user_id, client_group_id)))
+            parts.append(("creative tests guide", CREATIVE_TESTS_GUIDE))
+        parts.append(("lessons", _data_block("Your lessons (Media Buyer's memory)", "lessons",
+                                             await _media_buyer_lessons(db, user_id, client_group_id))))
     if agent == SALES_COACH:
-        parts.append(_data_block("Your lessons (Sales Coach's memory)", "lessons",
-                                 await _sales_coach_lessons(db, user_id, client_group_id)))
-    parts.append(await context_block(db, user_id, client_group_id))
+        parts.append(("lessons", _data_block("Your lessons (Sales Coach's memory)", "lessons",
+                                             await _sales_coach_lessons(db, user_id, client_group_id))))
+    parts.append(("context cards", await context_block(db, user_id, client_group_id)))
     if client_group_id:
-        parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))
+        parts.append(("client scope", _SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id)))
     else:
-        parts.append(_SCOPE_AGENCY)
+        parts.append(("client scope", _SCOPE_AGENCY))
     if nested:
-        parts.append(_DELEGATED.format(asked_by=asked_by))
-    parts.append(f"\nToday's date is {date.today().isoformat()}.\n")
-    return "".join(p for p in parts if p)
+        parts.append(("delegated note", _DELEGATED.format(asked_by=asked_by)))
+    parts.append(("date", f"\nToday's date is {date.today().isoformat()}.\n"))
+    return [(name, text) for name, text in parts if text]
+
+
+async def build_instructions(agent: str, db, user_id: str, *, client_group_id: str | None,
+                             client_name: str | None, asked_by: str | None, source: str | None = None) -> str:
+    """The system prompt for one run of `agent`. `asked_by` (an agent name) marks a delegated run."""
+    parts = await instruction_parts(agent, db, user_id, client_group_id=client_group_id, client_name=client_name,
+                                    asked_by=asked_by, source=source)
+    return "".join(text for _, text in parts)
 
 
 def sub_agent_instructions(sub, parent_name: str, *, client_group_id: str | None, client_name: str | None,

@@ -1,3 +1,5 @@
+import hashlib
+import json
 import logging
 from openai import AsyncOpenAI, APIStatusError
 
@@ -6,6 +8,19 @@ from ai.providers.base import BaseLLMProvider, ProviderResponse, ToolCall, Usage
 logger = logging.getLogger(__name__)
 
 DEFAULT_OPENAI_MODEL = "gpt-4o"
+CACHE_KEY_PREFIX_CHARS = 4000
+
+
+def prompt_cache_key(model: str, messages: list[dict], tools: list[dict] | None) -> str:
+    """One key per fixed prefix (model, tool schemas, the start of the system prompt). OpenAI caches a
+    prompt's prefix on its own; the key routes calls that share a prefix (every loop turn of a reply,
+    and the next reply of the same agent) to the same cache, so more of them hit it."""
+    system = next((m.get("content") for m in messages if m.get("role") == "system"), "") or ""
+    h = hashlib.sha256()
+    h.update(model.encode())
+    h.update(json.dumps([t.get("function", {}).get("name") for t in tools or []]).encode())
+    h.update(str(system)[:CACHE_KEY_PREFIX_CHARS].encode())
+    return "birdy-" + h.hexdigest()[:32]
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -44,6 +59,8 @@ class OpenAIProvider(BaseLLMProvider):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice
+        # extra_body rather than the named argument, so an older pinned SDK still sends it
+        kwargs["extra_body"] = {"prompt_cache_key": prompt_cache_key(self.model, messages, tools)}
 
         try:
             response = await self.client.chat.completions.create(**kwargs)
@@ -73,6 +90,7 @@ class OpenAIProvider(BaseLLMProvider):
         usage = Usage(
             input_tokens=getattr(u, "prompt_tokens", 0) or 0,
             output_tokens=getattr(u, "completion_tokens", 0) or 0,
+            cached_input_tokens=getattr(getattr(u, "prompt_tokens_details", None), "cached_tokens", 0) or 0,
         ) if u else Usage()
 
         return ProviderResponse(
