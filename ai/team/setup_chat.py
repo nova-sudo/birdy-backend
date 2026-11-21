@@ -271,9 +271,7 @@ _RULES = """
 _DONE_NOTE = {
     "media_buyer": ("When every step is done, say you are set up. The setup state's `activation` says whether you were "
                     "switched on; if it is not_ready, say plainly what is missing (its `missing` lines) and don't say "
-                    "you are on. Your automatic daily checks only start after one finished practice run, so if that "
-                    "is what is missing, say so once and ask whether they want to do one now; if they say yes, show "
-                    "it with show_setup_step(\"practice\"). Chat and your pages work without it."),
+                    "you are on."),
     "sales_coach": "When every step is done, say you are set up and what you will report on.",
 }
 

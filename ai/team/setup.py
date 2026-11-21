@@ -627,6 +627,13 @@ async def agent_state(db, user_id: str, key: str, st: dict | None = None, rows: 
         "values": values, "completed_at": _iso(_completed(row)),
     }
     if key == MEDIA_BUYER and _completed(row):
+        # Set up but recorded as not switched on: try again, once it can. Only while the record says
+        # not_ready, so an owner who later switches the agent off isn't overruled.
+        if ((row.get("setup") or {}).get("activation") or {}).get("status") == "not_ready":
+            result = await activate_media_buyer(db, user_id)
+            if result["status"] == "active":
+                await db[TEAM_AGENTS].update_one({"_id": row_id(key, user_id)},
+                                                 {"$set": {"setup.activation": {**result, "at": _now()}}})
         out["activation"] = await media_buyer_activation(db, user_id)   # beyond the contract
     out["chat_session_id"] = await _setup_session(db, user_id, key)    # beyond the contract
     return out

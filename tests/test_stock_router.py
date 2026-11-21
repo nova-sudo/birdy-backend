@@ -166,18 +166,14 @@ async def test_activate_lists_what_is_missing_until_ready(api, mock_db):
     aid = agent["_id"]
     await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft", "scope.client_group_ids": []}})
     r = api.post(f"/api/agents/{aid}/activate")
-    assert r.status_code == 409 and len(r.json()["missing"]) >= 2
-    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"scope.client_group_ids": ["g1"]}})
-    r = api.post(f"/api/agents/{aid}/activate")
-    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
-
-    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"settings.zones": {
+    assert r.status_code == 409 and r.json()["missing"] == ["Choose at least one client to watch"]
+    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"scope.client_group_ids": ["g1"], "settings.zones": {
         "currency": None, "green_under": None, "red_over": None}, "settings.clients.g1.zones": None}})
     r = api.post(f"/api/agents/{aid}/activate")
-    assert any("zone" in m.lower() for m in r.json()["missing"])
+    assert r.status_code == 409 and any("zone" in m.lower() for m in r.json()["missing"])
 
+    # With a client and its zones it switches on. No preview is needed first.
     await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"settings.zones": ZONES}})
-    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
     r = api.post(f"/api/agents/{aid}/activate")
     assert r.status_code == 200 and r.json()["status"] == "active"
     assert await claims.holder(mock_db, USER, "g1") == aid
@@ -450,16 +446,14 @@ async def test_deleting_a_draft_agent_removes_its_outcomes(mock_db):
     assert [o["_id"] async for o in mock_db[OUTCOMES].find()] == ["o2"]
 
 
-async def test_activate_needs_a_preview_covering_the_current_clients(api, mock_db):
+async def test_activate_does_not_need_a_preview(api, mock_db):
+    """The owner dropped the preview requirement: the daily run starts straight after setup."""
     agent = await _setup(mock_db, "g1", claim=False)
     aid = agent["_id"]
     await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
-    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
-    await _client(mock_db, "g2")
-    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {
-        "scope.client_group_ids": ["g1", "g2"], "settings.clients.g2": {"batch_id": "a", "treatment_ids": []}}})
+    assert await mock_db[RUNS].count_documents({"agent_id": aid, "kind": "preview"}) == 0
     r = api.post(f"/api/agents/{aid}/activate")
-    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
+    assert r.status_code == 200 and r.json()["status"] == "active"
 
 
 async def test_run_view_trims_internals_and_outcome_rows_name_their_fields(api, mock_db):
@@ -585,17 +579,6 @@ async def test_agent_view_tells_the_stock_agent_whether_add_writes_are_on(api, m
 async def test_custom_agent_view_has_no_add_writes_field(api, mock_db):
     custom = await create_agent(mock_db, USER, type="custom", name="Rules")
     assert "add_writes_enabled" not in api.get(f"/api/agents/{custom['_id']}").json()
-
-
-async def test_a_preview_where_every_client_failed_does_not_count(api, mock_db):
-    agent = await _setup(mock_db, "g1", claim=False)
-    aid = agent["_id"]
-    await mock_db[AGENTS].update_one({"_id": aid}, {"$set": {"status": "draft"}})
-    assert api.post(f"/api/agents/{aid}/preview").status_code == 200
-    await mock_db[RUNS].update_many({"agent_id": aid, "kind": "preview"}, {"$set": {
-        "clients.g1": {"state": "failed", "error": "Meta needs reconnecting. Reconnect to check this client."}}})
-    r = api.post(f"/api/agents/{aid}/activate")
-    assert r.status_code == 409 and any("preview" in m.lower() for m in r.json()["missing"])
 
 
 # ---------------------------------------------------------------------------
