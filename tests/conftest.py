@@ -231,6 +231,23 @@ def _close_currency_client() -> None:
 
 
 @pytest.fixture(autouse=True)
+def _agents_set_up(request, monkeypatch):
+    """Agent onboarding (ai/team/setup.py) locks every account's agents until their setup chats are done.
+    The suite's other tests are about agents that are set up, so the lock reads "all done" for them. A test
+    marked `agent_onboarding` gets the real lock, read from its mock database."""
+    if request.node.get_closest_marker("agent_onboarding") is not None:
+        yield
+        return
+    import ai.team.setup as team_setup
+
+    async def all_done(db, user_id):
+        return {k: {"status": team_setup.DONE, "waits_on": None} for k in team_setup.ORDER}
+
+    monkeypatch.setattr(team_setup, "statuses", all_done)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _no_outbound_connections(request):
     start = len(BLOCKED)
     _current.update(test=request.node.nodeid, live=request.node.get_closest_marker("live") is not None,

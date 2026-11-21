@@ -39,6 +39,7 @@ TOOL_LABELS = {
     "get_metrics_by_day_windows": "Results by day ranges",
     "get_call_center_stats": "Call center stats",
     "get_call_trend": "Calls against the period before",
+    "get_sales_outcomes": "Booked, closed and speed to lead",
     "get_daily_metrics": "Daily numbers",
     "get_call_recordings_summary": "Call recordings summary",
     "analyze_call_recordings": "Call analysis",

@@ -92,6 +92,9 @@ def _is_due(agent: dict, now_utc: datetime) -> bool:
     sched_utc, today = _scheduled_utc(agent, now_utc)
     if now_utc < sched_utc:
         return False
+    # "weekdays" (set in the agent onboarding, ai/team/setup.py): no run on Saturday or Sunday.
+    if ((agent.get("scope") or {}).get("schedule") or {}).get("days") == "weekdays" and today.weekday() >= 5:
+        return False
     last = agent.get("last_run_at")
     return not (last and _aware_utc(last).astimezone(tz).date() == today)
 

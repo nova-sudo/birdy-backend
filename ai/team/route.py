@@ -63,6 +63,7 @@ TOOL_LABELS = {
     "get_ghl_opp_stats_windowed": "Pipeline for a period",
     "get_call_center_stats": "Call stats",
     "get_call_trend": "Calls against the period before",
+    "get_sales_outcomes": "Booked, closed and speed to lead",
     "recall_conversations": "Earlier chats",
     "propose_sub_agent": "A new sub-agent",
     "use_helper": "Started a helper",
@@ -181,6 +182,7 @@ class Turn:
     credits_total: Optional[float] = None   # the charge actually debited, once known
     _rates: Optional[dict] = None           # credit settings, loaded once per reply
     budget: Optional[float] = None          # seconds for the whole reply; None = TURN_BUDGET_SECONDS
+    locked: Optional[frozenset] = None      # agents not set up yet (ai/team/setup.py), read once per reply
 
     # time
     def elapsed(self) -> float:

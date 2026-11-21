@@ -71,6 +71,7 @@ _RECALL_SCHEMA = {
 }
 
 AGENCY = "agency"
+SUB_AGENTS_LOCK = "sub_agents"   # in a run's locked set while sub-agents are locked (ai/team/setup.py)
 ANSWER_MAX_CHARS = 4000      # how much of a child's answer goes back into the parent's context
 QUESTION_MAX_CHARS = 1500
 
@@ -173,21 +174,23 @@ def owner_of(frame: rt.Frame) -> str | None:
     return frame.parent_main
 
 
-async def subs_for(db, frame: rt.Frame, user_id: str) -> list:
-    """A main agent's callable sub-agents (none for Birdy or a sub-agent, or when the chain is full)."""
-    if frame.agent not in defs.MAIN_AGENTS or frame.depth + 1 > rt.MAX_DEPTH:
+async def subs_for(db, frame: rt.Frame, user_id: str, locked=frozenset()) -> list:
+    """A main agent's callable sub-agents (none for Birdy or a sub-agent, when the chain is full, or
+    while sub-agents are locked: ai/team/setup.py)."""
+    if frame.agent not in defs.MAIN_AGENTS or frame.depth + 1 > rt.MAX_DEPTH or SUB_AGENTS_LOCK in locked:
         return []
     return await list_sub_agents(db, frame.agent, user_id)
 
 
-def tool_schemas(frame: rt.Frame, subs: list) -> list[dict]:
-    """The delegation tools this run is offered. Never an ask to an agent already in the chain."""
+def tool_schemas(frame: rt.Frame, subs: list, locked=frozenset()) -> list[dict]:
+    """The delegation tools this run is offered. Never an ask to an agent already in the chain, nor to
+    one not set up yet (`locked`, ai/team/setup.py)."""
     if frame.helper:
         return []       # a helper reads with its own tools and nothing else
     out = []
     if frame.agent == defs.BIRDY:
         for tool, target in ((ASK_MEDIA_BUYER, defs.MEDIA_BUYER), (ASK_SALES_COACH, defs.SALES_COACH)):
-            if target not in frame.chain:
+            if target not in frame.chain and target not in locked:
                 out.append(_SCHEMAS[tool])
     elif frame.agent in defs.MAIN_AGENTS:
         if defs.BIRDY not in frame.chain:
@@ -274,6 +277,11 @@ async def handle(name: str, args: dict, frame: rt.Frame, ctx: dict) -> str:
     key, display, sub = target
     if not _allowed_edge(frame, key):
         return _result(False, error=f"You can't ask {display} directly. Agents only ask Birdy or their own sub-agents.")
+    locked = ctx.get("locked") or frozenset()
+    if key in locked or (sub is not None and SUB_AGENTS_LOCK in locked):
+        from ai.team import setup as team_setup
+        return _result(False, error="agent_locked", agent=display,
+                       note=team_setup.locked_text(key if sub is None else team_setup.SUB_AGENTS))
 
     question = str(args.get("question") or "").strip()
     if not question:

@@ -87,8 +87,10 @@ MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
 # open and won revenue per preset (many clients) or for any dates (one client). Lead counts and sources
 # (get_unified_lead_stats) stay Birdy's: they say nothing about what the calls achieved.
 SALES_COACH_PIPELINE = ("get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed")
+# get_sales_outcomes: booked and closed counts and speed to lead, as the owner defined them in its setup chat
+# (ai/team/sales_coach.py).
 SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
-                    *SALES_COACH_PIPELINE, "list_lessons")
+                    *SALES_COACH_PIPELINE, "get_sales_outcomes", "list_lessons")
 SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
 
 BIRDY_READ = (
@@ -350,6 +352,8 @@ async def instruction_parts(agent: str, db, user_id: str, *, client_group_id: st
     if agent == SALES_COACH:
         parts.append(("lessons", _data_block("Your lessons (Sales Coach's memory)", "lessons",
                                              await _sales_coach_lessons(db, user_id, client_group_id))))
+        from ai.team.sales_coach import prompt_block as _sales_setup
+        parts.append(("setup", await _sales_setup(db, user_id)))
     parts.append(("context cards", await context_block(db, user_id, client_group_id)))
     if client_group_id:
         parts.append(("client scope", _SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id)))

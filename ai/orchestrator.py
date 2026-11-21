@@ -34,6 +34,9 @@ from ai.team import lesson_tools as team_lesson_tools
 from ai.team import pinning as team_pinning
 from ai.team import propose_only as team_propose_only
 from ai.team import route as team_route
+from ai.team import setup as team_setup
+from ai.team import setup_chat as team_setup_chat
+from ai.team.sales_coach import TOOL_NAME as SALES_OUTCOMES_TOOL
 
 logger = logging.getLogger(__name__)
 
@@ -193,6 +196,9 @@ _PAGE_TOOLS["stock_card"] = list(STOCK_CARD_TOOL_NAMES)
 _PAGE_TOOLS["stock_lessons"] = list(STOCK_LESSON_TOOL_NAMES)
 _STOCK_CHAT_TOOL_NAMES = frozenset(STOCK_CARD_TOOL_NAMES) | frozenset(STOCK_LESSON_TOOL_NAMES)
 _PAGE_ONLY_TOOLS |= _STOCK_CHAT_TOOL_NAMES
+# Agent onboarding (page "team_setup", ai/team/setup_chat.py): the agent's own setup interview.
+_PAGE_ONLY_TOOLS |= set(team_setup_chat.TOOL_NAMES)
+TEAM_SETUP_PAGE = team_setup_chat.PAGE
 # page -> async (db, user_id) -> str
 _ASYNC_PAGE_PROMPTS = {"stock_card": stock_card_tools.build_system_prompt,
                        "stock_lessons": stock_lesson_tools.build_system_prompt}
@@ -216,7 +222,7 @@ _AGENT_PINNED_GROUP_IDS_TOOLS = _CLIENT_PINNED_GROUP_IDS_TOOLS | {
     "get_ghl_contacts", "get_ghl_opportunity_stats", "get_ghl_tag_breakdown", "get_tag_rollup_by_campaign",
     "get_account_summary", "compare_periods", "get_meta_insights_live", "get_meta_insights_monthly",
     "get_meta_leads_live", "compute_custom_metric", "get_unified_leads", "get_unified_lead_stats",
-    "get_metrics_by_day_windows", "get_call_center_stats", "get_call_trend"}
+    "get_metrics_by_day_windows", "get_call_center_stats", "get_call_trend", SALES_OUTCOMES_TOOL}
 # Client lists in a one-client agent run are cut down to that client.
 _AGENT_FILTERED_CLIENT_LISTS = {"get_client_groups"}
 
@@ -670,7 +676,14 @@ def _only_client(result: str, client_group_id: str) -> str:
     return result
 
 
-async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
+def _is_setup_chat(frame, page) -> bool:
+    """A main agent's own setup interview (page "team_setup"), never a delegated run."""
+    return page == TEAM_SETUP_PAGE and frame is not None and not frame.nested and frame.agent in team_defs.MAIN_AGENTS
+
+
+async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source, page=None) -> str:
+    if _is_setup_chat(frame, page):
+        return await team_setup_chat.system_prompt(db, user_id, frame.agent)
     if frame.helper:
         return delegation.helper_instructions(frame, client_group_id=client_group_id, client_name=client_name)
     if frame.sub is not None:
@@ -691,12 +704,21 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
         asked_by=asked_by, source=source)
     if not frame.nested and team_propose_only.active():
         prompt += "\n" + team_propose_only.PROMPT_NOTE
+    locked = [k for k in team_defs.MAIN_AGENTS if k in (frame.turn.locked or ())]
+    if frame.agent == team_defs.BIRDY and locked:
+        names = " and ".join(team_defs.NAMES[k] for k in locked)
+        prompt += (f"\n## Not set up yet\n{names} {'is' if len(locked) == 1 else 'are'} not set up yet, so you "
+                   "cannot ask them. When a question needs them, say so in one line and tell the owner to finish "
+                   "their setup chat in Birdy; answer what you can from your own reads.\n")
     return prompt
 
 
-def _agent_tool_names(frame) -> list:
+def _agent_tool_names(frame, page=None) -> list:
     """The registry/MCP tools one agent run may use. A sub-agent's list is cut to its main
-    agent's read tools: never more than the main agent has, never a write."""
+    agent's read tools: never more than the main agent has, never a write. The setup chat gets
+    only its setup tools and the client list."""
+    if _is_setup_chat(frame, page):
+        return ["get_client_groups", *team_setup_chat.TOOL_NAMES]
     if frame.sub is not None:
         parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
         from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
@@ -749,6 +771,9 @@ async def run_chat(
                                     on_change=on_route, model=getattr(provider, "model", None))
         await frame.turn.load_rates(db)
         frame.turn.changed()   # the stream's first route event: the agent has started
+    if frame is not None and frame.turn.locked is None:
+        # Agents not set up yet (ai/team/setup.py): hidden from asks and refused, once per reply.
+        frame.turn.locked = await team_setup.locked_agents(db, user_id)
     nested = frame is not None and frame.nested
     # Agent chats are archived with their agent/card (see conversation_log).
     archive_ids = {"agent_id": agent_id, "card_id": card_id}
@@ -786,7 +811,7 @@ async def run_chat(
     # that began under older instructions must not keep them.
     if frame is not None:
         fresh = {"role": "system", "content": await _agent_system_prompt(
-            frame, db, user_id, client_group_id, client_name, source)}
+            frame, db, user_id, client_group_id, client_name, source, page)}
         if history and history[0].get("role") == "system":
             history[0] = fresh
         else:
@@ -862,6 +887,12 @@ async def run_chat(
 
     async def _guard_setup() -> None:
         """Add the block the setup step needs if the model only talked about it."""
+        if _is_setup_chat(frame, page):
+            try:
+                await team_setup_chat.ensure_block(db, user_id, frame.agent, agent_changes)
+            except Exception:
+                logger.exception("team setup guard failed")
+            return
         if page != "agent_setup":
             return
         try:
@@ -987,7 +1018,7 @@ async def run_chat(
         return result
 
     if frame is not None:
-        allowed = _agent_tool_names(frame)
+        allowed = _agent_tool_names(frame, page)
     else:
         allowed = _PAGE_TOOLS.get(page) if page else None
     max_iterations = team_route.NESTED_MAX_TOOL_ITERATIONS if nested else MAX_TOOL_ITERATIONS
@@ -1031,11 +1062,18 @@ async def run_chat(
         if frame is not None:
             # The ask / propose tools, and every tool name this run may call:
             # an agent run never executes a tool it was not offered.
-            subs = await delegation.subs_for(db, frame, user_id)
-            tool_schemas = tool_schemas + delegation.tool_schemas(frame, subs) + team_lesson_tools.tool_schemas(frame)
+            locked = frame.turn.locked or frozenset()
+            subs = await delegation.subs_for(db, frame, user_id, locked=locked)
+            if _is_setup_chat(frame, page):
+                # The interview asks no one; in the sub-agents step it proposes them (once that step is open).
+                extra = [s for s in delegation.tool_schemas(frame, [], locked=locked)
+                         if s["function"]["name"] == delegation.PROPOSE_SUB_AGENT and team_setup.SUB_AGENTS not in locked]
+            else:
+                extra = delegation.tool_schemas(frame, subs, locked=locked) + team_lesson_tools.tool_schemas(frame)
+            tool_schemas = tool_schemas + extra
             delegation_ctx = {"provider": provider, "tool_registry": tool_registry, "db": db,
                               "user_id": user_id, "mongo_client": mongo_client, "source": source,
-                              "session_id": session_id, "subs": subs}
+                              "session_id": session_id, "subs": subs, "locked": locked}
         offered = {s["function"]["name"] for s in tool_schemas}
         excluded = _SLACK_EXCLUDED_TOOLS if source == conversation_log.SOURCE_SLACK else frozenset()
         if excluded:
@@ -1218,6 +1256,9 @@ async def run_chat(
                         call_args = {**args, "session_id": session_id}
                     elif tc.name == RENDER_UI_TOOL_NAME:
                         call_args = {**args, "ui_blocks_sink": ui_blocks}
+                    elif tc.name in team_setup_chat.TOOL_NAMES:
+                        # The setup chat's agent, from the server, whatever the model passed.
+                        call_args = {**args, "agent": frame.agent if frame is not None else None}
                     result = await tool_registry.execute(
                         tc.name,
                         db=db,

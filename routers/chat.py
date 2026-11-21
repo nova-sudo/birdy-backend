@@ -34,6 +34,9 @@ from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
 from ai.team import definitions as team_defs
 from ai.team import proposals as team_proposals
+from ai.team import setup as team_setup
+from ai.team.sales_coach import register_sales_coach_tools
+from ai.team.setup_chat import PAGE as TEAM_SETUP_PAGE, register_setup_chat_tools
 from ai.tools.agent_tools import current_training_agent
 from ai.tools.stock_card_tools import (current_card_read_only, current_stock_card, load_chat_card,
                                       register_stock_card_tools)
@@ -68,6 +71,8 @@ register_creative_tools()
 register_render_ui_tools()
 register_page_view_tools()
 register_attribution_tools()
+register_sales_coach_tools()
+register_setup_chat_tools()
 
 
 def _archive_ids(request: ChatRequest) -> dict:
@@ -102,17 +107,33 @@ async def _onboarding_complete(db, user_id: str) -> bool:
     return bool((user.get("onboarding") or {}).get("completed"))
 
 
+async def _agent_lock(db, user_id: str, request: ChatRequest) -> None:
+    """Agent onboarding (ai/team/setup.py): a main agent not set up yet takes no chat, except its own
+    setup chat (page "team_setup") once it is open; a set-up agent's setup chat edits its answers.
+    423 {"detail": {"code": "agent_locked", "agent", "waits_on"}}. Birdy is never locked."""
+    if request.page == TEAM_SETUP_PAGE and request.agent not in team_defs.MAIN_AGENTS:
+        raise HTTPException(status_code=422, detail="team_setup needs agent media_buyer or sales_coach")
+    if request.agent not in team_defs.MAIN_AGENTS:
+        return
+    st = await team_setup.status_of(db, user_id, request.agent)
+    allowed = (team_setup.OPEN, team_setup.DONE) if request.page == TEAM_SETUP_PAGE else (team_setup.DONE,)
+    if st["status"] not in allowed:
+        raise HTTPException(status_code=423, detail=team_setup.locked_body(request.agent, st["waits_on"]))
+
+
 async def _checks(db, current_user: str, request: ChatRequest, mongo_client) -> tuple:
-    """Owner checks, the credit gate and the provider: everything that answers with an
+    """Owner checks, the agent lock, the credit gate and the provider: everything that answers with an
     HTTP status before a turn starts. Returns (provider, stock_card_id, lessons_agent_id)."""
     stock_card_id = await _stock_card_id(db, current_user, request)
     lessons_agent_id = await _lessons_agent_id(db, current_user, request)
+    await _agent_lock(db, current_user, request)
     # Stopper: block when the user is out of Birdy Credits (raises 402
     # OUT_OF_CREDITS, which the frontend turns into a top-up prompt).
-    # Except the report copilot during onboarding: it runs before
-    # billing, and a new account must be able to finish setting up.
-    if not (request.page == "report_designer"
-            and not await _onboarding_complete(db, current_user)):
+    # Except the report copilot during onboarding, and the agents' setup
+    # chats: they are part of setting up, and a new account must be able to
+    # finish. Their replies are still charged.
+    if not ((request.page == "report_designer" and not await _onboarding_complete(db, current_user))
+            or request.page == TEAM_SETUP_PAGE):
         await check_credits(current_user, mongo_client)
     provider = await get_provider_for_user(current_user, db)
     if lessons_agent_id is None and request.agent in team_defs.MAIN_AGENTS:
@@ -456,7 +477,7 @@ MAX_CONVERSATIONS = 100
 TITLE_LENGTH = 60
 # Agent chats (a stock card, Teach Birdy, agent setup) are archived with their
 # agent/card and reopened from that agent's page, never from the history list.
-HIDDEN_HISTORY_PAGES = {"stock_card", "stock_lessons", "agent_setup"}
+HIDDEN_HISTORY_PAGES = {"stock_card", "stock_lessons", "agent_setup", TEAM_SETUP_PAGE}
 
 
 @router.get("/api/chat/conversations")

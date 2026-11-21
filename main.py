@@ -24,7 +24,7 @@ from jobs.cache_jobs import populate_cache_for_existing_groups
 from dependencies import get_mongo_client
 from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 
-from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, mcp_activity, mcp_oauth, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock, sub_agents, context, team
+from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, mcp_activity, mcp_oauth, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock, sub_agents, context, team, team_setup
 from billing import router as billing_router
 from credits import router as credits_router
 
@@ -180,6 +180,7 @@ app.include_router(agent_stock.router)
 app.include_router(creatives.router)
 app.include_router(client_notes.router)
 app.include_router(context.router)
+app.include_router(team_setup.router)  # before team: /api/team/setup is not an agent key
 app.include_router(team.router)
 app.include_router(attribution.router)
 # Public, unauthenticated tracker edge — see routers/tracking.py for why it

@@ -432,12 +432,12 @@ async def test_log_message_stores_card_fields(mock_db):
 
 async def test_history_hides_agent_pages(chat_api, mock_db):
     await a_conversation(mock_db, "ask", ["What's my CPL?", "£10"])
-    for page in ("stock_card", "stock_lessons", "agent_setup"):
+    for page in ("stock_card", "stock_lessons", "agent_setup", "team_setup"):
         await log_message(mock_db, user_id=USER, session_id=f"s-{page}", source="birdy", role="user",
                           content="hidden", page=page, agent_id="ag1")
     out = await chat_router.list_conversations(current_user=USER)
     assert [c["session_id"] for c in out["conversations"]] == ["ask"]
-    assert chat_router.HIDDEN_HISTORY_PAGES == {"stock_card", "stock_lessons", "agent_setup"}
+    assert chat_router.HIDDEN_HISTORY_PAGES == {"stock_card", "stock_lessons", "agent_setup", "team_setup"}
 
 
 async def test_card_transcript_latest_session_in_order(mock_db):
