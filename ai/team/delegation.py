@@ -429,13 +429,15 @@ async def _recall(args: dict, frame: rt.Frame, ctx: dict) -> str:
     except (TypeError, ValueError):
         limit = 3
     db, user_id = ctx["db"], ctx["user_id"]
-    match = {"user_id": user_id, "source": "birdy", "agent": {"$in": agents}, "role": {"$in": ["user", "assistant"]}}
+    # Slack threads count too: since Slack talks to Birdy they are chats with the team like any other.
+    match = {"user_id": user_id, "source": {"$in": ["birdy", "slack"]}, "agent": {"$in": agents},
+             "role": {"$in": ["user", "assistant"]}}
     if ctx.get("session_id"):
         match["session_id"] = {"$ne": ctx["session_id"]}
     if frame.client_group_id:
         match["client_group_id"] = frame.client_group_id
     rows = await db["ai_conversation_log"].find(
-        match, {"_id": 0, "session_id": 1, "agent": 1, "role": 1, "content": 1, "created_at": 1},
+        match, {"_id": 0, "session_id": 1, "agent": 1, "role": 1, "content": 1, "created_at": 1, "source": 1},
     ).sort("created_at", -1).limit(400).to_list(length=400)
     order, by_session = [], {}
     for r in rows:
@@ -445,11 +447,14 @@ async def _recall(args: dict, frame: rt.Frame, ctx: dict) -> str:
                 continue
             order.append(sid)
             by_session[sid] = {"agent": r.get("agent"), "with": defs.NAMES.get(r.get("agent"), r.get("agent")),
-                               "last_message_at": r.get("created_at"), "messages": []}
+                               "last_message_at": r.get("created_at"), "messages": [],
+                               "where": "Slack" if r.get("source") == "slack" else "Birdy app"}
         conv = by_session[sid]
         text = str(r.get("content") or "")
         if len(conv["messages"]) < RECALL_MESSAGES and text and not text.startswith(("[UI_RESPONSE]", "[APPROVED_PROPOSAL]")):
-            conv["messages"].append({"from": "owner" if r.get("role") == "user" else conv["with"],
+            # In Slack anyone in the workspace can write, so the asker is not called the owner there.
+            asker = "someone in Slack" if conv["where"] == "Slack" else "owner"
+            conv["messages"].append({"from": asker if r.get("role") == "user" else conv["with"],
                                      "text": rt.clip(text, RECALL_MESSAGE_CHARS)})
     convs = [by_session[sid] for sid in order]
     for c in convs:

@@ -849,6 +849,17 @@ async def test_agents_read_the_owners_chats_with_each_other(mock_db, registry, g
     assert [c["agent"] for c in only] == ["media_buyer"]
 
 
+async def test_agents_read_slack_threads_too(mock_db, registry, groups):
+    # Slack talks to Birdy, so a Slack thread is a chat with the team like any other
+    await chat(TeamProvider({"birdy": [say("Calls dipped on Tuesday.")]}), registry, mock_db, agent="birdy",
+               message="what happened to calls this week?", source="slack")
+    p = TeamProvider({"sales_coach": [call("recall_conversations"), say("ok")]})
+    await chat(p, registry, mock_db, agent="sales_coach", message="what did we say in Slack?")
+    conv, = json.loads(next(m for m in p.calls[-1][2] if m["role"] == "tool")["content"])["conversations"]
+    assert conv["where"] == "Slack"
+    assert sorted(m["from"] for m in conv["messages"]) == ["Birdy", "someone in Slack"]
+
+
 async def test_birdy_has_a_main_agent_propose_a_sub_agent(mock_db, registry, groups):
     p = TeamProvider({
         "birdy": [call("ask_sales_coach", question="Set up a sub-agent that watches weekly call volume.", client="agency"),
