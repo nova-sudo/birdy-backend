@@ -155,6 +155,9 @@ async def compare_periods(preset_a: str, preset_b: str, group_ids: list[str] | N
             totals_a[k] += row_a.get(k, 0) or 0
             totals_b[k] += row_b.get(k, 0) or 0
 
+    # Past the cap, keep the clients that spend most (either period), not the first the database returned.
+    per_group.sort(key=lambda r: max(r["period_a"].get("spend") or 0, r["period_b"].get("spend") or 0), reverse=True)
+
     overall_a = enrich({**totals_a})
     overall_b = enrich({**totals_b})
 

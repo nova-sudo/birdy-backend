@@ -2,7 +2,7 @@ import json
 import logging
 from typing import Any, Callable, Coroutine, Optional
 
-from ai.tools.result_shaping import serialize_with_truncation, error_payload
+from ai.tools.result_shaping import serialize_with_truncation, error_payload, shape_for_chat
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +44,7 @@ class ToolRegistry:
 
         try:
             result = await self._tools[tool_name]["executor"](**kwargs)
-            return serialize_with_truncation(result)
+            return serialize_with_truncation(shape_for_chat(tool_name, result))
         except Exception as e:
             logger.error(f"Tool '{tool_name}' execution error: {e}", exc_info=True)
             # Explicitly return a structured error so the LLM can recognize
