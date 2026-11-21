@@ -26,7 +26,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from ai.mcp import mcp_app
-from ai.tools.result_shaping import serialize_with_truncation, error_payload
+from ai.tools.result_shaping import serialize_with_truncation, error_payload, shape_for_chat
 
 logger = logging.getLogger(__name__)
 
@@ -160,4 +160,4 @@ async def call_mcp_tool(client: "Client", name: str, args: dict) -> str:
         return error_payload(name, message)
 
     payload = result.structured_content if result.structured_content is not None else result.data
-    return serialize_with_truncation(payload)
+    return serialize_with_truncation(shape_for_chat(name, payload))
