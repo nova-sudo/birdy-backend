@@ -177,7 +177,26 @@ def test_sales_coach_only_has_call_tools():
     names = set(defs.tool_names(defs.SALES_COACH, nested=False))
     assert names == {"get_client_groups", "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
                      "analyze_call_recordings", "render_ui",
+                     "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",     # what the calls turned into
                      "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
+    # lead counts and sources stay Birdy's
+    assert "get_unified_lead_stats" not in names
+
+
+def test_sales_coach_reads_closed_deals_itself():
+    from ai.agents.sub_agents.tools import TOOL_LABELS, known_tool_names, parent_tool_names
+    from ai.team.route import TOOL_LABELS as ROUTE_LABELS
+    pipeline = {"get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed"}
+    # asked by Birdy, it still has them (they only read)
+    assert pipeline <= set(defs.tool_names(defs.SALES_COACH, nested=True))
+    assert pipeline <= set(defs.tool_names(defs.SALES_COACH, nested=True, one_client=True))
+    # its sub-agents may be given them, and they have plain labels
+    assert pipeline <= parent_tool_names("sales_coach") and pipeline <= known_tool_names()
+    assert all(n in TOOL_LABELS and n in ROUTE_LABELS for n in pipeline)
+    # nobody is told Sales Coach has to ask for closed deals
+    assert "closed deals, lead counts and lead sources are not in your tools" not in defs._SALES_COACH_ROLE.replace("\n", " ")
+    assert "get_ghl_opportunity_stats" in defs._SALES_COACH_ROLE
+    assert "Sales Coach reads\n  the pipeline itself" in defs._BIRDY_ROLE
 
 
 def test_media_buyer_has_no_call_or_pipeline_tools():

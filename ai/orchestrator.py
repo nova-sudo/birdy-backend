@@ -1017,10 +1017,14 @@ async def run_chat(
                 s for s in tool_registry.get_schemas(allowed=allowed)
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
+        registry_names = {s["function"]["name"] for s in registry_schemas}
+        # A tool on both the registry and the MCP server (find_ads, get_daily_metrics, the creative and
+        # call tools, ...) runs from the registry (below), so only the registry's schema is sent. Sending
+        # both put every such tool in the request twice.
+        mcp_schemas = [s for s in mcp_schemas if s["function"]["name"] not in registry_names]
         tool_schemas = registry_schemas + mcp_schemas
         # An agent run may be offered MCP-hosted tools the orchestrator has no copy of (Birdy's client
         # note, target and Slack report tools); those are called through MCP. The general chat is unchanged.
-        registry_names = {s["function"]["name"] for s in registry_schemas}
         mcp_only = ({s["function"]["name"] for s in mcp_schemas} - registry_names - mcp_client.MCP_TOOL_NAMES
                     if frame is not None and mcp is not None else set())
         delegation_ctx = None

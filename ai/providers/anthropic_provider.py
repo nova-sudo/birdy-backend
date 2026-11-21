@@ -46,11 +46,15 @@ class AnthropicProvider(BaseLLMProvider):
             "temperature": temperature,
             "max_tokens": max_tokens,
         }
+        # Prompt caching of the fixed prefix (tools, then the system prompt): the same on every loop turn
+        # of a reply, so turns after the first read it from the cache.
         if system_prompt:
-            kwargs["system"] = system_prompt
+            kwargs["system"] = [{"type": "text", "text": system_prompt, "cache_control": {"type": "ephemeral"}}]
 
         if tools:
-            kwargs["tools"] = self._convert_tools(tools)
+            converted = self._convert_tools(tools)
+            converted[-1] = {**converted[-1], "cache_control": {"type": "ephemeral"}}
+            kwargs["tools"] = converted
             kwargs["tool_choice"] = {"type": tool_choice}
 
         response = await self.client.messages.create(**kwargs)
@@ -70,9 +74,14 @@ class AnthropicProvider(BaseLLMProvider):
                 ))
 
         u = getattr(response, "usage", None)
+        # Anthropic reports cached prompt tokens apart from input_tokens; credits stay metered on every
+        # prompt token, as before caching.
+        cache_read = getattr(u, "cache_read_input_tokens", 0) or 0
+        cache_write = getattr(u, "cache_creation_input_tokens", 0) or 0
         usage = Usage(
-            input_tokens=getattr(u, "input_tokens", 0) or 0,
+            input_tokens=(getattr(u, "input_tokens", 0) or 0) + cache_read + cache_write,
             output_tokens=getattr(u, "output_tokens", 0) or 0,
+            cached_input_tokens=cache_read,
         ) if u else Usage()
 
         return ProviderResponse(

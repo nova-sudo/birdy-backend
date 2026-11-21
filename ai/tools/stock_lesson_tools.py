@@ -17,6 +17,7 @@ from ai.agents.stock import lessons as stock_lessons
 from ai.agents.store import MEMORY, TYPE_STOCK
 from ai.prompts import stock_lessons_chat
 from ai.tools.agent_tools import _match_client
+from ai.team import proposals as team_proposals
 from ai.tools.registry import registry
 
 NOT_FOUND = "not_found"
@@ -113,8 +114,10 @@ async def save_lesson(db, user_id, mongo_client=None, text=None, client_name=Non
     else:
         lesson = await stock_lessons.lesson_from_text(db, agent, text, source=SOURCE, author=user_id,
                                                       client_group_id=gid)
-    if lesson is None:
+    if lesson is None or "_id" not in lesson:
         return _fail("empty_lesson")
+    team_proposals.record({"op": team_proposals.LESSON_SAVED, "agent_id": agent["_id"], "lesson_id": lesson["_id"],
+                           "text": lesson.get("text")})
     return {"ok": True, "changed": "lesson", "lesson": {"id": lesson["_id"], "text": lesson.get("text"), "client": name}}
 
 
@@ -127,6 +130,10 @@ async def edit_lesson(db, user_id, mongo_client=None, lesson_id=None, text=None,
     lesson = await stock_lessons.edit_lesson_text(db, agent["_id"], str(lesson_id or ""), text, author=user_id)
     if lesson is None:
         return _fail(NOT_FOUND)
+    before = (lesson.get("previous_texts") or [{}])[-1]
+    team_proposals.record({"op": team_proposals.LESSON_EDITED, "agent_id": agent["_id"], "lesson_id": lesson["_id"],
+                           "before": {"text": before.get("text"), "source": before.get("source")},
+                           "after_text": lesson.get("text")})
     return {"ok": True, "changed": "lesson_edited", "lesson": {"id": lesson["_id"], "text": lesson.get("text")}}
 
 
@@ -136,6 +143,11 @@ async def remove_lesson(db, user_id, mongo_client=None, lesson_id=None, **_):
         return _fail(NOT_FOUND)
     if not await stock_lessons.remove_lesson(db, agent["_id"], str(lesson_id or "")):
         return _fail(NOT_FOUND)
+    if team_proposals.current_journal.get() is not None:
+        gone = await db[MEMORY].find_one({"_id": str(lesson_id), "agent_id": agent["_id"]}, {"text": 1, "status": 1})
+        team_proposals.record({"op": team_proposals.LESSON_REMOVED, "agent_id": agent["_id"],
+                               "lesson_id": str(lesson_id), "text": (gone or {}).get("text"),
+                               "status": (gone or {}).get("status")})
     return {"ok": True, "changed": "lesson_removed"}
 
 

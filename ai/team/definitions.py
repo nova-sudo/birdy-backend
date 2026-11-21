@@ -8,9 +8,10 @@ memory loader. Tool lists start from today's page lists in ai/orchestrator.py:
 Media Buyer from the `campaigns` page, Sales Coach from `call_center`, Birdy
 from the cross-area reads of `dashboard`.
 
-Areas never overlap (design section 4): Sales Coach has only call-center
-tools, Media Buyer only ads, creative-test and its own lesson tools, Birdy only
-cross-area reads plus the ask tools. `get_client_groups` (resolving a client's
+Areas never overlap (design section 4): Sales Coach has the call-center tools
+plus the two pipeline reads that say whether calls became closed deals, Media
+Buyer only ads, creative-test and its own lesson tools, Birdy only cross-area
+reads plus the ask tools. `get_client_groups` (resolving a client's
 name) and `render_ui` (drawing what was fetched) are not area tools and every
 agent has them in its own chat.
 
@@ -82,7 +83,12 @@ MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remov
 # apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
 MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
 
-SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_trend", "get_call_recordings_summary", "list_lessons")
+# The pipeline reads let Sales Coach answer "did those calls turn into closed deals" itself: won, lost,
+# open and won revenue per preset (many clients) or for any dates (one client). Lead counts and sources
+# (get_unified_lead_stats) stay Birdy's: they say nothing about what the calls achieved.
+SALES_COACH_PIPELINE = ("get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed")
+SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
+                    *SALES_COACH_PIPELINE, "list_lessons")
 SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
 
 BIRDY_READ = (
@@ -165,7 +171,8 @@ _TEAM = """
 You are one of three agents in this agency's Birdy workspace. Agents never talk sideways:
 - Birdy (Agency Ops) sees every area and passes work between the others.
 - Media Buyer owns the ads: Meta campaigns, ad sets, ads, spend, CPL, creative tests.
-- Sales Coach owns the call centre: Hot Prospector call stats and call recordings.
+- Sales Coach owns the call centre: Hot Prospector call stats and call recordings, and reads the
+  pipeline (won, lost and open opportunities) to see what the calls turned into.
 
 Media Buyer and Sales Coach can each have sub-agents: small helpers for one recurring job in their
 area (watch a number, check something every morning). A sub-agent is proposed with
@@ -181,7 +188,8 @@ _BIRDY_ROLE = """
 You are the orchestrator: you decide which agent a question belongs to, ask it, and give the
 owner one answer built on the replies.
 - Anything about calls, the call centre, callers, connect rates, talk time or recordings belongs
-  to Sales Coach: always `ask_sales_coach`. You have no call tools of your own.
+  to Sales Coach: always `ask_sales_coach`. You have no call tools of your own. Sales Coach reads
+  the pipeline itself, so "did those calls turn into deals" is one ask, not an ask plus your own read.
 - Anything about ads, campaigns, ad sets, creatives, spend, cost per lead or results over time
   belongs to Media Buyer: always `ask_media_buyer`. You have no ad tools of your own.
 - When the owner wants an agent, a watcher or a sub-agent for something ("make an agent that
@@ -225,9 +233,12 @@ You own the call centre: Hot Prospector call stats, call recordings and what hap
 Stay in that area. For anything outside it (ads, spend, agency-wide questions) use `ask_birdy`:
 Birdy finds the answer from the right agent and you get it back in this chat.
 For "why did X drop or rise" or "compared with last week", start with `get_call_trend`.
-Booked appointments, closed deals, lead counts and lead sources are not in your tools. When a
-question needs them, do not say you cannot answer: say what the calls show, then `ask_birdy` for
-the rest and combine the two into one answer.
+For "did those calls turn into appointments or deals", read the pipeline yourself:
+`get_ghl_opportunity_stats` (a preset window, many clients) or `get_ghl_opp_stats_windowed` (one
+client, any dates). Won is closed deals (with won revenue), open is still in the pipeline. There is no
+separate count of booked appointments: say so, and give open opportunities as the nearest figure,
+named as such. Lead counts and lead sources are not in your tools: for those, say what the calls
+show, then `ask_birdy` for the rest and combine the two into one answer.
 When the owner (or Birdy on their behalf) wants a sub-agent, do not interview them. Work out the
 job from this conversation, and from `recall_conversations` if they point at another chat, then
 call `propose_sub_agent` straight away with your own best picks: a short name, a one-line purpose,
@@ -311,9 +322,11 @@ async def context_block(db, user_id: str, client_group_id: str | None) -> str:
     return await _block(db, user_id, client_group_id)
 
 
-async def build_instructions(agent: str, db, user_id: str, *, client_group_id: str | None,
-                             client_name: str | None, asked_by: str | None, source: str | None = None) -> str:
-    """The system prompt for one run of `agent`. `asked_by` (an agent name) marks a delegated run."""
+async def instruction_parts(agent: str, db, user_id: str, *, client_group_id: str | None,
+                            client_name: str | None, asked_by: str | None,
+                            source: str | None = None) -> list[tuple[str, str]]:
+    """The system prompt for one run of `agent`, as (part name, text) in order. `asked_by` (an agent
+    name) marks a delegated run. scripts/measure_agent_prompt.py reports each part's size."""
     nested = asked_by is not None
     if agent == SALES_COACH:
         from ai.orchestrator import _CALL_CENTER_SYSTEM_PROMPT
@@ -322,27 +335,38 @@ async def build_instructions(agent: str, db, user_id: str, *, client_group_id: s
             base = with_rich_output(base)
         role = _SALES_COACH_ROLE
     else:
-        base = get_system_prompt()
+        # Only the guide lines for this run's own tools; a delegated run's answer goes to another agent,
+        # so it gets no screen blocks (status, forms, visuals), as Sales Coach's delegated runs already don't.
+        offered = tool_names(agent, nested=nested, one_client=bool(client_group_id))
+        base = get_system_prompt(offered, for_screen=not nested)
         role = _BIRDY_ROLE if agent == BIRDY else _MEDIA_BUYER_ROLE
-    parts = [base, _TEAM, role]
+    parts = [("base prompt", base), ("team notes", _TEAM), ("role prompt", role)]
     if agent == MEDIA_BUYER:
-        parts.append("\n" + get_media_buying_module())
+        parts.append(("media buying module", "\n" + get_media_buying_module()))
         if not nested and source != "slack":
-            parts.append(CREATIVE_TESTS_GUIDE)
-        parts.append(_data_block("Your lessons (Media Buyer's memory)", "lessons",
-                                 await _media_buyer_lessons(db, user_id, client_group_id)))
+            parts.append(("creative tests guide", CREATIVE_TESTS_GUIDE))
+        parts.append(("lessons", _data_block("Your lessons (Media Buyer's memory)", "lessons",
+                                             await _media_buyer_lessons(db, user_id, client_group_id))))
     if agent == SALES_COACH:
-        parts.append(_data_block("Your lessons (Sales Coach's memory)", "lessons",
-                                 await _sales_coach_lessons(db, user_id, client_group_id)))
-    parts.append(await context_block(db, user_id, client_group_id))
+        parts.append(("lessons", _data_block("Your lessons (Sales Coach's memory)", "lessons",
+                                             await _sales_coach_lessons(db, user_id, client_group_id))))
+    parts.append(("context cards", await context_block(db, user_id, client_group_id)))
     if client_group_id:
-        parts.append(_SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))
+        parts.append(("client scope", _SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id)))
     else:
-        parts.append(_SCOPE_AGENCY)
+        parts.append(("client scope", _SCOPE_AGENCY))
     if nested:
-        parts.append(_DELEGATED.format(asked_by=asked_by))
-    parts.append(f"\nToday's date is {date.today().isoformat()}.\n")
-    return "".join(p for p in parts if p)
+        parts.append(("delegated note", _DELEGATED.format(asked_by=asked_by)))
+    parts.append(("date", f"\nToday's date is {date.today().isoformat()}.\n"))
+    return [(name, text) for name, text in parts if text]
+
+
+async def build_instructions(agent: str, db, user_id: str, *, client_group_id: str | None,
+                             client_name: str | None, asked_by: str | None, source: str | None = None) -> str:
+    """The system prompt for one run of `agent`. `asked_by` (an agent name) marks a delegated run."""
+    parts = await instruction_parts(agent, db, user_id, client_group_id=client_group_id, client_name=client_name,
+                                    asked_by=asked_by, source=source)
+    return "".join(text for _, text in parts)
 
 
 def sub_agent_instructions(sub, parent_name: str, *, client_group_id: str | None, client_name: str | None,

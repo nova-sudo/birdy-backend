@@ -159,8 +159,8 @@ async def get_call_trend(db, user_id, days=7, periods=2, group_ids=None, **_):
         "clients": clients[:TREND_CLIENTS], "total_clients": len(clients), "shown_clients": min(len(clients), TREND_CLIENTS),
         "note": "Periods and each client's calls/answered lists are newest first. Full days only; today is "
                 "left out. Clients are the busiest in the newest period; pass group_ids for others. These "
-                "are calls and what happened on them: booked appointments, closed deals and lead counts "
-                "are not call-centre data and are not here.",
+                "are calls only: closed deals (won) and open opportunities come from get_ghl_opportunity_stats "
+                "or get_ghl_opp_stats_windowed, and lead counts are not here.",
     }
 
 
