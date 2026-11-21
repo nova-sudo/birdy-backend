@@ -42,6 +42,8 @@ TOOL_LABELS = {
     "get_daily_metrics": "Daily numbers",
     "get_call_recordings_summary": "Call recordings summary",
     "analyze_call_recordings": "Call analysis",
+    "get_ghl_opportunity_stats": "Pipeline totals",
+    "get_ghl_opp_stats_windowed": "Pipeline for a period",
     "find_ads": "Find ads",
     "list_ad_accounts": "Ad accounts",
     "list_adsets": "Ad sets",
