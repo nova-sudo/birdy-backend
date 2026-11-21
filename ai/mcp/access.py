@@ -31,7 +31,8 @@ from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from ai.mcp import voice
-from ai.mcp.outcome import get_outcome, is_error_result, reset_outcome, response_chars, set_outcome, start_activity
+from ai.mcp.outcome import (CHAT_BILLED, get_outcome, is_error_result, reset_outcome, response_chars, set_outcome,
+                             start_activity)
 from services import mcp_activity, mcp_billing, posthog_events
 
 logger = logging.getLogger(__name__)
@@ -151,8 +152,11 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
     grant_id = claims.get("grant_id") or claims.get("jti")
     duration_ms = int((time.monotonic() - started) * 1000)
 
+    # A chat reply (CHAT_BILLED) was already billed once by the chat engine; the MCP fee is not added on top.
+    chat_billed = okind == CHAT_BILLED
+
     async def charge():
-        if not free:
+        if not free and not chat_billed:
             await mcp_billing.charge_mcp_call(db, claims.get("sub"), tool=tool_name, grant_id=grant_id, chars=chars, live=live)
 
     async def record():
@@ -166,7 +170,13 @@ async def _charge_and_record(db, claims: dict, tool_name: str, tags: set, args: 
             name_error = exc
         if not rate_limited:
             try:
-                credits = _ZERO_CREDITS if free else await mcp_billing.charge_breakdown(db, chars, live)
+                if free:
+                    credits = _ZERO_CREDITS
+                elif chat_billed:
+                    cost = round(float(outcome.get("credits") or 0.0), 4)
+                    credits = {"request": cost, "data": 0.0, "live": 0.0, "total": cost}
+                else:
+                    credits = await mcp_billing.charge_breakdown(db, chars, live)
             except Exception as exc:
                 credits_error = exc
         if rate_limited:
@@ -219,10 +229,18 @@ async def _with_signoff(db, tool_name: str, tags: set, args: dict, result, avail
         outcome = get_outcome() or {}
         if outcome.get("kind") in _FREE_OUTCOMES or is_error_result(getattr(result, "structured_content", None)):
             return result
-        live = outcome.get("kind") == "live_executed" and "live" in tags
-        cost = (await mcp_billing.charge_breakdown(db, response_chars(result), live))["total"]
+        if outcome.get("kind") == CHAT_BILLED:
+            # What the chat reply was billed, and the page that reply lives on.
+            cost = round(float(outcome.get("credits") or 0.0), 4)
+            link = outcome.get("link") or mcp_activity.link_for(tool_name, args)
+            lookup = False
+        else:
+            live = outcome.get("kind") == "live_executed" and "live" in tags
+            cost = (await mcp_billing.charge_breakdown(db, response_chars(result), live))["total"]
+            link = mcp_activity.link_for(tool_name, args)
+            lookup = "write" not in tags
         left = available - cost if available is not None else None
-        line = voice.closing_block(mcp_activity.link_for(tool_name, args), cost, left, lookup="write" not in tags)
+        line = voice.closing_block(link, cost, left, lookup=lookup)
         if not line:
             return result
         return ToolResult(content=[*result.content, TextContent(type="text", text=line)],

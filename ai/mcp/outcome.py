@@ -2,8 +2,12 @@
 
 Tools and gates record the outcome (`two_step` for confirm-code tools, the middleware for
 refusals); the middleware resets it at the start of every call. Kinds: `preview`,
-`live_executed`, `bad_code`, `state_changed`, `refused`. Extras may carry `reason` (refusals)
+`live_executed`, `bad_code`, `state_changed`, `refused`, `chat_billed`. Extras may carry `reason` (refusals)
 or `confirmed_after` (a live_executed call: the activity id of the preview that issued the code).
+
+`chat_billed` (CHAT_BILLED): the tool ran a Birdy chat reply, which billed itself once like a web chat
+reply (ai/mcp/team_mcp.py). The middleware then adds no per-call MCP charge; extras `credits` (what the
+reply cost) and `link` (its Birdy page) fill the sign-off line instead.
 
 The middleware also pre-allocates this call's activity id, so a preview can stamp it on its
 confirm code before the activity row exists.
@@ -12,6 +16,8 @@ confirm code before the activity row exists.
 import json
 import uuid
 from contextvars import ContextVar, Token
+
+CHAT_BILLED = "chat_billed"
 
 call_outcome: ContextVar[dict | None] = ContextVar("mcp_call_outcome", default=None)
 
