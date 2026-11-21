@@ -78,6 +78,18 @@ async def start_practice_run(db, mongo_client, user_id: str) -> dict:
         raise team_setup.SetupError(409, "Choose at least one client first")
     blocker = await preview_blocker(db, user_id, agent)
     if blocker is not None:
+        if blocker.get("not_ready"):
+            # Said in full: which clients are still loading, and that waiting fixes it.
+            names = [g.get("name") or g["id"] async for g in db["client_groups"].find(
+                {"user_id": user_id, "id": {"$in": blocker["not_ready"]}}, {"_id": 0, "id": 1, "name": 1})]
+            n = len(blocker["not_ready"])
+            shown = ", ".join(names[:3]) + (f" and {n - 3} more" if n > 3 else "")
+            raise team_setup.SetupError(409, {
+                "code": "ad_history_loading", "agent": team_setup.MEDIA_BUYER, "clients": names,
+                "message": (f"Birdy is still loading the ad history for {n} client{'' if n == 1 else 's'}"
+                            f"{' (' + shown + ')' if shown else ''}. A practice run needs it. "
+                            "This usually takes a few minutes after a client is added; try again then. "
+                            "Setup doesn't need a practice run, so you can carry on.")})
         raise team_setup.SetupError.from_body(409, blocker)
     now = datetime.now(timezone.utc)
     run = await stock_runner.get_or_create_run(db, agent, now, kind=stock_runner.PREVIEW)

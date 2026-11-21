@@ -5,7 +5,7 @@ Agent onboarding: each team agent is set up, in order, through a chat interview 
 (contract: GET/PUT /api/team/setup, routers/team_setup.py).
 
   birdy        done when the normal onboarding is (users.onboarding.completed), else open
-  media_buyer  clients, cpl, playbook, permissions, schedule, slack, practice
+  media_buyer  clients, cpl, playbook, permissions, schedule, slack   (a practice run is optional, on request)
   sales_coach  clients, outcomes, speed, schedule, slack
   sub_agents   one step: finish or skip
 
@@ -39,8 +39,11 @@ ORDER = (BIRDY, MEDIA_BUYER, SALES_COACH, SUB_AGENTS)
 WAITS_ON = {MEDIA_BUYER: BIRDY, SALES_COACH: MEDIA_BUYER, SUB_AGENTS: SALES_COACH}
 LOCKED, OPEN, DONE = "locked", "open", "done"
 
+# Not a step: a form the agent shows only when the owner asks for it.
+OPTIONAL_BLOCKS = {MEDIA_BUYER: ("practice",), SALES_COACH: ()}
+
 STEPS = {
-    MEDIA_BUYER: ("clients", "cpl", "playbook", "permissions", "schedule", "slack", "practice"),
+    MEDIA_BUYER: ("clients", "cpl", "playbook", "permissions", "schedule", "slack"),
     SALES_COACH: ("clients", "outcomes", "speed", "schedule", "slack"),
 }
 LABELS = {
@@ -309,13 +312,8 @@ async def _mb_save(db, user_id: str, step: str, body: dict) -> None:
         from services import client_targets
         for gid, v in clients.items():   # the client's own CPL target is the same number
             await client_targets.apply_targets(db, user_id, gid, {"cpl": v})
-    elif step in ("playbook", "practice"):
+    elif step == "playbook":
         _bool_body(body)
-        if step == "practice":
-            practice = await practice_status(db, user_id)
-            if practice["status"] != "done":
-                raise SetupError(409, {"code": "practice_not_finished", "agent": MEDIA_BUYER,
-                                       "message": "Run the practice report and let it finish first"})
     elif step == "permissions":
         perms = {}
         for k in ("ads", "adsets", "campaigns"):
@@ -580,8 +578,6 @@ async def _mb_values(db, user_id: str, row: dict | None, groups: list[dict]) -> 
     values["slack"] = {"channel_id": slack.get("channel_id")}
     text["slack"] = (f"#{slack['channel_name']}" if slack.get("channel_name") else slack.get("channel_id")) \
         if slack.get("channel_id") else "Not in Slack"
-    values["practice"] = {"confirmed": True}
-    text["practice"] = "Practice run finished"
     return values, text
 
 

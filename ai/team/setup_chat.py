@@ -9,6 +9,11 @@ and the server adds the current step's block itself when the model only talked a
 
   get_setup_state     what is saved so far, which step is next, and what Birdy already knows
   show_setup_step     the form for one step, with the data it needs ({"type": <step>, ...})
+  save_setup_step     save or change one step's answer from what the owner said in the chat
+
+What the agent offers is a suggestion, never the answer: nothing is saved until the owner says so, and
+any answer can be changed at any point of the interview, in the chat or in its form. A practice run is
+not a step; its form is shown only when the owner asks for one.
 
 Rules are reviewed and confirmed in the playbook step, not edited here: the stock agent's own settings
 page changes them afterwards. In the sub-agents step the agent proposes sub-agents with the existing
@@ -23,8 +28,8 @@ from ai.team import setup as team_setup
 logger = logging.getLogger(__name__)
 
 PAGE = "team_setup"
-GET_STATE, SHOW_STEP = "get_setup_state", "show_setup_step"
-TOOL_NAMES = (GET_STATE, SHOW_STEP)
+GET_STATE, SHOW_STEP, SAVE_STEP = "get_setup_state", "show_setup_step", "save_setup_step"
+TOOL_NAMES = (GET_STATE, SHOW_STEP, SAVE_STEP)
 GUARD_TOOL = "setup_guard"
 SUB_AGENTS_BLOCK = "sub_agents"
 
@@ -90,7 +95,8 @@ async def block(db, user_id: str, agent: str, step: str) -> dict:
     elif step == "permissions":
         stock = await team_setup.stock_agent(db, user_id) or {}
         perms = stock.get("permissions") or {}
-        out["value"] = out["value"] or {k: bool(perms.get(k)) for k in ("ads", "adsets", "campaigns")}
+        if out["value"] is None:   # what it may change today: offered, not chosen
+            out["suggestion"] = {k: bool(perms.get(k)) for k in ("ads", "adsets", "campaigns")}
         out["budgets"] = False
     elif step == "schedule":
         if out["value"] is None:
@@ -131,9 +137,27 @@ async def show_setup_step(db, user_id, agent=None, step=None, **_):
         return _fail("This tool is only for the setup chat")
     if step == SUB_AGENTS_BLOCK:
         return {"ok": True, "ui_block": await _sub_agents_block(db, user_id, agent)}
-    if step not in team_setup.STEPS[agent]:
-        return _fail(f"step must be one of {list(team_setup.STEPS[agent]) + [SUB_AGENTS_BLOCK]}")
+    allowed = list(team_setup.STEPS[agent]) + list(team_setup.OPTIONAL_BLOCKS[agent])
+    if step not in allowed:
+        return _fail(f"step must be one of {allowed + [SUB_AGENTS_BLOCK]}")
     return {"ok": True, "ui_block": await block(db, user_id, agent, step)}
+
+
+async def save_setup_step(db, user_id, agent=None, step=None, answer=None, **_):
+    """Save or change one step from the chat. The same validation, order and storage as the form's PUT."""
+    if agent not in team_setup.STEPS:
+        return _fail("This tool is only for the setup chat")
+    if step not in team_setup.STEPS[agent]:
+        return _fail(f"step must be one of {list(team_setup.STEPS[agent])}")
+    if not isinstance(answer, dict):
+        return _fail("answer must be an object in the step's shape")
+    try:
+        await team_setup.save_step(db, user_id, agent, step, answer)
+    except team_setup.SetupError as e:
+        return {"ok": False, "error": e.detail}
+    st = await team_setup.agent_state(db, user_id, agent)
+    return {"ok": True, "saved": step, "known": st["known"], "current": st["current"],
+            "activation": st.get("activation")}
 
 
 _DEFS = {
@@ -145,9 +169,25 @@ _DEFS = {
                 "Show the owner the form for one setup step under your reply. Saves nothing: the owner saves in "
                 "the form and the app tells you.",
                 {"type": "object", "properties": {"step": {"type": "string", "description": (
-                    "The step: clients, cpl, playbook, permissions, schedule, slack, practice (Media Buyer); "
-                    "clients, outcomes, speed, schedule, slack (Sales Coach); or sub_agents.")}},
+                    "The step: clients, cpl, playbook, permissions, schedule, slack (Media Buyer); "
+                    "clients, outcomes, speed, schedule, slack (Sales Coach); sub_agents; or practice "
+                    "(Media Buyer, only when the owner asks for a practice run).")}},
                  "required": ["step"]}),
+    SAVE_STEP: (save_setup_step,
+                "Save one step's answer, or change one already saved, from what the owner said in the chat. Use it "
+                "only for an answer the owner gave or clearly agreed to in their own message, never for your own "
+                "suggestion. Works for the step being asked and for any step already done.",
+                {"type": "object", "properties": {
+                    "step": {"type": "string"},
+                    "answer": {"type": "object", "description": (
+                        'The answer, by step. clients: {"client_group_ids": [ids] or "all"}. '
+                        'cpl: {"default": number or null, "clients": {client id: number}}. '
+                        'playbook: {"confirmed": true}. permissions: {"ads": bool, "adsets": bool, "campaigns": bool}. '
+                        'schedule: {"time": "HH:MM", "tz": IANA timezone, "days": "daily" or "weekdays"}. '
+                        'slack: {"channel_id": id or null}. '
+                        'outcomes: {"booked": {"kind": "tag" or "stage", "value", "label"}, "closed": {same}}. '
+                        'speed: {"minutes": whole number}.')}},
+                 "required": ["step", "answer"]}),
 }
 
 
@@ -206,7 +246,8 @@ _STAGES = {
 4. permissions: what you may change: ads, ad sets, campaigns. You never touch budgets.
 5. schedule: when you check and report each day, in their timezone, every day or weekdays only.
 6. slack: the Slack channel you post to, or not in Slack.
-7. practice: a practice run on their real data. It changes nothing in Meta and sends nothing to Slack. They start it from the form; when it has finished, go through what it found in two or three lines and ask them to confirm.""",
+
+A practice run is NOT a step and you never bring it up. Only if the owner asks for one (a trial run on their real data that changes nothing in Meta and sends nothing to Slack), show it with show_setup_step("practice"); they start it from the form. If it can't start, the form says why (usually the ad history is still loading); tell them setup doesn't need it and carry on.""",
     defs.SALES_COACH: """1. clients: which clients you coach.
 2. outcomes: what counts as booked and what counts as closed, each a GoHighLevel tag or a pipeline stage, picked in the form from what Birdy has.
 3. speed: how fast a new lead should be called, in minutes.
@@ -218,17 +259,21 @@ _RULES = """
 ## How to run the interview
 - Open by introducing yourself in one or two sentences, then say in one sentence what you already know from Birdy's setup (the <birdy_knows> data below), then ask the first step still to do.
 - Ask ONE step at a time, in the order above. Call show_setup_step for the step you are asking so the form shows under your reply. Never ask about a later step before the earlier ones are done.
-- Plain words, short replies, no headings, no long lists. Offer a sensible default they can just accept, taken from what Birdy already knows.
+- Plain words, short replies, no headings, no long lists.
+- You may offer a suggestion taken from what Birdy already knows, and say it is only a suggestion. A suggestion is never the answer: nothing is decided or saved until the owner picks or says it themselves. Never write as if your suggestion was chosen, and never argue for it when they pick something else.
 - Never invent numbers. A number you mention comes from the data below or from the owner. If Birdy has no number for something, say so and ask.
-- The owner saves each step in its form; the app then sends a short message such as "Saved clients". Take that as the step done: confirm it in one short sentence and ask the next step. Never say something was saved unless the state below or get_setup_state shows it.
-- When they say "I want to change {step}", show that step's form again; they save it the same way.
+- The owner can answer in the form or in words. In the form: the app saves it and sends a short message such as "Saved clients"; take that as the step done. In words (for example "9am on weekdays"): save it yourself with save_setup_step, using exactly what they said; if their message leaves a required part out, ask for that part instead of filling it in yourself.
+- After a save, confirm it in one short sentence and ask the next step. Never say something was saved unless save_setup_step returned ok, or the state below or get_setup_state shows it.
+- The owner can change any earlier answer at any point, as often as they like. When they give the new answer in words, save it with save_setup_step; when they only say they want to change a step, show that step's form again. Then go back to the step you were on. Never tell them an answer is final or has to wait until setup is over.
 - The app adds the form for the step you're on when you didn't show it. Still call show_setup_step yourself.
 """
 
 _DONE_NOTE = {
     "media_buyer": ("When every step is done, say you are set up. The setup state's `activation` says whether you were "
                     "switched on; if it is not_ready, say plainly what is missing (its `missing` lines) and don't say "
-                    "you are on."),
+                    "you are on. Your automatic daily checks only start after one finished practice run, so if that "
+                    "is what is missing, say so once and ask whether they want to do one now; if they say yes, show "
+                    "it with show_setup_step(\"practice\"). Chat and your pages work without it."),
     "sales_coach": "When every step is done, say you are set up and what you will report on.",
 }
 

@@ -87,9 +87,10 @@ SC_ANSWERS = [
 
 async def _media_buyer_done(db):
     for step, body in MB_ANSWERS:
-        await s.save_step(db, U, s.MEDIA_BUYER, step, body)
-    await _finished_preview(db)
-    return await s.save_step(db, U, s.MEDIA_BUYER, "practice", {"confirmed": True})
+        last = await s.save_step(db, U, s.MEDIA_BUYER, step, body)
+        if step == "clients":
+            await _finished_preview(db)   # a practice run the owner asked for: lets it switch on
+    return last
 
 
 async def _sales_coach_done(db):
@@ -121,7 +122,7 @@ async def test_after_onboarding_media_buyer_opens_on_its_first_step(mock_db):
     await _account(mock_db)
     mb = (await s.state(mock_db, U))["agents"]["media_buyer"]
     assert mb["status"] == "open" and mb["waits_on"] is None
-    assert mb["order"] == ["clients", "cpl", "playbook", "permissions", "schedule", "slack", "practice"]
+    assert mb["order"] == ["clients", "cpl", "playbook", "permissions", "schedule", "slack"]
     assert mb["current"] == "clients" and mb["steps"] == {k: False for k in mb["order"]}
     assert [k["step"] for k in mb["known"]] == mb["order"] and all(k["value"] is None for k in mb["known"])
     assert mb["values"] == {} and mb["completed_at"] is None
@@ -161,7 +162,7 @@ async def test_media_buyer_finishes_turns_on_and_unlocks_sales_coach(mock_db):
         "clients": "2 clients: Aura, Beaulea", "cpl": "£10 for every client; Beaulea £8",
         "playbook": "Asks first before pausing, adding or reviving ads",
         "permissions": "Can change ads; never budgets", "schedule": "08:30 Europe/London, weekdays",
-        "slack": "C123", "practice": "Practice run finished"}
+        "slack": "C123"}
     # editing later is allowed and keeps it done
     again = await s.save_step(mock_db, U, s.MEDIA_BUYER, "slack", {"channel_id": None})
     assert again["agents"]["media_buyer"]["status"] == "done"
@@ -171,23 +172,27 @@ async def test_media_buyer_finishes_turns_on_and_unlocks_sales_coach(mock_db):
 async def test_finishing_does_not_force_an_agent_that_is_not_ready(mock_db):
     await _account(mock_db)
     for step, body in MB_ANSWERS:
-        await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
-    await _finished_preview(mock_db, clients=(G1,))   # the preview didn't cover Beaulea
-    out = await s.save_step(mock_db, U, s.MEDIA_BUYER, "practice", {"confirmed": True})
+        out = await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
+        if step == "clients":
+            await _finished_preview(mock_db, clients=(G1,))   # the preview didn't cover Beaulea
     mb = out["agents"]["media_buyer"]
     assert mb["status"] == "done"
     assert mb["activation"]["status"] == "not_ready" and mb["activation"]["missing"]
     assert (await _stock(mock_db))["status"] != "active"
 
 
-async def test_practice_needs_a_finished_run(mock_db):
+async def test_practice_run_is_optional_and_not_a_step(mock_db):
     await _account(mock_db)
     for step, body in MB_ANSWERS:
-        await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
+        out = await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
+    mb = out["agents"]["media_buyer"]
+    assert mb["status"] == "done" and "practice" not in mb["order"]     # done with no practice run
+    assert mb["activation"]["status"] == "not_ready"                    # daily runs still wait for one
+    assert out["agents"]["sales_coach"]["status"] == "open"
     assert (await s.practice_status(mock_db, U))["status"] == "none"
     with pytest.raises(s.SetupError) as e:
         await s.save_step(mock_db, U, s.MEDIA_BUYER, "practice", {"confirmed": True})
-    assert e.value.status == 409 and e.value.detail["code"] == "practice_not_finished"
+    assert e.value.status == 404
     agent = await _stock(mock_db)
     await mock_db[RUNS].insert_one({"_id": "r1", "agent_id": agent["_id"], "kind": "preview", "phase": "clients",
                                     "as_of": datetime.utcnow(), "clients": {}})
@@ -350,8 +355,9 @@ async def test_practice_post_refuses_without_clients_and_with_history_not_ready(
     assert r.status_code == 409
     await s.save_step(mock_db, U, s.MEDIA_BUYER, "clients", {"client_group_ids": [G1]})
     r = client.post("/api/team/setup/media_buyer/practice")
-    assert r.status_code == 409 and r.json()["detail"] == "Ad history isn't ready yet"
-    assert r.json()["not_ready"] == [G1]
+    detail = r.json()["detail"]
+    assert r.status_code == 409 and detail["code"] == "ad_history_loading" and detail["clients"] == ["Aura"]
+    assert "still loading the ad history for 1 client (Aura)" in detail["message"]
 
 
 async def test_practice_post_runs_the_stock_preview(mock_db, mock_mongo_client, monkeypatch):
@@ -530,7 +536,7 @@ async def test_setup_chat_adds_the_current_step_block_when_the_model_forgets(moc
     assert block["type"] == "clients" and block["agent"] == "media_buyer" and block["value"] is None
     assert {o["id"] for o in block["options"]} == {G1, G2, G3}
     offered = p.calls[0][1]
-    assert set(offered) == {"get_client_groups", "get_setup_state", "show_setup_step"}   # no asks, no writes
+    assert set(offered) == {"get_client_groups", "get_setup_state", "show_setup_step", "save_setup_step"}   # no asks
     # setup chats stay out of the history list; the state names the latest one so the app can reopen it
     assert (await s.state(mock_db, U))["agents"]["media_buyer"]["chat_session_id"] == out["session_id"]
     assert (await s.state(mock_db, U))["agents"]["sales_coach"]["chat_session_id"] is None
@@ -561,7 +567,8 @@ async def test_setup_chat_step_blocks_carry_their_form_data(mock_db):
     playbook = await setup_chat.block(mock_db, U, "media_buyer", "playbook")
     assert playbook["modes"] == {"remove": "ask", "add": "ask", "revive": "ask"} and playbook["creative"]["max_ads_live"]
     perms = await setup_chat.block(mock_db, U, "media_buyer", "permissions")
-    assert perms["value"] == {"ads": True, "adsets": True, "campaigns": False} and perms["budgets"] is False
+    assert perms["value"] is None and perms["budgets"] is False    # offered, not chosen
+    assert perms["suggestion"] == {"ads": True, "adsets": True, "campaigns": False}
     sched = await setup_chat.block(mock_db, U, "media_buyer", "schedule")
     assert sched["value"] is None and sched["default"] == {"time": "07:00", "tz": "Europe/London", "days": "daily"}
     slack = await setup_chat.block(mock_db, U, "media_buyer", "slack")
@@ -692,3 +699,32 @@ async def test_sales_outcomes_tool_is_pinned_in_a_one_client_run():
     reg = ToolRegistry()
     sc.register_sales_coach_tools(reg)
     assert sc.TOOL_NAME in {s_["function"]["name"] for s_ in reg.get_schemas()}
+
+
+async def test_the_agent_saves_and_changes_answers_from_the_chat(mock_db):
+    """What the owner says in words is saved by the agent, and an earlier answer can be changed mid-setup."""
+    await _account(mock_db)
+    out = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="clients",
+                                           answer={"client_group_ids": [G1, G2]})
+    assert out["ok"] and out["saved"] == "clients" and out["current"] == "cpl"
+    # a later step can't be saved before its turn, and the refusal says which step is expected
+    early = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="schedule",
+                                             answer={"time": "09:00", "tz": "Europe/London", "days": "daily"})
+    assert early["ok"] is False and early["error"]["expected"] == "cpl"
+    # changing the first answer while still on the second step
+    changed = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="clients",
+                                               answer={"client_group_ids": [G1]})
+    assert changed["ok"] and changed["current"] == "cpl"
+    assert (await _stock(mock_db))["scope"]["client_group_ids"] == [G1]
+    bad = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="practice", answer={"confirmed": True})
+    assert bad["ok"] is False
+    assert (await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="cpl", answer="10"))["ok"] is False
+
+
+async def test_the_practice_form_is_shown_only_on_request(mock_db):
+    await _account(mock_db)
+    shown = await setup_chat.show_setup_step(mock_db, U, agent="media_buyer", step="practice")
+    assert shown["ok"] and shown["ui_block"]["type"] == "practice"
+    assert (await setup_chat.show_setup_step(mock_db, U, agent="sales_coach", step="practice"))["ok"] is False
+    prompt = await setup_chat.system_prompt(mock_db, U, "media_buyer")
+    assert "NOT a step" in prompt and "only a suggestion" in prompt
