@@ -15,8 +15,9 @@ class Usage:
     """Token usage for one model call, used for Birdy Credits metering.
     Providers populate this from their raw response; defaults to zero so any
     provider that can't report usage simply meters nothing for that call."""
-    input_tokens: int = 0
+    input_tokens: int = 0            # every prompt token, cached or not (what credits are metered on)
     output_tokens: int = 0
+    cached_input_tokens: int = 0     # of input_tokens, how many the provider read from its prompt cache
 
 
 @dataclass

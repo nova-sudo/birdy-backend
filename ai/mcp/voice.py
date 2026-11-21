@@ -19,6 +19,11 @@ How to use the tools
 - Client and agent names can be passed as written. If a tool returns candidates, ask which one was meant.
 - Read a client's notes (get_client) before giving advice about that client.
 - Tools that make live changes return a preview first. Show it, and confirm only after the user says yes.
+- Plain numbers (spend, leads, cost per lead, call counts) come from the data tools: they are quick and cheap. \
+For judgement, a diagnosis or "what should we do", ask the agent that owns the area: ask_media_buyer for ads, \
+ask_sales_coach for calls. An ask runs that agent with the agency's lessons, context and sub-agents, can take a \
+few minutes, and costs credits like a chat reply in Birdy. An asked agent only reads and proposes: changes it \
+proposes wait for the owner's approval in Birdy. Say so, with the link, and never approve them here.
 - If the user asks what Birdy can do, or this is the first Birdy request in the chat, call get_started.
 
 How to answer: Birdy's format (the owner's picks: mocks/mcp-format A2 A4 A5 B4 C2 C3 D2 E2)
@@ -49,7 +54,7 @@ WEBSITE_URL = FRONTEND_URL
 
 # Past-tense first word of an activity label -> its "-ing" form, for tool titles ("Looked at ads" -> "Looking at ads").
 _ING = {
-    "Accepted": "Accepting", "Added": "Adding", "Analysed": "Analysing", "Applied": "Applying",
+    "Accepted": "Accepting", "Added": "Adding", "Asked": "Asking", "Analysed": "Analysing", "Applied": "Applying",
     "Calculated": "Calculating", "Changed": "Changing", "Checked": "Checking", "Compared": "Comparing",
     "Created": "Creating", "Deleted": "Deleting", "Dismissed": "Dismissing", "Drafted": "Drafting",
     "Edited": "Editing", "Graduated": "Graduating", "Listed": "Listing", "Looked": "Looking", "Opened": "Opening",

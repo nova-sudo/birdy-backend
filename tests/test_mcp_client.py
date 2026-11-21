@@ -61,6 +61,7 @@ async def test_mcp_tool_names_matches_server_registration():
                      "list_report_clients", "list_report_metrics", "get_report_draft", "preview_report", "propose_report",
                      "attribution_status", "leads_by_ad", "funnel", "attribution_overview",
                      "refresh_client_data", "refresh_status", "check_my_accounts", "get_fired_alerts", "explain_alert"}
+    external_only |= mcp_client.EXTERNAL_ONLY_TOOL_NAMES   # the team asks (ai/mcp/team_mcp.py)
     assert mcp_client.MCP_TOOL_NAMES == registered - external_only, (
         f"MCP_TOOL_NAMES is out of sync with the server's registered tools.\n"
         f"In MCP_TOOL_NAMES but not registered: {mcp_client.MCP_TOOL_NAMES - registered}\n"

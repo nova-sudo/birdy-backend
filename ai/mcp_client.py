@@ -55,6 +55,11 @@ MCP_TOOL_NAMES = {
     "get_unified_leads", "get_unified_lead_stats",
 }
 
+# MCP tools for assistants outside Birdy only, never offered to Birdy's own chat (which lists every MCP
+# tool when its page has no allowlist): ai/mcp/team_mcp.py's asks run a whole agent chat reply, and the
+# chat's agents ask each other through their own ask tools (ai/team/delegation.py) instead.
+EXTERNAL_ONLY_TOOL_NAMES = frozenset({"ask_media_buyer", "ask_sales_coach"})
+
 _INTERNAL_TOKEN_TTL_SECONDS = 280
 # One token is minted per run_chat() call and reused for every tool call across
 # every iteration of that chat turn (see mcp_client_for below) — it is never
@@ -131,6 +136,7 @@ async def get_mcp_schemas(client: "Client", allowed: list | None) -> list[dict] 
             },
         }
         for t in tools
+        if t.name not in EXTERNAL_ONLY_TOOL_NAMES
     ]
     if allowed is not None:
         schemas = [s for s in schemas if s["function"]["name"] in allowed]

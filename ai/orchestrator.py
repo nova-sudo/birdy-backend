@@ -32,6 +32,7 @@ from ai.team import definitions as team_defs
 from ai.team import delegation
 from ai.team import lesson_tools as team_lesson_tools
 from ai.team import pinning as team_pinning
+from ai.team import propose_only as team_propose_only
 from ai.team import route as team_route
 
 logger = logging.getLogger(__name__)
@@ -670,6 +671,8 @@ def _only_client(result: str, client_group_id: str) -> str:
 
 
 async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
+    if frame.helper:
+        return delegation.helper_instructions(frame, client_group_id=client_group_id, client_name=client_name)
     if frame.sub is not None:
         try:
             from ai.agents.stock.lessons import lessons_for_prompt
@@ -683,9 +686,12 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
     asked_by = None
     if frame.nested:
         asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])
-    return await team_defs.build_instructions(
+    prompt = await team_defs.build_instructions(
         frame.agent, db, user_id, client_group_id=client_group_id, client_name=client_name,
         asked_by=asked_by, source=source)
+    if not frame.nested and team_propose_only.active():
+        prompt += "\n" + team_propose_only.PROMPT_NOTE
+    return prompt
 
 
 def _agent_tool_names(frame) -> list:
@@ -695,7 +701,8 @@ def _agent_tool_names(frame) -> list:
         parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
         from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
         return [n for n in frame.sub.tools if n in parent and n not in NOT_FOR_SUB_AGENTS]
-    names = team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
+    names = team_defs.tool_names(frame.agent, nested=team_propose_only.restricted(frame),
+                                 one_client=bool(frame.client_group_id))
     if frame.agent == team_defs.MEDIA_BUYER and not frame.nested and stock_card_tools.current_stock_card.get():
         # Applying an approved proposal that names one card (routers/chat.apply_proposal).
         names = names + list(team_defs.MEDIA_BUYER_CARD_TOOLS)
@@ -1010,10 +1017,14 @@ async def run_chat(
                 s for s in tool_registry.get_schemas(allowed=allowed)
                 if s["function"]["name"] in mcp_client.MCP_TOOL_NAMES
             ]
+        registry_names = {s["function"]["name"] for s in registry_schemas}
+        # A tool on both the registry and the MCP server (find_ads, get_daily_metrics, the creative and
+        # call tools, ...) runs from the registry (below), so only the registry's schema is sent. Sending
+        # both put every such tool in the request twice.
+        mcp_schemas = [s for s in mcp_schemas if s["function"]["name"] not in registry_names]
         tool_schemas = registry_schemas + mcp_schemas
         # An agent run may be offered MCP-hosted tools the orchestrator has no copy of (Birdy's client
         # note, target and Slack report tools); those are called through MCP. The general chat is unchanged.
-        registry_names = {s["function"]["name"] for s in registry_schemas}
         mcp_only = ({s["function"]["name"] for s in mcp_schemas} - registry_names - mcp_client.MCP_TOOL_NAMES
                     if frame is not None and mcp is not None else set())
         delegation_ctx = None
@@ -1162,7 +1173,8 @@ async def run_chat(
                         "No time is left in this reply to run more tools. Answer with what you have "
                         "and say what you could not check.")})
                 elif frame is not None and (tc.name not in offered
-                                            or (nested and tc.name in team_defs.WRITE_TOOLS)):
+                                            or (team_propose_only.restricted(frame)
+                                                and tc.name in team_defs.WRITE_TOOLS)):
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available to {team_defs.NAMES.get(frame.agent, 'this agent')} "
                         "here. Use only the tools you were given.")})
@@ -1220,7 +1232,7 @@ async def run_chat(
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
 
                 if frame is not None:
-                    detail = (team_route.clip(str(args.get("question") or ""), team_route.SUMMARY_MAX) or None
+                    detail = (team_route.clip(str(args.get("question") or args.get("name") or ""), team_route.SUMMARY_MAX) or None
                               if tc.name in delegation.TOOL_NAMES else team_route.tool_detail(args))
                     frame.step["tools"].append({"name": tc.name, "label": team_route.tool_label(tc.name),
                                                 "detail": detail})

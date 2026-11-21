@@ -843,6 +843,8 @@ async def get_facebook_leads_filtered(
                     "field_data": row["field_data"],
                     "lead_source": row["lead_source"],
                     "ghl_matched": row["ghl_matched"],
+                    # the CRM contact a matched lead opens (instant-form leads included)
+                    "ghl_contact_id": row.get("ghl_contact_id"),
                     "ghl_tags": row["ghl_tags"],
                     "ghl_opportunity_status": row["ghl_opportunity_status"],
                     "ghl_opportunity_value": row["ghl_opportunity_value"],
