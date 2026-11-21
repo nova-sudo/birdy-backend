@@ -96,6 +96,27 @@ async def patch_settings(agent_id: str, body: SettingsPatch,
 # Preview
 # ---------------------------------------------------------------------------
 
+async def preview_blocker(db, user_id: str, agent: dict) -> dict | None:
+    """The 409 body that stops a preview starting, or None. Also used by the agent onboarding's practice
+    run (routers/team_setup.py)."""
+    gids = list((agent.get("scope") or {}).get("client_group_ids") or [])
+    if not gids:
+        return {"detail": "Choose at least one client first"}
+    watched = [g["id"] async for g in db["client_groups"].find(
+        {"id": {"$in": gids}, "user_id": user_id, "meta_ad_account_id": {"$nin": [None, ""]}})]
+    states = await ad_history.statuses(db, watched)
+    # Only a client still syncing holds the preview up. One Meta won't let Birdy read may stay that
+    # way for good, so it shows as having no data, unless no client at all can be read.
+    ready = [g for g in watched if ad_history.is_ready(states.get(g))]
+    not_ready = [g for g in watched if g not in ready and states[g]["status"] != ad_history.STATUS_ERROR]
+    if not_ready:
+        return {"detail": "Ad history isn't ready yet", "not_ready": not_ready}
+    if watched and not ready:
+        return {"detail": "Birdy can't read ad history from Meta for any of your clients, so there's nothing to preview yet.",
+                "unreadable": watched}
+    return None
+
+
 @router.post("/{agent_id}/preview")
 async def start_preview(agent_id: str, current_user: str = Depends(get_current_user)):
     """A run on real data that writes nothing to Meta or Slack and never calls the urgent hook.
@@ -104,23 +125,9 @@ async def start_preview(agent_id: str, current_user: str = Depends(get_current_u
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]
         agent = await _stock_agent(db, current_user, agent_id)
-        gids = list((agent.get("scope") or {}).get("client_group_ids") or [])
-        if not gids:
-            return JSONResponse(status_code=409, content={"detail": "Choose at least one client first"})
-        watched = [g["id"] async for g in db["client_groups"].find(
-            {"id": {"$in": gids}, "user_id": current_user, "meta_ad_account_id": {"$nin": [None, ""]}})]
-        states = await ad_history.statuses(db, watched)
-        # Only a client still syncing holds the preview up. One Meta won't let Birdy read may stay that
-        # way for good, so it shows as having no data, unless no client at all can be read.
-        ready = [g for g in watched if ad_history.is_ready(states.get(g))]
-        not_ready = [g for g in watched if g not in ready and states[g]["status"] != ad_history.STATUS_ERROR]
-        if not_ready:
-            return JSONResponse(status_code=409, content={
-                "detail": "Ad history isn't ready yet", "not_ready": not_ready})
-        if watched and not ready:
-            return JSONResponse(status_code=409, content={
-                "detail": "Birdy can't read ad history from Meta for any of your clients, so there's nothing to preview yet.",
-                "unreadable": watched})
+        blocker = await preview_blocker(db, current_user, agent)
+        if blocker is not None:
+            return JSONResponse(status_code=409, content=blocker)
         now = _utcnow()
         run = await stock_runner.get_or_create_run(db, agent, now, kind=stock_runner.PREVIEW)
         if run["phase"] != stock_runner.DONE:

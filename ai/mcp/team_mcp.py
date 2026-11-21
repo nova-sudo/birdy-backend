@@ -177,6 +177,10 @@ async def ask_agent(agent: str, question: str, client: str | None = None,
     user_id = _current_user_id()
     mongo_client = get_shared_mongo_client()
     db = get_db(mongo_client)
+    from ai.team import setup as team_setup
+    locked = await team_setup.refusal(db, user_id, agent)   # agent onboarding: not set up yet
+    if locked:
+        raise ToolError(f"{locked} Nothing was asked or charged.")
     conversation_id = (conversation_id or "").strip() or None
 
     # Continuing: the conversation must be this user's chat with this agent; it keeps its one client.

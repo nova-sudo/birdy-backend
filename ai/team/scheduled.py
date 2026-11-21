@@ -67,6 +67,10 @@ async def run_one(db, mongo_client, sub_agent: dict, *, local_date: str, deadlin
 
     user_id = sub_agent["user_id"]
     parent = sub_agent["parent"]
+    from ai.team import setup as team_setup
+    locked = await team_setup.refusal(db, user_id, team_setup.SUB_AGENTS)   # agent onboarding not finished
+    if locked:
+        return {**_skipped("agent_locked", "Skipped: sub-agents locked until setup is done"), "answer": locked}
     if await credits.is_blocked(db, user_id):
         return _skipped("out_of_credits", "Skipped: out of Birdy Credits")
     if provider is None:

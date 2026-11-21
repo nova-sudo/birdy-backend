@@ -178,6 +178,7 @@ def test_sales_coach_only_has_call_tools():
     assert names == {"get_client_groups", "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
                      "analyze_call_recordings", "render_ui",
                      "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",     # what the calls turned into
+                     "get_sales_outcomes",                     # booked, closed, speed to lead (its setup)
                      "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
     # lead counts and sources stay Birdy's
     assert "get_unified_lead_stats" not in names
