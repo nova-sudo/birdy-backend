@@ -670,6 +670,8 @@ def _only_client(result: str, client_group_id: str) -> str:
 
 
 async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_name, source) -> str:
+    if frame.helper:
+        return delegation.helper_instructions(frame, client_group_id=client_group_id, client_name=client_name)
     if frame.sub is not None:
         try:
             from ai.agents.stock.lessons import lessons_for_prompt
@@ -1220,7 +1222,7 @@ async def run_chat(
                 logger.info(f"Tool result ({tc.name}): {result[:500]}")
 
                 if frame is not None:
-                    detail = (team_route.clip(str(args.get("question") or ""), team_route.SUMMARY_MAX) or None
+                    detail = (team_route.clip(str(args.get("question") or args.get("name") or ""), team_route.SUMMARY_MAX) or None
                               if tc.name in delegation.TOOL_NAMES else team_route.tool_detail(args))
                     frame.step["tools"].append({"name": tc.name, "label": team_route.tool_label(tc.name),
                                                 "detail": detail})

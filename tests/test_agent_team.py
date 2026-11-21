@@ -41,6 +41,8 @@ def role_of(messages) -> str:
     system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
     if "a sub-agent working for" in system:
         return "sub:" + system.split("You are ", 1)[1].split(",", 1)[0]
+    if ", a one-off helper " in system:
+        return "helper:" + system.split("You are ", 1)[1].split(",", 1)[0]
     for key, marker in (("birdy", "Your role: Birdy"), ("media_buyer", "Your role: Media Buyer"),
                         ("sales_coach", "Your role: Sales Coach")):
         if marker in system:
@@ -129,7 +131,7 @@ def assert_route_shape(route):
     assert route["limit_hit"] in (None, "asks", "depth", "repeat")
     for s in route["steps"]:
         assert set(s) == STEP_KEYS
-        assert s["kind"] in ("orchestrator", "main", "sub")
+        assert s["kind"] in ("orchestrator", "main", "sub", "helper")
         assert s["status"] in ("working", "done", "failed", "skipped")
         assert len(s["summary"]) <= 60
         for t in s["tools"]:
@@ -866,3 +868,178 @@ async def test_birdy_has_a_main_agent_propose_a_sub_agent(mock_db, registry, gro
     # a main agent asked by another main agent's request (through Birdy) still cannot be told to by a sub-agent,
     # and Birdy itself is never offered the tool
     assert "propose_sub_agent" not in p.offered("birdy")
+
+
+# ── 10. one-off helpers (use_helper) ──────────────────────────────────────────
+
+def helper(name="Ad check", job="Check every Aura campaign's CPL for the last 7 days.", tools=("get_campaign_insights",)):
+    return ProviderResponse(content=None, tool_calls=[ToolCall(
+        id=f"tc-helper-{name}", name="use_helper",
+        arguments=json.dumps({"name": name, "job": job, "tools": list(tools)}))],
+        finish_reason="tool_calls", usage=Usage(1000, 100))
+
+
+def tool_results(p, role):
+    """Every tool result the last call of `role` saw, parsed."""
+    last = [c for c in p.calls if c[0] == role][-1]
+    return [json.loads(m["content"]) for m in last[2] if m["role"] == "tool"]
+
+
+async def test_helper_runs_with_only_its_chosen_tools(mock_db, registry):
+    p = TeamProvider({
+        "media_buyer": [helper(), say("Aura's CPL is up on one campaign.")],
+        "helper:Ad check": [call("get_campaign_insights", date_preset="last_7d"),
+                            say("Campaign B doubled its CPL.\nSUMMARY: 4 campaigns checked")],
+    })
+    out = await chat(p, registry, mock_db, agent="media_buyer")
+    assert "use_helper" in p.offered("media_buyer")
+    # only the tool it was given: no ask, propose, recall or lesson tool, no other read
+    assert p.offered("helper:Ad check") == ["get_campaign_insights"]
+    route = out["route"]
+    assert_route_shape(route)
+    root, step = route["steps"]
+    assert step["kind"] == "helper" and step["agent"].startswith("sub:helper-") and step["name"] == "Ad check"
+    assert step["asked_by"] == "media_buyer" and step["question"].startswith("Check every Aura campaign")
+    assert step["status"] == "done" and step["summary"] == "4 campaigns checked"
+    assert step["answer"] == "Campaign B doubled its CPL."
+    assert step["tools"] == [{"name": "get_campaign_insights", "label": "Campaign figures", "detail": "last_7d"}]
+    assert root["tools"][0] == {"name": "use_helper", "label": "Started a helper", "detail": "Ad check"}
+    assert route["limit_hit"] is None
+    # the answer reached Media Buyer, and nothing was saved as a sub-agent
+    assert tool_results(p, "media_buyer")[0]["answer"] == "Campaign B doubled its CPL."
+    assert await mock_db["sub_agents"].count_documents({}) == 0
+    # its system prompt is the short helper one, not a full agent prompt
+    system = next(c for c in p.calls if c[0] == "helper:Ad check")[2][0]["content"]
+    assert len(system) < 1200 and "Your role" not in system
+
+
+@pytest.mark.parametrize("tools, said", [
+    (["post_creative_test"], "can't make the change"),          # a write tool of its own main agent
+    (["create_alert"], "can't make the change"),                  # another agent's write
+    (["get_call_center_stats"], "Outside Media Buyer's area"),    # another agent's read
+    (["list_lessons"], "Outside Media Buyer's area"),             # its main agent's private memory
+    (["not_a_tool"], "Unknown tool"),
+    ([], "at least one tool"),
+])
+async def test_helper_refuses_write_and_unknown_tools(mock_db, registry, tools, said):
+    frame = rt.new_turn("media_buyer")
+    res = json.loads(await delegation.handle("use_helper", {"name": "x", "job": "j", "tools": tools},
+                                             frame, {"db": mock_db, "user_id": U}))
+    assert res["ok"] is False and said in res["error"] and "sub-agent" not in res["error"]
+    assert len(frame.turn.steps) == 1 and frame.turn.helpers == 0
+
+
+async def test_only_main_agents_get_helpers(mock_db, registry):
+    p = TeamProvider({"birdy": [call("ask_media_buyer", question="q", client="agency"), say("ok")],
+                      "media_buyer": [say("ok")]})
+    await chat(p, registry, mock_db, agent="birdy")
+    assert "use_helper" not in p.offered("birdy") and "use_helper" in p.offered("media_buyer")
+    birdy = rt.new_turn("birdy")
+    res = json.loads(await delegation.handle("use_helper", {"name": "x", "job": "j", "tools": ["get_alerts"]},
+                                             birdy, {"db": mock_db, "user_id": U}))
+    assert res["ok"] is False and "Only Media Buyer and Sales Coach" in res["error"]
+
+
+async def test_two_helpers_per_reply(mock_db, registry):
+    p = TeamProvider({
+        "media_buyer": [helper("Check A"), helper("Check B"), helper("Check C"), say("Here is what I have.")],
+        "helper:Check A": [say("A fine.\nSUMMARY: A checked")],
+        "helper:Check B": [say("B fine.\nSUMMARY: B checked")],
+    })
+    out = await chat(p, registry, mock_db, agent="media_buyer")
+    route = out["route"]
+    assert_route_shape(route)
+    assert [(s["name"], s["kind"], s["status"]) for s in route["steps"]] == [
+        ("Media Buyer", "main", "done"), ("Check A", "helper", "done"), ("Check B", "helper", "done"),
+        ("Check C", "helper", "skipped")]
+    assert route["steps"][3]["summary"] == "Not started: limit of 2 helpers"
+    assert not [c for c in p.calls if c[0] == "helper:Check C"]
+    third = tool_results(p, "media_buyer")[2]
+    assert third["ok"] is False and third["limit_hit"] == "helpers"
+    # helpers do not use up the reply's agent asks, and the route's limit_hit stays for the asks banner
+    assert route["limit_hit"] is None
+
+
+async def test_helper_cap_is_across_the_whole_reply(mock_db, registry):
+    p = TeamProvider({
+        "birdy": [call("ask_media_buyer", question="ads?", client="agency"),
+                  call("ask_sales_coach", question="calls?", client="agency"), say("done")],
+        "media_buyer": [helper("Ads 1"), helper("Ads 2"), say("ads fine")],
+        "sales_coach": [helper("Calls 1", tools=["get_call_center_stats"]), say("calls fine")],
+        "helper:Ads 1": [say("ok")], "helper:Ads 2": [say("ok")],
+    })
+    out = await chat(p, registry, mock_db, agent="birdy")
+    steps = out["route"]["steps"]
+    assert [(s["name"], s["asked_by"], s["status"]) for s in steps] == [
+        ("Birdy", None, "done"), ("Media Buyer", "birdy", "done"), ("Ads 1", "media_buyer", "done"),
+        ("Ads 2", "media_buyer", "done"), ("Sales Coach", "birdy", "done"), ("Calls 1", "sales_coach", "skipped")]
+    assert tool_results(p, "sales_coach")[0]["limit_hit"] == "helpers"
+
+
+async def test_helper_cannot_nest_ask_write_or_propose(mock_db, registry):
+    p = TeamProvider({
+        "media_buyer": [helper(), say("ok")],
+        "helper:Ad check": [helper("again"),
+                            call("propose_action", title="Pause ad", detail="d", kind="pause_creative_ads"),
+                            call("ask_birdy", question="q", client="agency"),
+                            call("post_creative_test", test_id="t"),
+                            say("Only read.")],
+    })
+    out = await chat(p, registry, mock_db, agent="media_buyer")
+    for res in tool_results(p, "helper:Ad check"):
+        assert "isn't available" in res["error"]
+    assert out["proposals"] == [] and len(out["route"]["steps"]) == 2
+    assert "post_creative_test" not in registry.seen
+    # and directly: a helper frame is offered no delegation tool and every one is refused
+    frame = rt.new_turn("media_buyer")
+    sub = sub_agents.SubAgent(id="helper-x", name="h", instructions="j", tools=("get_campaign_insights",),
+                              parent="media_buyer")
+    hf = rt.Frame(turn=frame.turn, agent=sub.key, depth=1, chain=("media_buyer", sub.key), step=frame.step,
+                  usage=frame.usage, sub=sub, parent_main="media_buyer", helper=True)
+    assert delegation.tool_schemas(hf, []) == []
+    for name in delegation.TOOL_NAMES:
+        res = json.loads(await delegation.handle(name, {"question": "q", "client": "agency"}, hf,
+                                                 {"db": mock_db, "user_id": U}))
+        assert res["ok"] is False and "asks and proposes nothing" in res["error"]
+
+
+async def test_helper_is_billed_in_the_one_debit(mock_db, registry):
+    await mock_db["users"].insert_one({"user_id": U, "credits": {**credits._effective_credits({})[0],
+                                                                  "topup_balance": 1000.0}})
+    p = TeamProvider({
+        "media_buyer": [helper(), say("done")],
+        "helper:Ad check": [call("get_campaign_insights"), say("fine")],
+    })
+    out = await chat(p, registry, mock_db, agent="media_buyer")
+    rows = await mock_db["ai_usage"].find({}).to_list(None)
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["model_calls"] == 4 and row["prompt_tokens"] == 4000
+    mb, h = row["agents"]
+    assert mb["agent"] == "media_buyer" and "kind" not in mb
+    assert h["agent"] == out["route"]["steps"][1]["agent"] and h["depth"] == 1
+    assert (h["kind"], h["name"], h["parent"]) == ("helper", "Ad check", "media_buyer")
+    assert h["credits"] > 0 and h["credits"] == out["route"]["steps"][1]["credits"]
+    assert out["route"]["credits"] == row["credits"]
+
+
+async def test_helper_keeps_the_client_scope(mock_db, registry, groups):
+    p = TeamProvider({
+        "sales_coach": [helper("Call check", tools=["get_call_center_stats"]), say("ok")],
+        "helper:Call check": [call("get_call_center_stats", group_ids=[G2]), say("fine")],
+    })
+    await chat(p, registry, mock_db, agent="sales_coach", client_group_id=G1, client_name="Aura")
+    assert registry.seen["get_call_center_stats"][-1]["group_ids"] == [G1]
+    system = next(c for c in p.calls if c[0] == "helper:Call check")[2][0]["content"]
+    assert f'"Aura" (group ID: {G1})' in system
+
+
+async def test_helper_uses_the_ask_timeout(mock_db, registry, monkeypatch):
+    monkeypatch.setattr(rt, "ASK_TIMEOUT_SECONDS", 0.2)
+    monkeypatch.setattr(rt, "MIN_ASK_SECONDS", 0.05)
+    p = TeamProvider({"media_buyer": [helper(), say("Partial.")], "helper:Ad check": [say("late")]},
+                     delays={"helper:Ad check": 2})
+    out = await chat(p, registry, mock_db, agent="media_buyer")
+    step = out["route"]["steps"][1]
+    assert step["kind"] == "helper" and step["status"] == "failed" and step["summary"] == "Ran out of time"
+    assert tool_results(p, "media_buyer")[0]["error"] == "timeout"
