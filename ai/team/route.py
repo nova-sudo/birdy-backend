@@ -21,6 +21,9 @@ from ai.team import definitions as defs
 
 # ── Limits (design section 4) ─────────────────────────────────────────────────
 MAX_ASKS_PER_REPLY = 3
+# One-off helpers a main agent starts for itself (delegation.use_helper), across the whole reply.
+# They do not count against the asks above.
+MAX_HELPERS_PER_REPLY = 2
 # Longest chain: main agent -> Birdy -> other main agent -> one sub-agent.
 # Depth counts hops from the agent the user addressed (depth 0).
 MAX_DEPTH = 3
@@ -62,6 +65,7 @@ TOOL_LABELS = {
     "get_call_trend": "Calls against the period before",
     "recall_conversations": "Earlier chats",
     "propose_sub_agent": "A new sub-agent",
+    "use_helper": "Started a helper",
     "get_call_recordings_summary": "Call recordings",
     "analyze_call_recordings": "Call analysis",
     "find_ads": "Ad search",
@@ -147,6 +151,9 @@ class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
     model_calls: int = 0
+    kind: Optional[str] = None      # "helper" for a one-off helper's run; None for an agent
+    name: Optional[str] = None      # the helper's name
+    parent: Optional[str] = None    # the main agent that started the helper
 
     def add(self, response) -> None:
         self.model_calls += 1
@@ -167,6 +174,7 @@ class Turn:
     usages: list = field(default_factory=list)
     proposals: list = field(default_factory=list)
     asks: int = 0
+    helpers: int = 0
     limit_hit: Optional[str] = None
     involved: bool = False      # a second agent took part (or was refused): the route is shown
     status: str = "working"
@@ -252,7 +260,9 @@ class Turn:
         """Per-agent usage for the ledger row: who spent what in this reply."""
         return [{"agent": u.agent, "depth": u.depth, "prompt_tokens": u.prompt_tokens,
                  "completion_tokens": u.completion_tokens, "model_calls": u.model_calls,
-                 "credits": self.credits_for(u)} for u in self.usages]
+                 "credits": self.credits_for(u),
+                 **({"kind": u.kind, "name": u.name, "parent": u.parent} if u.kind else {})}
+                for u in self.usages]
 
     # output
     def to_route(self) -> Optional[dict]:
@@ -291,6 +301,7 @@ class Frame:
     client_name: Optional[str] = None
     sub: object = None          # the SubAgent record, for "sub:<id>" frames
     parent_main: Optional[str] = None   # for a sub-agent: its main agent's key
+    helper: bool = False        # a one-off helper (delegation.use_helper): reads only, asks and proposes nothing
 
     def parent_is_birdy(self) -> bool:
         """Asked directly by Birdy (the chain ends ..., birdy, this agent)."""

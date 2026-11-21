@@ -6,15 +6,16 @@ Agents asking agents, hub and spoke (design section 4):
 - Birdy asks a main agent:        ask_media_buyer / ask_sales_coach
 - A main agent passes a need up:  ask_birdy
 - A main agent asks its own sub:  ask_sub_agent
-- Main agents never ask each other; a sub-agent asks no one.
+- A main agent starts a helper:   use_helper (one-off, read-only, never saved)
+- Main agents never ask each other; a sub-agent or a helper asks no one.
 
 Each ask runs a nested, bounded `run_chat` for the child with the child's own
 instructions, tools and memory (ai/team/definitions.py), in the client scope
 the ask carries. The child can only read and propose (`propose_action`); its
 answer comes back to the asking agent as the tool result.
 
-Limits per user reply (route.py): 3 asks, chain depth 3, and an agent already
-involved in the reply is never asked again. A hit sets the route's `limit_hit`
+Limits per user reply (route.py): 3 asks, 2 helpers, chain depth 3, and an agent
+already involved in the reply is never asked again. A hit sets the route's `limit_hit`
 and the asking agent is told to answer with what it has.
 """
 
@@ -26,7 +27,7 @@ import uuid
 
 from ai.team import definitions as defs
 from ai.team import route as rt
-from ai.team.sub_agents import list_sub_agents
+from ai.team.sub_agents import SubAgent, list_sub_agents
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,10 @@ PROPOSE_ACTION = "propose_action"
 ASK_TOOLS = {ASK_MEDIA_BUYER: defs.MEDIA_BUYER, ASK_SALES_COACH: defs.SALES_COACH, ASK_BIRDY: defs.BIRDY}
 PROPOSE_SUB_AGENT = "propose_sub_agent"
 RECALL = "recall_conversations"
-TOOL_NAMES = frozenset({*ASK_TOOLS, ASK_SUB_AGENT, PROPOSE_ACTION, PROPOSE_SUB_AGENT, RECALL})
+USE_HELPER = "use_helper"
+TOOL_NAMES = frozenset({*ASK_TOOLS, ASK_SUB_AGENT, PROPOSE_ACTION, PROPOSE_SUB_AGENT, RECALL, USE_HELPER})
+HELPER_KIND = "helper"      # a helper's route step `kind` and its ledger line's `kind`
+LIMIT_HELPERS = "helpers"   # in the refused tool result only; the route's limit_hit is left alone
 
 RECALL_MAX_CONVERSATIONS = 5
 RECALL_MESSAGES = 8          # the latest turns of each conversation
@@ -120,6 +124,47 @@ def _propose_schema(owner: str) -> dict:
     }}
 
 
+def _helper_schema(agent: str) -> dict:
+    """use_helper for one main agent: the tools enum is its read tools, the same set a saved
+    sub-agent may be given (ai/agents/sub_agents/tools.parent_tool_names)."""
+    from ai.agents.sub_agents.core import NAME_MAX
+    from ai.agents.sub_agents.tools import parent_tool_names
+    return {"type": "function", "function": {
+        "name": USE_HELPER,
+        "description": (
+            "Start a one-off helper for one side job in this reply. It reads with the tools you pick, answers "
+            "you, and is discarded: no approval, nothing saved. Use it for a self-contained job that needs many "
+            "tool calls, or to split off two independent look-ups. Not for anything one or two of your own tool "
+            "calls answer, and not for a recurring job (propose a sub-agent for that). "
+            f"At most {rt.MAX_HELPERS_PER_REPLY} per reply."),
+        "parameters": {"type": "object", "properties": {
+            "name": {"type": "string", "description": f"Short name, e.g. 'Ad fatigue check' (at most {NAME_MAX} characters)."},
+            "job": {"type": "string", "description": "The whole job: what to check, the clients and period, what to send back."},
+            "tools": {"type": "array", "items": {"type": "string", "enum": sorted(parent_tool_names(agent))},
+                      "minItems": 1, "description": "Only the tools the job needs."},
+        }, "required": ["name", "job", "tools"]},
+    }}
+
+
+def helper_instructions(frame: rt.Frame, *, client_group_id: str | None, client_name: str | None) -> str:
+    """A helper's system prompt: short on purpose (its job is the message it is given)."""
+    from datetime import date
+    parent = defs.NAMES.get(frame.parent_main, "your main agent")
+    name = frame.sub.name if frame.sub else "Helper"
+    parts = [
+        f"You are {name}, a one-off helper {parent} started for one job in this agency's Birdy workspace. "
+        f"Your job is the message below. Today's date is {date.today().isoformat()}.\n",
+    ]
+    if client_group_id:
+        parts.append(defs._SCOPE_CLIENT.format(name=client_name or client_group_id, gid=client_group_id))
+    parts.append(
+        f"\n## How to answer\n"
+        "- Use your tools; never guess a number. You only read: you change nothing, propose nothing, ask no one.\n"
+        f"- Answer {parent}, briefly: the finding first, then the figures behind it.\n"
+        "- Finish with one last line: `SUMMARY: <at most 8 plain words on what you checked>`\n")
+    return "".join(parts)
+
+
 def owner_of(frame: rt.Frame) -> str | None:
     """The main agent a frame's proposals belong to (Birdy owns no writes)."""
     if frame.agent in defs.MAIN_AGENTS:
@@ -136,6 +181,8 @@ async def subs_for(db, frame: rt.Frame, user_id: str) -> list:
 
 def tool_schemas(frame: rt.Frame, subs: list) -> list[dict]:
     """The delegation tools this run is offered. Never an ask to an agent already in the chain."""
+    if frame.helper:
+        return []       # a helper reads with its own tools and nothing else
     out = []
     if frame.agent == defs.BIRDY:
         for tool, target in ((ASK_MEDIA_BUYER, defs.MEDIA_BUYER), (ASK_SALES_COACH, defs.SALES_COACH)):
@@ -146,6 +193,8 @@ def tool_schemas(frame: rt.Frame, subs: list) -> list[dict]:
             out.append(_SCHEMAS[ASK_BIRDY])
         if subs:
             out.append(_sub_schema(subs))
+        if frame.depth + 1 <= rt.MAX_DEPTH:
+            out.append(_helper_schema(frame.agent))
         if not frame.nested or frame.parent_is_birdy():
             # In the main agent's own chat, or when Birdy passed the owner's request on: either way
             # the proposal is a card the owner approves in the chat they are in.
@@ -205,6 +254,10 @@ def _allowed_edge(frame: rt.Frame, target: str) -> bool:
 
 async def handle(name: str, args: dict, frame: rt.Frame, ctx: dict) -> str:
     """Run one delegation tool call and return its result for the asking agent."""
+    if frame.helper:
+        return _result(False, error="A helper only reads with its own tools: it asks and proposes nothing.")
+    if name == USE_HELPER:
+        return await _use_helper(args, frame, ctx)
     if name == PROPOSE_ACTION:
         return _propose(args, frame)
     if name == PROPOSE_SUB_AGENT:
@@ -257,21 +310,67 @@ async def handle(name: str, args: dict, frame: rt.Frame, ctx: dict) -> str:
                        note=(f"This reply already used its {rt.MAX_ASKS_PER_REPLY} agent asks. Answer with what you "
                              "know and tell the owner what you could not check."))
 
+    turn.asks += 1
+    return await _run_nested(frame, ctx, key=key, display=display, question=question, gid=gid, gname=gname,
+                             sub=sub, scope_note=scope_note)
+
+
+async def _use_helper(args: dict, frame: rt.Frame, ctx: dict) -> str:
+    """A one-off helper: a nested read-only run with tools the main agent picked from its own
+    reads (validated exactly as a saved sub-agent's), in the main agent's client scope. Never saved."""
+    if frame.agent not in defs.MAIN_AGENTS:
+        return _result(False, error="Only Media Buyer and Sales Coach can start a helper.")
+    from ai.agents.sub_agents import core
+    args = args or {}
+    try:
+        name = core.clean_name(args.get("name"))
+        tools = core.clean_tools(frame.agent, args.get("tools"))
+    except core.SubAgentError as e:
+        return _result(False, error=str(e.body.get("detail") or e.code).replace("sub-agent", "helper"))
+    job = str(args.get("job") or "").strip()
+    if not job:
+        return _result(False, error="Write the helper's job: what to check and what to send back.")
+    job = job[:QUESTION_MAX_CHARS]
+    helper = SubAgent(id="helper-" + uuid.uuid4().hex[:10], name=name, instructions=job, tools=tuple(tools),
+                      parent=frame.agent)
+    turn = frame.turn
+    if frame.depth + 1 > rt.MAX_DEPTH:      # a main agent is never this deep; kept as a guard
+        return _result(False, limit_hit=rt.LIMIT_DEPTH, note="No helper can start this deep. Answer with what you know.")
+    if turn.helpers >= rt.MAX_HELPERS_PER_REPLY:
+        turn.involved = True
+        step = turn.add_step(helper.key, name, question=job, asked_by=frame.agent, status="skipped")
+        step.update(kind=HELPER_KIND, summary=f"Not started: limit of {rt.MAX_HELPERS_PER_REPLY} helpers")
+        turn.changed()
+        return _result(False, limit_hit=LIMIT_HELPERS,
+                       note=(f"This reply already used its {rt.MAX_HELPERS_PER_REPLY} helpers. Do the rest with your "
+                             "own tools, or answer with what you have."))
+    turn.helpers += 1
+    return await _run_nested(frame, ctx, key=helper.key, display=name, question=job, gid=frame.client_group_id,
+                             gname=frame.client_name, sub=helper, helper=True)
+
+
+async def _run_nested(frame: rt.Frame, ctx: dict, *, key: str, display: str, question: str, gid, gname,
+                      sub, scope_note: str = "", helper: bool = False) -> str:
+    """One nested run (an ask or a helper): its route step, its usage line, the time budget and
+    the per-ask timeout, and its answer back to the agent that started it."""
+    turn = frame.turn
     timeout = turn.ask_timeout()
     turn.involved = True
-    turn.asks += 1
     step = turn.add_step(key, display, question=question, asked_by=frame.agent)
+    if helper:
+        step["kind"] = HELPER_KIND
     if timeout <= 0:
         step.update(status="failed", summary="Not asked: no time left in this reply")
         turn.changed()
         return _result(False, error="timeout",
                        note="There is no time left in this reply to ask. Answer with what you know.")
 
-    child_usage = rt.Usage(agent=key, depth=frame.depth + 1, model=frame.usage.model)
+    child_usage = rt.Usage(agent=key, depth=frame.depth + 1, model=frame.usage.model,
+                           **({"kind": HELPER_KIND, "name": display, "parent": frame.agent} if helper else {}))
     turn.usages.append(child_usage)
     child = rt.Frame(turn=turn, agent=key, depth=frame.depth + 1, chain=(*frame.chain, key), step=step,
                      usage=child_usage, client_group_id=gid, client_name=gname, sub=sub,
-                     parent_main=sub.parent if sub else None)
+                     parent_main=sub.parent if sub else None, helper=helper)
     turn.changed()
 
     started = time.monotonic()
