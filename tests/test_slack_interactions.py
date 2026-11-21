@@ -231,3 +231,38 @@ async def test_view_submission_success_reconstructs_ui_response(signed_post, db_
     sent_message = mock_run_chat.call_args.kwargs["message"]
     assert json.loads(sent_message[len("[UI_RESPONSE] "):]) == {"name": "My Alert"}
     assert await get_pending_interaction(db_provider, "chat_xyz:0") is None
+
+
+@pytest.mark.asyncio
+async def test_form_submit_goes_back_to_birdy_and_shows_the_route(signed_post, db_provider):
+    await create_pending_interaction(
+        db_provider, "chat_abc:0", team_id="T1", channel_id="C1", thread_ts="1.1",
+        slack_user_id="U1", birdy_user_id="alice@example.com", session_id="chat_abc",
+        fields=FIELDS, mode="inline",
+    )
+    from services.slack_interaction_store import record_answers
+    await record_answers(db_provider, "chat_abc:0", {"type": "warning"})
+    mock_run_chat = AsyncMock(return_value={
+        "reply": "Alert created.", "tools_used": [], "session_id": "chat_abc",
+        "route": {"seconds": 6.2, "credits": 38, "steps": [{"agent": "birdy", "name": "Birdy", "status": "done"}]},
+        "proposals": [],
+    })
+    mock_post_message = AsyncMock()
+    with patch("routers.slack_interactions.get_decrypted_bot_token_for_user", AsyncMock(return_value="xoxb-fake")), \
+         patch("routers.slack_interactions.get_provider_for_user", AsyncMock(return_value=object())), \
+         patch("credits.is_blocked", AsyncMock(return_value=False)), \
+         patch("routers.slack_interactions.run_chat", mock_run_chat), \
+         patch("routers.slack_interactions.save_thread_session_id", AsyncMock()), \
+         patch("slack_sdk.web.async_client.AsyncWebClient.chat_postMessage", mock_post_message), \
+         patch("slack_sdk.web.async_client.AsyncWebClient.chat_update", AsyncMock()):
+        await signed_post({
+            "type": "block_actions", "user": {"id": "U1"},
+            "actions": [{"block_id": "ui|chat_abc:0|__submit__", "type": "button", "value": "chat_abc:0"}],
+            "message": {"ts": "1.1"},
+        })
+    kw = mock_run_chat.call_args.kwargs
+    assert kw["agent"] == "birdy" and kw["source"] == "slack" and kw["session_id"] == "chat_abc"
+    mock_post_message.assert_awaited_once()
+    blocks = mock_post_message.call_args.kwargs["blocks"]
+    assert blocks[-1]["elements"][0]["text"] == "Birdy · 6s · 38 credits"
+    assert not any(b.get("block_id") == "team_proposals_note" for b in blocks)

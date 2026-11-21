@@ -13,6 +13,10 @@ already rules out APScheduler on this deployment — see main.py's lifespan
 comment), so background work here has no guarantee of completing. This means
 we exceed Slack's 3-second ack window and Slack will retry the delivery;
 we detect that via X-Slack-Retry-Num and no-op rather than reprocessing.
+
+Every message goes to Birdy the orchestrator (ai/team), which asks Media
+Buyer or Sales Coach itself; billing, archiving and the team's limits are
+run_chat's, the same as the web chat (see services/slack_team_reply.py).
 """
 
 import logging
@@ -32,9 +36,8 @@ from services.slack_bot_service import (
     get_thread_session_id,
     save_thread_session_id,
 )
-from services.slack_block_formatter import build_blocks_from_reply
-from services.slack_interaction_store import create_pending_interaction
 from services.slack_signature import verify_slack_request
+from services.slack_team_reply import SLACK_AGENT, prepare_reply
 
 logger = logging.getLogger(__name__)
 
@@ -174,19 +177,13 @@ async def slack_events(request: Request):
                 session_id=session_id,
                 mongo_client=mongo_client,
                 source="slack",
+                agent=SLACK_AGENT,
             )
 
-            blocks, fallback_text, ui_pending = build_blocks_from_reply(
-                result["reply"], iid_prefix=result["session_id"]
+            blocks, fallback_text = await prepare_reply(
+                db, result, team_id=team_id, channel_id=channel, thread_ts=thread_key,
+                slack_user_id=event.get("user"), birdy_user_id=user_id,
             )
-
-            for pending in ui_pending:
-                await create_pending_interaction(
-                    db, pending["iid"],
-                    team_id=team_id, channel_id=channel, thread_ts=thread_key,
-                    slack_user_id=event.get("user"), birdy_user_id=user_id,
-                    session_id=result["session_id"], fields=pending["fields"], mode=pending["mode"],
-                )
 
             await _reply(text=fallback_text, blocks=blocks)
 

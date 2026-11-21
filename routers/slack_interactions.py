@@ -37,15 +37,15 @@ from services.slack_bot_service import (
     save_thread_session_id,
     get_user_id_by_team_id,
 )
-from services.slack_block_formatter import build_blocks_from_reply, build_modal_view
+from services.slack_block_formatter import build_modal_view
 from services.slack_interaction_store import (
     get_pending_interaction,
     record_field_answer,
     record_answers,
     delete_pending_interaction,
-    create_pending_interaction,
 )
 from services.slack_signature import verify_slack_request
+from services.slack_team_reply import SLACK_AGENT, prepare_reply
 
 logger = logging.getLogger(__name__)
 
@@ -85,22 +85,17 @@ async def _run_chat_and_reply(db, mongo_client, slack_client, pending: dict, ans
         )
         return
 
+    # The form belongs to a Birdy (orchestrator) turn, so its answers go back to Birdy.
     result = await run_chat(
         provider=provider, tool_registry=registry, db=db, user_id=birdy_user_id,
         message=message, session_id=pending["session_id"], mongo_client=mongo_client,
-        source="slack",
+        source="slack", agent=SLACK_AGENT,
     )
 
-    blocks, fallback_text, ui_pending = build_blocks_from_reply(
-        result["reply"], iid_prefix=result["session_id"]
+    blocks, fallback_text = await prepare_reply(
+        db, result, team_id=pending["team_id"], channel_id=pending["channel_id"], thread_ts=pending["thread_ts"],
+        slack_user_id=pending["slack_user_id"], birdy_user_id=birdy_user_id,
     )
-    for new_pending in ui_pending:
-        await create_pending_interaction(
-            db, new_pending["iid"],
-            team_id=pending["team_id"], channel_id=pending["channel_id"], thread_ts=pending["thread_ts"],
-            slack_user_id=pending["slack_user_id"], birdy_user_id=birdy_user_id,
-            session_id=result["session_id"], fields=new_pending["fields"], mode=new_pending["mode"],
-        )
 
     await slack_client.chat_postMessage(
         channel=pending["channel_id"], thread_ts=pending["thread_ts"], blocks=blocks, text=fallback_text,
