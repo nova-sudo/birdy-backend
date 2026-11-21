@@ -46,6 +46,7 @@ TOOL_NAMES = frozenset({*ASK_TOOLS, ASK_SUB_AGENT, PROPOSE_ACTION, PROPOSE_SUB_A
 HELPER_KIND = "helper"      # a helper's route step `kind` and its ledger line's `kind`
 LIMIT_HELPERS = "helpers"   # in the refused tool result only; the route's limit_hit is left alone
 
+SUB_PURPOSE_CHARS = 160
 RECALL_MAX_CONVERSATIONS = 5
 RECALL_MESSAGES = 8          # the latest turns of each conversation
 RECALL_MESSAGE_CHARS = 500
@@ -103,8 +104,16 @@ _SCHEMAS = {
 
 
 def _sub_schema(subs: list) -> dict:
-    listing = "; ".join(f"{s.id}: {s.name}" for s in subs)
-    return _ask_schema(ASK_SUB_AGENT, "one of your sub-agents", f"Your sub-agents: {listing}.",
+    # Name and job: with only a name the main agent had no way to tell when one applied, and never asked.
+    def line(s):
+        purpose = getattr(s, "purpose", "") or ""
+        return f"{s.id}: {s.name}" + (f" ({purpose[:SUB_PURPOSE_CHARS]})" if purpose else "")
+    listing = "; ".join(line(s) for s in subs)
+    return _ask_schema(ASK_SUB_AGENT, "one of your sub-agents",
+                       f"Your sub-agents, each with the job the owner approved it for: {listing}. When a request "
+                       "falls within a sub-agent's job, ask that sub-agent instead of doing the job yourself, and "
+                       "say in your answer that it did it. A sub-agent gives back words and figures only: any "
+                       "chart or table the owner should see, you draw from what it returns.",
                        {"sub_agent_id": {"type": "string", "enum": [s.id for s in subs],
                                          "description": "Which sub-agent to ask."}},
                        ("sub_agent_id",))

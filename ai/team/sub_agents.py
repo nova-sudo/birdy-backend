@@ -40,6 +40,7 @@ class SubAgent:
     client_group_ids: tuple = ()
     status: str = "active"
     parent: str = ""
+    purpose: str = ""      # its one-line job, as the owner approved it
 
     @property
     def key(self) -> str:
@@ -77,6 +78,7 @@ def coerce(rec, parent: str) -> SubAgent | None:
         client_group_ids=tuple(str(g) for g in (_get(rec, "client_group_ids") or ()) if g),
         status=str(_get(rec, "status") or "active"),
         parent=parent,
+        purpose=" ".join(str(_get(rec, "purpose") or "").split()),
     )
 
 
