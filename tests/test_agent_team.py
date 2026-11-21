@@ -1074,3 +1074,17 @@ async def test_helper_uses_the_ask_timeout(mock_db, registry, monkeypatch):
     step = out["route"]["steps"][1]
     assert step["kind"] == "helper" and step["status"] == "failed" and step["summary"] == "Ran out of time"
     assert tool_results(p, "media_buyer")[0]["error"] == "timeout"
+
+
+def test_a_main_agent_is_told_each_sub_agents_job_and_to_use_it():
+    """With names only, Media Buyer never asked a sub-agent whose job matched the request."""
+    from ai.team import delegation
+    from ai.team.sub_agents import coerce
+    subs = [coerce({"id": "s1", "name": "Visualize agent", "purpose": "Turn  ad figures\ninto charts", "instructions": "x"},
+                   "media_buyer"),
+            coerce({"id": "s2", "name": "No purpose", "instructions": "x"}, "media_buyer")]
+    text = delegation._sub_schema(subs)["function"]["description"]
+    assert "s1: Visualize agent (Turn ad figures into charts)" in text and "s2: No purpose;" not in text
+    assert "s2: No purpose." in text
+    assert "ask that sub-agent instead of doing the job yourself" in text
+    assert "you draw from what it returns" in text
