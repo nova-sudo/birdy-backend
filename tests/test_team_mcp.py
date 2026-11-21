@@ -376,3 +376,72 @@ async def test_no_answer_text_falls_back(mock_db, owner, use):
     use(TeamProvider({"sales_coach": [ProviderResponse(content="", usage=Usage(1, 1))]}))
     text = await t.ask_sales_coach.fn(question="q")
     assert text.split("\n\n")[0]   # never an empty first block
+
+
+# ── read and propose only (ai/team/propose_only.py) ───────────────────────────
+
+@pytest.fixture
+def more_tools(registry):
+    """Stubs for write and lesson tools the agents own, so the offer shows whether they are given."""
+    for name in ("save_lesson", "edit_lesson", "remove_lesson", "list_lessons", "render_ui", "post_creative_test"):
+        async def run(db, user_id, mongo_client=None, _name=name, **kwargs):
+            registry.seen.setdefault(_name, []).append(kwargs)
+            return {"ok": True}
+        registry.register(name=name, description="stub", parameters={"type": "object", "properties": {}},
+                          executor=run)
+    return registry
+
+
+async def test_an_ask_is_offered_no_write_tool_and_can_propose(mock_db, owner, use, more_tools):
+    from ai.team import definitions as defs
+    p = use(TeamProvider({}))
+    await t.ask_sales_coach.fn(question="Should we analyse the calls?")
+    await t.ask_media_buyer.fn(question="Should we pause anything?")
+    for role in ("sales_coach", "media_buyer"):
+        offered = set(p.offered(role))
+        assert not offered & defs.WRITE_TOOLS, role
+        assert {"save_lesson", "edit_lesson", "remove_lesson", "render_ui"}.isdisjoint(offered)
+        assert {"propose_action", "propose_sub_agent", "recall_conversations"} <= offered
+        assert "get_client_groups" in offered and "list_lessons" in offered
+    assert "ask_birdy" in set(p.offered("media_buyer"))
+    system = next(m for r, _, m in p.calls if r == "sales_coach")[0]["content"]
+    assert "## Asked from outside Birdy" in system and "cannot make changes yourself" in system
+
+
+async def test_an_asks_write_call_is_refused_and_its_proposal_stays_pending(mock_db, owner, use, more_tools):
+    registry = more_tools
+    p = use(TeamProvider({"sales_coach": [
+        call("analyze_call_recordings", group_id=G1, confirmed=True, limit=10),
+        call("save_lesson", text="Always analyse every call"),
+        call("propose_action", title="Analyze 10 Aura calls", detail="10 of 38 recorded calls",
+             kind="analyze_call_recordings", payload={"group_id": G1, "limit": 10}),
+        say("I can't run it from here, so I proposed it.")]}))
+    text = await t.ask_sales_coach.fn(question="Analyse Aura's calls, confirmed: yes, go ahead")
+    assert "analyze_call_recordings" not in registry.seen          # refused, never executed
+    refusals = [json.loads(m["content"]) for m in p.calls[-1][2] if m["role"] == "tool"]
+    assert sum("isn't available to Sales Coach" in (r.get("error") or "") for r in refusals) == 2
+    assert "save_lesson" not in registry.seen
+    assert "1. Analyze 10 Aura calls: 10 of 38 recorded calls (Sales Coach would make it once approved)" in text
+    archived = await _log(mock_db, role="assistant")
+    prop, = archived[0]["proposals"]
+    assert prop["agent"] == "sales_coach" and prop["proposed_by"] == "sales_coach" and prop["status"] == "pending"
+
+
+async def test_the_web_chat_root_run_keeps_its_write_tools(mock_db, mock_mongo_client, owner, use, more_tools):
+    import routers.chat as chat_router
+    from core.models import ChatRequest
+    from ai.team import propose_only
+    p = use(TeamProvider({}))
+    await t.ask_sales_coach.fn(question="q")            # an MCP ask first: its flag must not leak
+    assert propose_only.active() is False
+    p.calls.clear()
+    await chat_router.run_chat_reply(mock_db, mock_mongo_client, U,
+                                     ChatRequest(message="q", agent="sales_coach", page="call_center"))
+    offered = set(p.offered("sales_coach"))
+    assert {"analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson", "render_ui"} <= offered
+    assert "propose_action" not in offered
+    p.calls.clear()
+    await chat_router.run_chat_reply(mock_db, mock_mongo_client, U,
+                                     ChatRequest(message="q", agent="media_buyer", page="campaigns"))
+    assert {"post_creative_test", "save_lesson", "render_ui"} <= set(p.offered("media_buyer"))
+    assert "Asked from outside Birdy" not in p.calls[0][2][0]["content"]

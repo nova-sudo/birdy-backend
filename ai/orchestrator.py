@@ -32,6 +32,7 @@ from ai.team import definitions as team_defs
 from ai.team import delegation
 from ai.team import lesson_tools as team_lesson_tools
 from ai.team import pinning as team_pinning
+from ai.team import propose_only as team_propose_only
 from ai.team import route as team_route
 
 logger = logging.getLogger(__name__)
@@ -685,9 +686,12 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
     asked_by = None
     if frame.nested:
         asked_by = team_defs.NAMES.get(frame.chain[-2], frame.chain[-2])
-    return await team_defs.build_instructions(
+    prompt = await team_defs.build_instructions(
         frame.agent, db, user_id, client_group_id=client_group_id, client_name=client_name,
         asked_by=asked_by, source=source)
+    if not frame.nested and team_propose_only.active():
+        prompt += "\n" + team_propose_only.PROMPT_NOTE
+    return prompt
 
 
 def _agent_tool_names(frame) -> list:
@@ -697,7 +701,8 @@ def _agent_tool_names(frame) -> list:
         parent = set(team_defs.tool_names(frame.parent_main, nested=True, one_client=bool(frame.client_group_id)))
         from ai.agents.sub_agents.tools import NOT_FOR_SUB_AGENTS
         return [n for n in frame.sub.tools if n in parent and n not in NOT_FOR_SUB_AGENTS]
-    names = team_defs.tool_names(frame.agent, nested=frame.nested, one_client=bool(frame.client_group_id))
+    names = team_defs.tool_names(frame.agent, nested=team_propose_only.restricted(frame),
+                                 one_client=bool(frame.client_group_id))
     if frame.agent == team_defs.MEDIA_BUYER and not frame.nested and stock_card_tools.current_stock_card.get():
         # Applying an approved proposal that names one card (routers/chat.apply_proposal).
         names = names + list(team_defs.MEDIA_BUYER_CARD_TOOLS)
@@ -1164,7 +1169,8 @@ async def run_chat(
                         "No time is left in this reply to run more tools. Answer with what you have "
                         "and say what you could not check.")})
                 elif frame is not None and (tc.name not in offered
-                                            or (nested and tc.name in team_defs.WRITE_TOOLS)):
+                                            or (team_propose_only.restricted(frame)
+                                                and tc.name in team_defs.WRITE_TOOLS)):
                     result = json.dumps({"error": (
                         f"{tc.name} isn't available to {team_defs.NAMES.get(frame.agent, 'this agent')} "
                         "here. Use only the tools you were given.")})

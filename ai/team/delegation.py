@@ -27,6 +27,7 @@ import uuid
 
 from ai.team import definitions as defs
 from ai.team import route as rt
+from ai.team.propose_only import restricted
 from ai.team.sub_agents import SubAgent, list_sub_agents
 
 logger = logging.getLogger(__name__)
@@ -202,7 +203,7 @@ def tool_schemas(frame: rt.Frame, subs: list) -> list[dict]:
             out.append(propose_tool.tool_schema(frame.agent))
     if frame.agent in defs.AGENT_KEYS:
         out.append(_RECALL_SCHEMA)
-    if frame.nested:
+    if restricted(frame):   # a nested run, or any run under propose-only (ai/team/propose_only.py)
         owner = owner_of(frame)
         if owner:
             out.append(_propose_schema(owner))
@@ -493,7 +494,7 @@ async def _propose_sub_agent(args: dict, frame: rt.Frame, ctx: dict) -> str:
 
 def _propose(args: dict, frame: rt.Frame) -> str:
     owner = owner_of(frame)
-    if not frame.nested or owner is None:
+    if not restricted(frame) or owner is None:
         return _result(False, error="propose_action is only for agents asked by another agent.")
     kind = str(args.get("kind") or "other")
     if kind not in defs.write_tools(owner):
