@@ -41,6 +41,7 @@ EXPECTED_TOOLS_BY_MODULE = {
     "watch_mcp": {"check_my_accounts", "get_fired_alerts", "explain_alert"},
     "hello_mcp": {"get_started"},
     "pacing_mcp": {"get_budget_pacing"},
+    "team_mcp": {"ask_media_buyer", "ask_sales_coach"},
     "prompts_mcp": set(),  # prompts only, no tools
 }
 

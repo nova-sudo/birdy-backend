@@ -157,6 +157,16 @@ async def _run_turn(db, mongo_client, current_user: str, request: ChatRequest, p
         current_training_agent.reset(agent_token)
 
 
+async def run_chat_reply(db, mongo_client, current_user: str, request: ChatRequest, on_route=None) -> dict:
+    """One chat reply exactly as /api/chat makes it: the owner checks, the credit gate and the provider
+    (_checks), then the turn (_run_turn), which run_chat bills once and archives to ai_conversation_log.
+    Raises what _checks raises (HTTPException, NoAiCredentialError). Also used by the MCP ask tools
+    (ai/mcp/team_mcp.py), so a reply asked from outside Birdy is billed and logged like a web one."""
+    provider, stock_card_id, lessons_agent_id = await _checks(db, current_user, request, mongo_client)
+    return await _run_turn(db, mongo_client, current_user, request, provider,
+                           stock_card_id, lessons_agent_id, on_route=on_route)
+
+
 @router.post("/api/chat", response_model=ChatResponse)
 async def chat(
     request: ChatRequest,
@@ -165,9 +175,7 @@ async def chat(
     async with get_mongo_client() as mongo_client:
         try:
             db = get_db(mongo_client)
-            provider, stock_card_id, lessons_agent_id = await _checks(db, current_user, request, mongo_client)
-            result = await _run_turn(db, mongo_client, current_user, request, provider,
-                                     stock_card_id, lessons_agent_id)
+            result = await run_chat_reply(db, mongo_client, current_user, request)
             return ChatResponse(**result)
         except HTTPException:
             # Preserve deliberate status codes (e.g. 402 OUT_OF_CREDITS) instead

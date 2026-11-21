@@ -26,6 +26,9 @@ LABELS: dict[str, dict] = {
     "explain_alert": _l("Looked into why an alert fired", _ALERTS),
     "check_my_accounts": _l("Checked accounts", "/clients"),
     "get_started": _l("Checked what Birdy can do", _SUGGESTIONS),
+    # Asking a team agent (ai/mcp/team_mcp.py): the reply lives in that agent's chat
+    "ask_media_buyer": _l("Asked Media Buyer", "/media-buyer/chat"),
+    "ask_sales_coach": _l("Asked Sales Coach", "/sales-coach/chat"),
     # Meta and lead data
     "get_campaign_insights": _l("Looked at campaign results"),
     "get_adset_insights": _l("Looked at ad set results"),
