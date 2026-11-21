@@ -173,12 +173,23 @@ async def test_finishing_does_not_force_an_agent_that_is_not_ready(mock_db):
     await _account(mock_db)
     for step, body in MB_ANSWERS:
         out = await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
-        if step == "clients":
-            await _finished_preview(mock_db, clients=(G1,))   # the preview didn't cover Beaulea
+        if step == "cpl":   # its zones go missing before the last step: it can't switch on
+            agent = await _stock(mock_db)
+            zones = agent["settings"]["zones"]
+            await mock_db["agents"].update_one({"_id": agent["_id"]}, {"$set": {
+                "settings.zones": {"currency": None, "green_under": None, "red_over": None},
+                "settings.clients": {}}})
     mb = out["agents"]["media_buyer"]
     assert mb["status"] == "done"
     assert mb["activation"]["status"] == "not_ready" and mb["activation"]["missing"]
     assert (await _stock(mock_db))["status"] != "active"
+    # Once what was missing is there, reading the setup switches it on; an owner who then
+    # switches it off is not overruled.
+    await mock_db["agents"].update_one({"_id": agent["_id"]}, {"$set": {"settings.zones": zones}})
+    assert (await s.state(mock_db, U))["agents"]["media_buyer"]["activation"]["status"] == "active"
+    await mock_db["agents"].update_one({"_id": agent["_id"]}, {"$set": {"status": "paused"}})
+    await s.state(mock_db, U)
+    assert (await _stock(mock_db))["status"] == "paused"
 
 
 async def test_practice_run_is_optional_and_not_a_step(mock_db):
@@ -187,7 +198,7 @@ async def test_practice_run_is_optional_and_not_a_step(mock_db):
         out = await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
     mb = out["agents"]["media_buyer"]
     assert mb["status"] == "done" and "practice" not in mb["order"]     # done with no practice run
-    assert mb["activation"]["status"] == "not_ready"                    # daily runs still wait for one
+    assert mb["activation"]["status"] == "active"                       # and its daily run is on without one
     assert out["agents"]["sales_coach"]["status"] == "open"
     assert (await s.practice_status(mock_db, U))["status"] == "none"
     with pytest.raises(s.SetupError) as e:

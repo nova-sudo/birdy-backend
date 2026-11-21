@@ -189,23 +189,15 @@ async def get_job(db, user_id: str, agent_id: str, job_id: str) -> dict:
 # ---------------------------------------------------------------------------
 
 async def stock_missing(db, user_id: str, agent: dict) -> tuple[list[str], list[dict]]:
-    """What stops the stock agent switching on: a client, zones that resolve for each, and a
-    finished preview. Also returns the settings errors behind any zone messages."""
+    """What stops the stock agent switching on: a client, and zones that resolve for each. Also
+    returns the settings errors behind any zone messages. A finished preview used to be required
+    too; the owner dropped that (2026-11-22) so the daily run starts straight after setup. Its
+    rules default to "ask first", so a first run proposes changes and applies none on its own."""
     ids = list((agent.get("scope") or {}).get("client_group_ids") or [])
     groups = await db["client_groups"].find({"id": {"$in": ids}, "user_id": user_id}).to_list(length=None)
     errors = stock_settings.settings_errors(agent.get("settings") or {}, groups)
     missing = [] if ids else ["Choose at least one client to watch"]
     missing += [e["message"] for e in errors]
-    preview = await db[agent_store.RUNS].find_one(
-        {"agent_id": agent["_id"], "kind": "preview", "phase": "done", "ended_early": {"$ne": True}},
-        {"clients": 1}, sort=[("as_of", -1)])
-    # The newest finished preview must have covered every client in scope now.
-    covered = preview is not None and set(ids) <= set(preview.get("clients") or {})
-    # A preview that couldn't check any client proves nothing (an expired Meta token fails them all).
-    read = covered and any((preview["clients"].get(g) or {}).get("state") != "failed" for g in ids)
-    if not read:
-        missing.append("Preview the first report" if not covered
-                       else "Preview the first report again: it couldn't check any client")
     return missing, errors
 
 
