@@ -124,8 +124,28 @@ async def _checks(db, current_user: str, request: ChatRequest, mongo_client) -> 
 
 
 async def _run_turn(db, mongo_client, current_user: str, request: ChatRequest, provider,
-                    stock_card_id, lessons_agent_id, on_route=None) -> dict:
-    """One chat turn with this request's ContextVars set, and reset afterwards."""
+                    stock_card_id, lessons_agent_id, on_route=None, journal: list | None = None) -> dict:
+    """One chat turn with this request's ContextVars set, and reset afterwards. `journal` collects what
+    the turn's write tools changed (team_proposals.record) while a proposal is applied. A later turn in
+    the chat that applied a proposal (the owner's "yes") keeps its changes on that proposal too."""
+    applying = None
+    if journal is None and request.agent in team_defs.MAIN_AGENTS and request.session_id:
+        applying = await team_proposals.applying_in(db, current_user, request.session_id)
+        if applying:
+            journal = []
+    journal_token = team_proposals.current_journal.set(journal)
+    try:
+        result = await _run_turn_inner(db, mongo_client, current_user, request, provider,
+                                       stock_card_id, lessons_agent_id, on_route)
+    finally:
+        team_proposals.current_journal.reset(journal_token)
+    if applying and journal:
+        await team_proposals.add_changes(db, current_user, applying, journal)
+    return result
+
+
+async def _run_turn_inner(db, mongo_client, current_user: str, request: ChatRequest, provider,
+                          stock_card_id, lessons_agent_id, on_route=None) -> dict:
     agent_token = current_training_agent.set(
         request.agent_id if request.page in AGENT_CHAT_PAGES else None)
     card_token = current_stock_card.set(stock_card_id)
@@ -358,12 +378,13 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
         request = ChatRequest(message=proposal_message(proposal), agent=owner,
                               client_group_id=proposal.get("client_group_id"), client_name=name)
         before = team_proposals.line_states(card)
+        journal: list = []
         try:
             provider, stock_card_id, lessons_agent_id = await _checks(db, current_user, request, mongo_client)
             if card is not None:
                 stock_card_id = card["_id"]
             result = await _run_turn(db, mongo_client, current_user, request, provider,
-                                     stock_card_id, lessons_agent_id)
+                                     stock_card_id, lessons_agent_id, journal=journal)
         except BaseException as e:
             await put_back()
             if isinstance(e, HTTPException) or not isinstance(e, Exception):
@@ -379,7 +400,13 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
             went = team_proposals.applied_lines(before, after)
             if went:
                 fields["applied"] = {"type": team_proposals.CARD_LINES, "card_id": card["_id"], "line_ids": went}
+        if "applied" not in fields and journal:
+            # every other change the owner agent made (lessons, creative-test drafts and targets, ...)
+            fields["applied"] = {"type": team_proposals.CHANGES, "changes": journal}
         await team_proposals.set_fields(db, current_user, proposal_id, fields)
+        if "applied" not in fields or fields["applied"]["type"] == team_proposals.CHANGES:
+            # the owner's "yes" in this chat lands in a later turn: keep what that turn changes too
+            await team_proposals.mark_apply_session(db, current_user, result.get("session_id"), proposal_id)
         return ChatResponse(**result)
 
 
@@ -394,8 +421,9 @@ async def dismiss_proposal(proposal_id: str, current_user: str = Depends(get_cur
 @router.post("/api/chat/proposals/{proposal_id}/undo")
 async def undo_proposal(proposal_id: str, current_user: str = Depends(get_current_user)):
     """Undo an approved proposal through its change's own undo path (stock card lines: the card's undo,
-    with its window and checks). 404 not found; 409 {code: "cannot_undo"} when the change has no undo
-    path (or it has passed); 409 {code: "undo_failed", lines} when the undo itself refused."""
+    with its window and checks; lessons, creative-test drafts and targets: their recorded previous state;
+    a new sub-agent: paused). 404 not found; 409 {code: "cannot_undo"} when the change has no undo path,
+    it has passed, or the thing was changed since; 409 {code: "undo_failed"} when the undo itself refused."""
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
         status, body = await team_proposals.undo(db, mongo_client, current_user, proposal_id)

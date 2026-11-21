@@ -13,6 +13,7 @@ import re
 from datetime import date, datetime
 
 from ai.suggestions.agents.useless_ad_purger import _symbol
+from ai.team import proposals as team_proposals
 from ai.tools.registry import registry
 from integrations.facebook_utils.meta_creative_reader import (
     MetaReadError,
@@ -384,6 +385,8 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
         test = await store.update_test(
             db, user_id, test["id"],
             {"draft_accounts": accounts, "requested_accounts": acts, "draft_needs": needs})
+        team_proposals.record({"op": team_proposals.DRAFT_CREATED, "test_id": test["id"],
+                               "updated_at": test.get("updated_at")})
     else:
         fields = {"creative": creative, "draft_accounts": accounts, "requested_accounts": acts,
                   "draft_needs": needs}
@@ -400,6 +403,10 @@ async def draft_creative_test(db, user_id, mongo_client=None, name=None, origin=
         except reads.ReadError as e:
             return _fail(e.message)
         test = await store.update_test(db, user_id, existing["id"], fields)
+        team_proposals.record({"op": team_proposals.DRAFT_EDITED, "test_id": test["id"],
+                               "updated_at": test.get("updated_at"), "before_updated_at": existing.get("updated_at"),
+                               "before": {k: existing[k] for k in fields if k in existing and k != "updated_at"},
+                               "unset": [k for k in fields if k not in existing and k != "updated_at"]})
 
     warnings = []
     if not (test.get("targets") or {}).get("metrics"):
@@ -458,6 +465,7 @@ async def post_creative_test(db, user_id, mongo_client=None, test_id=None, confi
         res = await reads.enqueue_accounts(db, user_id, test["id"], accounts, add_accounts=False)
     except posting.PostingError as e:
         return _fail(e.message)
+    team_proposals.record({"op": team_proposals.TEST_POSTED, "test_id": test["id"]})
     return _json(res)
 
 
@@ -485,6 +493,7 @@ async def scale_creative_test(db, user_id, mongo_client=None, test_id=None, ad_a
         return _fail(e.message)
     except posting.PostingError as e:
         return _fail(e.message)
+    team_proposals.record({"op": team_proposals.TEST_SCALED, "test_id": test["id"]})
     return _json(res)
 
 
@@ -499,6 +508,7 @@ async def pause_creative_ads(db, user_id, mongo_client=None, test_id=None, ad_ac
         res = await posting.pause_ads(db, mongo_client, user_id, test["id"], ad_account_ids)
     except posting.PostingError as e:
         return _fail(e.message)
+    team_proposals.record({"op": team_proposals.ADS_PAUSED, "test_id": test["id"]})
     return _json(res)
 
 
@@ -513,6 +523,10 @@ async def update_creative_targets(db, user_id, mongo_client=None, test_id=None, 
         return _fail(err or "targets is required")
     fields = reads.prepare_patch(test, {"targets": norm})
     updated = await store.update_test(db, user_id, test["id"], fields)
+    team_proposals.record({"op": team_proposals.TARGETS_CHANGED, "test_id": updated["id"],
+                           "updated_at": updated.get("updated_at"), "before_updated_at": test.get("updated_at"),
+                           "before": {"targets": test.get("targets")},
+                           "unset": [] if "targets" in test else ["targets"]})
     return _json({"test_id": updated["id"], "code": updated["code"], "targets": updated["targets"]})
 
 

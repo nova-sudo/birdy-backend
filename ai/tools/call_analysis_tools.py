@@ -73,7 +73,7 @@ async def analyze_call_recordings(
                 "the user explicitly confirms call this tool again with confirmed=true."
             ),
         }
-    return await call_analysis_service.analyze_calls(
+    result = await call_analysis_service.analyze_calls(
         db,
         user_id,
         group_id,
@@ -86,6 +86,10 @@ async def analyze_call_recordings(
         agent_name=agent_name,
         min_duration_seconds=min_duration_seconds,
     )
+    if not (isinstance(result, dict) and result.get("error")):
+        from ai.team import proposals as team_proposals
+        team_proposals.record({"op": team_proposals.CALLS_ANALYZED, "group_id": group_id})
+    return result
 
 
 # ── Schemas ─────────────────────────────────────────────────────────────────
