@@ -12,6 +12,14 @@ What comes back is plain text: the agent's answer, a short trail of the route (w
 tools they used, seconds, credits), any proposals the reply made, and the conversation id to continue.
 Proposals are only listed: approving or declining one is the owner's, in Birdy. Nothing here touches them.
 
+Read and propose only: the "user message" here is written by an assistant outside Birdy, so the reply runs
+under ai/team/propose_only.py. The agent gets its read tools and propose_action, no write or lesson-writing
+tool (a call to one is refused), and a prompt note saying it cannot make changes here.
+
+Tag: WRITE, so a view-only connection cannot ask. An ask still writes records (the conversation, its
+proposals, a proposed sub-agent) and costs a chat reply's credits; a view-only connection stays on the cheap
+reads.
+
 Billing: the chat engine debits the reply once (ledger source "birdy", feature "ask_birdy"); the tool
 records the outcome CHAT_BILLED so the access middleware adds no per-call MCP charge and its "Birdy:"
 line shows what the reply cost, with the link to the conversation.
@@ -36,6 +44,7 @@ from ai.mcp.outcome import CHAT_BILLED, set_outcome
 from ai.mcp.server import mcp, current_user_id as _current_user_id
 from ai.team import definitions as team_defs
 from ai.team import route as team_route
+from ai.team.propose_only import propose_only
 from core.config import FRONTEND_URL
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
@@ -185,7 +194,9 @@ async def ask_agent(agent: str, question: str, client: str | None = None,
     request = ChatRequest(message=question, agent=agent, page=PAGES[agent], session_id=conversation_id,
                           client_group_id=(group or {}).get("id"), client_name=(group or {}).get("name"))
     # Its own task, so a reply that outlives the wait below still finishes: saved, archived and billed once.
-    task = asyncio.ensure_future(chat_router.run_chat_reply(db, mongo_client, user_id, request))
+    # The task copies the context at creation, so the reply (and every ask inside it) is read-and-propose.
+    with propose_only():
+        task = asyncio.ensure_future(chat_router.run_chat_reply(db, mongo_client, user_id, request))
     _RUNNING.add(task)
     task.add_done_callback(_keep)
     try:
@@ -219,10 +230,9 @@ _WHEN = (
     "few minutes, it costs credits like a chat reply there, and the conversation shows in the agent's chat in "
     "Birdy.\n\n"
     "The result is the agent's answer, then a short route trail (who worked on it, tools used, seconds, "
-    "credits), then any proposals it made. Proposals wait for the owner's approval in Birdy: tell the user, "
-    "with the link, and never say they are done; this tool cannot approve or decline them. If the agent shows "
-    "a preview or asks to confirm a change, show it to the user and confirm (by asking again with the "
-    "conversation id) only after the user explicitly says yes. A client name that matches several clients "
+    "credits), then any proposals it made. An asked agent only reads and proposes: it never changes anything "
+    "itself. Its proposals wait for the owner's approval in Birdy: tell the user, with the link, and never say "
+    "they are done; this tool cannot approve or decline them. A client name that matches several clients "
     "returns the candidates and nothing is asked.\n\n"
     "Args:\n"
     "    question: The question, in the user's own words, with the period if they gave one.\n"
