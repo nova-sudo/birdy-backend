@@ -21,6 +21,15 @@ CORS_ORIGINS = [
     "http://localhost:3000",
     "http://localhost:3005",
 ]
+# More exact origins without a code change: comma-separated.
+CORS_ORIGINS += [o.strip().rstrip("/") for o in os.getenv("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
+# Every Vercel deployment of the frontend project: previews and past builds
+# (birdy-beta-<hash or branch>-<team>.vercel.app). The team suffix keeps it to
+# our own project; a bare *.vercel.app would let anyone's site call the API.
+CORS_ORIGIN_REGEX = os.getenv(
+    "CORS_ORIGIN_REGEX",
+    r"https://birdy-beta-[a-z0-9-]+-abdelrahman-mohameds-projects-ef52aae4\.vercel\.app",
+)
 
 FRONTEND_URL = os.getenv("FRONTEND_URL", "https://birdy-beta.vercel.app").rstrip("/")
 # Public URL of this API (OAuth issuer; the MCP server is served at {API_PUBLIC_URL}/mcp).

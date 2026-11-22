@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from core.config import CORS_ORIGINS
+from core.config import CORS_ORIGINS, CORS_ORIGIN_REGEX
 from middleware.etag import ETagMiddleware
 from middleware.token_refresh import TokenRefreshMiddleware
 from jobs.scheduler import start_background_jobs, stop_background_jobs
@@ -104,6 +104,7 @@ app = FastAPI(lifespan=combined_lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=CORS_ORIGINS,
+    allow_origin_regex=CORS_ORIGIN_REGEX or None,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
