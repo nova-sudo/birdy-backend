@@ -16,6 +16,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Sandbox accounts: provider requests carrying an sbx_ credential are answered in-process
+# (sandbox/routing.py). A no-op for every other request.
+import sandbox
+
+sandbox.install()
+
 from core.config import CORS_ORIGINS, CORS_ORIGIN_REGEX
 from middleware.etag import ETagMiddleware
 from middleware.token_refresh import TokenRefreshMiddleware

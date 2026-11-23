@@ -25,6 +25,8 @@ from integrations.hotprospector import (
 )
 from services.hp_service import claim_hp_live_refresh, fetch_and_cache_hp_call_center, _in_window
 from services.hp_members import get_member_dashboard_range
+from sandbox import credential_error
+from sandbox.connect import hp_credentials_for
 
 logger = logging.getLogger(__name__)
 
@@ -47,8 +49,13 @@ async def connect_hotprospector(request: Request, current_user: str = Depends(ge
             body = await request.json()
             api_uid = body.get("api_uid")
             api_key = body.get("api_key")
+            # A sandbox account connects its own sandbox credentials, whatever was typed.
+            api_uid, api_key = hp_credentials_for(current_user, api_uid, api_key)
             if not api_uid or not api_key:
                 raise HTTPException(status_code=400, detail="api_uid and api_key are required")
+            refused = credential_error(current_user, api_uid) or credential_error(current_user, api_key)
+            if refused:
+                raise HTTPException(status_code=400, detail=refused)
             test_integration = HotProspectorIntegration(api_uid, api_key)
             success, result = await test_integration.get_member_users()
             if not success:
