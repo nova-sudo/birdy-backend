@@ -38,6 +38,8 @@ from integrations.gohighlevel import (
 )
 from services.meta_service import get_facebook_data, save_facebook_data
 from services.meta_status_service import set_object_status, MetaStatusError
+from sandbox import is_sandbox_user
+from sandbox.connect import code_error, sandbox_auth_url, token_error
 # Called through the module so tests can swap the live Graph listing.
 from services import meta_campaign_scope as meta_scope_svc
 
@@ -88,6 +90,10 @@ async def debug_facebook_token(current_user: str = Depends(get_current_user)):
 
 @router.get("/api/connect/facebook")
 async def connect_facebook(current_user: str = Depends(get_current_user)):
+    if is_sandbox_user(current_user):
+        # Sandbox: no Facebook dialog, straight back to our own callback with a sandbox code.
+        auth_url = sandbox_auth_url(facebook_integration.redirect_uri, current_user, "meta_code")
+        return {"auth_url": auth_url}
     auth_url = facebook_integration.generate_auth_url()
     logger.info(f"Generated auth URL for Meta OAuth flow for user: {current_user}")
     return {"auth_url": auth_url}
@@ -105,7 +111,15 @@ async def oauth_callback_facebook(
 ):
     async with get_mongo_client() as mongo_client:
         logger.info(f"Received Meta callback with code: {code} for user: {current_user}")
-        success, result = await facebook_integration.exchange_code_for_token(code)
+        # A sandbox account only takes sandbox codes and tokens, a real one never does.
+        refused = code_error(current_user, code)
+        if refused:
+            success, result = False, {"error": refused}
+        else:
+            success, result = await facebook_integration.exchange_code_for_token(code)
+            refused = success and token_error(current_user, result)
+            if refused:
+                success, result = False, {"error": refused}
         if not success:
             logger.error(f"Meta OAuth callback error: {result}")
             redirect_url = (

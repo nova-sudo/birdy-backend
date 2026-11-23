@@ -68,6 +68,7 @@ def _load_creators():
     from services.slack_reports import create_slack_report_indexes
     from services.report_events import create_report_event_indexes
     from utils.cache_helpers import create_performance_indexes
+    from sandbox.state import create_sandbox_state_indexes
 
     return [
         create_performance_indexes,
@@ -101,6 +102,7 @@ def _load_creators():
         create_dashboard_briefing_indexes,
         create_lead_summary_indexes,
         create_creative_indexes,
+        create_sandbox_state_indexes,
     ]
 
 

@@ -26,6 +26,8 @@ from integrations.gohighlevel import (
     fetch_ghl_contacts_on_demand,
 )
 from services.ghl_service import fetch_and_cache_ghl_data_optimized
+from sandbox import is_sandbox_user
+from sandbox.connect import code_error, sandbox_auth_url, token_error
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +39,9 @@ router = APIRouter()
 # ------------------------------------------------------------------
 @router.get("/api/connect")
 async def connect(current_user: str = Depends(get_current_user)):
+    if is_sandbox_user(current_user):
+        # Sandbox: no GoHighLevel dialog, straight back to our own callback with a sandbox code.
+        return {"auth_url": sandbox_auth_url(ghl_integration.redirect_uri, current_user, "ghl_code")}
     auth_url = ghl_integration.generate_auth_url()
     logger.info(f"Generated auth URL for GoHighLevel agency flow for user: {current_user}")
     return {"auth_url": auth_url}
@@ -49,7 +54,15 @@ async def connect(current_user: str = Depends(get_current_user)):
 async def oauth_callback(code: str, response: Response, current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         logger.info(f"Received GoHighLevel callback with code: {code} for user: {current_user}")
-        success, result = await ghl_integration.exchange_code_for_token(code)
+        # A sandbox account only takes sandbox codes and tokens, a real one never does.
+        refused = code_error(current_user, code)
+        if refused:
+            success, result = False, {"error": refused}
+        else:
+            success, result = await ghl_integration.exchange_code_for_token(code)
+            refused = success and token_error(current_user, result, "access_token", "refresh_token")
+            if refused:
+                success, result = False, {"error": refused}
         if not success:
             logger.error(f"GoHighLevel OAuth callback error: {result}")
             redirect_url = f"https://birdy-beta.vercel.app/settings?tab=integrations&status=error&error={urllib.parse.quote(result.get('error', 'OAuth callback failed'))}"

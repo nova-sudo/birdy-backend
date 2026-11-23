@@ -12,6 +12,7 @@ from pymongo import UpdateOne
 from typing import List, Tuple, Optional, Dict
 import asyncio
 
+from sandbox.credentials import is_credential
 from utils.phone_normalize import compute_match_keys
 
 # Load environment variables
@@ -411,7 +412,10 @@ class HotProspectorIntegration:
     async def _execute(self, payload: dict):
         """One request: proactive throttle, then v2 Bearer auth (401 refresh) + 429 backoff."""
         # Proactively space out same-Method calls to stay under the per-endpoint limit.
-        await _throttle_method(payload.get("Method", ""))
+        # A sandbox account's calls are answered in-process (sandbox/), so they don't
+        # count against HotProspector's limit and must not hold up real accounts' calls.
+        if not is_credential(self.api_uid):
+            await _throttle_method(payload.get("Method", ""))
         is_v1 = HOTPROSPECTOR_CONFIG.get("api_version") == "v1"
 
         async with httpx.AsyncClient(timeout=HOTPROSPECTOR_CONFIG["request_timeout"]) as client:
