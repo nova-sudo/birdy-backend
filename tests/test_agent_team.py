@@ -1088,3 +1088,61 @@ def test_a_main_agent_is_told_each_sub_agents_job_and_to_use_it():
     assert "s2: No purpose." in text
     assert "ask that sub-agent instead of doing the job yourself" in text
     assert "you draw from what it returns" in text
+
+
+# ── Asking goes both ways: a main agent asks Agency Ops (Birdy) for one of its own changes ──
+
+def _coach_asks_birdy_script():
+    return TeamProvider({
+        "sales_coach": [call("ask_birdy", question="Create an alert when Aura's connect rate drops under 30%",
+                             client="agency"), say("Agency Ops proposed the alert; approve it below.")],
+        "birdy": [call("propose_action", title="Alert: Aura connect rate under 30%", detail="Asked by Sales Coach",
+                       kind="create_alert", payload={"name": "Aura connect rate", "threshold": 30}),
+                  say("Proposed the alert.")],
+    })
+
+
+async def test_birdy_asked_by_a_main_agent_proposes_its_own_change(mock_db, registry):
+    p = _coach_asks_birdy_script()
+    out = await chat(p, registry, mock_db, agent="sales_coach")
+    offered = p.offered("birdy")
+    # asked by another agent, Birdy reads and proposes: none of its write tools, and propose_action
+    assert not set(offered) & defs.WRITE_TOOLS and "propose_action" in offered
+    assert "create_alert" not in registry.seen
+    assert len(out["proposals"]) == 1
+    prop = out["proposals"][0]
+    assert prop["agent"] == "birdy" and prop["proposed_by"] == "birdy" and prop["kind"] == "create_alert"
+    assert prop["status"] == "pending" and prop["payload"] == {"name": "Aura connect rate", "threshold": 30}
+
+
+async def test_birdy_in_its_own_chat_still_proposes_nothing(mock_db, registry):
+    p = TeamProvider({})
+    await chat(p, registry, mock_db, agent="birdy")
+    offered = p.offered("birdy")
+    assert "create_alert" in offered and "propose_action" not in offered
+
+
+def test_main_agents_are_told_agency_ops_is_birdy_and_can_be_asked():
+    for role in (defs._MEDIA_BUYER_ROLE, defs._SALES_COACH_ROLE):
+        assert "Agency Ops is Birdy" in role and "Never say you cannot" in role
+    assert "propose_action" in defs._BIRDY_ROLE and "Birdy is Agency Ops" in defs._TEAM
+    described = delegation._SCHEMAS[delegation.ASK_BIRDY]["function"]["description"]
+    assert "Agency Ops" in described and "proposes the change" in described
+
+
+def test_apply_birdys_proposal_runs_birdy_for_the_whole_agency(api, monkeypatch, registry, mock_db):
+    chat_router, app = api
+    p = _coach_asks_birdy_script()
+    _use(monkeypatch, chat_router, p, registry)
+    client = TestClient(app)
+    first = client.post("/api/chat", json={"message": "alert me on Aura's connect rate", "agent": "sales_coach"}).json()
+    pid = first["proposals"][0]["id"]
+    p.scripts["birdy"] = [say("Here is the alert I will create. Go ahead?")]
+    res = client.post(f"/api/chat/proposals/{pid}/apply")
+    assert res.status_code == 200
+    owner_call = [c for c in p.calls if c[0] == "birdy"][-1]
+    # a top-level Birdy turn: its own settings tool with its own confirm flow, nothing to propose
+    assert "create_alert" in owner_call[1] and "propose_action" not in owner_call[1]
+    user_turn = next(m for m in owner_call[2] if m["role"] == "user")
+    assert user_turn["content"].startswith("[APPROVED_PROPOSAL]") and '"threshold": 30' in user_turn["content"]
+    assert client.post(f"/api/chat/proposals/{pid}/apply").status_code == 404

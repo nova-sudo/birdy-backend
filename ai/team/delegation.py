@@ -4,7 +4,9 @@ ai/team/delegation.py
 Agents asking agents, hub and spoke (design section 4):
 
 - Birdy asks a main agent:        ask_media_buyer / ask_sales_coach
-- A main agent passes a need up:  ask_birdy
+- A main agent passes a need up:  ask_birdy (Birdy is Agency Ops). Asked this way Birdy can read, ask the
+                                  other main agent, and propose a change to the agency's own settings
+                                  (its own write tools); the owner approves it and Birdy makes it.
 - A main agent asks its own sub:  ask_sub_agent
 - A main agent starts a helper:   use_helper (one-off, read-only, never saved)
 - Main agents never ask each other; a sub-agent or a helper asks no one.
@@ -98,8 +100,10 @@ _SCHEMAS = {
                                  "It owns the ads: campaigns, ad sets, ads, spend, CPL, creative tests."),
     ASK_SALES_COACH: _ask_schema(ASK_SALES_COACH, "Sales Coach",
                                  "It owns the call centre: call stats, call recordings, what happens on calls."),
-    ASK_BIRDY: _ask_schema(ASK_BIRDY, "Birdy, the orchestrator",
-                           "Use it for anything outside your area; Birdy asks the right agent."),
+    ASK_BIRDY: _ask_schema(ASK_BIRDY, "Agency Ops (Birdy, the orchestrator: the same agent)",
+                           "Use it for anything outside your area: Birdy asks the right agent, and for a change "
+                           "to the agency's own settings (alerts, custom metrics, Slack reports, client notes, "
+                           "client targets) it proposes the change for the owner to approve."),
 }
 
 
@@ -177,9 +181,13 @@ def helper_instructions(frame: rt.Frame, *, client_group_id: str | None, client_
 
 
 def owner_of(frame: rt.Frame) -> str | None:
-    """The main agent a frame's proposals belong to (Birdy owns no writes)."""
+    """The agent a frame's proposals belong to. A main agent's are its own, a sub-agent's its main
+    agent's. Birdy's are its own when a main agent asked it (`ask_birdy`): the agency's settings.
+    In its own chat Birdy makes those changes itself, so it proposes nothing there."""
     if frame.agent in defs.MAIN_AGENTS:
         return frame.agent
+    if frame.agent == defs.BIRDY:
+        return defs.BIRDY if frame.nested else None
     return frame.parent_main
 
 
