@@ -391,7 +391,7 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
             await team_proposals.claim(db, current_user, proposal_id, PROPOSAL_APPROVED, PROPOSAL_PENDING)
 
         owner = proposal.get("agent")
-        if owner not in team_defs.MAIN_AGENTS:
+        if owner not in team_defs.AGENT_KEYS:
             await put_back()
             raise HTTPException(status_code=422, detail="proposal_has_no_owner")
         try:
@@ -400,12 +400,15 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
             await put_back()
             raise
         name = None
-        if proposal.get("client_group_id"):
+        # Birdy's changes are the agency's settings: its agency-wide tools are not offered in a
+        # one-client chat, so its turn runs for the whole agency (the proposal names the client).
+        scope = None if owner == team_defs.BIRDY else proposal.get("client_group_id")
+        if scope:
             group = await db["client_groups"].find_one(
-                {"user_id": current_user, "id": proposal["client_group_id"]}, {"name": 1})
+                {"user_id": current_user, "id": scope}, {"name": 1})
             name = (group or {}).get("name")
         request = ChatRequest(message=proposal_message(proposal), agent=owner,
-                              client_group_id=proposal.get("client_group_id"), client_name=name)
+                              client_group_id=scope, client_name=name)
         before = team_proposals.line_states(card)
         journal: list = []
         try:
