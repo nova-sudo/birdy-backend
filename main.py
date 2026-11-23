@@ -33,6 +33,7 @@ from core.mongo_client import get_shared_mongo_client, close_shared_mongo_client
 from routers import auth, ghl, meta, hotprospector, client_groups, leads, settings, alerts, admin, admin_console, chat, metrics, cron, webhooks, call_logs, call_analysis, mcp_tokens, mcp_activity, mcp_oauth, ai_credentials, slack, slack_events, slack_interactions, waitlist, dashboard, onboarding, client_notes, tracking, attribution, report_designer, dashboards, agents, slack_reports, creatives, agent_stock, sub_agents, context, team, team_setup
 from billing import router as billing_router
 from credits import router as credits_router
+from routers import sandbox as sandbox_router
 
 from ai.mcp import mcp, mcp_app
 
@@ -193,6 +194,8 @@ app.include_router(attribution.router)
 # Public, unauthenticated tracker edge — see routers/tracking.py for why it
 # sits outside the CORS allowlist rather than inside it.
 app.include_router(tracking.router)
+# Public placeholder media for sandbox accounts (routers/sandbox.py).
+app.include_router(sandbox_router.router)
 
 # MCP server — all migrated tools live in ai/mcp/*.py, registered onto the
 # shared FastMCP instance in ai/mcp/server.py

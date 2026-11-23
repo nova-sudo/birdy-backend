@@ -168,14 +168,14 @@ async def test_fake_endpoint_gap_answers_in_the_providers_shape(caplog):
     caplog.set_level(logging.WARNING, logger="sandbox.fakes")
     token = make_credential(SBX, "meta")
     async with httpx.AsyncClient(transport=Stub().transport) as client:
-        r = await client.get("https://graph.facebook.com/v25.0/act_1/nothing_here", params={"access_token": token})
+        r = await client.get("https://graph.facebook.com/v25.0/act_1/nothing_here/deeper", params={"access_token": token})
         g = await client.get("https://services.leadconnectorhq.com/nothing",
                              headers={"Authorization": f"Bearer {make_credential(SBX, 'ghl')}"})
         h = await client.post("https://service.hookscall.com/glu/api/v2/request",
                               headers={"Authorization": f"Bearer {make_credential(SBX, 'hp')}"},
                               json={"Method": "NoSuchMethod"})
     assert r.status_code == 400 and r.json()["error"]["code"] == 100
-    assert r.json()["error"]["message"] == "sandbox: GET /act_1/nothing_here is not implemented"
+    assert r.json()["error"]["message"] == "sandbox: GET /act_1/nothing_here/deeper is not implemented"
     assert g.status_code == 404 and g.json()["message"].startswith("sandbox: GET /nothing")
     assert h.status_code == 200 and h.json()["response"] == "false" and "NoSuchMethod" in h.json()["message"]
     assert sum("sandbox_unhandled" in rec.getMessage() for rec in caplog.records) == 3
