@@ -40,6 +40,7 @@ PROVIDER_HOSTS: dict[str, str] = {
 }
 
 _registry: dict[str, Callable] = {}
+_provider_apps: dict[str, Callable] = {}   # provider -> its fake, for hosts configured through env
 _clients: dict[int, httpx.AsyncClient] = {}
 _installed = {"done": False}
 _orig_async_send = httpx.AsyncClient.send
@@ -60,10 +61,23 @@ def _match(host: str, table) -> Optional[str]:
     return None
 
 
+def configured_hosts() -> dict[str, str]:
+    """Provider hosts that come from configuration rather than the table above: wherever the
+    HOTPROSPECTOR_*_URL overrides point (sandbox.hp_app.configured_hosts). Read on every call, so
+    an override set after start-up is covered too."""
+    if not _installed["done"]:
+        return {}
+    from sandbox import hp_app
+
+    return {host: "hp" for host in hp_app.configured_hosts()}
+
+
 def provider_of(host: str) -> Optional[str]:
     """"meta" / "ghl" / "hp" for a provider host, else None."""
     key = _match(host, PROVIDER_HOSTS)
-    return PROVIDER_HOSTS[key] if key else None
+    if key:
+        return PROVIDER_HOSTS[key]
+    return configured_hosts().get((host or "").lower().rstrip("."))
 
 
 def register_app(hosts: Iterable[str], asgi_app: Callable) -> None:
@@ -85,7 +99,10 @@ def app_for(host: str) -> Callable:
     if exact in _registry:
         return _registry[exact]
     key = _match(host, {k: v for k, v in _registry.items() if k.startswith(".")})
-    return _registry[key] if key else not_implemented_app
+    if key:
+        return _registry[key]
+    provider = configured_hosts().get(exact.rstrip("."))
+    return _provider_apps.get(provider, not_implemented_app)
 
 
 async def not_implemented_app(scope, receive, send):
@@ -157,6 +174,7 @@ def _register_fakes() -> None:
     register_app(meta_app.HOSTS, meta_app.app)
     register_app(ghl_app.HOSTS, ghl_app.app)
     register_app(hp_app.HOSTS, hp_app.app)
+    _provider_apps.update(meta=meta_app.app, ghl=ghl_app.app, hp=hp_app.app)
 
 
 def install() -> None:

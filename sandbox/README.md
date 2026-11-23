@@ -110,6 +110,20 @@ async def adaccounts(request: Request):
 Callbacks refuse a non-`sbx_` code or token for a sandbox account and an `sbx_` one for a normal
 account (`sandbox.connect.code_error` / `token_error`), before exchanging anything.
 
+## 5b. Hot Prospector fake (phase 2)
+
+`sandbox/hp_methods.py` (operations) and `sandbox/hp_rows.py` (HP's row shapes, pure), on v2
+(`/glu/api/v2/request`, Bearer) and v1 (`/glu/custom_api`, uid + key in the body, same account):
+`getMemberUsers`, `SearchByUserInput` (`locationId`, `searchField`/`searchText`, `limit` <= 100,
+`offset`, oldest first), `FetchUserCallLog` (`locationId`?, `from_date`/`to_date` <= 30 days,
+default last 7; `type`, `limit` <= 500, `offset`, `sort_order`), `FetchLeadCallLogs` (list-wrapped),
+`getMemberDashboardData` (`date`), plus `getGroups`, `getLists`, `getLeadDetails` (not called by
+the product). Only call-centre clients (`hp_group_id`) have HP leads and calls; a location without
+one answers an empty page. A "No Answer" call reports 0 s; a member's dashboard day is counted from
+that day's call log rows. **No recordings**: `recording` / `recordingId` are empty, and a world
+recording URL answers 404, so call analysis finds nothing to transcribe. Hosts that
+`HOTPROSPECTOR_*_URL` point at are HP hosts too (`hp_app.configured_hosts`, read per request).
+
 ## 6. The world
 
 ```python

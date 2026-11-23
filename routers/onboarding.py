@@ -44,6 +44,7 @@ from core.database import DB_NAME
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from dependencies import get_current_user, get_mongo_client
+from sandbox.connect import foreign_provider_id
 from integrations.facebook_utils.facebook import get_facebook_token
 from integrations.gohighlevel import (
     ghl_integration,
@@ -1169,6 +1170,12 @@ async def import_subaccounts(
     which treat last_*_refresh=None as maximally stale."""
     if not body.accounts:
         raise HTTPException(status_code=400, detail="No accounts to import")
+    # A sandbox account imports only its own generated ids (never a real location, whose
+    # incoming webhooks would then be attributed to it). None for a normal account.
+    foreign = next((f for f in (foreign_provider_id(current_user, a.location_id, a.meta_ad_account_id)
+                                for a in body.accounts) if f), None)
+    if foreign:
+        raise HTTPException(status_code=400, detail=f"{foreign} is not one of this sandbox account's accounts")
 
     async with get_mongo_client() as mongo_client:
         db = mongo_client[DB_NAME]

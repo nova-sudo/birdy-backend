@@ -343,6 +343,7 @@ async def analyze_single_call(
     from bson import ObjectId
     from bson.errors import InvalidId
     from openai import AsyncOpenAI
+    from sandbox.connect import recording_url_error
 
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY is not configured — call analysis requires it.")
@@ -366,7 +367,11 @@ async def analyze_single_call(
             sort=[("started_at", -1)],
         )
         if not doc:
-            # Not yet synced into call_logs — analyze straight off the URL.
+            # Not yet synced into call_logs — analyze straight off the URL. Never for a
+            # sandbox account: its calls have no recordings, so the URL is not one of its own.
+            refused = recording_url_error(user_id, recording_url)
+            if refused:
+                raise ValueError(refused)
             doc = {"_id": None, "recording_url": recording_url, **(extra_meta or {})}
 
     meta = {

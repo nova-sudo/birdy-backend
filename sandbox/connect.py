@@ -49,3 +49,35 @@ def token_error(user_id: str, tokens: dict, *fields: str) -> Optional[str]:
         if problem:
             return problem
     return None
+
+
+def foreign_provider_id(user_id: str, location_id=None, meta_ad_account_id=None) -> Optional[str]:
+    """For a sandbox account: the id (a GHL location or Meta ad account) that is not in its world,
+    else None. A sandbox account may only hold its own fake ids, so it can never claim a real
+    location and have that location's incoming webhooks (call logs) attributed to it. Always None
+    for a normal account."""
+    if not is_sandbox_user(user_id):
+        return None
+    from sandbox.world import world_for
+
+    w = world_for(user_id)
+    if location_id:
+        c = w.client(str(location_id))
+        if c is None or c.ghl_location_id != str(location_id):
+            return str(location_id)
+    if meta_ad_account_id:
+        act = str(meta_ad_account_id)
+        act = act if act.startswith("act_") else f"act_{act}"
+        c = w.client(act)
+        if c is None or c.meta_ad_account_id != act:
+            return str(meta_ad_account_id)
+    return None
+
+
+def recording_url_error(user_id: str, recording_url) -> Optional[str]:
+    """Why call analysis must not download this ad-hoc recording URL for this account (None: go
+    ahead). Sandbox calls have no recordings, so a sandbox account never downloads one: no real
+    host is fetched and nothing reaches the transcription service."""
+    if is_sandbox_user(user_id) and recording_url:
+        return "Sandbox calls have no recordings to analyze."
+    return None
