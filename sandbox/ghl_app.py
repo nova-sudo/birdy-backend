@@ -4,9 +4,10 @@ sandbox/ghl_app.py
 The fake LeadConnector API (services.leadconnectorhq.com, *.gohighlevel.com, *.msgsndr.com).
 
 Errors use LeadConnector's shape: ``{"statusCode": 401, "message": "...", "error": "Unauthorized"}``.
-Phase 1 has the token endpoints the connect flow and location access need: ``POST /oauth/token``
-(authorization_code and refresh_token, agency and location) and ``POST /oauth/locationToken``.
-Phase 2: add endpoints to ``router`` below the ADD ENDPOINTS HERE marker.
+The token endpoints live here (``POST /oauth/token``: authorization_code and refresh_token, agency
+and location; ``POST /oauth/locationToken``); every other endpoint the product calls (locations,
+contacts, opportunities, pipelines, conversations, appointments, notes, tasks, users, custom
+fields) is in sandbox/ghl_endpoints.py, built on the GHL view of the world in sandbox/ghl_data.py.
 """
 
 from __future__ import annotations
@@ -97,11 +98,7 @@ async def location_token(request: Request):
     return JSONResponse(_location_tokens(world, cred.user_id, location_id), status_code=201)
 
 
-# ---------------------------------------------------------------------------
-# ADD ENDPOINTS HERE (phase 2): /locations/search, /oauth/installedLocations, /locations/{id},
-# /contacts/, /contacts/search, /opportunities/search, /opportunities/pipelines, conversations.
-# A location token is ``require_credential(request, "ghl_location")``; ``cred.arg`` is its location.
-# ---------------------------------------------------------------------------
+from sandbox import ghl_endpoints  # noqa: E402,F401  (registers the phase 2 endpoints on router)
 
 
 app = build_app("ghl", router, error=ghl_error, not_implemented_status=404)
