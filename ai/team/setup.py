@@ -488,6 +488,44 @@ async def save_step(db, user_id: str, key: str, step: str, body: dict) -> dict:
     return await state(db, user_id)
 
 
+PLAYBOOK_KEYS = ("modes", "creative", "scoring")
+
+
+async def edit_playbook(db, user_id: str, changes: dict) -> None:
+    """Change Media Buyer's playbook rules during its interview: `changes` is a partial patch of the
+    stock agent's `modes`, `creative` and `scoring` settings, checked by the settings' own validation.
+    It ticks nothing: the owner still confirms the playbook. Allowed once the playbook step is reached."""
+    if not isinstance(changes, dict) or not changes or set(changes) - set(PLAYBOOK_KEYS):
+        raise SetupError(400, f"changes must be an object with any of {list(PLAYBOOK_KEYS)}")
+    st = await statuses(db, user_id)
+    if st[MEDIA_BUYER]["status"] == LOCKED:
+        raise SetupError(423, locked_body(MEDIA_BUYER, st[MEDIA_BUYER]["waits_on"]))
+    row = (await _rows(db, user_id)).get(MEDIA_BUYER)
+    steps = _steps_done(row, MEDIA_BUYER)
+    current = current_step(steps, MEDIA_BUYER)
+    if not steps["playbook"] and st[MEDIA_BUYER]["status"] != DONE and current != "playbook":
+        raise SetupError(409, {"code": "step_out_of_order", "agent": MEDIA_BUYER, "step": "playbook",
+                               "expected": current})
+    agent = await ensure_stock_agent(db, user_id)
+    before = _stock_settings(agent)
+    agent = await _settings_update(db, user_id, agent, settings=changes)
+    after = _stock_settings(agent)
+    if after["scoring"].get("lose_cpl_multiple") != before["scoring"].get("lose_cpl_multiple"):
+        # The red CPL line is the target times the loser multiple: keep it in step.
+        zones = after.get("zones") or {}
+        patch: dict = {}
+        if zones.get("green_under") is not None:
+            patch["zones"] = {**zones, "red_over": _red_for(zones["green_under"], after)}
+        own = {gid: {"zones": {"green_under": c["zones"]["green_under"],
+                               "red_over": _red_for(c["zones"]["green_under"], after)}}
+               for gid, c in (after.get("clients") or {}).items()
+               if (c or {}).get("zones") and c["zones"].get("green_under") is not None}
+        if own:
+            patch["clients"] = own
+        if patch:
+            await _settings_update(db, user_id, agent, settings=patch)
+
+
 async def finish_sub_agents(db, user_id: str, skipped: bool) -> dict:
     if not isinstance(skipped, bool):
         raise SetupError(400, "skipped must be true or false")

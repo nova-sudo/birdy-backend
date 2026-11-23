@@ -739,3 +739,70 @@ async def test_the_practice_form_is_shown_only_on_request(mock_db):
     assert (await setup_chat.show_setup_step(mock_db, U, agent="sales_coach", step="practice"))["ok"] is False
     prompt = await setup_chat.system_prompt(mock_db, U, "media_buyer")
     assert "NOT a step" in prompt and "only a suggestion" in prompt
+
+
+# ── The playbook's rules can be changed in the interview, then confirmed ──
+
+async def _at_playbook(db):
+    await _account(db)
+    for step, body in MB_ANSWERS[:2]:
+        await s.save_step(db, U, s.MEDIA_BUYER, step, body)
+
+
+async def test_the_interview_changes_a_playbook_rule_and_leaves_it_to_confirm(mock_db):
+    await _at_playbook(mock_db)
+    out = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="playbook",
+                                           answer={"changes": {"scoring": {"min_days": 10}}})
+    assert out["ok"] is True and out["changed"] == ["scoring"]
+    assert out["rules"]["scoring"]["min_days"] == 10
+    # changed, not confirmed: the playbook is still the step to ask
+    assert out["current"] == "playbook" and "confirm" in out["note"]
+    block = await setup_chat.block(mock_db, U, "media_buyer", "playbook")
+    assert block["scoring"]["min_days"] == 10 and block["scoring"]["lose_cpl_multiple"] == 1.3
+    done = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="playbook",
+                                            answer={"confirmed": True})
+    assert done["ok"] is True and done["current"] == "permissions"
+    assert (await setup_chat.block(mock_db, U, "media_buyer", "playbook"))["scoring"]["min_days"] == 10
+
+
+async def test_a_change_and_a_confirm_can_come_together(mock_db):
+    await _at_playbook(mock_db)
+    out = await setup_chat.save_setup_step(
+        mock_db, U, agent="media_buyer", step="playbook",
+        answer={"changes": {"modes": {"remove": "auto"}, "creative": {"max_ads_live": 6}}, "confirmed": True})
+    assert out["ok"] is True and out["current"] == "permissions"
+    block = await setup_chat.block(mock_db, U, "media_buyer", "playbook")
+    assert block["modes"] == {"remove": "auto", "add": "ask", "revive": "ask"} and block["creative"]["max_ads_live"] == 6
+    row = await mock_db[s.TEAM_AGENTS].find_one({"_id": s.row_id(s.MEDIA_BUYER, U)})
+    assert row["setup"]["answers"]["playbook"] == {"confirmed": True}      # the rules live on the agent, not here
+
+
+async def test_a_new_loser_multiple_moves_the_red_cpl_line(mock_db):
+    await _at_playbook(mock_db)      # CPL 10 for every client, 8 for G2: red at 13 and 10.4
+    out = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="playbook",
+                                           answer={"changes": {"scoring": {"lose_cpl_multiple": 1.5}}})
+    assert out["ok"] is True
+    settings = s._stock_settings(await s.stock_agent(mock_db, U))
+    assert settings["zones"]["green_under"] == 10 and settings["zones"]["red_over"] == 15
+    assert settings["clients"][G2]["zones"] == {"green_under": 8, "red_over": 12}
+
+
+async def test_bad_or_early_playbook_changes_are_refused(mock_db):
+    await _account(mock_db)
+    early = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="playbook",
+                                             answer={"changes": {"scoring": {"min_days": 10}}})
+    assert early["ok"] is False and early["error"]["code"] == "step_out_of_order"
+    for step, body in MB_ANSWERS[:2]:
+        await s.save_step(mock_db, U, s.MEDIA_BUYER, step, body)
+    for changes in ({"scoring": {"min_days": 0}}, {"modes": {"remove": "always"}}, {"zones": {"green_under": 1}}, {}):
+        bad = await setup_chat.save_setup_step(mock_db, U, agent="media_buyer", step="playbook",
+                                               answer={"changes": changes})
+        assert bad["ok"] is False, changes
+    assert (await setup_chat.block(mock_db, U, "media_buyer", "playbook"))["scoring"]["min_days"] == 7
+
+
+def test_the_interview_is_told_it_can_change_the_playbook():
+    stages = setup_chat._STAGES[defs.MEDIA_BUYER]
+    assert 'save_setup_step("playbook", {"changes"' in stages and "can't change these rules" not in stages
+    described = setup_chat._DEFS[setup_chat.SAVE_STEP][2]["properties"]["answer"]["description"]
+    assert '"min_days"' in described and '"changes"' in described

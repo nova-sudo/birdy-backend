@@ -15,9 +15,9 @@ What the agent offers is a suggestion, never the answer: nothing is saved until 
 any answer can be changed at any point of the interview, in the chat or in its form. A practice run is
 not a step; its form is shown only when the owner asks for one.
 
-Rules are reviewed and confirmed in the playbook step, not edited here: the stock agent's own settings
-page changes them afterwards. In the sub-agents step the agent proposes sub-agents with the existing
-propose_sub_agent tool.
+The playbook step shows Media Buyer's rules and the owner confirms them; a rule the owner wants different
+is changed here too (save_setup_step "playbook" with `changes`), then confirmed. In the sub-agents step
+the agent proposes sub-agents with the existing propose_sub_agent tool.
 """
 
 import logging
@@ -151,13 +151,27 @@ async def save_setup_step(db, user_id, agent=None, step=None, answer=None, **_):
         return _fail(f"step must be one of {list(team_setup.STEPS[agent])}")
     if not isinstance(answer, dict):
         return _fail("answer must be an object in the step's shape")
+    changed = None
     try:
-        await team_setup.save_step(db, user_id, agent, step, answer)
+        if agent == defs.MEDIA_BUYER and step == "playbook" and "changes" in answer:
+            # A rule the owner wants different: changed now, confirmed separately.
+            await team_setup.edit_playbook(db, user_id, answer["changes"])
+            changed = sorted(answer["changes"])
+            answer = {k: v for k, v in answer.items() if k != "changes"}
+        if not changed or answer.get("confirmed") is True:
+            await team_setup.save_step(db, user_id, agent, step, answer)
     except team_setup.SetupError as e:
         return {"ok": False, "error": e.detail}
     st = await team_setup.agent_state(db, user_id, agent)
-    return {"ok": True, "saved": step, "known": st["known"], "current": st["current"],
-            "activation": st.get("activation")}
+    out = {"ok": True, "saved": step, "known": st["known"], "current": st["current"],
+           "activation": st.get("activation")}
+    if changed:
+        out["changed"] = changed
+        out["rules"] = (await block(db, user_id, agent, "playbook"))
+        if st["current"] == "playbook":
+            out["note"] = ("The rules are changed. Show the playbook form again and ask the owner to confirm it; "
+                           "it is not confirmed yet.")
+    return out
 
 
 _DEFS = {
@@ -182,7 +196,12 @@ _DEFS = {
                     "answer": {"type": "object", "description": (
                         'The answer, by step. clients: {"client_group_ids": [ids] or "all"}. '
                         'cpl: {"default": number or null, "clients": {client id: number}}. '
-                        'playbook: {"confirmed": true}. permissions: {"ads": bool, "adsets": bool, "campaigns": bool}. '
+                        'playbook: {"confirmed": true} to confirm, and/or {"changes": {...}} to change rules first: '
+                        '"modes": {"remove"|"add"|"revive": "flag" (only suggests) | "ask" (asks first) | "auto" (acts on its own)}, '
+                        '"creative": {"max_ads_live", "winner_days", "winner_min_leads", "revive_after_days"}, '
+                        '"scoring": {"min_days" (days live before an ad is judged), "win_min_leads", '
+                        '"lose_cpl_multiple" (a loser costs more than this many times the target), "lose_max_leads"}; '
+                        'pass only the fields that change. permissions: {"ads": bool, "adsets": bool, "campaigns": bool}. '
                         'schedule: {"time": "HH:MM", "tz": IANA timezone, "days": "daily" or "weekdays"}. '
                         'slack: {"channel_id": id or null}. '
                         'outcomes: {"booked": {"kind": "tag" or "stage", "value", "label"}, "closed": {same}}. '
@@ -242,7 +261,7 @@ _INTRO = {
 _STAGES = {
     defs.MEDIA_BUYER: """1. clients: which clients you run ads for. Clients without a Meta ad account can't be run.
 2. cpl: the cost per lead to aim for, one number for every client and, where it differs, one per client, each in that client's own currency. Use the CPL targets Birdy already has as the starting suggestion. A client is green under its number and red over it by your loser multiple.
-3. playbook: how you work, in plain words, from the form's data: for pausing, adding and reviving ads whether you only flag, ask first or act on your own, how many ads you keep live, when an ad counts as a winner or a loser. Ask them to confirm. You can't change these rules in this chat: if they want a change, say it is made in your settings after setup, and ask them to confirm the rest.
+3. playbook: how you work, in plain words, from the form's data: for pausing, adding and reviving ads whether you only flag, ask first or act on your own, how many ads you keep live, when an ad counts as a winner or a loser. Ask them to confirm. If they want a rule different (for example "judge an ad after 10 days, not 7", "keep 6 ads live", "pause losers on your own"), change it straight away with save_setup_step("playbook", {"changes": {...}}) using only the fields that change, then call show_setup_step("playbook") so the form shows the new rules, say in one line what changed, and ask them to confirm. Never say a rule is changed unless the tool said ok, and never ask them to confirm the old value after they asked for a new one.
 4. permissions: what you may change: ads, ad sets, campaigns. You never touch budgets.
 5. schedule: when you check and report each day, in their timezone, every day or weekdays only.
 6. slack: the Slack channel you post to, or not in Slack.
