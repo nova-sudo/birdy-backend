@@ -40,6 +40,7 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
+from pydantic import BaseModel
 
 from whop_sdk import AsyncWhop
 
@@ -70,7 +71,8 @@ except ImportError:  # pragma: no cover
     StandardWebhook = None
 
 from dependencies import get_mongo_client, get_current_user
-from billing_middleware import override_limit
+from billing_middleware import needs_plan, override_limit
+from sandbox import is_sandbox_user
 
 logger = logging.getLogger(__name__)
 
@@ -420,51 +422,102 @@ async def billing_status(current_user: str = Depends(get_current_user)):
     user_id = current_user
 
     async with get_mongo_client() as mc:
-        sub   = await _get_sub(user_id, mc)
-        count = await _client_count(user_id, mc)
-        # An admin override replaces the plan's client limit (see
-        # billing_middleware.check_client_limit, which enforces the same number).
-        override = override_limit(await mc[os.getenv("MONGODB_DB", "birdyaidev")]["users"].find_one(
-            {"user_id": user_id}, {"client_limit_override": 1, "_id": 0}
-        ))
+        return await _status(user_id, mc)
 
-        if not sub or sub.get("status") not in ACTIVE_STATUSES:
-            return {
-                "subscribed": False,
-                "plan": {"id": "free", "name": "Free", "max_clients": 0},
-                "status": "inactive",
-                "client_count": count,
-                "client_limit": override if override is not None else 0,
-                "client_limit_override": override,
-                "extra_clients_paid": 0,
-                "can_add_extra_slots": False,
-                "current_period_end": None,
-                "cancel_at_period_end": False,
-                "whop_membership_id": None,
-                "_user_id": user_id,
-            }
 
-        plan = {
-            "id":          sub.get("plan_id", "unknown"),
-            "name":        sub.get("plan_name", "Unknown"),
-            "max_clients": sub.get("max_clients", 0),
-        }
-        extra_paid = sub.get("extra_clients_paid", 0) if plan["id"] in EXTRA_CLIENTS_ALLOWED_PLANS else 0
+async def _status(user_id: str, mc) -> dict:
+    """The body of GET /api/billing/status, also returned by the sandbox plan pick."""
+    sub   = await _get_sub(user_id, mc)
+    count = await _client_count(user_id, mc)
+    # An admin override replaces the plan's client limit (see
+    # billing_middleware.check_client_limit, which enforces the same number).
+    override = override_limit(await mc[os.getenv("MONGODB_DB", "birdyaidev")]["users"].find_one(
+        {"user_id": user_id}, {"client_limit_override": 1, "_id": 0}
+    ))
 
+    if not sub or sub.get("status") not in ACTIVE_STATUSES:
         return {
-            "subscribed": True,
-            "plan": plan,
-            "status": sub.get("status"),
+            "subscribed": False,
+            "plan": {"id": "free", "name": "Free", "max_clients": 0},
+            "status": "inactive",
             "client_count": count,
-            "client_limit": override if override is not None else plan["max_clients"] + extra_paid,
+            "client_limit": override if override is not None else 0,
             "client_limit_override": override,
-            "extra_clients_paid": extra_paid,
-            "can_add_extra_slots": plan["id"] in EXTRA_CLIENTS_ALLOWED_PLANS,
-            "current_period_end": sub.get("current_period_end"),
-            "cancel_at_period_end": sub.get("cancel_at_period_end", False),
-            "whop_membership_id": sub.get("whop_membership_id"),
+            "extra_clients_paid": 0,
+            "can_add_extra_slots": False,
+            "current_period_end": None,
+            "cancel_at_period_end": False,
+            "whop_membership_id": None,
             "_user_id": user_id,
+            # No plan and no admin-granted limit: setup's plan step is not done.
+            "needs_plan": override is None,
+            "sandbox": is_sandbox_user(user_id),
         }
+
+    plan = {
+        "id":          sub.get("plan_id", "unknown"),
+        "name":        sub.get("plan_name", "Unknown"),
+        "max_clients": sub.get("max_clients", 0),
+    }
+    extra_paid = sub.get("extra_clients_paid", 0) if plan["id"] in EXTRA_CLIENTS_ALLOWED_PLANS else 0
+
+    return {
+        "subscribed": True,
+        "plan": plan,
+        "status": sub.get("status"),
+        "client_count": count,
+        "client_limit": override if override is not None else plan["max_clients"] + extra_paid,
+        "client_limit_override": override,
+        "extra_clients_paid": extra_paid,
+        "can_add_extra_slots": plan["id"] in EXTRA_CLIENTS_ALLOWED_PLANS,
+        "current_period_end": sub.get("current_period_end"),
+        "cancel_at_period_end": sub.get("cancel_at_period_end", False),
+        "whop_membership_id": sub.get("whop_membership_id"),
+        "_user_id": user_id,
+        "needs_plan": False,
+        "sandbox": is_sandbox_user(user_id),
+    }
+
+
+# ── POST /api/billing/sandbox-plan ────────────────────────────────────────────
+
+class SandboxPlanRequest(BaseModel):
+    plan_id: str
+
+
+# The plans by their own id, wherever the Whop plan ids are configured or not.
+_PLANS_BY_ID = {
+    "starter": {"id": "starter", "name": "Starter", "max_clients": 3},
+    "growth":  {"id": "growth",  "name": "Growth",  "max_clients": 10},
+    "scale":   {"id": "scale",   "name": "Scale",   "max_clients": 25},
+}
+
+
+@router.post("/api/billing/sandbox-plan")
+async def sandbox_plan(body: SandboxPlanRequest, current_user: str = Depends(get_current_user)):
+    """A sandbox account picks a plan and has it at once, without paying: setup's
+    required plan step for test accounts on generated data. Nothing reaches Whop.
+    403 {"detail": {"code": "not_sandbox"}} for any other account."""
+    if not is_sandbox_user(current_user):
+        raise HTTPException(status_code=403, detail={"code": "not_sandbox"})
+    plan = _PLANS_BY_ID.get((body.plan_id or "").strip().lower())
+    if plan is None:
+        raise HTTPException(status_code=422, detail={"code": "unknown_plan"})
+    async with get_mongo_client() as mc:
+        await _save_sub(current_user, {
+            "plan_id": plan["id"],
+            "plan_name": plan["name"],
+            "max_clients": plan["max_clients"],
+            "status": "active",
+            "extra_clients_paid": 0,
+            "cancel_at_period_end": False,
+            "current_period_end": None,
+            "whop_membership_id": None,
+            # Marks a plan nobody paid for, so it is never mistaken for revenue.
+            "sandbox": True,
+            "started_at": datetime.now(timezone.utc),
+        }, mc)
+        return await _status(current_user, mc)
 
 
 # ── GET /api/billing/portal-url ───────────────────────────────────────────────

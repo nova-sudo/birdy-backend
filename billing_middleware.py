@@ -83,6 +83,16 @@ async def require_active_subscription(current_user: str, mongo_client) -> dict:
     return sub
 
 
+def needs_plan(user: dict | None) -> bool:
+    """Whether this account must pick a plan before it can use Birdy: no active
+    subscription, and no client limit granted by an admin. `user` is the users
+    document (or just its `subscription` and `client_limit_override` fields)."""
+    if override_limit(user) is not None:
+        return False
+    sub = (user or {}).get("subscription")
+    return not sub or sub.get("status") not in ("active", "trialing")
+
+
 async def check_client_limit(current_user: str, mongo_client):
     """
     Raise 402 if the user is at or over their client group limit.
@@ -115,15 +125,9 @@ async def check_client_limit(current_user: str, mongo_client):
             )
         return True
 
-    # A brand-new account's very first client group is free — lets someone
-    # see Birdy actually work before paying. Every client after this one
-    # requires an active subscription, including onboarding's own bulk
-    # import (which is gated by its own mandatory billing step before
-    # import-subaccounts — the other caller of this function — ever runs,
-    # so in practice a real subscription already exists by then).
-    if count == 0:
-        return True
-
+    # There is no free tier: every client needs an active plan, the first one
+    # included. Setup has a required plan step before the first client, and a
+    # sandbox account gets its plan there without paying (billing.sandbox_plan).
     if not sub or sub.get("status") not in ("active", "trialing"):
         raise HTTPException(
             status_code=402,
