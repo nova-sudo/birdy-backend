@@ -39,7 +39,7 @@ import httpx
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException
 from pydantic import BaseModel
 
-from billing_middleware import check_client_limit
+from billing_middleware import check_client_limit, needs_plan
 from core.database import DB_NAME
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
@@ -176,6 +176,8 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
             {
                 "role": 1,
                 "onboarding": 1,
+                "subscription": 1,
+                "client_limit_override": 1,
                 "integrations.gohighlevel.agency": 1,
                 "name": 1,
                 "agency_name": 1,
@@ -186,7 +188,7 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
             raise HTTPException(status_code=404, detail="User not found")
 
         if user_doc.get("role") == "admin":
-            return {"completed": True, "admin": True}
+            return {"completed": True, "admin": True, "needs_plan": False}
 
         onboarding = user_doc.get("onboarding")
         if onboarding is None:
@@ -209,6 +211,9 @@ async def onboarding_status(current_user: str = Depends(get_current_user)):
                 onboarding = {"completed": False, "step": 0, "data": {}}
 
         return {
+            # No free tier: an account without a plan is kept in setup, on its
+            # plan step, however far it got before (billing_middleware.needs_plan).
+            "needs_plan": needs_plan(user_doc),
             "completed": bool(onboarding.get("completed")),
             "step": onboarding.get("step", 0),
             "data": onboarding.get("data", {}),
