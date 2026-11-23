@@ -438,14 +438,20 @@ def _as_utc(dt):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def _ghl_window_contacts(w, cl, group, days):
+def _ghl_window_contacts(w, cl, group, days, before=timedelta(0)):
     """The contacts GHL's last_Nd window counts: UTC dateAdded from today-N through today, as of the
-    group's last GHL sync (core.constants.ghl_date_bounds)."""
+    group's last GHL sync (core.constants.ghl_date_bounds), or as of `before` earlier than it."""
     today = datetime.now(timezone.utc).date()
-    synced = _as_utc(group["last_ghl_refresh"])
+    synced = _as_utc(group["last_ghl_refresh"]) - before
     return [x for x in w.contacts(cl, today - timedelta(days=days + 1), w.today)
             if today - timedelta(days=days) <= _as_utc(x.date_added).date() <= today
             and _as_utc(x.date_added) <= synced]
+
+
+# The sync reads the contacts first and stamps `last_ghl_refresh` when it has stored them, and new
+# contacts keep arriving in the world meanwhile: the stored count is what existed somewhere between
+# those two moments. A slow run (the full suite) widens the gap, so the check is a range, not a point.
+_SYNC_TOOK_AT_MOST = timedelta(minutes=20)
 
 
 @pytest.mark.parametrize("preset,days", [("last_7d", 7), ("last_30d", 30)])
@@ -465,7 +471,9 @@ def test_09_client_groups_agree_with_the_world(walk, preset, days):
         assert insights["results"] == want.leads, cl.name
         assert g["facebook"]["metrics"]["total_campaigns"] == len(cl.campaigns)
         ghl = g["gohighlevel"]["metrics"]
-        assert ghl["total_contacts"] == len(_ghl_window_contacts(w, cl, stored[g["id"]], days)) > 0, cl.name
+        at_stamp = len(_ghl_window_contacts(w, cl, stored[g["id"]], days))
+        at_read = len(_ghl_window_contacts(w, cl, stored[g["id"]], days, before=_SYNC_TOOK_AT_MOST))
+        assert 0 < at_read <= ghl["total_contacts"] <= at_stamp, cl.name
         assert ghl["lifetime_total_contacts"] > ghl["total_contacts"]
         calls = (g["hotprospector"] or {}).get("call_stats") or {}
         if cl.hp_group_id:
