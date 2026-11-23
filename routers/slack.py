@@ -43,6 +43,9 @@ from services.slack_bot_service import (
 
 logger = logging.getLogger(__name__)
 
+from sandbox import is_sandbox_user
+from sandbox.connect import code_error, sandbox_auth_url
+
 router = APIRouter()
 
 SLACK_CLIENT_ID = os.getenv("SLACK_CLIENT_ID")
@@ -84,6 +87,13 @@ async def connect_slack(current_user: str = Depends(get_current_user)):
         raise HTTPException(status_code=503, detail="Slack integration not configured")
 
     state = _mint_install_state(current_user)
+    if is_sandbox_user(current_user):
+        # A sandbox account gets a made-up workspace (sandbox/slack_fake.py): Slack links a real one
+        # to a single Birdy account, so a tester's own workspace would be refused. Straight back to
+        # our callback with a sandbox code, no Slack screens.
+        from sandbox import slack_fake
+        auth_url = sandbox_auth_url(SLACK_REDIRECT_URI, current_user, slack_fake.CODE_KIND)
+        return {"auth_url": f"{auth_url}&{urllib.parse.urlencode({'state': state})}"}
     params = {
         "client_id": SLACK_CLIENT_ID,
         "scope": _BOT_SCOPES,
@@ -117,6 +127,15 @@ async def slack_callback(request: Request, response: Response):
     except Exception as e:
         logger.warning(f"Slack install state verification failed: {e}")
         redirect_url = f"{_FRONTEND_SETTINGS_URL}&status=error&error=invalid_state"
+        response.headers["Location"] = redirect_url
+        response.status_code = 302
+        return {"redirect_url": redirect_url}
+
+    # A sandbox account only ever exchanges a sandbox code, and a normal account never does.
+    problem = code_error(user_id, code)
+    if problem:
+        logger.warning(f"Slack callback refused for {user_id}: {problem}")
+        redirect_url = f"{_FRONTEND_SETTINGS_URL}&status=error&error={urllib.parse.quote(problem)}"
         response.headers["Location"] = redirect_url
         response.status_code = 302
         return {"redirect_url": redirect_url}

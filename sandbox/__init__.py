@@ -42,6 +42,7 @@ def is_sandbox_user(user_id) -> bool:
 
 def install() -> None:
     """Route sandbox credentials to the in-process fakes (idempotent). Called from main.py."""
-    from sandbox import routing
+    from sandbox import routing, slack_fake
 
     routing.install()
+    slack_fake.install()
