@@ -324,9 +324,10 @@ What is fake and what stays real:
 | Fake (answered in-process, never sent) | Real |
 |---|---|
 | Meta Graph API, GoHighLevel (LeadConnector), Hot Prospector | Billing: the first client is free; importing more needs a plan (or an admin's client-limit override) |
-| The OAuth dialogs (skipped) | Slack: connecting Slack, reports and alerts go to a real workspace |
-| Lead messages (SMS / email are remembered, not delivered) | The AI model: chat, agents and summaries call the real model and use credits |
-| Creative media (placeholder SVGs from `/api/sandbox/media/...`) | Birdy's own database, crons, alerts, email from Birdy |
+| The OAuth dialogs (skipped) | The AI model: chat, agents and summaries call the real model and use credits |
+| Lead messages (SMS / email are remembered, not delivered) | Birdy's own database, crons, alerts, email from Birdy |
+| Creative media (placeholder SVGs from `/api/sandbox/media/...`) | |
+| Slack: a made-up workspace with five channels; posts are accepted and go nowhere (`sandbox/slack_fake.py`). A real workspace can be linked to one Birdy account only, so a tester's own would be refused | |
 
 Odd but expected: calls have no recordings (call analysis finds nothing to transcribe); the
 `no_leads` client stops getting leads for the last four days on purpose; today's numbers grow
