@@ -124,6 +124,52 @@ that day's call log rows. **No recordings**: `recording` / `recordingId` are emp
 recording URL answers 404, so call analysis finds nothing to transcribe. Hosts that
 `HOTPROSPECTOR_*_URL` point at are HP hosts too (`hp_app.configured_hosts`, read per request).
 
+## 5c. Meta fake (phase 2)
+
+`sandbox/meta_app.py` (the app, *.facebook.com and *.fbcdn.net) and `sandbox/meta_graph.py` (the
+engine), with `meta_fields.py` (the `fields` grammar) and `meta_media.py` (placeholder media).
+Paths match without the version prefix (`/v25.0/me/adaccounts` is `@router.get("/me/adaccounts")`).
+
+- Graph's object model over the world: any node (`GET /{id}` with field expansion), any edge
+  (`GET /{id}/{edge}`, paged with `cursors` and a `next` that carries the token), insights (any
+  `date_preset`, `time_range`, `time_increment`, `level`), the `leads` edge, the batch API
+  (`POST /` with `batch`), and writes (`POST /{id}` status / budget / name, `POST /act_x/{edge}`
+  to create, `DELETE /{id}`). Errors are Graph's `{"error": {message, type, code, error_subcode,
+  fbtrace_id}}`.
+- Numbers add up at every level: an account's insights for a range are the sum of its
+  campaigns', which are the sum of their ads', which are what the daily rows add to; the `lead`
+  action count equals the leads the `leads` edge lists. Insight numbers are strings, as Graph's.
+  Dates are the account's (Europe/London); a lead's `created_time` is UTC.
+- Ad account ids are `act_<n>`; `w.client()` takes them with or without `act_`.
+- Objects created through the fake (creative tests: ads, creatives, images, videos, campaigns,
+  ad sets) are kept in `sandbox_state` (kind `meta_object`) and merged into every listing; they
+  never deliver (no insights, no leads).
+- Media a browser loads (creative `image_url` / thumbnails, video pictures, ad previews) points at
+  the backend's own `/api/sandbox/media/...` (generated SVGs, `routers/sandbox.py`); media the
+  backend downloads is on `scontent.xx.fbcdn.net` with an `sbx_` segment and is answered in-process.
+- A field the fake does not know is left out (logged `sandbox_unhandled_field`), so a new product
+  request still works.
+
+## 5d. GoHighLevel fake (phase 2)
+
+`sandbox/ghl_app.py` (the app and the token endpoints), `ghl_endpoints.py` (every other endpoint
+Birdy calls), `ghl_data.py` (the world as GHL sees it) and `ghl_search.py` (`POST /contacts/search`
+filters, sort, paging).
+
+- Tokens as GHL enforces them: the agency token (`ghl`) lists locations (`/locations/search`,
+  `/oauth/installedLocations`, `/locations`, `/locations/{id}`, `/users/`) and mints location tokens
+  (`POST /oauth/locationToken`); a location token (`ghl_location:<id>`) works only inside its own
+  location (another location's contact / opportunity / conversation is a 403). Every endpoint but
+  OAuth wants a `Version` header. Refresh (`grant_type=refresh_token`, agency and location) works.
+- A contact is a Meta lead (same name, email, phone, ad ids, `attributionSource`), created a little
+  after the lead; its opportunity is `World.opportunity_for(lead)` (pipeline New / Contacted /
+  Booked / Won / Lost); conversations, appointments, notes and custom fields are generated from the
+  same deterministic primitives. Nothing is dated after `now`.
+- Every paging style reaches the end (page / pageLimit, startAfter / startAfterId, searchAfter).
+- Writes (create / update contact, tags, opportunity status, notes, tasks, send SMS or email) answer
+  in GHL's shape and are remembered (`sandbox_state` kinds `ghl_*`), so later reads show them.
+  Nothing is sent to anyone. Calls have no recordings (recording / transcription answer 404).
+
 ## 6. The world
 
 ```python
@@ -245,3 +291,43 @@ day (so today's earlier leads never vanish). Names just replace.
 - Budgets are per ad set; campaigns have no budget.
 - Created objects (a new ad from a creative test) are not in the world yet: phase 2 can keep them
   in `state` under its own kind and merge them into its responses.
+
+## Trying it
+
+A tester's whole account runs on the generated world; the rest of the product is the real one.
+`tests/test_sandbox_onboarding_e2e.py` walks exactly this path through the HTTP routes.
+
+1. **Register** at `/register` with any address on `@sandbox.birdy.test` (or another domain in
+   `SANDBOX_EMAIL_DOMAINS`), for example `tester@sandbox.birdy.test`. Each address gets its own
+   world: eight UK clients (aesthetics, dental, gyms) with 120 days of history, the same every
+   time for that address. Fill in the basics as usual.
+2. **Connect Meta**: the button skips Facebook's dialog and lands straight back on the callback
+   with a sandbox code. Eight ad accounts appear, named like the clients.
+3. **Connect GoHighLevel**: the same, no GoHighLevel dialog. Eight sub-accounts appear.
+4. **Calling**: pick Hot Prospector and type anything into the API UID and key. What is typed is
+   ignored; the account's own sandbox keys are stored. Five of the eight clients run a call centre
+   (they have calls, agents and member dashboards); the other three have no Hot Prospector data.
+5. **Import** ("bring in the rest"): the review reads every sub-account's recent leads and pairs
+   each with its own ad account (the names match exactly; no model call is made for a sandbox
+   account). Import them all.
+6. **Wait for the first sync**: the cron ticks fill each client in the next few minutes, as for a
+   real account (GoHighLevel two clients a minute, Meta five, Hot Prospector one client a minute
+   per account). Until then a client shows as syncing. The Hot Prospector member dashboards
+   backfill the current year 20 days a tick; days before the world's history read zero.
+7. Everything after that reads the world: dashboards, hubs, leads, a lead's conversation, the
+   call centre, the agents' Meta and GHL tools. Writes are remembered per account: pausing an ad,
+   changing a budget, renaming, moving an opportunity, sending a lead an SMS or email. They show
+   up in later reads (a paused ad stops spending from that moment) and are never sent anywhere.
+
+What is fake and what stays real:
+
+| Fake (answered in-process, never sent) | Real |
+|---|---|
+| Meta Graph API, GoHighLevel (LeadConnector), Hot Prospector | Billing: the first client is free; importing more needs a plan (or an admin's client-limit override) |
+| The OAuth dialogs (skipped) | Slack: connecting Slack, reports and alerts go to a real workspace |
+| Lead messages (SMS / email are remembered, not delivered) | The AI model: chat, agents and summaries call the real model and use credits |
+| Creative media (placeholder SVGs from `/api/sandbox/media/...`) | Birdy's own database, crons, alerts, email from Birdy |
+
+Odd but expected: calls have no recordings (call analysis finds nothing to transcribe); the
+`no_leads` client stops getting leads for the last four days on purpose; today's numbers grow
+through the day.

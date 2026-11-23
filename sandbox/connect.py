@@ -81,3 +81,22 @@ def recording_url_error(user_id: str, recording_url) -> Optional[str]:
     if is_sandbox_user(user_id) and recording_url:
         return "Sandbox calls have no recordings to analyze."
     return None
+
+
+def account_matches(user_id: str, unmatched: list[dict], fb_accounts: list[dict]) -> Optional[dict]:
+    """The onboarding review's "which ad account is this sub-account's" answer for a sandbox account,
+    straight from its world ({location_id: ad_account_id}, only for the pairs still on offer), so the
+    review makes no model call on made-up names. None for a normal account: it asks the model."""
+    if not is_sandbox_user(user_id):
+        return None
+    from sandbox.world import world_for
+    bare = lambda v: str(v or "").removeprefix("act_")
+    offered = {bare(a.get("id")): a.get("id") for a in fb_accounts or []}
+    pairs = {c.ghl_location_id: bare(c.meta_ad_account_id) for c in world_for(user_id).clients}
+    out = {}
+    for t in unmatched or []:
+        account = offered.get(pairs.get(t.get("location_id"), ""))
+        if account:
+            out[t["location_id"]] = account
+    return out
+

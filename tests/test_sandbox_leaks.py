@@ -162,3 +162,17 @@ async def test_sandbox_import_refuses_ids_outside_its_world(mock_db, outgoing, a
     assert r.status_code == 400 and "not one of this sandbox account" in r.json()["detail"]
     assert await mock_db["client_groups"].count_documents({}) == 0
     assert outgoing == []
+
+
+def test_the_onboarding_review_matches_sandbox_accounts_without_a_model():
+    from sandbox.connect import account_matches
+    from sandbox.world import world_for
+    user = "tester@sandbox.birdy.test"
+    clients = world_for(user).clients
+    unmatched = [{"location_id": c.ghl_location_id} for c in clients[:3]] + [{"location_id": "not-in-the-world"}]
+    offered = [{"id": "act_" + str(c.meta_ad_account_id).removeprefix("act_")} for c in clients[:2]]
+    out = account_matches(user, unmatched, offered)
+    # only pairs whose ad account is still on offer, in the id form the list used
+    assert out == {c.ghl_location_id: "act_" + str(c.meta_ad_account_id).removeprefix("act_") for c in clients[:2]}
+    # a normal account is not answered here: it goes to the model as before
+    assert account_matches("owner@example.com", unmatched, offered) is None

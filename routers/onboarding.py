@@ -660,7 +660,11 @@ async def _prepare_review_job(user_id: str):
                 t for t in targets
                 if not (similarity.get(t["location_id"]) or {}).get("confident")
             ]
-            ai_matches = await _ai_match_accounts(unmatched, free_fb)
+            # A sandbox account's pairs are known (sandbox/world.py): no model call on made-up names.
+            from sandbox.connect import account_matches as _sandbox_matches
+            ai_matches = _sandbox_matches(user_id, unmatched, free_fb)
+            if ai_matches is None:
+                ai_matches = await _ai_match_accounts(unmatched, free_fb)
 
             await users.update_one(
                 {"user_id": user_id},
