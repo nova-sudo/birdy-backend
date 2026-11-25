@@ -84,8 +84,8 @@ async def test_propose_stores_an_inert_proposal(mock_db):
     (dict(tools=[]), "bad_tools"),
     (dict(tools="get_ad_insights"), "bad_tools"),
     (dict(tools=["made_up_tool"]), "unknown_tool"),
-    (dict(tools=["analyze_call_recordings"]), "tool_not_allowed"),       # Sales Coach's, not Media Buyer's
-    (dict(tools=["create_alert"]), "tool_not_allowed"),                  # a write tool Media Buyer lacks
+    (dict(tools=["analyze_call_recordings"]), "tool_not_allowed"),       # Sales Coach's, not Marketing Guru's
+    (dict(tools=["create_alert"]), "tool_not_allowed"),                  # a write tool Marketing Guru lacks
     (dict(parent="sales_coach", tools=["pause_creative_ads"]), "tool_not_allowed"),
     (dict(parent="birdy"), "bad_parent"),
     (dict(created_by="sales_coach"), "bad_creator"),

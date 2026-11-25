@@ -15,7 +15,7 @@ What the agent offers is a suggestion, never the answer: nothing is saved until 
 any answer can be changed at any point of the interview, in the chat or in its form. A practice run is
 not a step; its form is shown only when the owner asks for one.
 
-The playbook step shows Media Buyer's rules and the owner confirms them; a rule the owner wants different
+The playbook step shows Marketing Guru's rules and the owner confirms them; a rule the owner wants different
 is changed here too (save_setup_step "playbook" with `changes`), then confirmed. In the sub-agents step
 the agent proposes sub-agents with the existing propose_sub_agent tool.
 """
@@ -183,9 +183,9 @@ _DEFS = {
                 "Show the owner the form for one setup step under your reply. Saves nothing: the owner saves in "
                 "the form and the app tells you.",
                 {"type": "object", "properties": {"step": {"type": "string", "description": (
-                    "The step: clients, cpl, playbook, permissions, schedule, slack (Media Buyer); "
+                    "The step: clients, cpl, playbook, permissions, schedule, slack (Marketing Guru); "
                     "clients, outcomes, speed, schedule, slack (Sales Coach); sub_agents; or practice "
-                    "(Media Buyer, only when the owner asks for a practice run).")}},
+                    "(Marketing Guru, only when the owner asks for a practice run).")}},
                  "required": ["step"]}),
     SAVE_STEP: (save_setup_step,
                 "Save one step's answer, or change one already saved, from what the owner said in the chat. Use it "
@@ -250,7 +250,7 @@ async def ensure_block(db, user_id: str, agent: str, agent_changes: list) -> Non
 # ---------------------------------------------------------------------------
 
 _INTRO = {
-    defs.MEDIA_BUYER: ("You are Media Buyer, the agent in this agency's Birdy workspace that runs their Meta ads: it "
+    defs.MEDIA_BUYER: ("You are Marketing Guru, the agent in this agency's Birdy workspace that runs their Meta ads: it "
                        "checks the ads every day, pauses ones that cost too much, brings back old winners and adds "
                        "new ones, and reports in Slack."),
     defs.SALES_COACH: ("You are Sales Coach, the agent in this agency's Birdy workspace that watches the call centre: "

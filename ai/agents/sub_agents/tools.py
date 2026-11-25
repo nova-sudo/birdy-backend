@@ -18,7 +18,7 @@ from functools import lru_cache
 MEDIA_BUYER = "media_buyer"
 SALES_COACH = "sales_coach"
 PARENTS = (MEDIA_BUYER, SALES_COACH)
-PARENT_LABELS = {MEDIA_BUYER: "Media Buyer", SALES_COACH: "Sales Coach"}
+PARENT_LABELS = {MEDIA_BUYER: "Marketing Guru", SALES_COACH: "Sales Coach"}
 
 _PARENT_PAGE = {MEDIA_BUYER: "campaigns", SALES_COACH: "call_center"}  # temporary, see the module note
 

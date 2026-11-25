@@ -355,7 +355,7 @@ async def test_out_of_credits_never_runs_the_team(signed_post):
 async def test_end_to_end_team_turn_bills_once_and_archives_route_and_proposal(signed_post, mock_db, mock_mongo_client,
                                                                                monkeypatch):
     """The real run_chat behind the Slack route, on mongomock, with a scripted provider: Birdy asks
-    Media Buyer, which proposes a change. One debit for the whole reply (source slack, with the
+    Marketing Guru, which proposes a change. One debit for the whole reply (source slack, with the
     per-agent breakdown), the archive row carries the route and the proposal, the app lists the
     proposal as pending, and the Slack reply ends with the route line."""
     import credits
@@ -376,8 +376,8 @@ async def test_end_to_end_team_turn_bills_once_and_archives_route_and_proposal(s
         def __init__(self):
             self.scripts = {
                 "Your role: Birdy": [call("ask_media_buyer", question="Why is Aura's CPL up?", client="agency"),
-                                     say("One ad doubled its CPL. Media Buyer proposed pausing it.")],
-                "Your role: Media Buyer": [call("propose_action", title="Pause ad 'Spring promo'",
+                                     say("One ad doubled its CPL. Marketing Guru proposed pausing it.")],
+                "Your role: Marketing Guru": [call("propose_action", title="Pause ad 'Spring promo'",
                                                 detail="CPL doubled in 7 days", kind="other"),
                                            say("One ad doubled its CPL.\nSUMMARY: 1 ad checked")],
             }
@@ -426,7 +426,7 @@ async def test_end_to_end_team_turn_bills_once_and_archives_route_and_proposal(s
     mock_update.assert_awaited_once()
     blocks = mock_update.call_args.kwargs["blocks"]
     line = blocks[-1]["elements"][0]["text"]
-    assert line.startswith("Birdy asked Media Buyer · ") and line.endswith(" credits")
+    assert line.startswith("Birdy asked Marketing Guru · ") and line.endswith(" credits")
     assert any("Pause ad 'Spring promo'" in (b.get("text") or {}).get("text", "") for b in blocks)
     # the thread now points at this session, so the next message continues it
     saved = await mock_db["slack_thread_sessions"].find_one({"_id": "T1:D1:5.5"})

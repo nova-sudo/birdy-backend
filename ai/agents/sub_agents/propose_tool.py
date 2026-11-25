@@ -2,7 +2,7 @@
 ai/agents/sub_agents/propose_tool.py
 ------------------------------------
 `propose_sub_agent` as a chat tool for a main agent. NOT registered anywhere: the agent-hierarchy
-branch adds it to Media Buyer's and Sales Coach's tool lists and passes `parent` from the agent
+branch adds it to Marketing Guru's and Sales Coach's tool lists and passes `parent` from the agent
 that is running (never from the model's arguments, so one main agent can't propose for another).
 
     schema = tool_schema("media_buyer")          # the tool's JSON schema, with this parent's tools as the enum

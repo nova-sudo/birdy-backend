@@ -3,8 +3,8 @@
     python scripts/measure_agent_prompt.py            # the size tables
     python scripts/measure_agent_prompt.py --json     # the same, as JSON
 
-Runs the real `run_chat` (ai/orchestrator.py) for each agent's own chat (Birdy, Media Buyer, Sales Coach)
-and for every nested run a reply can make (Birdy asking Media Buyer and Sales Coach, each of them asking
+Runs the real `run_chat` (ai/orchestrator.py) for each agent's own chat (Birdy, Marketing Guru, Sales Coach)
+and for every nested run a reply can make (Birdy asking Marketing Guru and Sales Coach, each of them asking
 Birdy), with a scripted provider that records the first model call of each run and answers at once. So
 the system prompt, tool schemas and history measured are exactly what turn one sends. Nothing leaves
 the process: the database is in-memory (mongomock, empty: no lessons or Context cards saved), MCP tool
@@ -32,7 +32,7 @@ def tokens(chars: int) -> int:
 def _role(messages) -> tuple[str, str | None]:
     """(agent, asked_by or None) from a call's system prompt."""
     system = messages[0]["content"] if messages and messages[0].get("role") == "system" else ""
-    agent = next((k for k, m in (("birdy", "Your role: Birdy"), ("media_buyer", "Your role: Media Buyer"),
+    agent = next((k for k, m in (("birdy", "Your role: Birdy"), ("media_buyer", "Your role: Marketing Guru"),
                                  ("sales_coach", "Your role: Sales Coach")) if m in system), "other")
     asked_by = None
     if "## You were asked by another agent" in system:

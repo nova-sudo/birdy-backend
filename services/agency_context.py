@@ -12,7 +12,7 @@ notes. Most of what a card shows already has a home, and is read from there, nev
   users.default_targets                          setup's KPI defaults    -> Targets     (source "setup")
   users.integrations.*, users.onboarding.data    connected tools         -> How we work (source "derived")
   users.integrations.slack_bot.brief             the Slack brief         -> How we work (source "derived")
-  agents (type stock) settings                   Media Buyer's lines,    -> Targets, How we work, Rules
+  agents (type stock) settings                   Marketing Guru's lines,    -> Targets, How we work, Rules
                                                  batches and modes          (source "derived")
   client_groups.targets                          a client's targets      -> the client's card ("derived")
   client_notes                                   a client's notes        -> notes
@@ -392,27 +392,27 @@ async def derived_items(db, user_id: str, *, user: dict | None = None, agent: di
             cur = z.get("currency") or currency
             out[TARGETS].append(_derived(
                 "targets.mb_zones",
-                f"Media Buyer's cost per lead lines: green under {_money(z['green_under'], cur)}, "
+                f"Marketing Guru's cost per lead lines: green under {_money(z['green_under'], cur)}, "
                 f"red over {_money(z['red_over'], cur)}", when_a))
         batches = [b for b in (s.get("batches") or []) if isinstance(b, dict) and b.get("weekdays")]
         if batches:
             parts = [f"{b.get('name') or b.get('id')} on "
                      + " & ".join(_DAYS[d] for d in b["weekdays"] if isinstance(d, int) and 0 <= d <= 6)
                      for b in batches]
-            out[HOW_WE_WORK].append(_derived("work.mb_batches", "Media Buyer checks clients: " + "; ".join(parts), when_a))
+            out[HOW_WE_WORK].append(_derived("work.mb_batches", "Marketing Guru checks clients: " + "; ".join(parts), when_a))
         weekly = s.get("weekly") or {}
         if weekly.get("enabled"):
             day = weekly.get("weekday")
             on = f" on {_DAYS[day]}" if isinstance(day, int) and 0 <= day <= 6 else ""
-            out[HOW_WE_WORK].append(_derived("work.mb_weekly", f"Media Buyer writes a weekly report{on}", when_a))
+            out[HOW_WE_WORK].append(_derived("work.mb_weekly", f"Marketing Guru writes a weekly report{on}", when_a))
         modes = s.get("modes") or {}
         for kind, label in _MODE_CHANGES.items():
             m = modes.get(kind)
             if m in _MODE_WORDS:
-                out[RULES].append(_derived(f"rules.mb_mode.{kind}", f"{label}: Media Buyer {_MODE_WORDS[m]}", when_a))
+                out[RULES].append(_derived(f"rules.mb_mode.{kind}", f"{label}: Marketing Guru {_MODE_WORDS[m]}", when_a))
         if weekly.get("enabled"):
             post = "posts it on its own" if weekly.get("auto_post") else "waits for you to post it"
-            out[RULES].append(_derived("rules.mb_weekly_post", f"Weekly report: Media Buyer {post}", when_a))
+            out[RULES].append(_derived("rules.mb_weekly_post", f"Weekly report: Marketing Guru {post}", when_a))
     return out
 
 
@@ -435,7 +435,7 @@ def client_derived(group: dict, *, currency=None, agent: dict | None = None) -> 
             if z.get("red_over") is not None:
                 bits.append(f"red over {_money(z['red_over'], cur)}")
             out.append(_derived(f"client.{gid}.mb_zones",
-                                "Media Buyer's cost per lead lines for this client: " + ", ".join(bits), _when(agent)))
+                                "Marketing Guru's cost per lead lines for this client: " + ", ".join(bits), _when(agent)))
     return out
 
 

@@ -129,8 +129,8 @@ async def test_setup_and_settings_show_as_derived_lines(mock_db, seeded):
     assert any("green under 5.00 GBP, red over 8.00 GBP" in t for t in by["targets"])
     assert {"Ad platform: Meta", "CRM: GoHighLevel", "Sales tool: Hot Prospector"} <= set(by["how_we_work"])
     assert "Reports go to Slack · daily brief at 9:00 AM" in by["how_we_work"]
-    assert "Media Buyer checks clients: Batch A on Mon & Thu" in by["how_we_work"]
-    assert "Pausing an ad: Media Buyer does it on its own" in by["rules"]
+    assert "Marketing Guru checks clients: Batch A on Mon & Thu" in by["how_we_work"]
+    assert "Pausing an ad: Marketing Guru does it on its own" in by["rules"]
     for card in out["cards"]:
         for i in card["items"]:
             assert i["editable"] is False and i["source"] in ("setup", "derived")
@@ -396,7 +396,7 @@ async def test_sub_agents_get_their_parents_context(mock_db, seeded):
     await _two_clients_of_context(mock_db)
     block = await defs.context_block(mock_db, U, G1)
     sub = type("Sub", (), {"name": "Checker", "instructions": "check"})()
-    system = defs.sub_agent_instructions(sub, "Media Buyer", client_group_id=G1, client_name="Aura", context=block)
+    system = defs.sub_agent_instructions(sub, "Marketing Guru", client_group_id=G1, client_name="Aura", context=block)
     data = _context_json(system)
     assert "Aura prefers Thursday calls" in data["client"]["card"] and "Beaulea secret" not in system
 

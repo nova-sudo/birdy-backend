@@ -1,7 +1,7 @@
 """
 ai/agents/sub_agents
 --------------------
-Sub-agents under a main agent (Media Buyer, Sales Coach). See core.py for the model and lifecycle,
+Sub-agents under a main agent (Marketing Guru, Sales Coach). See core.py for the model and lifecycle,
 tools.py for the tool-list merge point, schedule.py for scheduled runs, propose_tool.py for the
 main agents' proposal tool. Every function takes `db` first and the owner's `user_id` second.
 """

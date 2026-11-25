@@ -5,12 +5,12 @@ The main agents' lessons (design section 8: "Lessons are private to each agent. 
 its sub-agents' lessons; Birdy can read the main agents'.").
 
 Both live in `agent_memory`, keyed by the agent's id, never mixed:
-  Media Buyer   the user's stock (Media Buying) agent: its lessons ARE Media Buyer's (one store).
+  Marketing Guru   the user's stock (Media Buying) agent: its lessons ARE Marketing Guru's (one store).
   Sales Coach   a small per-user record in `team_agents`, id "sales_coach:<user_id>". It is stable
                 (derived from the user), so lessons can be listed before it exists; it is written
                 lazily, on the first lesson, never by a migration.
 
-`main_agent_id(db, user_id, key)` gives the id lessons are stored under (None for a Media Buyer with
+`main_agent_id(db, user_id, key)` gives the id lessons are stored under (None for a Marketing Guru with
 no stock agent yet). Lessons reach an agent's own prompt only as delimited data
 (definitions._data_block), and only this client's and the agency-wide ones.
 """
@@ -144,7 +144,7 @@ async def _one_api(db, user_id: str, row: dict) -> dict:
 
 async def list_lessons_api(db, user_id: str, key: str, client_group_id: str | None = None) -> dict:
     """{"lessons": [...]}, newest first. With a client: that client's lessons and the agency-wide ones
-    (what the agent itself is given for that client). Media Buyer with no stock agent yet: none."""
+    (what the agent itself is given for that client). Marketing Guru with no stock agent yet: none."""
     check_agent(key)
     agent_id = await main_agent_id(db, user_id, key)
     if client_group_id:

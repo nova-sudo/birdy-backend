@@ -5,7 +5,7 @@ The top two levels of the team: Birdy (orchestrator) and the main agents.
 
 Each agent is a name, instructions (its system prompt), a tool list and a
 memory loader. Tool lists start from today's page lists in ai/orchestrator.py:
-Media Buyer from the `campaigns` page, Sales Coach from `call_center`, Birdy
+Marketing Guru from the `campaigns` page, Sales Coach from `call_center`, Birdy
 from the cross-area reads of `dashboard`.
 
 Areas never overlap (design section 4): Sales Coach has the call-center tools
@@ -40,7 +40,7 @@ KIND_ORCHESTRATOR = "orchestrator"
 KIND_MAIN = "main"
 KIND_SUB = "sub"
 
-NAMES = {BIRDY: "Birdy", MEDIA_BUYER: "Media Buyer", SALES_COACH: "Sales Coach"}
+NAMES = {BIRDY: "Birdy", MEDIA_BUYER: "Marketing Guru", SALES_COACH: "Sales Coach"}
 
 # ── Write tools (never offered in a delegated run) ────────────────────────────
 WRITE_TOOLS = frozenset({
@@ -78,7 +78,7 @@ MEDIA_BUYER_READ = (
     "list_lessons",
 )
 MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remove_lesson")
-# One stock agent card's tools: offered to Media Buyer's own chat only for the turn that applies an
+# One stock agent card's tools: offered to Marketing Guru's own chat only for the turn that applies an
 # approved proposal naming that card (routers/chat.apply_proposal pins the card, after an owner check).
 # apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
 MEDIA_BUYER_CARD_TOOLS = ("get_card", "apply_card_lines")
@@ -96,7 +96,7 @@ SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "r
 BIRDY_READ = (
     *_COMMON,
     # The overview and what no other agent owns (leads and the pipeline). Calls are Sales Coach's and
-    # ads are Media Buyer's: Birdy has no tool for either, so those questions are always asked.
+    # ads are Marketing Guru's: Birdy has no tool for either, so those questions are always asked.
     "get_account_summary", "get_alerts",
     "get_unified_lead_stats", "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",
     # what Birdy's own settings tools need to read first
@@ -104,7 +104,7 @@ BIRDY_READ = (
     "list_slack_reports", "get_client", "get_client_notes",
 )
 # Agency-level settings, in Birdy's own (top-level) chat only, each with its tool's own confirm flow:
-# alerts, custom metrics, Slack reports, client notes, client targets. Ads changes stay Media Buyer's
+# alerts, custom metrics, Slack reports, client notes, client targets. Ads changes stay Marketing Guru's
 # and call-centre work Sales Coach's; Birdy reaches them by asking, and they propose.
 BIRDY_WRITE = (
     "create_alert", "update_alert",
@@ -171,15 +171,16 @@ def write_tools(agent: str) -> tuple:
 _TEAM = """
 ## Your team
 You are one of three agents in this agency's Birdy workspace. Asking goes both ways through Birdy:
-Birdy asks Media Buyer and Sales Coach, and each of them asks Birdy. Media Buyer and Sales Coach do
+Birdy asks Marketing Guru and Sales Coach, and each of them asks Birdy. Marketing Guru and Sales Coach do
 not ask each other directly; Birdy passes it on in the same reply.
 - Birdy is Agency Ops: one agent with two names. It sees every area, passes work between the others,
   and keeps the agency's own settings (alerts, custom metrics, Slack reports, client notes, client targets).
-- Media Buyer owns the ads: Meta campaigns, ad sets, ads, spend, CPL, creative tests.
+- Marketing Guru owns the ads: Meta campaigns, ad sets, ads, spend, CPL, creative tests.
+  It used to be called Media Buyer: when the owner says "Media Buyer" or "the media buyer", they mean Marketing Guru.
 - Sales Coach owns the call centre: Hot Prospector call stats and call recordings, and reads the
   pipeline (won, lost and open opportunities) to see what the calls turned into.
 
-Media Buyer and Sales Coach can each have sub-agents: small helpers for one recurring job in their
+Marketing Guru and Sales Coach can each have sub-agents: small helpers for one recurring job in their
 area (watch a number, check something every morning). A sub-agent is proposed with
 `propose_sub_agent` and does nothing until the owner approves its card.
 
@@ -196,7 +197,7 @@ owner one answer built on the replies.
   to Sales Coach: always `ask_sales_coach`. You have no call tools of your own. Sales Coach reads
   the pipeline itself, so "did those calls turn into deals" is one ask, not an ask plus your own read.
 - Anything about ads, campaigns, ad sets, creatives, spend, cost per lead or results over time
-  belongs to Media Buyer: always `ask_media_buyer`. You have no ad tools of your own.
+  belongs to Marketing Guru: always `ask_media_buyer`. You have no ad tools of your own.
 - When the owner wants an agent, a watcher or a sub-agent for something ("make an agent that
   watches that"), it is a sub-agent under the agent that owns the area: ask that agent to propose
   it, passing on what it should watch and for which clients. Its card appears under your reply for
@@ -214,17 +215,17 @@ owner one answer built on the replies.
   notes and client targets. Follow each tool's own flow: say what you will change and get the
   owner's yes first; when a tool returns a preview and a confirm code, show the preview and call it
   again with the code only after the owner says yes.
-- You never change ads or call-centre work yourself. Ask Media Buyer or Sales Coach; they propose,
+- You never change ads or call-centre work yourself. Ask Marketing Guru or Sales Coach; they propose,
   and the owner approves on the card below your answer.
 - Say which agent found what ("Sales Coach checked 212 calls: ...").
-- When Media Buyer or Sales Coach asks you (you were not asked by the owner directly), you read and
+- When Marketing Guru or Sales Coach asks you (you were not asked by the owner directly), you read and
   you ask the other agent as usual. If what they need is a change to the agency's settings, call
   `propose_action` with the tool that makes it and its arguments, and say in your answer that it is
   waiting for the owner's approval. Nothing changes until the owner approves the card.
 """
 
 _MEDIA_BUYER_ROLE = """
-## Your role: Media Buyer
+## Your role: Marketing Guru
 You own the ads: campaigns, ad sets, ads, spend, leads, CPL and creative tests. Stay in that area.
 For anything outside it (calls, the sales team, agency-wide questions) use `ask_birdy`: Birdy finds
 the answer from the right agent and you get it back in this chat.
@@ -313,7 +314,7 @@ async def _sales_coach_lessons(db, user_id: str, gid: str | None) -> list[str]:
 
 
 async def stock_agent_id(db, user_id: str) -> str | None:
-    """The user's Media Buying (stock) agent id: Media Buyer's lessons live there."""
+    """The user's Media Buying (stock) agent id: Marketing Guru's lessons live there."""
     try:
         from ai.agents.store import AGENTS, TYPE_STOCK
         agent = await db[AGENTS].find_one({"user_id": user_id, "type": TYPE_STOCK}, {"_id": 1})
@@ -362,7 +363,7 @@ async def instruction_parts(agent: str, db, user_id: str, *, client_group_id: st
         parts.append(("media buying module", "\n" + get_media_buying_module()))
         if not nested and source != "slack":
             parts.append(("creative tests guide", CREATIVE_TESTS_GUIDE))
-        parts.append(("lessons", _data_block("Your lessons (Media Buyer's memory)", "lessons",
+        parts.append(("lessons", _data_block("Your lessons (Marketing Guru's memory)", "lessons",
                                              await _media_buyer_lessons(db, user_id, client_group_id))))
     if agent == SALES_COACH:
         parts.append(("lessons", _data_block("Your lessons (Sales Coach's memory)", "lessons",

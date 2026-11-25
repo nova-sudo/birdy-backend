@@ -246,7 +246,7 @@ _WHEN = (
 )
 
 ASK_MEDIA_BUYER = (
-    "Ask Media Buyer, Birdy's ads agent, and get its considered answer: Meta campaigns, ad sets, ads, spend, "
+    "Ask Marketing Guru, Birdy's ads agent, and get its considered answer: Meta campaigns, ad sets, ads, spend, "
     "cost per lead, creatives and creative tests. It pulls the figures itself and can ask Birdy about leads "
     "and calls.\n\n" + _WHEN
 )

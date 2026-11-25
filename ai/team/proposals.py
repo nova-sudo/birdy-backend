@@ -14,7 +14,7 @@ status is read from the sub-agent record: approved once it exists past "proposed
 gone, expired once it lapsed.
 
 Undo, per kind of applied change:
-- Stock card lines Media Buyer applied on approval: recorded as `applied: {type: "card_lines", card_id,
+- Stock card lines Marketing Guru applied on approval: recorded as `applied: {type: "card_lines", card_id,
   line_ids}`; undo runs each line through the card's own undo (ai/agents/stock/apply.undo_line: its
   window, lease and checks).
 - Everything else the owning agent changes while applying (the approval turn and later turns in that
@@ -54,7 +54,7 @@ TEST_POSTED, TEST_SCALED, ADS_PAUSED, CALLS_ANALYZED = ("creative_test_posted", 
 NO_REVERSE = {
     TEST_POSTED: "The test was posted to Meta; take it down from the test's page instead.",
     TEST_SCALED: "Ads were added on Meta and may have spent; pause them from the test's page instead.",
-    ADS_PAUSED: "Ads were paused on Meta; turning them back on spends money, so ask Media Buyer to do it.",
+    ADS_PAUSED: "Ads were paused on Meta; turning them back on spends money, so ask Marketing Guru to do it.",
     CALLS_ANALYZED: "The calls were already transcribed and the credits spent.",
 }
 
@@ -145,10 +145,10 @@ async def set_fields(db, user_id: str, proposal_id: str, fields: dict) -> None:
             return
 
 
-# ── the card a Media Buyer proposal names ─────────────────────────────────────
+# ── the card a Marketing Guru proposal names ─────────────────────────────────────
 
 def card_ref(proposal: dict) -> tuple[str | None, list[str] | None]:
-    """(card_id, line_ids) a Media Buyer proposal names, from its payload."""
+    """(card_id, line_ids) a Marketing Guru proposal names, from its payload."""
     payload = proposal.get("payload") if isinstance(proposal.get("payload"), dict) else {}
     card_id = payload.get("card_id")
     lines = payload.get("line_ids")

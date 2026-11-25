@@ -42,7 +42,7 @@ async def load_lessons_agent(db, user_id: str, agent_id: str | None) -> dict | N
 
 
 async def _agent(db, user_id) -> dict | None:
-    """The agent these tools work on: the user's stock agent (Teach Birdy, and Media Buyer's own chat),
+    """The agent these tools work on: the user's stock agent (Teach Birdy, and Marketing Guru's own chat),
     or the user's Sales Coach (ai/team/memory.py) in Sales Coach's own chat."""
     from ai.team import memory as team_memory
     agent_id = current_lessons_agent.get()
