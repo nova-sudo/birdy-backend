@@ -59,7 +59,7 @@ async def test_run_one_is_a_nested_run_with_its_own_memory_and_charge(mock_db, m
     system = p.calls[0][2][0]["content"]
     assert "Ignore ads under $20 spend" in system and "Look at frequency over 7 days." in system
     assert 'Aura" (group ID: grp-aura)' in system
-    # its own tools (cut to Media Buyer's reads) and propose_action; never a write
+    # its own tools (cut to Marketing Guru's reads) and propose_action; never a write
     assert set(p.offered("sub:Fatigue")) == {"get_ad_insights", "get_campaign_insights", "propose_action"}
     [prop] = out["proposals"]
     assert prop["status"] == "pending" and prop["origin"] == "sub_agent_run" and prop["sub_agent_id"] == s["id"]

@@ -110,7 +110,7 @@ def test_a_card_proposal_is_applied_through_the_card_and_undone(api, monkeypatch
     first = client.post("/api/chat", json={"message": "aura?", "agent": "birdy"}).json()
     prop = first["proposals"][0]
     assert prop["kind"] == "apply_card_lines" and prop["agent"] == "media_buyer"
-    # the delegated Media Buyer could not apply anything: no card tools, no writes
+    # the delegated Marketing Guru could not apply anything: no card tools, no writes
     assert not {"apply_card_lines", "get_card"} & set(p.offered("media_buyer"))
 
     p.scripts["media_buyer"] = [call("get_card"), call("apply_card_lines", line_ids=["l1"]), say("Paused Spring.")]

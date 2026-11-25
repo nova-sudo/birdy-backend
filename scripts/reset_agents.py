@@ -3,7 +3,7 @@ scripts/reset_agents.py
 -----------------------
 Wipe an account's agents so it starts agent onboarding from nothing.
 
-Agent onboarding locks Media Buyer and Sales Coach until the owner has done
+Agent onboarding locks Marketing Guru and Sales Coach until the owner has done
 each one's interview. This script removes what an account built before that
 existed, so the interview is the only source of an agent's setup:
 

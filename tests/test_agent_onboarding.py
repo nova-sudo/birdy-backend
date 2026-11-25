@@ -506,7 +506,7 @@ async def test_mcp_ask_refuses_a_locked_agent(mock_db, set_current_user):
     set_current_user(U)
     with pytest.raises(ToolError) as e:
         await team_mcp.ask_media_buyer.fn(question="How is Aura doing?")
-    assert "Media Buyer isn't set up yet" in str(e.value) and "Nothing was asked" in str(e.value)
+    assert "Marketing Guru isn't set up yet" in str(e.value) and "Nothing was asked" in str(e.value)
     assert await mock_db["ai_conversation_log"].count_documents({}) == 0
 
 
@@ -538,7 +538,7 @@ def _setup_registry(base):
 async def test_setup_chat_adds_the_current_step_block_when_the_model_forgets(mock_db, registry):
     await _account(mock_db)
     reg = _setup_registry(registry)
-    p = TeamProvider({"default": [say("Hi, I'm Media Buyer. Which clients should I run?")]})
+    p = TeamProvider({"default": [say("Hi, I'm Marketing Guru. Which clients should I run?")]})
     out = await run_chat(provider=p, tool_registry=reg, db=mock_db, user_id=U, message="hi",
                          agent="media_buyer", page="team_setup")
     blocks = [c for c in out["agent_changes"] if c.get("ui_block")]
@@ -552,7 +552,7 @@ async def test_setup_chat_adds_the_current_step_block_when_the_model_forgets(moc
     assert (await s.state(mock_db, U))["agents"]["media_buyer"]["chat_session_id"] == out["session_id"]
     assert (await s.state(mock_db, U))["agents"]["sales_coach"]["chat_session_id"] is None
     system = p.calls[0][2][0]["content"]
-    assert system.startswith("You are Media Buyer") and "<birdy_knows>" in system and "ONE step at a time" in system
+    assert system.startswith("You are Marketing Guru") and "<birdy_knows>" in system and "ONE step at a time" in system
     assert '"current": "clients"' in system
 
 

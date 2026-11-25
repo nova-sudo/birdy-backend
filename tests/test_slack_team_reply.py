@@ -20,10 +20,10 @@ def test_route_line_delegated_and_rounding():
 
 
 def test_route_line_two_agents_failed_skipped_and_small_credits():
-    r = _route({"agent": "media_buyer", "name": "Media Buyer", "status": "done"},
+    r = _route({"agent": "media_buyer", "name": "Marketing Guru", "status": "done"},
                {"agent": "sales_coach", "name": "Sales Coach", "status": "failed"},
                {"agent": "sub:x", "name": "Scout", "status": "skipped"}, seconds=95, credits=0.44)
-    assert str_.route_line(r) == "Birdy asked Media Buyer, Sales Coach (no answer) · 1m 35s · 0.4 credits"
+    assert str_.route_line(r) == "Birdy asked Marketing Guru, Sales Coach (no answer) · 1m 35s · 0.4 credits"
 
 
 def test_route_line_omits_zero_credits_and_handles_missing_route():
@@ -39,10 +39,10 @@ def test_proposal_blocks_link_each_owner_and_cap_the_list():
     assert blocks[0] == {"type": "divider"}
     sections = [b for b in blocks if b["type"] == "section"]
     assert len(sections) == str_.MAX_PROPOSALS_SHOWN
-    assert sections[0]["text"]["text"] == "*Proposal for Media Buyer: Change 0*\n*why* it helps"
+    assert sections[0]["text"]["text"] == "*Proposal for Marketing Guru: Change 0*\n*why* it helps"
     note = blocks[-1]["elements"][0]["text"]
     assert "These wait for your approval in Birdy (3 more there)" in note
-    assert "/media-buyer/suggestions|Open Media Buyer's suggestions>" in note
+    assert "/media-buyer/suggestions|Open Marketing Guru's suggestions>" in note
     assert "/sales-coach/suggestions|Open Sales Coach's suggestions>" in note
 
 

@@ -3,7 +3,7 @@ ai/team/lesson_tools.py
 -----------------------
 Read-only lesson tools that follow the hierarchy (design section 8):
 
-  list_agent_lessons      Birdy reads a main agent's lessons (Media Buyer's, Sales Coach's)
+  list_agent_lessons      Birdy reads a main agent's lessons (Marketing Guru's, Sales Coach's)
   list_sub_agent_lessons  a main agent reads its own sub-agents' lessons
 
 Nothing here writes. In a one-client run only that client's lessons and the agency-wide ones come
@@ -22,7 +22,7 @@ MAX_RETURNED = 100
 
 _AGENT_SCHEMA = {"type": "function", "function": {
     "name": LIST_AGENT_LESSONS,
-    "description": ("Read one main agent's lessons: what the owner taught Media Buyer or Sales Coach. Read only; "
+    "description": ("Read one main agent's lessons: what the owner taught Marketing Guru or Sales Coach. Read only; "
                     "use it to know how the owner wants that area judged before you answer or ask."),
     "parameters": {"type": "object", "properties": {
         "agent": {"type": "string", "enum": list(defs.MAIN_AGENTS)}}, "required": ["agent"]},

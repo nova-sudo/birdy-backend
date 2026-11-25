@@ -137,7 +137,7 @@ async def _checks(db, current_user: str, request: ChatRequest, mongo_client) -> 
         await check_credits(current_user, mongo_client)
     provider = await get_provider_for_user(current_user, db)
     if lessons_agent_id is None and request.agent in team_defs.MAIN_AGENTS:
-        # A main agent's own chat works on its own lessons: Media Buyer's are the stock agent's
+        # A main agent's own chat works on its own lessons: Marketing Guru's are the stock agent's
         # memory, Sales Coach's are under its per-user record (ai/team/memory.py).
         from ai.team import memory as team_memory
         lessons_agent_id = await team_memory.main_agent_id(db, current_user, request.agent)
@@ -353,7 +353,7 @@ async def _claim_proposal(db, user_id: str, proposal_id: str, status: str) -> di
 
 
 async def _proposal_card(db, user_id: str, proposal: dict) -> dict | None:
-    """The stock agent card a Media Buyer proposal names, after an owner check; None when it names none.
+    """The stock agent card a Marketing Guru proposal names, after an owner check; None when it names none.
     409 card_not_found when it names a card the owner no longer has."""
     card_id, _ = team_proposals.card_ref(proposal)
     if not card_id or proposal.get("agent") != team_defs.MEDIA_BUYER:
@@ -380,7 +380,7 @@ async def list_proposals(status: str = PROPOSAL_PENDING, agent: str | None = Non
 @router.post("/api/chat/proposals/{proposal_id}/apply", response_model=ChatResponse)
 async def apply_proposal(proposal_id: str, current_user: str = Depends(get_current_user)):
     """Approve a pending proposal: its owning agent makes the change in a new turn of its own chat.
-    A Media Buyer proposal that names a stock agent card is applied through that card's own guarded
+    A Marketing Guru proposal that names a stock agent card is applied through that card's own guarded
     path (stock_card_tools.apply_card_lines -> stock.apply.apply_card: claims, modes, guardrails)."""
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)

@@ -22,7 +22,7 @@ CAN_DO = [
     "Watch alerts and explain why one fired",
     "Draft and send client reports to Slack",
     "Run the Media Buying Agent and review its suggestions",
-    "Ask Media Buyer (ads) or Sales Coach (calls) what to do, using your agency's lessons and context. "
+    "Ask Marketing Guru (ads) or Sales Coach (calls) what to do, using your agency's lessons and context. "
     "Each ask costs credits like a chat reply in Birdy",
 ]
 CAN_CHANGE = "Make ad changes and message leads. You confirm each live change after a preview."

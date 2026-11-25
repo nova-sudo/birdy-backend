@@ -57,9 +57,9 @@ _RECALL_SCHEMA = {
     "function": {
         "name": RECALL,
         "description": (
-            "Read the owner's recent chats with the agents in this workspace (Birdy, Media Buyer, Sales "
+            "Read the owner's recent chats with the agents in this workspace (Birdy, Marketing Guru, Sales "
             "Coach), newest first. Use it whenever the owner refers to something said in another chat "
-            "('I just told Birdy', 'as I discussed with Media Buyer', 'find that conversation') instead "
+            "('I just told Birdy', 'as I discussed with Marketing Guru', 'find that conversation') instead "
             "of asking them to repeat it."),
         "parameters": {
             "type": "object",
@@ -96,7 +96,7 @@ def _ask_schema(name: str, who: str, what: str, extra_props: dict | None = None,
 
 
 _SCHEMAS = {
-    ASK_MEDIA_BUYER: _ask_schema(ASK_MEDIA_BUYER, "Media Buyer",
+    ASK_MEDIA_BUYER: _ask_schema(ASK_MEDIA_BUYER, "Marketing Guru",
                                  "It owns the ads: campaigns, ad sets, ads, spend, CPL, creative tests."),
     ASK_SALES_COACH: _ask_schema(ASK_SALES_COACH, "Sales Coach",
                                  "It owns the call centre: call stats, call recordings, what happens on calls."),
@@ -345,7 +345,7 @@ async def _use_helper(args: dict, frame: rt.Frame, ctx: dict) -> str:
     """A one-off helper: a nested read-only run with tools the main agent picked from its own
     reads (validated exactly as a saved sub-agent's), in the main agent's client scope. Never saved."""
     if frame.agent not in defs.MAIN_AGENTS:
-        return _result(False, error="Only Media Buyer and Sales Coach can start a helper.")
+        return _result(False, error="Only Marketing Guru and Sales Coach can start a helper.")
     from ai.agents.sub_agents import core
     args = args or {}
     try:

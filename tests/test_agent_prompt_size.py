@@ -175,8 +175,8 @@ async def test_the_measure_script_runs_offline():
     spec.loader.exec_module(mod)
     rows = await mod.measure()
     runs = {r["run"] for r in rows}
-    assert {"Birdy (own chat)", "Media Buyer (own chat)", "Sales Coach (own chat)",
-            "Media Buyer (asked by Birdy)", "Sales Coach (asked by Birdy)", "Birdy (asked by Media Buyer)"} <= runs
+    assert {"Birdy (own chat)", "Marketing Guru (own chat)", "Sales Coach (own chat)",
+            "Marketing Guru (asked by Birdy)", "Sales Coach (asked by Birdy)", "Birdy (asked by Marketing Guru)"} <= runs
     for r in rows:
         names = [t["tool"] for t in r["tools"]]
         assert len(names) == len(set(names)), r["run"]

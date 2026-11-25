@@ -1,7 +1,7 @@
 """
 ai/agents/sub_agents/core.py
 ----------------------------
-Sub-agents: the third level under a main agent (Media Buyer, Sales Coach). Design:
+Sub-agents: the third level under a main agent (Marketing Guru, Sales Coach). Design:
 briefs/2026-11-20-agent-hierarchy-design.md, sections 5, 6 and 8.
 
 Two kinds are listed as sub-agents:
@@ -10,7 +10,7 @@ Two kinds are listed as sub-agents:
               schedule and private lessons. Proposed by its main agent; nothing runs until the
               owner approves it.
   custom      today's four-rule ad agents, stored in `agents` (type "custom"). They count as
-              Media Buyer's sub-agents, read through here with parent "media_buyer". They are not
+              Marketing Guru's sub-agents, read through here with parent "media_buyer". They are not
               migrated or written by this module: their own setup, activate and turn-off routes
               still own them, and every write here refuses them (409 managed_elsewhere).
 
@@ -230,7 +230,7 @@ async def _check_name_free(db, user_id: str, parent: str, name: str, *, exclude_
         await db[agent_store.MEMORY].delete_many({"agent_id": clash["_id"]})
         clash = None
     if clash is None and parent == sub_tools.MEDIA_BUYER:
-        # Today's custom agents are Media Buyer's sub-agents too.
+        # Today's custom agents are Marketing Guru's sub-agents too.
         async for a in db[agent_store.AGENTS].find(
                 {"user_id": user_id, "type": agent_store.TYPE_CUSTOM}, {"name": 1}):
             if name_key(a.get("name") or "") == key:
@@ -260,7 +260,7 @@ def _custom_status(agent: dict) -> str:
 
 
 def _from_custom(agent: dict) -> dict:
-    """A four-rule custom agent shown as one of Media Buyer's sub-agents (backfilled on read)."""
+    """A four-rule custom agent shown as one of Marketing Guru's sub-agents (backfilled on read)."""
     scope = agent.get("scope") or {}
     sched = scope.get("schedule") or {}
     return {

@@ -16,7 +16,7 @@ missing completed_at, so nothing is migrated.
 State lives on the agent's `team_agents` row (ai/team/memory.py), `{_id: "<key>:<uid>", user_id, key,
 created_at, setup: {steps: {<step>: true}, answers: {<step>: body}, completed_at}}`; Sales Coach's
 answers are also its `settings`. Each step's answer is written where that setting really lives:
-Media Buyer's into the stock (Media Buying) agent (scope, settings, permissions) and the client
+Marketing Guru's into the stock (Media Buying) agent (scope, settings, permissions) and the client
 groups' CPL targets; Sales Coach's into its own `settings`.
 
 A refusal raises SetupError(status, detail). 423 is the lock: {"code": "agent_locked", agent, waits_on}.
@@ -58,7 +58,7 @@ LABEL_MAX = 120
 _HHMM = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
 
 # The plain-words refusal for tool, MCP and scheduled paths (the HTTP one is the 423 body).
-SUB_LOCKED_TEXT = "Sub-agents aren't available yet: finish setting up Media Buyer and Sales Coach in Birdy first."
+SUB_LOCKED_TEXT = "Sub-agents aren't available yet: finish setting up Marketing Guru and Sales Coach in Birdy first."
 
 
 class SetupError(Exception):
@@ -266,7 +266,7 @@ def _bool_body(body: dict, key: str = "confirmed") -> None:
         raise SetupError(400, f"{key} must be true")
 
 
-# ── Media Buyer ──────────────────────────────────────────────────────────────
+# ── Marketing Guru ──────────────────────────────────────────────────────────────
 
 def _main_currency(groups: list[dict]) -> str | None:
     counts = Counter(g.get("ad_account_currency") for g in groups if g.get("ad_account_currency"))
@@ -492,7 +492,7 @@ PLAYBOOK_KEYS = ("modes", "creative", "scoring")
 
 
 async def edit_playbook(db, user_id: str, changes: dict) -> None:
-    """Change Media Buyer's playbook rules during its interview: `changes` is a partial patch of the
+    """Change Marketing Guru's playbook rules during its interview: `changes` is a partial patch of the
     stock agent's `modes`, `creative` and `scoring` settings, checked by the settings' own validation.
     It ticks nothing: the owner still confirms the playbook. Allowed once the playbook step is reached."""
     if not isinstance(changes, dict) or not changes or set(changes) - set(PLAYBOOK_KEYS):

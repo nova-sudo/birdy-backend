@@ -121,7 +121,7 @@ async def test_unknown_client_and_no_account(mock_db, data):
 
 
 async def test_the_orchestrator_runs_the_pinned_version(mock_db, data, registry):
-    """In a one-client Media Buyer run, list_ad_accounts never reaches the general tool."""
+    """In a one-client Marketing Guru run, list_ad_accounts never reaches the general tool."""
     registry.register(name="list_ad_accounts", description="stub", parameters={"type": "object", "properties": {}},
                       executor=lambda **kw: pytest.fail("the unpinned tool ran"))
     p = TeamProvider({"media_buyer": [call("list_ad_accounts"), say("One account.")]})
@@ -202,7 +202,7 @@ async def test_birdy_keeps_agency_writes_in_its_own_chat_only(mock_db, registry,
                       "create_saved_view", "propose_report"}
     p.calls.clear()
     await chat(p, registry, mock_db, agent="media_buyer")
-    asked = set(p.offered("birdy"))          # Birdy asked by Media Buyer: read only
+    asked = set(p.offered("birdy"))          # Birdy asked by Marketing Guru: read only
     assert not asked & set(defs.BIRDY_WRITE) and "get_client" in asked
 
 

@@ -12,7 +12,7 @@ owner-scoped (another user's lesson is a 404), refusals as {detail, code} JSON w
   agent   "media_buyer" | "sales_coach" (anything else: 400 bad_agent)
   lesson  {id, text, client_group_id, client_name, source, created_at, updated_at}
 
-Media Buyer's lessons are the stock (Media Buying) agent's own: the same rows Teach Birdy, the card
+Marketing Guru's lessons are the stock (Media Buying) agent's own: the same rows Teach Birdy, the card
 chat and the card writer use. Sales Coach's are under its per-user id.
 """
 

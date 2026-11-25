@@ -43,7 +43,7 @@ def role_of(messages) -> str:
         return "sub:" + system.split("You are ", 1)[1].split(",", 1)[0]
     if ", a one-off helper " in system:
         return "helper:" + system.split("You are ", 1)[1].split(",", 1)[0]
-    for key, marker in (("birdy", "Your role: Birdy"), ("media_buyer", "Your role: Media Buyer"),
+    for key, marker in (("birdy", "Your role: Birdy"), ("media_buyer", "Your role: Marketing Guru"),
                         ("sales_coach", "Your role: Sales Coach")):
         if marker in system:
             return key
@@ -273,7 +273,7 @@ async def test_media_buyer_asks_up_through_birdy(mock_db, registry):
     assert [(s["agent"], s["asked_by"]) for s in steps] == [
         ("media_buyer", None), ("birdy", "media_buyer"), ("sales_coach", "birdy")]
     assert [s["kind"] for s in steps] == ["main", "orchestrator", "main"]
-    # Birdy, asked by Media Buyer, is never offered an ask back to Media Buyer
+    # Birdy, asked by Marketing Guru, is never offered an ask back to Marketing Guru
     assert "ask_media_buyer" not in p.offered("birdy") and "ask_sales_coach" in p.offered("birdy")
     # Sales Coach at the end of the chain can't ask Birdy again
     assert "ask_birdy" not in p.offered("sales_coach")
@@ -936,7 +936,7 @@ async def test_helper_runs_with_only_its_chosen_tools(mock_db, registry):
     assert step["tools"] == [{"name": "get_campaign_insights", "label": "Campaign figures", "detail": "last_7d"}]
     assert root["tools"][0] == {"name": "use_helper", "label": "Started a helper", "detail": "Ad check"}
     assert route["limit_hit"] is None
-    # the answer reached Media Buyer, and nothing was saved as a sub-agent
+    # the answer reached Marketing Guru, and nothing was saved as a sub-agent
     assert tool_results(p, "media_buyer")[0]["answer"] == "Campaign B doubled its CPL."
     assert await mock_db["sub_agents"].count_documents({}) == 0
     # its system prompt is the short helper one, not a full agent prompt
@@ -947,8 +947,8 @@ async def test_helper_runs_with_only_its_chosen_tools(mock_db, registry):
 @pytest.mark.parametrize("tools, said", [
     (["post_creative_test"], "can't make the change"),          # a write tool of its own main agent
     (["create_alert"], "can't make the change"),                  # another agent's write
-    (["get_call_center_stats"], "Outside Media Buyer's area"),    # another agent's read
-    (["list_lessons"], "Outside Media Buyer's area"),             # its main agent's private memory
+    (["get_call_center_stats"], "Outside Marketing Guru's area"),    # another agent's read
+    (["list_lessons"], "Outside Marketing Guru's area"),             # its main agent's private memory
     (["not_a_tool"], "Unknown tool"),
     ([], "at least one tool"),
 ])
@@ -968,7 +968,7 @@ async def test_only_main_agents_get_helpers(mock_db, registry):
     birdy = rt.new_turn("birdy")
     res = json.loads(await delegation.handle("use_helper", {"name": "x", "job": "j", "tools": ["get_alerts"]},
                                              birdy, {"db": mock_db, "user_id": U}))
-    assert res["ok"] is False and "Only Media Buyer and Sales Coach" in res["error"]
+    assert res["ok"] is False and "Only Marketing Guru and Sales Coach" in res["error"]
 
 
 async def test_two_helpers_per_reply(mock_db, registry):
@@ -981,7 +981,7 @@ async def test_two_helpers_per_reply(mock_db, registry):
     route = out["route"]
     assert_route_shape(route)
     assert [(s["name"], s["kind"], s["status"]) for s in route["steps"]] == [
-        ("Media Buyer", "main", "done"), ("Check A", "helper", "done"), ("Check B", "helper", "done"),
+        ("Marketing Guru", "main", "done"), ("Check A", "helper", "done"), ("Check B", "helper", "done"),
         ("Check C", "helper", "skipped")]
     assert route["steps"][3]["summary"] == "Not started: limit of 2 helpers"
     assert not [c for c in p.calls if c[0] == "helper:Check C"]
@@ -1002,7 +1002,7 @@ async def test_helper_cap_is_across_the_whole_reply(mock_db, registry):
     out = await chat(p, registry, mock_db, agent="birdy")
     steps = out["route"]["steps"]
     assert [(s["name"], s["asked_by"], s["status"]) for s in steps] == [
-        ("Birdy", None, "done"), ("Media Buyer", "birdy", "done"), ("Ads 1", "media_buyer", "done"),
+        ("Birdy", None, "done"), ("Marketing Guru", "birdy", "done"), ("Ads 1", "media_buyer", "done"),
         ("Ads 2", "media_buyer", "done"), ("Sales Coach", "birdy", "done"), ("Calls 1", "sales_coach", "skipped")]
     assert tool_results(p, "sales_coach")[0]["limit_hit"] == "helpers"
 
@@ -1077,7 +1077,7 @@ async def test_helper_uses_the_ask_timeout(mock_db, registry, monkeypatch):
 
 
 def test_a_main_agent_is_told_each_sub_agents_job_and_to_use_it():
-    """With names only, Media Buyer never asked a sub-agent whose job matched the request."""
+    """With names only, Marketing Guru never asked a sub-agent whose job matched the request."""
     from ai.team import delegation
     from ai.team.sub_agents import coerce
     subs = [coerce({"id": "s1", "name": "Visualize agent", "purpose": "Turn  ad figures\ninto charts", "instructions": "x"},

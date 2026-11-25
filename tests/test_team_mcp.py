@@ -81,7 +81,7 @@ async def test_media_buyer_answer_then_trail(mock_db, owner, use, registry):
     assert answer == "**Aura** is fine: CPL held at £12."
     lines = trail.split("\n")
     assert lines[0] == "Route:"
-    assert lines[1].startswith("1. Media Buyer, asked by you · used Campaign figures (last_7d) · ")
+    assert lines[1].startswith("1. Marketing Guru, asked by you · used Campaign figures (last_7d) · ")
     assert lines[1].endswith(" credits") and " s · " in lines[1]
     assert lines[2].startswith("Total: ") and lines[2].endswith(" credits")
     sid = convo.split()[2]
@@ -101,14 +101,14 @@ async def test_trail_names_who_asked_whom(mock_db, owner, use):
     }))
     text = await t.ask_media_buyer.fn(question="Why are leads not closing?")
     trail = text.split("\n\n")[1].split("\n")
-    assert trail[1].startswith("1. Media Buyer, asked by you · used Asked Birdy (Are the calls converting for Aura?)")
-    assert trail[2].startswith('2. Birdy, asked by Media Buyer ("Are the calls converting for Aura?") · used Asked Sales Coach')
+    assert trail[1].startswith("1. Marketing Guru, asked by you · used Asked Birdy (Are the calls converting for Aura?)")
+    assert trail[2].startswith('2. Birdy, asked by Marketing Guru ("Are the calls converting for Aura?") · used Asked Sales Coach')
     assert trail[3].startswith('3. Sales Coach, asked by Birdy ("Aura call conversion last 7 days?") · used Call stats · ')
 
 
 def test_format_result_exact_text():
     route = {"status": "done", "seconds": 21.4, "credits": 1.234, "limit_hit": None, "steps": [
-        {"agent": "media_buyer", "name": "Media Buyer", "asked_by": None, "question": None, "status": "done",
+        {"agent": "media_buyer", "name": "Marketing Guru", "asked_by": None, "question": None, "status": "done",
          "tools": [{"name": "get_campaign_insights", "label": "Campaign figures", "detail": "last_7d"}],
          "seconds": 21.4, "credits": 0.9},
         {"agent": "birdy", "name": "Birdy", "asked_by": "media_buyer", "question": "Calls for Aura?",
@@ -123,12 +123,12 @@ def test_format_result_exact_text():
     assert text == (
         "Pause ad 12.\n\n"
         "Route:\n"
-        "1. Media Buyer, asked by you · used Campaign figures (last_7d) · 21.4 s · 0.9 credits\n"
-        '2. Birdy, asked by Media Buyer ("Calls for Aura?") · used no tools · 4 s · 0.334 credits\n'
+        "1. Marketing Guru, asked by you · used Campaign figures (last_7d) · 21.4 s · 0.9 credits\n"
+        '2. Birdy, asked by Marketing Guru ("Calls for Aura?") · used no tools · 4 s · 0.334 credits\n'
         "Total: 21.4 s · 1.234 credits\n\n"
         "Proposals waiting for the owner's approval in Birdy. Nothing has changed: only the owner can approve "
         f"or decline them, at {url}\n"
-        "1. Pause the tired ad: Ad 12: active → paused (Media Buyer would make it once approved)\n"
+        "1. Pause the tired ad: Ad 12: active → paused (Marketing Guru would make it once approved)\n"
         "2. Analyze 10 calls: kind analyze call recordings, no details given (Sales Coach would make it once approved)\n\n"
         "Conversation id: s1 (pass it as conversation_id to ask_media_buyer to continue this conversation)"
     )
@@ -299,7 +299,7 @@ async def test_continue_refuses_another_agents_or_unknown_conversation(mock_db, 
     use(TeamProvider({"sales_coach": [say("212 calls.")]}))
     text = await t.ask_sales_coach.fn(question="Calls?")
     sid = text.rsplit("Conversation id: ", 1)[1].split()[0]
-    with pytest.raises(ToolError, match="not a chat with Media Buyer. It is with Sales Coach: use ask_sales_coach"):
+    with pytest.raises(ToolError, match="not a chat with Marketing Guru. It is with Sales Coach: use ask_sales_coach"):
         await t.ask_media_buyer.fn(question="q", conversation_id=sid)
     with pytest.raises(ToolError, match="No conversation nope was found"):
         await t.ask_media_buyer.fn(question="q", conversation_id="nope")
@@ -367,7 +367,7 @@ async def test_descriptions_say_when_to_ask_and_what_it_costs():
         assert "judgement" in d and "plain numbers" in d and "costs credits like a chat reply" in d
         assert "cannot approve or decline" in d and "conversation_id" in d
         assert tools[name].parameters["required"] == ["question"]
-    assert tools["ask_media_buyer"].title == "Asking Media Buyer"
+    assert tools["ask_media_buyer"].title == "Asking Marketing Guru"
     assert "ask_media_buyer" in INSTRUCTIONS and "ask_sales_coach" in INSTRUCTIONS
     assert any("Sales Coach" in c and "credits" in c for c in CAN_DO)
 

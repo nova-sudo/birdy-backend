@@ -1,7 +1,7 @@
 """
 routers/sub_agents.py
 ---------------------
-Sub-agents under Media Buyer and Sales Coach (ai/agents/sub_agents). Same conventions as
+Sub-agents under Marketing Guru and Sales Coach (ai/agents/sub_agents). Same conventions as
 routers/agents.py: owner-scoped (another user's sub-agent is a 404, never a 403), refusals as
 {detail} JSON with their status (here also a `code`).
 
