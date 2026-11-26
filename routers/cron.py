@@ -33,6 +33,7 @@ Endpoints (Vercel crons invoke with GET):
 """
 
 import asyncio
+import hmac
 import logging
 import os
 import time
@@ -130,7 +131,12 @@ def _verify_cron_auth(authorization: str | None):
         # If unset, fail closed — production deploys MUST configure this.
         logger.error("CRON_SECRET env var is not set — refusing cron invocation")
         raise HTTPException(status_code=503, detail="CRON_SECRET not configured")
-    if authorization != f"Bearer {expected_secret}":
+    # Constant-time: a plain != stops at the first differing character, so response
+    # timing could reveal how much of a guessed secret was right. Bytes, because
+    # compare_digest refuses non-ASCII str and a header can carry anything.
+    expected = f"Bearer {expected_secret}".encode("utf-8")
+    sent = (authorization or "").encode("utf-8", "surrogateescape")
+    if not hmac.compare_digest(sent, expected):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
