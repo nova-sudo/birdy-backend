@@ -555,6 +555,18 @@ def test_09_leads(walk):
     assert unified["meta"]["total_contacts"] == stored
     opps = [o for o in (w.opportunity_for(w.lead(x.lead_id)) for x in w.contacts(cl, w.history_start, w.today)) if o]
     assert abs(unified["meta"]["stats"]["total_opportunities"] - len(opps)) <= 2
+    # The client's pipeline comes from the fake GoHighLevel, stages in board order.
+    (pipeline,) = unified["meta"]["pipelines"]
+    assert pipeline["name"] == cl.pipeline.name
+    assert [s["name"] for s in pipeline["stages"]] == ["New", "Contacted", "Booked", "Won", "Lost"]
+    assert sum(s["count"] for s in pipeline["stages"]) > 0
+    named = [o for x in unified["contacts"] for o in x["opportunities"]]
+    assert named and all(o["pipelineStageName"] in {s.name for s in cl.pipeline.stages} for o in named)
+    booked = next(s for s in pipeline["stages"] if s["name"] == "Booked")
+    if booked["count"]:
+        only = _ok(c.get(f"/api/leads/unified?groups={g['id']}&stage_id={booked['id']}&limit=500"))
+        assert only["meta"]["total_contacts"] == booked["count"]
+        assert all(any(o["pipelineStageId"] == booked["id"] for o in x["opportunities"]) for x in only["contacts"])
 
     contact = unified["contacts"][0]
     detail = _ok(c.get(f"/api/leads/contact/{contact['contactId']}"))

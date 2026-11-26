@@ -31,14 +31,18 @@ def _is_fresh(fetched_at) -> bool:
     return datetime.now(timezone.utc) - fetched_at < CACHE_TTL
 
 
-async def stage_lookup(db, user_id: str, location_id: str) -> dict:
-    """Map stageId -> {stage_name, pipeline_id, pipeline_name}. Never raises."""
+async def _pipelines(db, user_id: str, location_id: str) -> list:
+    """The location's raw pipelines, from the 6h cache or one GHL refresh. Never raises.
+
+    A fresh cache hit costs one find_one. On a miss it refreshes from GHL and
+    falls back to the stale copy (or []) when there is no token or the fetch fails.
+    """
     try:
         cached = await db[COLLECTION].find_one({"location_id": location_id, "user_id": user_id})
         if cached and _is_fresh(cached.get("fetched_at")):
-            return _build_lookup(cached.get("pipelines"))
+            return cached.get("pipelines") or []
 
-        stale = _build_lookup(cached.get("pipelines")) if cached else {}
+        stale = (cached.get("pipelines") or []) if cached else []
 
         tokens = await get_subaccount_tokens(user_id, db.client)
         access_token = (tokens or {}).get(location_id, {}).get("access_token")
@@ -54,7 +58,44 @@ async def stage_lookup(db, user_id: str, location_id: str) -> dict:
             {"$set": {"pipelines": pipelines, "fetched_at": datetime.now(timezone.utc)}},
             upsert=True,
         )
-        return _build_lookup(pipelines)
+        return pipelines or []
     except Exception as e:
-        logger.warning("stage_lookup failed for location %s: %s", location_id, e)
-        return {}
+        logger.warning("pipeline lookup failed for location %s: %s", location_id, e)
+        return []
+
+
+async def stage_lookup(db, user_id: str, location_id: str) -> dict:
+    """Map stageId -> {stage_name, pipeline_id, pipeline_name}. Never raises."""
+    return _build_lookup(await _pipelines(db, user_id, location_id))
+
+
+def _stage_position(stage: dict):
+    pos = stage.get("position")
+    return pos if isinstance(pos, (int, float)) and not isinstance(pos, bool) else float("inf")
+
+
+def _ordered(pipelines: list) -> list:
+    out = []
+    for pipeline in pipelines or []:
+        if not isinstance(pipeline, dict) or not pipeline.get("id"):
+            continue
+        # GHL lists stages in board order; `position` is the authority when present.
+        stages = sorted(
+            (s for s in (pipeline.get("stages") or []) if isinstance(s, dict) and s.get("id")),
+            key=_stage_position,
+        )
+        out.append({
+            "id": pipeline["id"],
+            "name": pipeline.get("name"),
+            "stages": [{"id": s["id"], "name": s.get("name")} for s in stages],
+        })
+    return out
+
+
+async def ordered_pipelines(db, user_id: str, location_id: str) -> list:
+    """The location's pipelines in the CRM's own order, each with its stages in board order.
+
+    [{"id", "name", "stages": [{"id", "name"}]}]. Same cache/refresh path as
+    stage_lookup; [] when the pipelines cannot be read. Never raises.
+    """
+    return _ordered(await _pipelines(db, user_id, location_id))
