@@ -1,13 +1,46 @@
+import logging
 import os
 from dotenv import load_dotenv
 
 load_dotenv()
 
+logger = logging.getLogger(__name__)
+
+
+def _jwt_secrets(environ) -> tuple[str, str]:
+    """(JWT_SECRET, JWT_REFRESH_SECRET), refusing to start without a real signing secret.
+
+    PyJWT signs and verifies happily with an empty key, so a blank JWT_SECRET
+    (`JWT_SECRET=` in an env file) would let anyone mint a session for any
+    account, and the old refresh fallback made the refresh secret the public
+    string "_refresh". Both now stop the app at startup instead.
+
+    JWT_REFRESH_SECRET should be its own value. When it is unset (or blank) it
+    is still derived from JWT_SECRET exactly as before, so refresh cookies
+    already issued keep working; a warning says to set it. Setting a new value
+    later only means people sign in again once their 30-day session ends.
+    """
+    # Blank is judged after strip, but the value is used as given: trimming a real secret
+    # would change it and sign everyone out.
+    secret = environ.get("JWT_SECRET") or ""
+    if not secret.strip():
+        raise RuntimeError(
+            "JWT_SECRET environment variable is not set (or is blank). It signs every login "
+            "session; generate one with: python -c \"import secrets; print(secrets.token_urlsafe(48))\""
+        )
+    refresh = environ.get("JWT_REFRESH_SECRET") or ""
+    if not refresh.strip():
+        logger.warning("JWT_REFRESH_SECRET is not set; deriving it from JWT_SECRET. Set its own value.")
+        refresh = secret + "_refresh"
+    elif refresh == secret:
+        raise RuntimeError("JWT_REFRESH_SECRET must differ from JWT_SECRET.")
+    return secret, refresh
+
+
 # JWT
-JWT_SECRET = os.getenv("JWT_SECRET")
+JWT_SECRET, JWT_REFRESH_SECRET = _jwt_secrets(os.environ)
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRY_MINUTES = 60 * 24 * 30  # 30 days
-JWT_REFRESH_SECRET = os.getenv("JWT_REFRESH_SECRET", (JWT_SECRET or "") + "_refresh")
 JWT_REFRESH_EXPIRY_DAYS = 365  # 1 year
 
 # Cookies
