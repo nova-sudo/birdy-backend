@@ -2459,6 +2459,78 @@ async def _stage_contact_counts(ghl_col, query: dict) -> dict:
     return counts
 
 
+LEAD_STAGES = ("meta", "crm", "called", "closed", "lost")
+# One client's distinct contact match keys above which the stage sets are not
+# built (meta.lead_stages omitted, lead_stage ignored). Each contact has one or
+# two keys (email, phone), so this is ~25k+ contacts; at ~30 bytes a key the
+# largest condition list stays near 1.5 MB, well under Mongo's 16 MB command cap
+# even though the count aggregation carries the key lists three times.
+LEAD_STAGE_MAX_KEYS = 50_000
+
+
+async def _lead_stage_conditions(ghl_col, meta_col, hp_col, user_id: str, query: dict) -> Optional[dict]:
+    """One client's lead stages as Mongo conditions on ghl_contacts, or None if too big.
+
+    `meta` and `called` live on other collections, so they become
+    `match_keys: {$in: [...]}` over exactly the keys the enrichment step joins
+    on: a Meta lead (`facebook_leads`) or a call-centre lead with at least one
+    call (`hotprospector_leads`, `lead_data.call_logs_count > 0`) of this user
+    sharing a match key. Only keys of this client's contacts under `query` are
+    looked up, and only keys are fetched (distinct).
+
+    `closed` / `lost` / `called` / `crm` partition the contacts: closed has a
+    won opportunity; lost has opportunities, all lost or abandoned; called and
+    crm split the rest on the call keys (contacts with no opportunities or no
+    match keys land in crm). `meta` overlaps them.
+    """
+    contact_keys = [k for k in await ghl_col.distinct("match_keys", query) if isinstance(k, str) and k]
+    if len(contact_keys) > LEAD_STAGE_MAX_KEYS:
+        logger.warning(
+            "unified leads: %d match keys exceeds %d, lead stages skipped", len(contact_keys), LEAD_STAGE_MAX_KEYS,
+        )
+        return None
+    meta_keys: list = []
+    called_keys: list = []
+    if contact_keys:
+        meta_raw, called_raw = await asyncio.gather(
+            meta_col.distinct("match_keys", {"user_id": user_id, "match_keys": {"$in": contact_keys}}),
+            hp_col.distinct("match_keys", {
+                "user_id": user_id, "match_keys": {"$in": contact_keys},
+                "lead_data.call_logs_count": {"$gt": 0},
+            }),
+        )
+        wanted = set(contact_keys)
+        # distinct returns every key of the matched docs; keep the client's.
+        meta_keys = sorted(wanted.intersection(k for k in meta_raw if isinstance(k, str)))
+        called_keys = sorted(wanted.intersection(k for k in called_raw if isinstance(k, str)))
+
+    won = {"contact_data.opportunities": {"$elemMatch": {"status": {"$regex": "^won$", "$options": "i"}}}}
+    lost = {
+        "contact_data.opportunities.0": {"$exists": True},
+        "contact_data.opportunities": {"$not": {"$elemMatch": {
+            "status": {"$not": re.compile(r"^(lost|abandoned)$", re.IGNORECASE)},
+        }}},
+    }
+    still_open = {"$nor": [won, lost]}
+    return {
+        "meta": {"match_keys": {"$in": meta_keys}},
+        "crm": {"$and": [still_open, {"match_keys": {"$nin": called_keys}}]},
+        "called": {"$and": [still_open, {"match_keys": {"$in": called_keys}}]},
+        "closed": won,
+        "lost": lost,
+    }
+
+
+async def _lead_stage_counts(ghl_col, query: dict, conditions: dict) -> dict:
+    """{"all", "meta", "crm", "called", "closed", "lost"} over `query`, one $facet aggregation."""
+    facets = {"all": [{"$count": "n"}]}
+    for name in LEAD_STAGES:
+        facets[name] = [{"$match": conditions[name]}, {"$count": "n"}]
+    rows = await ghl_col.aggregate([{"$match": query}, {"$facet": facets}]).to_list(1)
+    row = rows[0] if rows else {}
+    return {name: int(((row.get(name) or [{}])[0]).get("n") or 0) for name in ("all",) + LEAD_STAGES}
+
+
 @router.get("/api/leads/unified")
 async def get_unified_leads(
     page: int = Query(default=1, ge=1),
@@ -2470,6 +2542,7 @@ async def get_unified_leads(
     tag: List[str] = Query(default=[]),
     opportunity_status: Optional[str] = Query(default=None),
     stage_id: Optional[str] = Query(default=None),
+    lead_stage: Optional[str] = Query(default=None),
     current_user: str = Depends(get_current_user),
 ):
     """
@@ -2485,6 +2558,13 @@ async def get_unified_leads(
     per-stage contact count (over the table's filters, ignoring `stage_id`), and
     `stage_id` narrows the table + its paging to contacts with an opportunity in
     that stage. With more or fewer groups, `stage_id` is ignored.
+
+    Also with exactly one group: `meta.lead_stages` counts the contacts per lead
+    stage (all, meta, crm, called, closed, lost; see _lead_stage_conditions) over
+    the table's filters incl. `stage_id`, ignoring `lead_stage`, and `lead_stage`
+    (one of LEAD_STAGES) narrows the table + its paging. `meta.pipelines` stage
+    counts follow `lead_stage` (and still ignore `stage_id`). If the stages can't
+    be computed, `meta.lead_stages` is omitted and `lead_stage` ignored.
     """
     import time as _time
     pipelines_task = None
@@ -2561,16 +2641,33 @@ async def get_unified_leads(
                 }}}
                 table_query = {"$and": [query, opp_cond]}
 
-            # ── Pipeline stage (single client only) ──────────────────────────
-            # Stage counts run over `table_query` before the stage filter, so
-            # every stage tab shows what picking it would list.
+            # ── Pipeline stage + lead stage (single client only) ─────────────
+            # Each set of counts ignores its own filter and follows the other,
+            # so every choice shows what picking it would list.
             stage_counts: dict = {}
+            lead_stages_meta = None
             if single_group:
+                stage_cond = (
+                    {"contact_data.opportunities.pipelineStageId": stage_id.strip()}
+                    if stage_id and stage_id.strip() else None
+                )
+                lead_cond = None
+                try:
+                    conditions = await _lead_stage_conditions(ghl_col, meta_col, hp_col, current_user, query)
+                    if conditions is not None:
+                        counted_q = {"$and": [table_query, stage_cond]} if stage_cond else table_query
+                        lead_stages_meta = await _lead_stage_counts(ghl_col, counted_q, conditions)
+                        wanted = (lead_stage or "").strip().lower()
+                        lead_cond = conditions.get(wanted) if wanted in LEAD_STAGES else None
+                except Exception as e:
+                    logger.warning("unified leads: lead stages unavailable for group %s: %s", group_ids[0], e)
+                    lead_stages_meta = None
+                    lead_cond = None
+                if lead_cond is not None:
+                    table_query = {"$and": [table_query, lead_cond]}
                 stage_counts = await _stage_contact_counts(ghl_col, table_query)
-                if stage_id and stage_id.strip():
-                    table_query = {"$and": [table_query, {
-                        "contact_data.opportunities.pipelineStageId": stage_id.strip(),
-                    }]}
+                if stage_cond:
+                    table_query = {"$and": [table_query, stage_cond]}
 
             # Paginate GHL contacts (filtered)
             total_contacts = await ghl_col.count_documents(table_query)
@@ -2898,6 +2995,8 @@ async def get_unified_leads(
             elapsed = _time.time() - start_time
 
             meta_extra = {"pipelines": pipelines_meta} if pipelines_meta is not None else {}
+            if lead_stages_meta is not None:
+                meta_extra["lead_stages"] = lead_stages_meta
             return {
                 "contacts": contacts,
                 "meta": {

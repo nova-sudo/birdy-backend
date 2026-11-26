@@ -576,6 +576,48 @@ def test_09_leads(walk):
     walk.contact_id = contact["contactId"]
 
 
+def test_09_lead_stages(walk):
+    """Lead stage tabs for one client: every stage the world has is non-zero and they partition all."""
+    w = walk.world()
+    c = walk.client
+    # The last 30 days keep the (in-memory, slow) key matching quick.
+    window = f"start_date={w.today - timedelta(days=30)}&end_date={w.today}"
+    groups = _groups(walk)
+    centre = next(g for g in groups if w.client(g["ghl_location_id"]).hp_group_id)
+    plain = next(g for g in groups if not w.client(g["ghl_location_id"]).hp_group_id)
+    for g, stages in ((centre, ("meta", "called", "closed", "lost")), (plain, ("crm",))):
+        name = w.client(g["ghl_location_id"]).name
+        body = _ok(c.get(f"/api/leads/unified?groups={g['id']}&{window}&limit=1"))
+        full = body["meta"]["lead_stages"]
+        assert full["all"] == body["meta"]["total_contacts"] > 0, name
+        assert full["crm"] + full["called"] + full["closed"] + full["lost"] == full["all"], name
+        # Every contact is a Meta lead in the world; the synced ones match.
+        assert 0 < full["meta"] <= full["all"], name
+        assert full["closed"] > 0 and full["lost"] > 0, name
+        if g is centre:
+            # The world's call centre dials every lead within hours.
+            assert full["called"] > 0, name
+        else:
+            assert full["called"] == 0 and full["crm"] > 0, name  # no call centre, nobody called
+        for stage in stages:
+            body = _ok(c.get(f"/api/leads/unified?groups={g['id']}&{window}&lead_stage={stage}&limit=50"))
+            assert body["meta"]["total_contacts"] == full[stage] > 0, (name, stage)
+            assert len(body["contacts"]) == min(full[stage], 50), (name, stage)
+            assert body["meta"]["lead_stages"] == full, (name, stage)
+            for x in body["contacts"]:
+                statuses = {(o.get("status") or "").lower() for o in x["opportunities"]}
+                if stage == "meta":
+                    assert x["sources"]["meta"]
+                elif stage == "closed":
+                    assert "won" in statuses
+                elif stage == "lost":
+                    assert statuses and statuses <= {"lost", "abandoned"}
+                elif stage == "called":
+                    assert "won" not in statuses and (x["hp_enrichment"] or {}).get("call_logs_count", 0) > 0
+                else:
+                    assert "won" not in statuses and not (statuses and statuses <= {"lost", "abandoned"})
+
+
 def test_09_complete_onboarding(walk):
     _ok(walk.client.post("/api/onboarding/complete"))
     assert _ok(walk.client.get("/api/onboarding/status"))["completed"] is True
