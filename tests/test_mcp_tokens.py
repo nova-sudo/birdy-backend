@@ -92,22 +92,36 @@ async def test_verifier_accepts_valid_mcp_token_and_rejects_after_revocation(moc
 
 
 @pytest.mark.asyncio
-async def test_verifier_accepts_normal_access_token_without_any_db_record(mock_db):
-    """type: "access" tokens (login cookie, or the orchestrator's internal
-    token) must keep working even with an empty mcp_tokens collection —
-    the revocation lookup only applies to type: "mcp" tokens."""
+async def test_verifier_accepts_internal_token_without_any_db_record(mock_db):
+    """The orchestrator's type: "internal" token must keep working even with an
+    empty mcp_tokens collection — the revocation lookup only applies to
+    type: "mcp" tokens."""
     from ai.mcp import mcp
 
     verifier = mcp.auth  # the live server's verifier (BirdyOAuthProvider)
-    access_token = pyjwt.encode(
-        {"sub": "alice@example.com", "exp": int(time.time()) + 60, "type": "access"},
+    internal_token = pyjwt.encode(
+        {"sub": "alice@example.com", "exp": int(time.time()) + 60, "type": "internal"},
         JWT_SECRET,
         algorithm=JWT_ALGORITHM,
     )
 
-    result = await verifier.verify_token(access_token)
+    result = await verifier.verify_token(internal_token)
     assert result is not None
     assert result.claims["sub"] == "alice@example.com"
+
+
+@pytest.mark.asyncio
+async def test_verifier_refuses_login_cookie(mock_db):
+    """The login cookie (type: "access") is not an MCP credential: every user holds
+    their own, and accepting it skipped subscription, credits and the rate limit."""
+    from ai.mcp import mcp
+
+    login_token = pyjwt.encode(
+        {"sub": "alice@example.com", "exp": int(time.time()) + 60, "type": "access"},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    assert await mcp.auth.verify_token(login_token) is None
 
 
 @pytest.mark.asyncio

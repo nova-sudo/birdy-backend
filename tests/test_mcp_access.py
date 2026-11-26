@@ -19,7 +19,7 @@ async def test_every_registered_tool_is_tagged_read_or_write():
 
 
 def test_token_scopes_defaults_to_full_when_claim_missing():
-    assert token_scopes({"type": "access"}) == {"birdy.read", "birdy.write"}
+    assert token_scopes({"type": "internal"}) == {"birdy.read", "birdy.write"}
     assert token_scopes({"type": "mcp", "scope": "birdy.read"}) == {"birdy.read"}
     assert token_scopes({"scope": "birdy.read birdy.write"}) == {"birdy.read", "birdy.write"}
 
@@ -49,8 +49,8 @@ async def test_external_token_without_subscription_is_refused(mcp_call, no_subsc
 
 
 @pytest.mark.asyncio
-async def test_internal_access_token_skips_subscription_gate(mcp_call, no_subscription):
-    res = await mcp_call("get_alerts", {}, token_type="access")
+async def test_internal_token_skips_subscription_gate(mcp_call, no_subscription):
+    res = await mcp_call("get_alerts", {}, token_type="internal")
     assert not res.is_error
 
 
@@ -74,19 +74,20 @@ async def test_external_calls_rate_limited_per_user(mcp_call, pinned_minute):
 @pytest.mark.asyncio
 async def test_internal_calls_are_not_rate_limited(mcp_call, mock_db):
     for _ in range(3):
-        await mcp_call("get_alerts", {}, token_type="access")
+        await mcp_call("get_alerts", {}, token_type="internal")
     assert await mock_db["mcp_rate"].count_documents({}) == 0
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("token_type", [None, "refresh"])
-async def test_unknown_or_missing_type_is_refused_even_for_reads(mcp_call, mock_db, token_type):
-    res = await mcp_call("get_alerts", {}, token_type=token_type)
-    assert res.is_error and "does not grant access" in res.text
-    res = await mcp_call("create_alert", ALERT_ARGS, token_type=token_type)
-    assert res.is_error and "does not grant access" in res.text
-    # Refusals are rate-limited too (the limit runs first), so a looping client cannot flood the activity log.
-    assert (await mock_db["mcp_rate"].find_one({}))["count"] == 2
+@pytest.mark.parametrize("token_type", [None, "refresh", "access"])
+async def test_unknown_missing_or_login_type_is_rejected_before_any_tool(mcp_call, mock_db, no_subscription,
+                                                                        token_type):
+    # "access" is the login cookie: every user holds one, so it must not reach the tools,
+    # where it used to skip subscription, credits and the rate limit.
+    for name, args in (("get_alerts", {}), ("create_alert", ALERT_ARGS)):
+        with pytest.raises(Exception):
+            await mcp_call(name, args, token_type=token_type)
+    assert await mock_db["alerts"].count_documents({}) == 0
 
 
 @pytest.mark.asyncio
@@ -99,3 +100,4 @@ async def test_scoped_token_with_no_birdy_scope_is_refused(mcp_call):
 def test_token_scopes_unknown_type_gets_nothing():
     assert token_scopes({}) == set()
     assert token_scopes({"type": "refresh"}) == set()
+    assert token_scopes({"type": "access"}) == set()

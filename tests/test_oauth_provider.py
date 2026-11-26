@@ -299,13 +299,26 @@ async def test_approving_write_for_read_only_request_stays_read(mock_db, provide
     assert (await mock_db["oauth_grants"].find_one({}))["access"] == "read"
 
 
-async def test_existing_session_and_manual_tokens_still_verify(mock_db, provider):
+async def test_internal_and_manual_tokens_verify_but_login_cookies_do_not(mock_db, provider):
     from services import mcp_token_service
 
-    session = pyjwt.encode({"sub": "alice@example.com", "type": "access", "exp": int(time.time()) + 600},
-                           JWT_SECRET, algorithm=JWT_ALGORITHM)
-    loaded = await provider.load_access_token(session)
+    internal = pyjwt.encode({"sub": "alice@example.com", "type": "internal", "exp": int(time.time()) + 600},
+                            JWT_SECRET, algorithm=JWT_ALGORITHM)
+    loaded = await provider.load_access_token(internal)
     assert loaded is not None and loaded.claims["sub"] == "alice@example.com"
+
+    # The login cookie, and an impersonation cookie, must not work as a bearer at /mcp:
+    # they would skip subscription, credits and the rate limit.
+    login = pyjwt.encode({"sub": "alice@example.com", "type": "access", "exp": int(time.time()) + 600},
+                         JWT_SECRET, algorithm=JWT_ALGORITHM)
+    assert await provider.load_access_token(login) is None
+    impersonation = pyjwt.encode({"sub": "alice@example.com", "type": "access", "imp": True,
+                                  "act": "admin@birdy.ai", "exp": int(time.time()) + 600},
+                                 JWT_SECRET, algorithm=JWT_ALGORITHM)
+    assert await provider.load_access_token(impersonation) is None
+    untyped = pyjwt.encode({"sub": "alice@example.com", "exp": int(time.time()) + 600},
+                           JWT_SECRET, algorithm=JWT_ALGORITHM)
+    assert await provider.load_access_token(untyped) is None
 
     manual = await mcp_token_service.create_mcp_token(mock_db, "bob@example.com", "Laptop", access="read")
     loaded = await provider.load_access_token(manual["token"])

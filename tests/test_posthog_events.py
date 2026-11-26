@@ -87,7 +87,7 @@ async def test_tool_called_properties_have_no_args_or_client_names(ph, mcp_call)
 
 @pytest.mark.asyncio
 async def test_internal_calls_send_nothing(ph, mcp_call):
-    await mcp_call("get_alerts", {}, user=USER, token_type="access")
+    await mcp_call("get_alerts", {}, user=USER, token_type="internal")
     await drain()
     assert ph.posts == []
 

@@ -262,7 +262,7 @@ async def test_tool_that_raises_is_logged_free_as_error_and_reraised(mcp_call, m
 
 @pytest.mark.asyncio
 async def test_internal_call_not_logged(mcp_call, mock_db):
-    res = await mcp_call("get_alerts", {}, user=USER, token_type="access")
+    res = await mcp_call("get_alerts", {}, user=USER, token_type="internal")
     assert not res.is_error
     assert await mock_db["mcp_activity"].count_documents({}) == 0
 

@@ -113,7 +113,7 @@ async def test_external_call_is_charged(mcp_call, mock_db):
 async def test_internal_call_not_charged(mcp_call, mock_db):
     await _give(mock_db, topup=0)
     await _enforce(mock_db)
-    res = await mcp_call("get_alerts", {}, user=USER, token_type="access")
+    res = await mcp_call("get_alerts", {}, user=USER, token_type="internal")
     assert not res.is_error
     assert await mock_db["ai_usage"].count_documents({}) == 0
 

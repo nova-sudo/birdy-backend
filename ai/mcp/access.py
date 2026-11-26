@@ -11,7 +11,10 @@ BirdyAccessMiddleware runs on every tool call:
 - a write tool needs the `birdy.write` scope;
 - external (`type: "mcp"`) tokens need an active/trialing subscription and are
   rate-limited per user (counted in Mongo: serverless has no shared memory).
-Internal `type: "access"` tokens (orchestrator, login cookie) skip both gates.
+Only the `type: "internal"` token Birdy's own chat mints in-process (ai/mcp_client)
+skips both gates. Login cookies (`type: "access"`) are refused at /mcp altogether
+(ai/mcp/oauth_provider.verify_birdy_token): every user holds their own, so
+exempting them would let anyone use the MCP server without paying.
 """
 
 import asyncio
@@ -39,6 +42,11 @@ logger = logging.getLogger(__name__)
 
 READ_SCOPE = "birdy.read"
 WRITE_SCOPE = "birdy.write"
+# The token type of Birdy's own in-process chat calls (ai/mcp_client). Never set as a cookie
+# (REST accepts only `type: "access"`), so no user ever holds one.
+INTERNAL_TOKEN_TYPE = "internal"
+# The only token types /mcp accepts: internal chat calls and external connections.
+MCP_TOKEN_TYPES = (INTERNAL_TOKEN_TYPE, "mcp")
 
 READ = {"tags": {"read"}, "annotations": {"readOnlyHint": True}}
 WRITE = {"tags": {"write"}, "annotations": {"readOnlyHint": False, "destructiveHint": False}}
@@ -55,11 +63,11 @@ _background: set = set()  # strong refs to in-flight charge-and-record tasks
 
 def token_scopes(claims: dict) -> set[str]:
     """The space-separated `scope` claim. A missing claim means full access (internal
-    `type: "access"` tokens and manual tokens issued before scopes existed)."""
+    chat tokens and manual tokens issued before scopes existed)."""
     scope = claims.get("scope")
     if scope is None:
         # Only the two token kinds that predate scopes get full access by default.
-        if claims.get("type") in ("access", "mcp"):
+        if claims.get("type") in MCP_TOKEN_TYPES:
             return {READ_SCOPE, WRITE_SCOPE}
         return set()
     return set(str(scope).split())
@@ -259,9 +267,8 @@ class BirdyAccessMiddleware(Middleware):
         token = get_access_token()
         claims = token.claims if token else {}
         tool = await context.fastmcp_context.fastmcp.get_tool(context.message.name)
-        # Only the internal orchestrator/login token is exempt; any other type (mcp, missing,
-        # refresh, ...) is treated as external.
-        external = claims.get("type") != "access"
+        # Only Birdy's own in-process chat token is exempt; any other type is treated as external.
+        external = claims.get("type") != INTERNAL_TOKEN_TYPE
         args = getattr(context.message, "arguments", None) or {}
         db = get_db(get_shared_mongo_client()) if external else None
         available = None  # the balance before this call, when known (for the sign-off line)
