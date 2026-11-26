@@ -10,9 +10,9 @@ own: they verify PKCE, client auth, redirect_uri matching and code/refresh
 expiry. Only the provider hooks are written here.
 
 load_access_token is also the verifier for every bearer token reaching /mcp
-(verify_birdy_token): session/orchestrator `type: "access"` JWTs, manual
+(verify_birdy_token): the chat's in-process `type: "internal"` JWTs, manual
 `type: "mcp"` tokens, and the OAuth access tokens issued below (`type: "mcp"`
-+ grant_id), all signed with JWT_SECRET.
++ grant_id), all signed with JWT_SECRET. Login cookies (`type: "access"`) are refused.
 """
 
 import calendar
@@ -42,7 +42,7 @@ from starlette.requests import Request
 from starlette.responses import Response
 from starlette.routing import Route
 
-from ai.mcp.access import READ_SCOPE, WRITE_SCOPE
+from ai.mcp.access import MCP_TOKEN_TYPES, READ_SCOPE, WRITE_SCOPE
 from core.config import API_PUBLIC_URL, FRONTEND_URL, JWT_ALGORITHM, JWT_SECRET
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
@@ -65,10 +65,17 @@ _BLOCKED_SCHEMES = {"javascript", "data", "file", "vbscript", "about", "blob", "
 
 
 async def verify_birdy_token(token: str) -> AccessToken | None:
-    """Signature + expiry for every Birdy JWT; `type: "mcp"` tokens (manual or OAuth)
-    additionally need a live, unrevoked mcp_tokens row (and grant, for OAuth)."""
+    """Signature + expiry for every Birdy JWT, and only the two types /mcp serves: Birdy's
+    own in-process chat token and `type: "mcp"` tokens (manual or OAuth), which also need a
+    live, unrevoked mcp_tokens row (and grant, for OAuth).
+
+    The login cookie (`type: "access"`) is refused: every user holds their own, and the
+    internal token's exemption from subscription, credits and rate limits must not reach it.
+    External apps connect through OAuth or a manual token instead."""
     result = await _jwt_verifier.verify_token(token)
     if result is None:
+        return None
+    if result.claims.get("type") not in MCP_TOKEN_TYPES:
         return None
     if result.claims.get("type") == "mcp":
         jti = result.claims.get("jti")

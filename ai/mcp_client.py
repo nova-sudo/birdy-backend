@@ -26,6 +26,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 
 from core.config import JWT_SECRET, JWT_ALGORITHM
 from ai.mcp import mcp_app
+from ai.mcp.access import INTERNAL_TOKEN_TYPE
 from ai.tools.result_shaping import serialize_with_truncation, error_payload, shape_for_chat
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,9 @@ def _mint_internal_token(user_id: str) -> str:
     # treats the naive UTC value as local time, silently shifting exp by the
     # host's UTC offset (harmless on a UTC-run server, wrong everywhere else).
     exp = int(time.time()) + _INTERNAL_TOKEN_TTL_SECONDS
-    return pyjwt.encode({"sub": user_id, "exp": exp, "type": "access"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    # Its own type, never "access": the login cookie is "access", and /mcp refuses it so a user
+    # cannot present their own cookie and skip the billing gates this token is exempt from.
+    return pyjwt.encode({"sub": user_id, "exp": exp, "type": INTERNAL_TOKEN_TYPE}, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def needs_mcp(allowed: list | None) -> bool:

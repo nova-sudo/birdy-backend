@@ -203,7 +203,8 @@ Birdy is an OAuth 2.1 authorization server and an MCP resource server in one Fas
 | Rate limit | 120 calls per minute per user for external tokens (counted in Mongo). |
 | Subscription | External calls need an `active` or `trialing` subscription. |
 | Credits | Every successful external call is charged (see [Credits and the activity log](#credits-and-the-activity-log)). With enforcement on, a call with no credits left is refused. Refused and failed calls are free. |
-| Internal calls | Ask Birdy's own orchestrator uses `type: "access"` tokens, skips these gates, the activity log and the request charge, and keeps its own credit metering. |
+| Internal calls | Ask Birdy's own orchestrator mints in-process `type: "internal"` tokens, which skip these gates, the activity log and the request charge, and keeps its own credit metering. |
+| Login cookies | The `auth_token` cookie (`type: "access"`) is refused at `/mcp` with a 401. Every user holds their own, so accepting it would skip the gates above. External apps use OAuth or a manual token. |
 
 `user_id` is always taken from the verified token, never from a tool argument.
 

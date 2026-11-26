@@ -38,7 +38,7 @@ from fastapi import HTTPException
 from fastmcp.exceptions import ToolError
 
 from ai.mcp import server as _server
-from ai.mcp.access import WRITE
+from ai.mcp.access import INTERNAL_TOKEN_TYPE, WRITE
 from ai.mcp.client_mcp import resolve_client
 from ai.mcp.outcome import CHAT_BILLED, set_outcome
 from ai.mcp.server import mcp, current_user_id as _current_user_id
@@ -171,7 +171,7 @@ async def ask_agent(agent: str, question: str, client: str | None = None,
     if not question:
         raise ToolError(f"Give the question to ask {name}.")
     token = _server.get_access_token()
-    if token is not None and token.claims.get("type") == "access":
+    if token is not None and token.claims.get("type") == INTERNAL_TOKEN_TYPE:
         # Birdy's own chats ask through their own ask tools (ai/team/delegation.py), never this one.
         raise ToolError(f"{TOOL_FOR[agent]} is for assistants outside Birdy. In Birdy, talk to {name} in its chat.")
     user_id = _current_user_id()

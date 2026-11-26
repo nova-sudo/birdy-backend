@@ -321,7 +321,7 @@ def mcp_call(mock_db, monkeypatch, subscription_state):
     monkeypatch.setattr("billing_middleware.require_active_subscription", _active)
     monkeypatch.setattr("ai.mcp.oauth_provider.is_mcp_token_valid", _token_valid)
 
-    async def _call(name, args=None, *, user="alice@example.com", scope=None, token_type="access"):
+    async def _call(name, args=None, *, user="alice@example.com", scope=None, token_type="internal"):
         claims = {"sub": user, "exp": int(time.time()) + 600}
         if token_type is not None:  # None leaves `type` out entirely
             claims["type"] = token_type

@@ -337,7 +337,7 @@ async def test_blank_question_is_refused(owner):
 
 async def test_internal_callers_are_refused(monkeypatch, use):
     p = use(TeamProvider({}))
-    token = types.SimpleNamespace(claims={"sub": U, "type": "access"})
+    token = types.SimpleNamespace(claims={"sub": U, "type": "internal"})
     monkeypatch.setattr("ai.mcp.server.get_access_token", lambda: token)
     with pytest.raises(ToolError, match="for assistants outside Birdy"):
         await t.ask_media_buyer.fn(question="q")

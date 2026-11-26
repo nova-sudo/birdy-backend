@@ -34,7 +34,7 @@ def test_mint_internal_token_round_trips_and_is_not_expired():
     claims = pyjwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
 
     assert claims["sub"] == "user@example.com"
-    assert claims["type"] == "access"
+    assert claims["type"] == "internal"  # never "access": /mcp refuses login cookies
     # Must be in the future relative to real wall-clock time (time.time()),
     # not a naive-datetime.utcnow().timestamp() computation — that pattern
     # silently mints already-expired tokens on any non-UTC host.
