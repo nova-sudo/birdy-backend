@@ -645,24 +645,29 @@ async def reactivate_subscription(current_user: str = Depends(get_current_user))
 
 @router.post("/api/billing/webhook")
 async def whop_webhook(request: Request):
+    # Fail closed, as routers/cron.py and services/slack_signature.py do. This route
+    # grants subscriptions and credits; unverified, anyone could POST a made-up
+    # membership or payment event and get a plan or credits for free. A non-2xx
+    # also makes Whop retry, so real events arrive once the secret is set.
+    if not WHOP_WEBHOOK_SECRET:
+        logger.error("WHOP_WEBHOOK_SECRET env var is not set — refusing Whop webhook")
+        raise HTTPException(status_code=503, detail="Billing webhook not configured")
+
     raw = await request.body()
     payload_str = raw.decode("utf-8")
 
-    if WHOP_WEBHOOK_SECRET:
-        try:
-            _verify_webhook_signature(dict(request.headers), payload_str)
-        except Exception as e:
-            present = {k.lower() for k in request.headers}
-            logger.warning(
-                "Whop webhook signature verification FAILED: %s "
-                "| backend secret_fp=%s secret_len=%d body_len=%d "
-                "| headers present: x-whop-signature=%s webhook-signature=%s",
-                e, _secret_fingerprint(), len(WHOP_WEBHOOK_SECRET), len(payload_str),
-                "x-whop-signature" in present, "webhook-signature" in present,
-            )
-            raise HTTPException(status_code=400, detail="Invalid signature")
-    else:
-        logger.warning("Whop webhook received but WHOP_WEBHOOK_SECRET is not set — skipping verification")
+    try:
+        _verify_webhook_signature(dict(request.headers), payload_str)
+    except Exception as e:
+        present = {k.lower() for k in request.headers}
+        logger.warning(
+            "Whop webhook signature verification FAILED: %s "
+            "| backend secret_fp=%s secret_len=%d body_len=%d "
+            "| headers present: x-whop-signature=%s webhook-signature=%s",
+            e, _secret_fingerprint(), len(WHOP_WEBHOOK_SECRET), len(payload_str),
+            "x-whop-signature" in present, "webhook-signature" in present,
+        )
+        raise HTTPException(status_code=400, detail="Invalid signature")
 
     try:
         event = json.loads(payload_str)
