@@ -79,6 +79,7 @@ from services import client_refresh as refresh_svc
 from services import client_targets as client_targets_service
 from services import lead_collection as lead_collection_service
 from services.contact_classifier import classify_contact_type
+from services.ghl_pipelines import ordered_pipelines
 from services.facebook_cache_shape import read_preset
 # Called through the module so tests can swap the live Graph listing.
 from services import meta_campaign_scope as meta_scope_svc
@@ -2410,6 +2411,54 @@ async def get_campaign_opp_rollup(
 # GET /api/leads/unified
 # ---------------------------------------------------------------------------
 
+PIPELINES_BUDGET_SECONDS = 3.0  # a cold pipeline cache must not hold up the leads table
+
+
+async def _group_pipelines(db, user_id: str, group_id: str) -> list:
+    """One client group's CRM pipelines (cached 6h), or [] — never raises.
+
+    [] when the group is not the user's, has no GoHighLevel location, has no
+    token, or GHL does not answer within PIPELINES_BUDGET_SECONDS.
+    """
+    try:
+        group = await db["client_groups"].find_one(
+            {"id": group_id, "user_id": user_id},
+            {"ghl_location_id": 1, "gohighlevel.location_id": 1},
+        )
+        if not group:
+            return []
+        location_id = group.get("ghl_location_id") or (group.get("gohighlevel") or {}).get("location_id")
+        if not location_id:
+            return []
+        return await asyncio.wait_for(
+            ordered_pipelines(db, user_id, location_id), PIPELINES_BUDGET_SECONDS,
+        )
+    except Exception as e:  # incl. asyncio.TimeoutError
+        logger.warning("unified leads: pipelines unavailable for group %s: %s", group_id, e)
+        return []
+
+
+async def _stage_contact_counts(ghl_col, query: dict) -> dict:
+    """stageId -> number of contacts under `query` with at least one opportunity in it.
+
+    One aggregation over the same filtered set the table pages through; a
+    contact with two opportunities in one stage counts once.
+    """
+    counts: dict = {}
+    pipeline = [
+        {"$match": query},
+        {"$unwind": "$contact_data.opportunities"},
+        {"$group": {"_id": {
+            "c": "$_id", "s": "$contact_data.opportunities.pipelineStageId",
+        }}},
+        {"$group": {"_id": "$_id.s", "count": {"$sum": 1}}},
+    ]
+    async for row in ghl_col.aggregate(pipeline):
+        if row.get("_id"):
+            counts[row["_id"]] = int(row.get("count") or 0)
+    return counts
+
+
 @router.get("/api/leads/unified")
 async def get_unified_leads(
     page: int = Query(default=1, ge=1),
@@ -2420,6 +2469,7 @@ async def get_unified_leads(
     source: List[str] = Query(default=[]),
     tag: List[str] = Query(default=[]),
     opportunity_status: Optional[str] = Query(default=None),
+    stage_id: Optional[str] = Query(default=None),
     current_user: str = Depends(get_current_user),
 ):
     """
@@ -2429,8 +2479,15 @@ async def get_unified_leads(
     `opportunity_status` (open|won|lost|abandoned) filters the leads list + its
     pagination server-side to contacts that have an opportunity in that status; the
     stats cards stay on the full unfiltered set.
+
+    With exactly one group in `groups`: each opportunity gains `pipelineStageName`
+    and `pipelineName`, `meta.pipelines` lists the client's CRM pipelines with a
+    per-stage contact count (over the table's filters, ignoring `stage_id`), and
+    `stage_id` narrows the table + its paging to contacts with an opportunity in
+    that stage. With more or fewer groups, `stage_id` is ignored.
     """
     import time as _time
+    pipelines_task = None
     async with get_mongo_client() as mongo_client:
         try:
             start_time = _time.time()
@@ -2440,6 +2497,12 @@ async def get_unified_leads(
             hp_col = db["hotprospector_leads"]
 
             group_ids = [g.strip() for g in groups.split(",") if g.strip()] if groups else []
+            single_group = len(group_ids) == 1
+            # Started now so a cold pipeline cache overlaps the contact queries.
+            pipelines_task = (
+                asyncio.create_task(_group_pipelines(db, current_user, group_ids[0]))
+                if single_group else None
+            )
 
             # Build GHL query (same as ghl-paginated)
             query = {"user_id": current_user}
@@ -2497,6 +2560,17 @@ async def get_unified_leads(
                     "status": {"$regex": f"^{re.escape(opportunity_status.strip())}$", "$options": "i"}
                 }}}
                 table_query = {"$and": [query, opp_cond]}
+
+            # ── Pipeline stage (single client only) ──────────────────────────
+            # Stage counts run over `table_query` before the stage filter, so
+            # every stage tab shows what picking it would list.
+            stage_counts: dict = {}
+            if single_group:
+                stage_counts = await _stage_contact_counts(ghl_col, table_query)
+                if stage_id and stage_id.strip():
+                    table_query = {"$and": [table_query, {
+                        "contact_data.opportunities.pipelineStageId": stage_id.strip(),
+                    }]}
 
             # Paginate GHL contacts (filtered)
             total_contacts = await ghl_col.count_documents(table_query)
@@ -2700,6 +2774,37 @@ async def get_unified_leads(
                     if row.get("_id") and row.get("count"):
                         top_missing_email_group = {"name": row["_id"], "count": int(row["count"])}
 
+            # ── Pipelines (single client only) ───────────────────────────────
+            pipelines_meta = None
+            stage_names: dict = {}
+            if pipelines_task is not None:
+                pipelines_meta = []
+                for p in await pipelines_task:
+                    if not p.get("stages"):
+                        continue
+                    pipelines_meta.append({
+                        "id": p["id"],
+                        "name": p.get("name"),
+                        "stages": [
+                            {"id": st["id"], "name": st.get("name"), "count": stage_counts.get(st["id"], 0)}
+                            for st in p["stages"]
+                        ],
+                    })
+                    for st in p["stages"]:
+                        stage_names[st["id"]] = (st.get("name"), p.get("name"))
+
+            def _opps_out(opps):
+                if not single_group:
+                    return opps
+                out = []
+                for o in opps:
+                    if not isinstance(o, dict):
+                        out.append(o)
+                        continue
+                    stage_name, pipeline_name = stage_names.get(o.get("pipelineStageId"), (None, None))
+                    out.append({**o, "pipelineStageName": stage_name, "pipelineName": pipeline_name})
+                return out
+
             # Format contacts with enrichment
             contacts = []
             for doc in contact_docs:
@@ -2777,7 +2882,7 @@ async def get_unified_leads(
                     "customFields": contact.get("customFields") or [],
                     "followers": contact.get("followers") or [],
                     "assignedTo": contact.get("assignedTo") or "",
-                    "opportunities": contact.get("opportunities") or [],
+                    "opportunities": _opps_out(contact.get("opportunities") or []),
                     "attributionSource": contact.get("attributionSource") or {},
                     "lastAttributionSource": contact.get("lastAttributionSource") or {},
                     "sources": {
@@ -2792,9 +2897,11 @@ async def get_unified_leads(
 
             elapsed = _time.time() - start_time
 
+            meta_extra = {"pipelines": pipelines_meta} if pipelines_meta is not None else {}
             return {
                 "contacts": contacts,
                 "meta": {
+                    **meta_extra,
                     "total_contacts": total_contacts,
                     "current_page": page,
                     "total_pages": total_pages,
@@ -2831,6 +2938,9 @@ async def get_unified_leads(
         except Exception as e:
             logger.error(f"Error fetching unified leads: {e}", exc_info=True)
             raise HTTPException(status_code=500, detail=f"Failed to fetch unified leads: {str(e)}")
+        finally:
+            if pipelines_task is not None and not pipelines_task.done():
+                pipelines_task.cancel()
 
 
 # ---------------------------------------------------------------------------
