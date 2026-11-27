@@ -100,6 +100,7 @@ LABELS: dict[str, dict] = {
     "apply_all_cards": _l("Applied all agent cards", _AGENT_PAGE),
     "undo_card_line": _l("Undid a card change", _AGENT_PAGE),
     "post_weekly_report": _l("Posted the weekly report", _AGENT_PAGE),
+    "send_test_agent_report": _l("Sent a test of an agent report", "/media-buyer/reports"),
     "dismiss_card": _l("Dismissed an agent card", _AGENT_PAGE),
     "edit_card": _l("Edited an agent card", _AGENT_PAGE),
     "add_agent_lesson": _l("Taught the agent a lesson", _AGENT_PAGE),

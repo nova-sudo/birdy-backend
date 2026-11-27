@@ -179,7 +179,8 @@ def test_sales_coach_only_has_call_tools():
                      "analyze_call_recordings", "render_ui",
                      "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",     # what the calls turned into
                      "get_sales_outcomes",                     # booked, closed, speed to lead (its setup)
-                     "list_lessons", "save_lesson", "edit_lesson", "remove_lesson"}   # its own memory
+                     "list_lessons", "save_lesson", "edit_lesson", "remove_lesson",   # its own memory
+                     *defs.REPORT_READ, *defs.REPORT_WRITE}                            # its own Slack reports
     # lead counts and sources stay Birdy's
     assert "get_unified_lead_stats" not in names
 

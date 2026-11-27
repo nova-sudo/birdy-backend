@@ -81,12 +81,15 @@ _INTERNAL_TOKEN_TTL_SECONDS = 280
 _INTERNAL_BASE_URL = "http://internal.local"
 
 
-def _mint_internal_token(user_id: str) -> str:
+def _mint_internal_token(user_id: str, agent: str | None = None) -> str:
     # time.time() is timezone-safe; datetime.utcnow().timestamp() is NOT — it
     # treats the naive UTC value as local time, silently shifting exp by the
     # host's UTC offset (harmless on a UTC-run server, wrong everywhere else).
     exp = int(time.time()) + _INTERNAL_TOKEN_TTL_SECONDS
-    return pyjwt.encode({"sub": user_id, "exp": exp, "type": "access"}, JWT_SECRET, algorithm=JWT_ALGORITHM)
+    claims = {"sub": user_id, "exp": exp, "type": "access"}
+    if agent:
+        claims["agent"] = agent   # which agent's run is calling: read by ai.mcp.server.current_agent
+    return pyjwt.encode(claims, JWT_SECRET, algorithm=JWT_ALGORITHM)
 
 
 def needs_mcp(allowed: list | None) -> bool:
@@ -95,9 +98,10 @@ def needs_mcp(allowed: list | None) -> bool:
 
 
 @contextlib.asynccontextmanager
-async def mcp_client_for(user_id: str):
-    """Async context manager yielding a fastmcp.Client authenticated as user_id."""
-    token = _mint_internal_token(user_id)
+async def mcp_client_for(user_id: str, agent: str | None = None):
+    """Async context manager yielding a fastmcp.Client authenticated as user_id. `agent` (an agent
+    run's key) goes into the token, so tools that are scoped per agent know who is calling."""
+    token = _mint_internal_token(user_id, agent)
 
     def httpx_client_factory(headers=None, timeout=None, auth=None, **kwargs):
         merged_headers = {**(headers or {}), "Authorization": f"Bearer {token}"}

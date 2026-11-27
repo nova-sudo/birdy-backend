@@ -46,3 +46,15 @@ def current_user_id() -> str:
     if token is None or not token.claims.get("sub"):
         raise ValueError("Unauthenticated MCP request: missing or invalid bearer token")
     return token.claims["sub"]
+
+
+def current_agent() -> str | None:
+    """The Birdy agent whose chat run is calling (birdy, media_buyer, sales_coach), or None.
+
+    Only the orchestrator's internal tokens carry it (ai/mcp_client.mcp_client_for, signed with the
+    server's secret), so a tool can scope what an agent sees and changes server-side, whatever the
+    model passed. Every other caller (an outside assistant, a manual token) is the owner, unscoped."""
+    token = get_access_token()
+    claims = token.claims if token is not None else {}
+    agent = claims.get("agent") if claims.get("type") == "access" else None
+    return agent if isinstance(agent, str) and agent else None

@@ -397,6 +397,19 @@ async def preview_slack_template(agent_id: str, kind: str, body: TemplateBody = 
         return {"kind": kind, "blocks": blocks, "text": text, "sample": True}
 
 
+@router.post("/{agent_id}/slack-templates/{kind}/test")
+async def test_slack_template(agent_id: str, kind: str, current_user: str = Depends(get_current_user)):
+    """Post that report to the agent's Slack channel now, labelled as a test: the latest real report's figures
+    when there is one, else the sample ones, with the saved template and no buttons. `kind` is a template kind
+    or "morning" (the summary). Recorded nowhere. {ok, kind, channel_id, channel_name, source}; 400 for an
+    unknown kind, 409 when there is no channel, Slack isn't connected or Birdy can't post there."""
+    async with get_mongo_client() as mongo_client:
+        db = mongo_client[DB_NAME]
+        agent = await _stock_agent(db, current_user, agent_id)
+        with _http_errors():
+            return await reports.send_test_message(db, agent, kind)
+
+
 # ---------------------------------------------------------------------------
 # Scoreboard and lessons
 # ---------------------------------------------------------------------------

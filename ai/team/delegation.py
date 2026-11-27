@@ -102,8 +102,9 @@ _SCHEMAS = {
                                  "It owns the call centre: call stats, call recordings, what happens on calls."),
     ASK_BIRDY: _ask_schema(ASK_BIRDY, "Agency Ops (Birdy, the orchestrator: the same agent)",
                            "Use it for anything outside your area: Birdy asks the right agent, and for a change "
-                           "to the agency's own settings (alerts, custom metrics, Slack reports, client notes, "
-                           "client targets) it proposes the change for the owner to approve."),
+                           "to the agency's own settings (alerts, custom metrics, client notes, client targets) it "
+                           "proposes the change for the owner to approve. Not for your own reports: you manage "
+                           "those yourself."),
 }
 
 

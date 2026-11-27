@@ -713,6 +713,16 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
     return prompt
 
 
+def _mcp_caller(frame) -> dict:
+    """Who an agent run's MCP calls come from (mcp_client_for's `agent`): the agent, or a sub-agent's
+    main agent. Tools scoped per agent (the Slack reports) enforce it from the token. The general chat
+    passes nothing and is unscoped, as before."""
+    if frame is None:
+        return {}
+    agent = frame.agent if frame.agent in team_defs.AGENT_KEYS else frame.parent_main
+    return {"agent": agent} if agent else {}
+
+
 def _agent_tool_names(frame, page=None) -> list:
     """The registry/MCP tools one agent run may use. A sub-agent's list is cut to its main
     agent's read tools: never more than the main agent has, never a write. The setup chat gets
@@ -1027,7 +1037,7 @@ async def run_chat(
         mcp = None
         if mcp_client.needs_mcp(allowed):
             try:
-                mcp = await stack.enter_async_context(mcp_client.mcp_client_for(user_id))
+                mcp = await stack.enter_async_context(mcp_client.mcp_client_for(user_id, **_mcp_caller(frame)))
             except Exception as e:
                 # MCP mount/connection broken — degrade to the registry fallback
                 # below instead of failing the whole chat request.

@@ -72,7 +72,7 @@ async def _measure() -> list[dict]:
     await db["client_groups"].insert_one({"user_id": USER, "id": GROUP, "name": "Measure Co"})
 
     @contextlib.asynccontextmanager
-    async def in_process_mcp(user_id):
+    async def in_process_mcp(user_id, **_):
         async with Client(mcp) as c:     # in-memory transport: the same tool list, no auth round trip
             yield c
     mcp_client.mcp_client_for = in_process_mcp

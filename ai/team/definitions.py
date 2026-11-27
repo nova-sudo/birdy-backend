@@ -59,13 +59,21 @@ WRITE_TOOLS = frozenset({
     *CREATIVE_WRITE_TOOLS,
     # call analysis: Whisper costs credits and the owner must confirm the batch size
     "analyze_call_recordings",
-    # agency-level settings Birdy keeps in its own chat
+    # Slack reports: every agent manages its own in its own chat
     "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
+    # Marketing Guru's own morning and weekly reports: a test post to Slack
+    "send_test_agent_report",
+    # agency-level settings Birdy keeps in its own chat
     "add_client_note", "delete_client_note",
 })
 
 # ── Tool lists ─────────────────────────────────────────────────────────────────
 _COMMON = ("get_client_groups",)
+
+# Every agent's own Slack reports, each scoped server-side to the calling agent (ai/mcp/slack_reports_mcp.py):
+# it sees and changes only its own, and what it creates is its own. Birdy lists everyone's, labelled.
+REPORT_READ = ("list_slack_reports",)
+REPORT_WRITE = ("create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report")
 
 MEDIA_BUYER_READ = (
     *_COMMON,
@@ -75,9 +83,11 @@ MEDIA_BUYER_READ = (
     "compare_periods", "get_metrics_by_day_windows", "get_daily_metrics",
     CLOSES_BY_AD_TOOL, "get_tag_rollup_by_campaign", "get_alerts",
     *CREATIVE_READ_TOOLS,
-    "list_lessons",
+    "list_lessons", *REPORT_READ,
 )
 MEDIA_BUYER_WRITE = (*CREATIVE_WRITE_TOOLS, "save_lesson", "edit_lesson", "remove_lesson")
+# Marketing Guru's own reports besides its Slack reports: the stock agent's morning and weekly messages.
+MEDIA_BUYER_REPORT_WRITE = (*REPORT_WRITE, "send_test_agent_report")
 # One stock agent card's tools: offered to Marketing Guru's own chat only for the turn that applies an
 # approved proposal naming that card (routers/chat.apply_proposal pins the card, after an owner check).
 # apply_card_lines goes through the card's own guarded path (claims, modes, guardrails).
@@ -90,8 +100,9 @@ SALES_COACH_PIPELINE = ("get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed
 # get_sales_outcomes: booked and closed counts and speed to lead, as the owner defined them in its setup chat
 # (ai/team/sales_coach.py).
 SALES_COACH_READ = (*_COMMON, "get_call_center_stats", "get_call_trend", "get_call_recordings_summary",
-                    *SALES_COACH_PIPELINE, "get_sales_outcomes", "list_lessons")
+                    *SALES_COACH_PIPELINE, "get_sales_outcomes", "list_lessons", *REPORT_READ)
 SALES_COACH_WRITE = ("analyze_call_recordings", "save_lesson", "edit_lesson", "remove_lesson")
+SALES_COACH_REPORT_WRITE = REPORT_WRITE
 
 BIRDY_READ = (
     *_COMMON,
@@ -101,7 +112,7 @@ BIRDY_READ = (
     "get_unified_lead_stats", "get_ghl_opportunity_stats", "get_ghl_opp_stats_windowed",
     # what Birdy's own settings tools need to read first
     "list_custom_metrics", "list_available_metric_fields", "compute_custom_metric",
-    "list_slack_reports", "get_client", "get_client_notes",
+    *REPORT_READ, "get_client", "get_client_notes",
 )
 # Agency-level settings, in Birdy's own (top-level) chat only, each with its tool's own confirm flow:
 # alerts, custom metrics, Slack reports, client notes, client targets. Ads changes stay Marketing Guru's
@@ -109,7 +120,7 @@ BIRDY_READ = (
 BIRDY_WRITE = (
     "create_alert", "update_alert",
     "create_custom_metric", "update_custom_metric", "delete_custom_metric",
-    "create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report",
+    *REPORT_WRITE,
     "add_client_note", "delete_client_note", "set_client_target",
 )
 # Birdy's tools that only the MCP server implements (ai/mcp/client_mcp.py, slack_reports_mcp.py). An agent
@@ -117,19 +128,22 @@ BIRDY_WRITE = (
 # edits a custom agent in training) is never offered in their place.
 MCP_HOSTED = frozenset({"get_client", "get_client_notes", "add_client_note", "delete_client_note",
                         "set_client_target", "list_slack_reports", "create_slack_report",
-                        "update_slack_report", "delete_slack_report", "send_test_slack_report"})
+                        "update_slack_report", "delete_slack_report", "send_test_slack_report",
+                        "send_test_agent_report"})
 # Agency-wide configuration with no client of its own: not offered in a one-client run.
-AGENCY_ONLY_TOOLS = frozenset({"list_slack_reports", "create_slack_report", "update_slack_report",
-                               "delete_slack_report", "send_test_slack_report"})
+AGENCY_ONLY_TOOLS = frozenset({*REPORT_READ, *REPORT_WRITE, "send_test_agent_report"})
 
 _READ = {BIRDY: BIRDY_READ, MEDIA_BUYER: MEDIA_BUYER_READ, SALES_COACH: SALES_COACH_READ}
-_WRITE = {BIRDY: BIRDY_WRITE, MEDIA_BUYER: MEDIA_BUYER_WRITE, SALES_COACH: SALES_COACH_WRITE}
+# The area writes plus each agent's own report tools (Birdy's are in BIRDY_WRITE already).
+_WRITE = {BIRDY: BIRDY_WRITE, MEDIA_BUYER: (*MEDIA_BUYER_WRITE, *MEDIA_BUYER_REPORT_WRITE),
+          SALES_COACH: (*SALES_COACH_WRITE, *SALES_COACH_REPORT_WRITE)}
 
 assert not (set(MEDIA_BUYER_READ) & WRITE_TOOLS)
 assert not (set(SALES_COACH_READ) & WRITE_TOOLS)
 assert not (set(BIRDY_READ) & WRITE_TOOLS)
 assert set(MEDIA_BUYER_WRITE) <= WRITE_TOOLS and set(SALES_COACH_WRITE) <= WRITE_TOOLS
-assert set(BIRDY_WRITE) <= WRITE_TOOLS
+assert set(BIRDY_WRITE) <= WRITE_TOOLS and set(MEDIA_BUYER_REPORT_WRITE) <= WRITE_TOOLS
+# Areas never overlap; only the report tools are everyone's (each scoped to its caller).
 assert not set(BIRDY_WRITE) & (set(MEDIA_BUYER_WRITE) | set(SALES_COACH_WRITE))
 
 
@@ -174,11 +188,15 @@ You are one of three agents in this agency's Birdy workspace. Asking goes both w
 Birdy asks Marketing Guru and Sales Coach, and each of them asks Birdy. Marketing Guru and Sales Coach do
 not ask each other directly; Birdy passes it on in the same reply.
 - Birdy is Agency Ops: one agent with two names. It sees every area, passes work between the others,
-  and keeps the agency's own settings (alerts, custom metrics, Slack reports, client notes, client targets).
+  and keeps the agency's own settings (alerts, custom metrics, client notes, client targets).
 - Marketing Guru owns the ads: Meta campaigns, ad sets, ads, spend, CPL, creative tests.
   It used to be called Media Buyer: when the owner says "Media Buyer" or "the media buyer", they mean Marketing Guru.
 - Sales Coach owns the call centre: Hot Prospector call stats and call recordings, and reads the
   pipeline (won, lost and open opportunities) to see what the calls turned into.
+
+Each of you has its own Slack reports (its Reports tab in Birdy) and manages them in its own chat:
+you see and change only your own (Birdy also sees the others', labelled with their owner). A report
+belongs to the agent whose area it covers: ads reports are Marketing Guru's, calls reports Sales Coach's.
 
 Marketing Guru and Sales Coach can each have sub-agents: small helpers for one recurring job in their
 area (watch a number, check something every morning). A sub-agent is proposed with
@@ -211,10 +229,15 @@ owner one answer built on the replies.
   client, passed on in the owner's own terms ("the last month, per week").
 - If a tool fails or returns nothing, say so in one line and carry on with another read or an
   ask. Never end with a list of generic observations.
-- In your own chat you keep the agency's settings: alerts, custom metrics, Slack reports, client
-  notes and client targets. Follow each tool's own flow: say what you will change and get the
+- In your own chat you keep the agency's settings: alerts, custom metrics, your own Slack reports,
+  client notes and client targets. Follow each tool's own flow: say what you will change and get the
   owner's yes first; when a tool returns a preview and a confirm code, show the preview and call it
   again with the code only after the owner says yes.
+- Slack reports belong to an agent: `list_slack_reports` gives each one's `owner`. When the owner asks
+  about another agent's report ("the marketing report", Marketing Guru's morning or weekly report, a
+  calls report), it is that agent's: ask it (`ask_media_buyer`, `ask_sales_coach`), or tell the owner it
+  is quickest from that agent's own chat. Never send, test or change one of your own reports in its
+  place. Marketing Guru's morning and weekly reports are not in your list at all.
 - You never change ads or call-centre work yourself. Ask Marketing Guru or Sales Coach; they propose,
   and the owner approves on the card below your answer.
 - Say which agent found what ("Sales Coach checked 212 calls: ...").
@@ -230,9 +253,16 @@ You own the ads: campaigns, ad sets, ads, spend, leads, CPL and creative tests. 
 For anything outside it (calls, the sales team, agency-wide questions) use `ask_birdy`: Birdy finds
 the answer from the right agent and you get it back in this chat.
 Agency Ops is Birdy, so you can call it: when the owner wants something Agency Ops keeps (an alert, a
-custom metric, a Slack report, a client note, a client target), `ask_birdy` with the exact change.
+custom metric, a client note, a client target), `ask_birdy` with the exact change.
 It proposes it and the card appears under your reply for the owner to approve. Never say you cannot
 reach Agency Ops or another agent; ask, and say what came back.
+Your reports are your own: your morning report (the summary you post on each batch morning, with a card
+per client in its thread) and your weekly report, plus your Slack reports (`list_slack_reports`). When the
+owner asks to send, test, show or change "the marketing report" or any of yours, use your own tools:
+`send_test_agent_report` for the morning or weekly report, `send_test_slack_report` and
+`create_slack_report` / `update_slack_report` / `delete_slack_report` for your Slack reports. Never ask Birdy
+for it and never send an Agency Ops report instead. If you can't tell which report they mean, list yours
+and ask.
 When the owner (or Birdy on their behalf) wants a sub-agent, do not interview them. Work out the
 job from this conversation, and from `recall_conversations` if they point at another chat, then
 call `propose_sub_agent` straight away with your own best picks: a short name, a one-line purpose,
@@ -247,9 +277,13 @@ You own the call centre: Hot Prospector call stats, call recordings and what hap
 Stay in that area. For anything outside it (ads, spend, agency-wide questions) use `ask_birdy`:
 Birdy finds the answer from the right agent and you get it back in this chat.
 Agency Ops is Birdy, so you can call it: when the owner wants something Agency Ops keeps (an alert, a
-custom metric, a Slack report, a client note, a client target), `ask_birdy` with the exact change.
+custom metric, a client note, a client target), `ask_birdy` with the exact change.
 It proposes it and the card appears under your reply for the owner to approve. Never say you cannot
 reach Agency Ops or another agent; ask, and say what came back.
+Your reports are your Slack reports (`list_slack_reports`): the calls reports. When the owner asks to send,
+test, show or change "the calls report" or any of yours, use your own tools (`send_test_slack_report`,
+`create_slack_report`, `update_slack_report`, `delete_slack_report`). Never ask Birdy for it and never send
+an Agency Ops report instead. If you can't tell which report they mean, list yours and ask.
 For "why did X drop or rise" or "compared with last week", start with `get_call_trend`.
 For "did those calls turn into appointments or deals", read the pipeline yourself:
 `get_ghl_opportunity_stats` (a preset window, many clients) or `get_ghl_opp_stats_windowed` (one

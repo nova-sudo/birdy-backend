@@ -42,8 +42,12 @@ class Trigger(BaseModel):
     alert_id: Optional[str] = None
 
 
+Owner = Literal["birdy", "media_buyer", "sales_coach"]   # sr.OWNERS
+
+
 class ReportBody(BaseModel):
     name: Optional[str] = Field(default=None, max_length=80)
+    owner: Optional[Owner] = None     # create only (default Birdy's); a change never moves a report
     enabled: Optional[bool] = None
     trigger: Optional[Trigger] = None
     channel_id: Optional[str] = None
@@ -104,6 +108,7 @@ async def clean_template(db, user_id: str, raw: dict, blocks: list | None = None
 
 def present(report: dict) -> dict:
     out = {k: v for k, v in report.items() if k != "_id"}
+    out["owner"] = sr.owner_of(report)
     out["summary"] = rt.describe(report.get("template") or {})
     return out
 
@@ -124,10 +129,15 @@ async def _write_brief(db, report: dict) -> None:
     )
 
 
-async def list_reports(db, user_id: str) -> dict:
+async def list_reports(db, user_id: str, owner: str | None = None) -> dict:
+    """Every report, the default first; with `owner`, only that agent's. `max` stays the account's
+    limit: it counts every owner's reports."""
     if not await db[sr.REPORTS].find_one({"user_id": user_id, "is_default": True}, {"_id": 1}):
         await sr.sync_default_from_brief(db, user_id)
     reports = await db[sr.REPORTS].find({"user_id": user_id}, {"_id": 0}).to_list(sr.MAX_REPORTS + 5)
+    if owner:
+        # Filtered here, not in the query: a report stored before owners existed has no field to match.
+        reports = [r for r in reports if sr.owner_of(r) == owner]
     reports.sort(key=lambda r: (not r.get("is_default"), r.get("created_at") or datetime.min))
     return {"reports": [present(r) for r in reports], "max": sr.MAX_REPORTS}
 
@@ -145,7 +155,8 @@ async def create_report(db, user_id: str, body: ReportBody) -> dict:
     template = await clean_template(db, user_id, body.template or {"frequency": "daily"}, trigger=trigger)
     report = sr.new_report(user_id, name=body.name.strip(), trigger=trigger, template=template,
                            channel_id=body.channel_id, channel_name=body.channel_name,
-                           enabled=True if body.enabled is None else body.enabled)
+                           enabled=True if body.enabled is None else body.enabled,
+                           owner=body.owner or sr.DEFAULT_OWNER)
     await db[sr.REPORTS].insert_one(dict(report))
     return {"report": present(report)}
 
