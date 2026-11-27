@@ -87,7 +87,7 @@ async def test_no_tool_is_sent_twice(mock_db, registry, monkeypatch):
                                                "parameters": {"type": "object", "properties": {}}}}
 
     @contextlib.asynccontextmanager
-    async def fake_mcp(user_id):
+    async def fake_mcp(user_id, **_):
         yield object()
 
     async def schemas(client, allowed):

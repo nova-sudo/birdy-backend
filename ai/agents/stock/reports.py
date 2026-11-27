@@ -23,6 +23,7 @@ from ai.agents.stock import templates as stock_templates
 from ai.agents.stock import weekly as stock_weekly
 from ai.agents.stock.cards import STATE_PROPOSED, STATUS_CLOSING, STATUS_OPEN, STATUS_PARTLY_APPLIED
 from ai.agents.stock.scoreboard import CLEARED, LOST, OUTCOMES, UNSCORED, WON
+from services.report_blocks import MAX_BLOCKS
 
 OUTCOME_ROWS = 100
 CLIENT_FIELDS = ("state", "error", "reason", "carded", "stale", "card_id", "wait_for", "health_due")
@@ -213,6 +214,124 @@ async def save_template(db, agent: dict, user_id: str, kind: str, template: dict
     merged = stock_settings.merge_settings(current, {"slack": {"templates": {kind: template}}})
     await db[agent_store.AGENTS].update_one({"_id": agent["_id"]}, {"$unset": {f"{stock_slack.NOTICES}.{kind}": ""}})
     return await agent_store.update_agent(db, user_id, agent["_id"], {"settings": merged})
+
+
+# ---------------------------------------------------------------------------
+# Test posts: one of the agent's reports, to its Slack channel, now
+# ---------------------------------------------------------------------------
+
+TEST_KINDS = {"morning": "summary"}   # the screens' name for the summary the agent posts each batch morning
+TEST_NAMES = {"summary": "morning report", "card": "client card", "weekly": "weekly report"}
+TEST_NO_CHANNEL = "No Slack channel is chosen for this agent. Pick one in its report settings first."
+TEST_NOT_CONNECTED = "Slack isn't connected. Connect it in Settings, then try again."
+
+
+def kind_for_test(kind: str) -> str:
+    """A template kind ("summary", "card", "weekly", or "morning" for the summary), else ReportError 400."""
+    kind = TEST_KINDS.get(kind, kind)
+    if kind not in stock_settings.TEMPLATE_KINDS:
+        raise ReportError(400, f"No report called {kind!r}: use morning, weekly or card")
+    return kind
+
+
+async def _latest_for_test(db, agent: dict, kind: str):
+    """The newest real run (and its cards) or card the test can show, else None (then sample figures)."""
+    agent_id = agent["_id"]
+    if kind == "card":
+        rows = await (db[stock_runner.CARDS].find({"agent_id": agent_id, "preview": {"$ne": True},
+                                                   "status": {"$ne": STATUS_CLOSING}})
+                      .sort("created_at", -1).limit(1).to_list(length=1))
+        return rows[0] if rows else None
+    q = {"agent_id": agent_id, "kind": {"$ne": stock_runner.PREVIEW}}
+    q.update({"weekly.values": {"$type": "object"}} if kind == "weekly" else
+             {"kind": stock_runner.BATCH, "phase": stock_runner.DONE})
+    rows = await db[stock_runner.RUNS].find(q).sort("as_of", -1).limit(1).to_list(length=1)
+    if not rows:
+        return None
+    if kind == "weekly":
+        return rows[0], None
+    cards = await db[stock_runner.CARDS].find({"run_id": rows[0]["_id"], "status": {"$ne": STATUS_CLOSING}}).to_list(length=None)
+    return rows[0], cards
+
+
+def _test_label(kind: str, source: dict | None) -> dict:
+    when = ""
+    if source is not None:
+        day = source.get("local_date") or (source.get("created_at").date().isoformat()
+                                           if isinstance(source.get("created_at"), datetime) else None)
+        when = f" from the {day} report" if day else " from the latest report"
+    figures = f"real figures{when}" if source is not None else "sample figures (the agent has no report yet)"
+    return {"type": "context", "elements": [{"type": "mrkdwn", "text": (
+        f":test_tube: *Test* of Marketing Guru's {TEST_NAMES[kind]}, with {figures}. Its buttons are left out, "
+        "so nothing here can be applied.")}]}
+
+
+async def build_test_message(db, agent: dict, kind: str) -> dict:
+    """The message a test post sends: {kind, blocks, text, source: "latest" | "sample"}. The latest real run's
+    figures when there is one, else the editor's sample ones, laid out with the saved template. Without buttons:
+    a press on a test must never act on a real report. Reads nothing from Meta and posts nothing."""
+    kind = kind_for_test(kind)
+    saved = stock_slack._saved_template(agent, kind)
+    latest = await _latest_for_test(db, agent, kind)
+    source = None
+    if latest is None:
+        currency = ((agent.get("settings") or {}).get("zones") or {}).get("currency") or "GBP"
+        template = saved or stock_templates.DEFAULT_TEMPLATES[kind]
+        try:
+            blocks, text = stock_templates.sample_preview(kind, template, now=_utcnow(), currency=currency,
+                                                          frontend_url=stock_slack.FRONTEND_URL)
+        except stock_templates.TemplateError:
+            blocks, text = stock_templates.sample_preview(kind, stock_templates.DEFAULT_TEMPLATES[kind], now=_utcnow(),
+                                                          currency=currency, frontend_url=stock_slack.FRONTEND_URL)
+    else:
+        if kind == "card":
+            source = latest
+            render = await stock_slack._card_renderer(db, agent, latest)
+        elif kind == "summary":
+            source = latest[0]
+            render = await stock_slack._summary_renderer(db, latest[0], agent, latest[1])
+        else:
+            source = latest[0]
+            values = latest[0]["weekly"]["values"]
+
+            def render(template):
+                b, t, fell_back = stock_templates.render_kind_safe("weekly", template, values, None,
+                                                                   stock_slack._context("weekly", agent))
+                return stock_templates.assemble(b, None), t, fell_back
+        blocks, text, _ = render(saved)
+    blocks = [_test_label(kind, source), *[b for b in blocks if b.get("type") != "actions"]]
+    return {"kind": kind, "blocks": blocks[:MAX_BLOCKS], "text": f"Test: {text}",
+            "source": "latest" if source is not None else "sample"}
+
+
+async def slack_for_test(db, agent: dict) -> tuple:
+    """(Slack client, the agent's Slack settings) a test posts with, else ReportError 409: no channel chosen,
+    Slack not connected, or it needs reconnecting. Checked before a chat asks the owner to confirm."""
+    slack = stock_slack._settings(agent).get("slack") or {}
+    if not slack.get("channel_id"):
+        raise ReportError(409, TEST_NO_CHANNEL)
+    client = await stock_slack._client_for(db, agent["user_id"])
+    if client is None:
+        status = await stock_slack.get_slack_bot_status(db, agent["user_id"])
+        raise ReportError(409, stock_slack.NEEDS_RECONNECT if status else TEST_NOT_CONNECTED)
+    return client, slack
+
+
+async def send_test_message(db, agent: dict, kind: str) -> dict:
+    """Post build_test_message to the agent's Slack channel now. Not recorded on any run or card, so nothing that
+    is already posted changes. {ok, kind, channel_id, channel_name, source}, or ReportError: 400 bad kind,
+    409 no channel / Slack not connected / Birdy can't post there, 502 Slack refused for another reason."""
+    kind = kind_for_test(kind)
+    client, slack = await slack_for_test(db, agent)
+    channel = slack["channel_id"]
+    message = await build_test_message(db, agent, kind)
+    try:
+        await stock_slack._call(client.chat_postMessage, channel=channel, blocks=message["blocks"], text=message["text"])
+    except stock_slack.SlackApiError as e:
+        failure = stock_slack._failure(e, await stock_slack._note_api_error(db, agent["user_id"], e))
+        raise ReportError(409 if not failure.retry or failure.reconnect else 502, str(failure))
+    return {"ok": True, "kind": kind, "channel_id": channel, "channel_name": slack.get("channel_name"),
+            "source": message["source"]}
 
 
 WEEKLY_REFUSED = {"preview": "A preview never posts to Slack."}

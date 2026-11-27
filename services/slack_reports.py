@@ -7,12 +7,16 @@ trigger fires.
 
 Stored in `slack_reports`:
 
-    {id, user_id, name, enabled, is_default,
+    {id, user_id, name, enabled, is_default, owner: "birdy" | "media_buyer" | "sales_coach",
      trigger:  {type: "schedule", frequency: "daily" | "weekly", day, time: "HH:MM", timezone}
              | {type: "event", event: "alert_fired" | "metric_created" | "account_created", alert_id},
      channel_id, channel_name,
      template: {version: 4, frequency: "daily" | "weekly", blocks: [...]},   # frequency = data window
      last_figures, last_run: {at, key, status, error}, created_at, updated_at}
+
+`owner` is the agent whose report it is (its Reports tab lists it, and only its
+chat changes it). A report stored before owners existed has none: it is Birdy's.
+Owner is only a label and a filter; scheduling and sending ignore it.
 
 A schedule's `timezone` may be None: it then follows the account's timezone
 (`users.timezone`), as the brief always did.
@@ -48,6 +52,14 @@ RUNS = "slack_report_runs"
 MAX_REPORTS = 20
 EVENTS = ("alert_fired", "metric_created", "account_created")
 DEFAULT_NAMES = {"daily": "Daily brief", "weekly": "Weekly brief"}
+OWNERS = ("birdy", "media_buyer", "sales_coach")   # ai/team/definitions.AGENT_KEYS; not imported to keep ai out
+DEFAULT_OWNER = "birdy"
+
+
+def owner_of(report: dict) -> str:
+    """Whose report this is. Reports stored before owners existed are Birdy's."""
+    owner = report.get("owner")
+    return owner if owner in OWNERS else DEFAULT_OWNER
 
 
 async def create_slack_report_indexes(mongo_client):
@@ -115,11 +127,11 @@ def brief_of(report: dict) -> dict:
 
 def new_report(user_id: str, *, name: str, trigger: dict, template: dict,
                channel_id: str | None = None, channel_name: str | None = None,
-               enabled: bool = True, is_default: bool = False) -> dict:
+               enabled: bool = True, is_default: bool = False, owner: str = DEFAULT_OWNER) -> dict:
     now = datetime.utcnow()
     return {
         "id": uuid.uuid4().hex, "user_id": user_id, "name": name, "enabled": enabled,
-        "is_default": is_default, "trigger": trigger, "template": template,
+        "is_default": is_default, "owner": owner, "trigger": trigger, "template": template,
         "channel_id": channel_id, "channel_name": channel_name,
         "last_figures": None, "last_run": None, "created_at": now, "updated_at": now,
     }

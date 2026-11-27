@@ -4,8 +4,8 @@ ai/mcp/stock_agent_mcp.py
 Tools for the Birdy Media Buying Agent: what it did, what it found and what is waiting on the owner (read), and
 the owner's decisions on it (write). Each wraps the logic behind the matching route in routers/agent_stock.py
 (ai/agents/stock/reports.py, apply.py, agent_settings.py). Tools that change live ads or post to Slack
-(apply_card, apply_all_cards, undo_card_line, post_weekly_report, and update_agent_settings when it lets the agent
-act on its own) are two-step: a preview and a confirm_code first.
+(apply_card, apply_all_cards, undo_card_line, post_weekly_report, send_test_agent_report, and update_agent_settings
+when it lets the agent act on its own) are two-step: a preview and a confirm_code first.
 """
 
 from typing import Literal
@@ -24,7 +24,7 @@ from ai.mcp.access import LIVE, READ, WRITE
 from ai.mcp.cards import card
 from ai.mcp.agent_mcp import resolve_agent
 from ai.mcp.confirm import two_step
-from ai.mcp.server import mcp, current_user_id as _current_user_id
+from ai.mcp.server import mcp, current_agent as _current_agent, current_user_id as _current_user_id
 from ai.tools import stock_card_tools
 from ai.tools.stock_card_tools import card_view
 from core.database import get_db
@@ -413,6 +413,48 @@ async def post_weekly_report(run_id: str, agent: str | None = None, confirm_code
 
     return await two_step(db, user_id, "post_weekly_report", {"agent_id": found["_id"], "run_id": run_id},
                           confirm_code, preview, execute)
+
+
+@mcp.tool(**LIVE)
+async def send_test_agent_report(kind: str, agent: str | None = None, confirm_code: str | None = None) -> dict:
+    """Post one of Marketing Guru's own reports to its Slack channel right now, as a test: "morning" (the summary it posts each batch morning), "weekly" (the weekly report) or "card" (one client's card). It uses the latest real report's figures when there is one, else sample figures, laid out with the saved template, marked as a test and without buttons. Nothing is recorded and nothing already posted changes.
+
+    Two steps. Called without confirm_code it posts nothing and returns a preview (the report, the Slack channel, the message text and whether the figures are real or sample) and a one-time confirm_code. Show the preview to the user and only call again with confirm_code after they say yes.
+    The second call must repeat the same arguments. With no Slack channel chosen for the agent or Slack not connected you get an error and no code.
+
+    Args:
+        kind: "morning", "weekly" or "card".
+        agent: Optional agent id or name. Defaults to the owner's Birdy Media Buying Agent.
+        confirm_code: The code from the preview, once the user has agreed.
+    """
+    caller = _current_agent()
+    if caller and caller != "media_buyer":
+        # The morning and weekly reports are Marketing Guru's: another agent asks it instead of sending them.
+        raise ToolError("These are Marketing Guru's reports, so only Marketing Guru sends them. Ask it.")
+    db, user_id, found = await _stock(agent)
+    try:
+        kind = reports.kind_for_test(kind)
+        # Refuse now if it can't work, so the owner is never asked to confirm something that will fail.
+        _, slack = await reports.slack_for_test(db, found)
+    except reports.ReportError as e:
+        raise _fail(e)
+
+    async def preview():
+        message = await reports.build_test_message(db, found, kind)
+        return {"kind": kind, "report": reports.TEST_NAMES[kind], "channel": slack.get("channel_name") or slack["channel_id"],
+                "channel_id": slack["channel_id"], "figures": message["source"], "message": message["text"]}
+
+    async def execute():
+        try:
+            res = await reports.send_test_message(db, found, kind)
+        except reports.ReportError as e:
+            raise _fail(e)
+        where = res.get("channel_name") or res["channel_id"]
+        return {**res, "summary": f"Posted a test of the {reports.TEST_NAMES[kind]} to #{where}."}
+
+    state = {"channel_id": slack.get("channel_id"), "template": reports.stored_templates(found).get(kind)}
+    return await two_step(db, user_id, "send_test_agent_report", {"agent_id": found["_id"], "kind": kind},
+                          confirm_code, preview, execute, state=state)
 
 
 @mcp.tool(**WRITE)

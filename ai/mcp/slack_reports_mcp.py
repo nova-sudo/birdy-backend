@@ -5,6 +5,12 @@ Tools for the owner's Slack reports (Hub -> Reports): list them (read), create, 
 post a test of one to Slack (live, two-step). They use the same request models, validation and writes as the
 dashboard routes (services/slack_report_ops.py), and the test send renders with the same function the real send
 posts with, so the preview has the same figures and layout as what lands in Slack.
+
+Every report belongs to one agent (its `owner`). Called from an agent's chat run, the tools are scoped to the
+calling agent, read from the run's signed token (server.current_agent), never from an argument: Marketing Guru and
+Sales Coach see and change only their own reports, and what they create is theirs. Birdy changes only hers but
+lists everyone's, labelled, so she can send the owner to the right agent. An outside assistant (no agent in its
+token) is the owner and sees and changes every report, as before.
 """
 
 from datetime import datetime, timezone
@@ -14,7 +20,7 @@ from pydantic import ValidationError
 
 from ai.mcp.access import LIVE, READ, WRITE
 from ai.mcp.confirm import two_step
-from ai.mcp.server import mcp, current_user_id as _current_user_id
+from ai.mcp.server import mcp, current_agent as _current_agent, current_user_id as _current_user_id
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
 from services import slack_report_ops as ops
@@ -34,8 +40,25 @@ _TEMPLATE_HELP = (
 )
 
 
+_NAMES = {"birdy": "Agency Ops (Birdy)", "media_buyer": "Marketing Guru", "sales_coach": "Sales Coach"}
+_ASK = {"birdy": "ask_birdy", "media_buyer": "ask_media_buyer", "sales_coach": "ask_sales_coach"}
+
+
 def _db():
     return get_db(get_shared_mongo_client())
+
+
+def _caller() -> str | None:
+    """The calling agent when it owns reports, else None (an outside assistant: the owner, unscoped)."""
+    agent = _current_agent()
+    return agent if agent in sr.OWNERS else None
+
+
+def _not_yours(caller: str, owner: str) -> ToolError:
+    """Refused, with where to go instead: the report's own agent changes it."""
+    ask = _ASK[owner] if caller == "birdy" or owner == "birdy" else "ask_birdy"
+    return ToolError(f"That is {_NAMES[owner]}'s report, so only {_NAMES[owner]} can change or send it. "
+                     f"Ask it with {ask}; don't send or change one of your own reports instead.")
 
 
 def _body(**fields) -> ops.ReportBody:
@@ -55,10 +78,15 @@ def _detail(e: ops.ReportError) -> str:
 
 
 async def _find(db, user_id: str, report_id: str) -> dict:
+    """The report, when the calling agent may change it (its own, or any for an outside assistant)."""
     try:
-        return await ops.get_report(db, user_id, report_id)
+        report = await ops.get_report(db, user_id, report_id)
     except ops.ReportError as e:
         raise ToolError(_detail(e))
+    caller = _caller()
+    if caller and sr.owner_of(report) != caller:
+        raise _not_yours(caller, sr.owner_of(report))
+    return report
 
 
 async def _slack_connected(db, user_id: str) -> bool:
@@ -83,12 +111,13 @@ async def _channel_label(db, user_id: str, report: dict, channel_id: str) -> str
 
 @mcp.tool(**READ)
 async def list_slack_reports() -> dict:
-    """The owner's Slack reports, the default daily/weekly brief first: each one's id, name, whether it is on, when it sends (a schedule or an event), where it is sent (`sends_to`: the report's own channel, or the account's default Birdy channel when channel_id is empty), its content template and a one-line summary of each block. Also returns `max`, how many reports an account can have.
+    """The owner's Slack reports, the default daily/weekly brief first: each one's id, name, `owner` (the agent whose report it is: birdy, media_buyer or sales_coach) and `owner_name`, whether it is on, when it sends (a schedule or an event), where it is sent (`sends_to`: the report's own channel, or the account's default Birdy channel when channel_id is empty), its content template and a one-line summary of each block. Also returns `max`, how many reports an account can have (every agent's count toward it).
 
-    Use it to find a report's id before update_slack_report, delete_slack_report or send_test_slack_report, or to answer "what do I get in Slack and when?".
+    In an agent's own chat you see your own reports (Birdy sees every agent's, labelled by owner, and changes only her own). Use it to find a report's id before update_slack_report, delete_slack_report or send_test_slack_report, or to answer "what do I get in Slack and when?".
     """
     db, user_id = _db(), _current_user_id()
-    out = await ops.list_reports(db, user_id)
+    caller = _caller()
+    out = await ops.list_reports(db, user_id, owner=caller if caller and caller != "birdy" else None)
     # A report with no channel of its own goes to the account's default Birdy channel; its channel_id
     # is empty, which read as "sent nowhere".
     user = await db["users"].find_one({"user_id": user_id}, {"integrations.slack_bot.notify_channel_id": 1,
@@ -99,6 +128,7 @@ async def list_slack_reports() -> dict:
         report["sends_to"] = {"channel_id": own or bot.get("notify_channel_id"),
                               "channel_name": report.get("channel_name") if own else bot.get("notify_channel_name"),
                               "default_channel": not own}
+        report["owner_name"] = _NAMES[report["owner"]]
     return out
 
 
@@ -109,7 +139,7 @@ async def list_slack_reports() -> dict:
 @mcp.tool(**WRITE)
 async def create_slack_report(name: str, trigger: dict, channel_id: str | None = None, channel_name: str | None = None,
                               enabled: bool = True, template: dict | None = None) -> dict:
-    """Create a Slack report: a message Birdy posts to Slack on a schedule or when something happens. Returns the new report. Nothing is posted by creating it; use send_test_slack_report to see it in Slack.
+    """Create a Slack report: a message Birdy posts to Slack on a schedule or when something happens. Returns the new report. Nothing is posted by creating it; use send_test_slack_report to see it in Slack. In an agent's own chat the report is that agent's (its `owner`) and appears on its Reports tab.
 
     Same rules as Hub -> Reports: a name (80 characters at most), a trigger, and an optional channel. Without channel_id the report goes to the account's default Birdy channel. An account can have a limited number of reports (see `max` in list_slack_reports).
 
@@ -122,7 +152,7 @@ async def create_slack_report(name: str, trigger: dict, channel_id: str | None =
         template: What it says. {template_help}
     """
     body = _body(name=name, trigger=trigger, channel_id=channel_id, channel_name=channel_name, enabled=enabled,
-                 template=template)
+                 template=template, owner=_caller())
     try:
         return await ops.create_report(_db(), _current_user_id(), body)
     except ops.ReportError as e:
@@ -152,8 +182,10 @@ async def update_slack_report(report_id: str, name: str | None = None, enabled: 
     """
     body = _body(name=name, enabled=enabled, trigger=trigger, channel_id=channel_id, channel_name=channel_name,
                  template=template)
+    db, user_id = _db(), _current_user_id()
+    await _find(db, user_id, report_id)
     try:
-        return await ops.update_report(_db(), _current_user_id(), report_id, body)
+        return await ops.update_report(db, user_id, report_id, body)
     except ops.ReportError as e:
         raise ToolError(_detail(e))
 
@@ -171,6 +203,7 @@ async def delete_slack_report(report_id: str) -> dict:
     """
     db = _db()
     user_id = _current_user_id()
+    await _find(db, user_id, report_id)
     try:
         return await ops.delete_report(db, user_id, report_id)
     except ops.ReportError as e:

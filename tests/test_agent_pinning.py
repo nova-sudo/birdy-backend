@@ -173,7 +173,7 @@ def mcp(monkeypatch, registry):
     calls = []
 
     @contextlib.asynccontextmanager
-    async def fake_client(user_id):
+    async def fake_client(user_id, **_):
         yield object()
 
     async def schemas(client, allowed):
