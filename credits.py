@@ -218,11 +218,11 @@ def credits_for_usage(mode: str, model: Optional[str], in_tokens: int, out_token
 
 # ── Balance model (users.credits) ───────────────────────────────────────────
 
-def _period_key(sub: dict) -> str:
+def _period_key(sub: dict, now: Optional[datetime] = None) -> str:
     """Identifies the current billing period so the allowance resets with it."""
     if sub and sub.get("current_period_end"):
         return str(sub["current_period_end"])
-    return datetime.now(timezone.utc).strftime("%Y-%m")
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m")
 
 
 def _allowance_for(sub: dict) -> int:
@@ -231,17 +231,64 @@ def _allowance_for(sub: dict) -> int:
     return PLAN_ALLOWANCE.get((sub.get("plan_id") or ""), 0)
 
 
-def _effective_credits(user_doc: dict) -> tuple[dict, bool]:
+def _period_end(key: Optional[str]) -> Optional[datetime]:
+    """When the period a _period_key names ends (aware UTC), or None if unreadable.
+
+    A "YYYY-MM" key (no subscription) ends on the first of the next month; a
+    subscription's key is its current_period_end, as Whop sent it."""
+    if not key:
+        return None
+    try:
+        if len(key) == 7 and key[4] == "-":
+            year, month = int(key[:4]), int(key[5:])
+            return datetime(year + month // 12, month % 12 + 1, 1, tzinfo=timezone.utc)
+        end = datetime.fromisoformat(key.replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    return end if end.tzinfo else end.replace(tzinfo=timezone.utc)
+
+
+def _iso_or_none(dt: Optional[datetime]) -> Optional[str]:
+    return dt.isoformat() if dt else None
+
+
+def _effective_credits(user_doc: dict, now: Optional[datetime] = None) -> tuple[dict, bool]:
     """Return (credits_dict, changed). Resets ``used`` when the billing period
-    rolls over and keeps ``allowance`` in sync with the current plan. Top-up
-    balance carries across periods."""
+    the allowance belongs to has ended, and keeps ``allowance`` in sync with the
+    current plan. Top-up balance carries across periods.
+
+    The reset is driven by ``resets_at`` (when the period in use ends), not by
+    the period key merely changing. The key is the subscription's period end,
+    and it also changes mid-period: on a plan change (a new Whop membership with
+    its own end date), on a renewal webhook that lands early, or on cancelling
+    and resubscribing. Resetting on any key change let a customer get a fresh
+    allowance by switching plans back and forth. Now a mid-period key change
+    keeps what was already used; only the period's end resets it.
+
+    - Same plan, new end date (renewal, resubscribe): the reset stays at the
+      earlier of the two ends, so an early renewal still resets on time.
+    - Different plan: the new plan's cycle is the one paid for, so the reset
+      moves to its end, and switching back and forth never resets early.
+    """
+    now = now or datetime.now(timezone.utc)
     sub = (user_doc or {}).get("subscription") or {}
     credits = dict((user_doc or {}).get("credits") or {})
-    pk = _period_key(sub)
+    pk = _period_key(sub, now)
+    plan = sub.get("plan_id")
     allowance = _allowance_for(sub)
+    new_end = _period_end(pk)
     changed = False
 
-    if credits.get("period_key") != pk:
+    stored_key = credits.get("period_key")
+    # Balances written before resets_at existed: their period ends where their key says.
+    resets_at = _period_end(credits["resets_at"]) if "resets_at" in credits else _period_end(stored_key)
+
+    due = (
+        stored_key is None                                    # first balance for this user
+        or (resets_at is not None and now >= resets_at)       # the period in use has ended
+        or (resets_at is None and stored_key != pk)           # end unknown: fall back to the key changing
+    )
+    if due:
         credits = {
             "allowance": allowance,
             "used": 0.0,
@@ -249,11 +296,27 @@ def _effective_credits(user_doc: dict) -> tuple[dict, bool]:
             "topup_balance": float(credits.get("topup_balance", 0.0) or 0.0),
             "credited_topup_ids": credits.get("credited_topup_ids", []),
             "period_key": pk,
+            # A stale period end (already past) must not reset on every read: wait for the key to change.
+            "resets_at": _iso_or_none(new_end if new_end and new_end > now else None),
+            "plan_id": plan,
         }
         changed = True
-    elif credits.get("allowance") != allowance:
-        credits["allowance"] = allowance
-        changed = True
+    else:
+        if stored_key != pk or credits.get("plan_id") != plan:
+            upcoming = new_end if new_end and new_end > now else None  # a past end never pulls the reset earlier
+            if "plan_id" in credits and credits.get("plan_id") != plan:
+                next_reset = upcoming or resets_at
+            else:
+                ends = [d for d in (resets_at, upcoming) if d]
+                next_reset = min(ends) if ends else None
+            credits.update(period_key=pk, plan_id=plan, resets_at=_iso_or_none(next_reset))
+            changed = True
+        elif "resets_at" not in credits:
+            credits["resets_at"] = _iso_or_none(resets_at)
+            changed = True
+        if credits.get("allowance") != allowance:
+            credits["allowance"] = allowance
+            changed = True
 
     credits.setdefault("allowance", allowance)
     credits.setdefault("used", 0.0)
