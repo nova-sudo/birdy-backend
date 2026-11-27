@@ -315,6 +315,9 @@ class AiModelsResponse(BaseModel):
 
 class SlackBotStatusResponse(BaseModel):
     installed: bool
+    # A sandbox account may connect a made-up workspace or a real one (GET /api/connect/slack?real=true).
+    sandbox_account: bool = False
+    test_workspace: bool = False
     team_id: Optional[str] = None
     team_name: Optional[str] = None
     bot_user_id: Optional[str] = None

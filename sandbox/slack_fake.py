@@ -26,6 +26,8 @@ from sandbox.credentials import PREFIX, make_credential, parse_credential
 logger = logging.getLogger(__name__)
 
 CODE_KIND = "slack_code"
+# Every made-up workspace id starts with this, so a status read can tell a test workspace from a real one.
+TEAM_PREFIX = "TSBX"
 TOKEN_KIND = "slack"
 
 # What Birdy asks for at install; echoed back as the granted scope.
@@ -43,7 +45,7 @@ def _short(user_id: str, salt: str, n: int = 9) -> str:
 def team_for(user_id: str) -> dict:
     """The account's made-up workspace. Its id is unique per account (the index requires it)."""
     name = user_id.split("@", 1)[0].replace(".", " ").replace("_", " ").title() or "Sandbox"
-    return {"id": f"TSBX{_short(user_id, 'team')}", "name": f"{name} Sandbox Workspace"}
+    return {"id": f"{TEAM_PREFIX}{_short(user_id, 'team')}", "name": f"{name} Sandbox Workspace"}
 
 
 def channels_for(user_id: str) -> list[dict]:
