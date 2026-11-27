@@ -129,3 +129,51 @@ async def test_callbacks_refuse_the_wrong_kind_of_code(mock_db, real_slack):
     assert res.status_code == 302 and "status=error" in res.headers["location"]
     assert real_slack == []
     assert await get_decrypted_bot_token_for_user(mock_db, SBX) is None
+
+
+async def test_a_sandbox_account_can_ask_for_a_real_workspace(mock_db, monkeypatch):
+    sent = []
+
+    async def slack(self, api_method, **kwargs):
+        # The stand-in for Slack: the code exchange a real install makes.
+        sent.append(api_method)
+        return {"ok": True, "access_token": "xoxb-real-workspace", "bot_user_id": "UBOT",
+                "scope": "chat:write", "team": {"id": "T0REAL", "name": "Real Workspace"}}
+
+    monkeypatch.setitem(slack_fake._installed, "orig", slack)
+    client = _client(SBX)
+    before = client.get("/api/integrations/slack/status").json()
+    assert before["installed"] is False and before["sandbox_account"] is True
+
+    auth_url = client.get("/api/connect/slack", params={"real": "true"}).json()["auth_url"]
+    assert auth_url.startswith("https://slack.com/oauth/v2/authorize?") and "sbx_" not in auth_url
+    state = parse_qs(urlsplit(auth_url).query)["state"][0]
+
+    res = client.get("/api/connect/slack/callback", params={"code": "real-code", "state": state},
+                     follow_redirects=False)
+    assert res.status_code == 302 and res.headers["location"].endswith("status=success")
+    assert sent == ["oauth.v2.access"]
+    assert await get_decrypted_bot_token_for_user(mock_db, SBX) == "xoxb-real-workspace"
+    status = client.get("/api/integrations/slack/status").json()
+    assert status["team_name"] == "Real Workspace" and status["sandbox_account"] and not status["test_workspace"]
+
+
+async def test_the_test_workspace_reads_as_one(mock_db, real_slack):
+    client = _client(SBX)
+    _follow(client, client.get("/api/connect/slack").json()["auth_url"])
+    status = client.get("/api/integrations/slack/status").json()
+    assert status["sandbox_account"] and status["test_workspace"]
+
+
+async def test_a_normal_account_cannot_use_the_real_flag_to_skip_anything(mock_db, real_slack):
+    # ?real=true changes nothing for a normal account, and a sandbox code is still refused.
+    client = _client(REAL)
+    auth_url = client.get("/api/connect/slack", params={"real": "true"}).json()["auth_url"]
+    assert auth_url.startswith("https://slack.com/oauth/v2/authorize?")
+    state = slack_router._mint_install_state(REAL, real=True)
+    res = client.get("/api/connect/slack/callback",
+                     params={"code": make_credential(SBX, slack_fake.CODE_KIND), "state": state},
+                     follow_redirects=False)
+    assert res.status_code == 302 and "status=error" in res.headers["location"]
+    assert client.get("/api/integrations/slack/status").json()["sandbox_account"] is False
+    assert real_slack == []

@@ -43,7 +43,7 @@ from services.slack_bot_service import (
 
 logger = logging.getLogger(__name__)
 
-from sandbox import is_sandbox_user
+from sandbox import is_credential, is_sandbox_user
 from sandbox.connect import code_error, sandbox_auth_url
 
 router = APIRouter()
@@ -60,37 +60,47 @@ _STATE_TTL_SECONDS = 600
 _FRONTEND_SETTINGS_URL = "https://birdy-beta.vercel.app/settings?tab=integrations"
 
 
-def _mint_install_state(user_id: str) -> str:
+def _mint_install_state(user_id: str, real: bool = False) -> str:
     # A distinct "purpose" claim (not "type": "access") documents intent, but
     # the real security boundary is the short TTL — any correctly-signed JWT
     # with a "sub" claim would pass get_current_user()'s cookie check
     # regardless of claim shape (a pre-existing property of this codebase's
     # single-shared-secret scheme, e.g. ai/mcp_client.py's internal token).
     exp = int(time.time()) + _STATE_TTL_SECONDS
+    claims = {"sub": user_id, "purpose": "slack_install", "exp": exp}
+    if real:
+        # A sandbox account that asked for a real workspace (see connect_slack).
+        claims["real"] = True
     return pyjwt.encode(
-        {"sub": user_id, "purpose": "slack_install", "exp": exp},
+        claims,
         JWT_SECRET,
         algorithm=JWT_ALGORITHM,
     )
 
 
-def _verify_install_state(state: str) -> str:
+def _read_install_state(state: str) -> dict:
     payload = pyjwt.decode(state, JWT_SECRET, algorithms=[JWT_ALGORITHM])
     if payload.get("purpose") != "slack_install":
         raise ValueError("Wrong token purpose")
-    return payload["sub"]
+    return payload
+
+
+def _verify_install_state(state: str) -> str:
+    return _read_install_state(state)["sub"]
 
 
 @router.get("/api/connect/slack")
-async def connect_slack(current_user: str = Depends(get_current_user)):
+async def connect_slack(real: bool = False, current_user: str = Depends(get_current_user)):
     if not SLACK_CLIENT_ID or not SLACK_REDIRECT_URI:
         raise HTTPException(status_code=503, detail="Slack integration not configured")
 
-    state = _mint_install_state(current_user)
-    if is_sandbox_user(current_user):
-        # A sandbox account gets a made-up workspace (sandbox/slack_fake.py): Slack links a real one
-        # to a single Birdy account, so a tester's own workspace would be refused. Straight back to
-        # our callback with a sandbox code, no Slack screens.
+    sandbox = is_sandbox_user(current_user)
+    state = _mint_install_state(current_user, real=sandbox and real)
+    if sandbox and not real:
+        # By default a sandbox account gets a made-up workspace (sandbox/slack_fake.py): Slack
+        # links a real one to a single Birdy account, so a tester's own workspace may be refused.
+        # Straight back to our callback with a sandbox code, no Slack screens. `?real=true` sends
+        # it through Slack like a normal account, so a tester can see Birdy in a real workspace.
         from sandbox import slack_fake
         auth_url = sandbox_auth_url(SLACK_REDIRECT_URI, current_user, slack_fake.CODE_KIND)
         return {"auth_url": f"{auth_url}&{urllib.parse.urlencode({'state': state})}"}
@@ -123,7 +133,8 @@ async def slack_callback(request: Request, response: Response):
         return {"redirect_url": redirect_url}
 
     try:
-        user_id = _verify_install_state(state)
+        install_state = _read_install_state(state)
+        user_id = install_state["sub"]
     except Exception as e:
         logger.warning(f"Slack install state verification failed: {e}")
         redirect_url = f"{_FRONTEND_SETTINGS_URL}&status=error&error=invalid_state"
@@ -131,8 +142,11 @@ async def slack_callback(request: Request, response: Response):
         response.status_code = 302
         return {"redirect_url": redirect_url}
 
-    # A sandbox account only ever exchanges a sandbox code, and a normal account never does.
-    problem = code_error(user_id, code)
+    # A sandbox account exchanges a sandbox code, and a normal account never does. The one exception:
+    # a sandbox account that asked for a real workspace (the signed state says so) exchanges Slack's
+    # own code.
+    real_for_sandbox = bool(install_state.get("real")) and is_sandbox_user(user_id) and not is_credential(code)
+    problem = None if real_for_sandbox else code_error(user_id, code)
     if problem:
         logger.warning(f"Slack callback refused for {user_id}: {problem}")
         redirect_url = f"{_FRONTEND_SETTINGS_URL}&status=error&error={urllib.parse.quote(problem)}"
@@ -182,14 +196,21 @@ async def slack_callback(request: Request, response: Response):
     return {"redirect_url": redirect_url}
 
 
+def slack_fake_team_prefix() -> str:
+    from sandbox import slack_fake
+    return slack_fake.TEAM_PREFIX
+
+
 @router.get("/api/integrations/slack/status", response_model=SlackBotStatusResponse)
 async def slack_status(current_user: str = Depends(get_current_user)):
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
         status = await get_slack_bot_status(db, current_user)
+        sandbox = is_sandbox_user(current_user)
         if not status:
-            return SlackBotStatusResponse(installed=False)
-        return SlackBotStatusResponse(installed=True, **status)
+            return SlackBotStatusResponse(installed=False, sandbox_account=sandbox)
+        test_workspace = sandbox and str(status.get("team_id") or "").startswith(slack_fake_team_prefix())
+        return SlackBotStatusResponse(installed=True, sandbox_account=sandbox, test_workspace=test_workspace, **status)
 
 
 @router.delete("/api/integrations/slack/remove")
