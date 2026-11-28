@@ -126,9 +126,19 @@ CATALOG: dict[str, dict] = {
                         "format": "currency", "formula": ("meta_spend", "ghl_total_opps"), "sources": ("meta", "ghl_opp")},
     "roas":            {"label": "Return on ad spend", "source": "combined", "lower_is_better": False,
                         "format": "roas", "formula": ("ghl_revenue", "meta_spend"), "sources": ("meta", "ghl_opp")},
+    # Sales Coach's outcomes, counted at send time with the owner's own definitions and speed target
+    # (services/report_sales.py). Listed only for an account that has what each needs.
+    "booked":          {"label": "Booked", "source": "sales_coach", "lower_is_better": False, "sources": ("sales_booked",)},
+    "closed":          {"label": "Closed", "source": "sales_coach", "lower_is_better": False, "sources": ("sales_closed",)},
+    "speed_to_lead":   {"label": "Speed to lead (min)", "source": "sales_coach", "lower_is_better": True,
+                        "format": "minutes", "sources": ("sales_speed",)},
+    "speed_within_target": {"label": "Called within target", "source": "sales_coach", "lower_is_better": False,
+                            "format": "percentage", "sources": ("sales_speed_target",)},
 }
+SALES_METRICS = frozenset(m for m, meta in CATALOG.items() if meta["source"] == "sales_coach")
 
-SOURCE_LABELS = {"meta": "Meta Ads", "ghl_opp": "CRM pipeline", "hp_call": "Call centre", "combined": "Meta + CRM"}
+SOURCE_LABELS = {"meta": "Meta Ads", "ghl_opp": "CRM pipeline", "hp_call": "Call centre", "combined": "Meta + CRM",
+                 "sales_coach": "Sales Coach"}
 
 SPECIAL_TOKENS = ("ranking", "breakdown", "alerts", "flagged_ads", "birdy_take", "period", "date", "client_count")
 # Filled from the Birdy event that sent the report (services/report_events.py);
@@ -600,6 +610,8 @@ def fmt(metric: str, value: float, currency: str) -> str:
         return f"{value:.1f}%"
     if kind == "decimal":
         return f"{value:,.2f}"
+    if kind == "minutes":
+        return f"{value:,.1f} min"
     return f"{value:,.0f}"
 
 
@@ -610,6 +622,7 @@ _SAMPLES = {
     "hp_total_calls": 46.0, "hp_inbound": 12.0, "hp_outbound": 34.0, "hp_answered_calls": 29.0,
     "hp_transfers": 4.0, "hp_talk_time": 182.0, "hp_answer_rate": 63.0, "hp_connect_rate": 72.0,
     "cost_per_win": 47.33, "cost_per_opp": 10.14, "roas": 16.9,
+    "booked": 6.0, "closed": 2.0, "speed_to_lead": 4.2, "speed_within_target": 68.0,
 }
 
 
@@ -633,6 +646,7 @@ class Context:
         self.values: dict[str, float] = {}   # this send's figures, for the next send's show=change
         self.event: dict[str, str] = {}      # the event that sent it, if one did
         self.agent: dict[str, str] = {}      # a stock agent template's values; they win over the report's own
+        self.sales: dict[tuple, dict] = {}   # Sales Coach's outcomes per (client, preset) (services/report_sales.py)
         self._views: dict[str, dict] = {}
 
     def views(self, preset):
@@ -645,11 +659,26 @@ class Context:
         return _PRESET_KEY.get(p, p) if p else self.base
 
     def value(self, metric, client_id, preset) -> float | None:
+        """One client's figure (or the portfolio's), kept for the next send's comparison."""
         if self.sample:
-            return _SAMPLES[metric] * (0.6 if client_id else 1)
+            value = _SAMPLES[metric] * (0.6 if client_id else 1)
+        else:
+            value = self.total(metric, [client_id] if client_id else list(self.groups), preset)
+        if value is not None:
+            self.values[_key(metric, client_id, preset)] = value
+        return value
+
+    def total(self, metric, client_ids, preset) -> float | None:
+        """The figure over these clients together."""
+        if metric in SALES_METRICS:
+            from services import report_sales
+            return report_sales.value(metric, [r for i in client_ids for r in [self.sales.get((i, preset))] if r])
         views = self.views(preset)
-        ids = [client_id] if client_id else list(views)
-        return _value(metric, [views[i] for i in ids if i in views], preset)
+        return _value(metric, [views[i] for i in client_ids if i in views], preset)
+
+    def before(self, metric, client_id, preset) -> float | None:
+        """The same figure in the last send, when that send covered the period just before this one."""
+        return self.previous.get(_key(metric, client_id, preset))
 
 
 def _key(metric, client_id, preset):
@@ -670,14 +699,12 @@ def _resolve(tok: dict, ctx: Context) -> str:
         preset = ctx.preset(opts)
         value = ctx.value(name, client_id, preset)
         show = opts.get("show", "value")
-        if value is not None:
-            ctx.values[_key(name, client_id, preset)] = value
         if value is None:
             return "no data" if show == "value" else ""
         if show == "value":
             return fmt(name, value, cur)
         if show == "change":
-            before = ctx.previous.get(_key(name, client_id, preset))
+            before = ctx.before(name, client_id, preset)
             if before in (None, 0):
                 return f"_(change vs {ctx.period['prev']} shows from the 2nd report)_" if ctx.preview else ""
             pct = (value - before) / abs(before) * 100
@@ -788,14 +815,29 @@ async def build_context(db, user_id: str, template: dict, now_utc: datetime,
 DAILY_FIELDS = ("meta_daily_spend", "ghl_daily_leads", "hp_daily_calls")
 
 
+def token_metrics(tokens: list[dict]) -> set[str]:
+    """The catalog metrics these placeholders read, rankings and breakdowns included."""
+    out = set()
+    for t in tokens:
+        if t["name"] in CATALOG:
+            out.add(t["name"])
+        elif t["name"] == "ranking":
+            out.add(t["opts"].get("metric"))
+        elif t["name"] == "breakdown":
+            out.update(m.strip() for m in (t["opts"].get("metrics") or "").split(","))
+    return out & set(CATALOG)
+
+
 async def load_context(db, user_id: str, frequency: str, now_utc: datetime, *, tokens: list[dict],
                        extra_presets: set[str] = frozenset(), daily: bool = False,
                        previous: dict | None = None, allow_sample: bool = False,
-                       preview: bool = False) -> Context:
+                       preview: bool = False, metrics: set[str] = frozenset()) -> Context:
     """
     Read what a report needs: the windows its placeholders (and any data
     blocks, via `extra_presets`) name, the daily series when a chart plots
-    days, and alerts / flagged ads only when something shows them. Pure reads.
+    days, alerts / flagged ads only when something shows them, and Sales
+    Coach's outcomes only when a placeholder or a data block (`metrics`)
+    shows one. Pure reads.
     """
     base = PERIODS[frequency]["preset"]
     presets = {base} | set(extra_presets) | {_PRESET_KEY.get(t["opts"]["period"], t["opts"]["period"])
@@ -832,6 +874,10 @@ async def load_context(db, user_id: str, frequency: str, now_utc: datetime, *, t
     ctx = Context(frequency=frequency, groups=groups, currency=user.get("default_currency") or "GBP",
                   now_utc=now_utc, alerts=alerts, flagged=flagged, previous=previous, preview=preview)
     ctx.timezone = user.get("timezone")
+    sales = (token_metrics(tokens) | set(metrics)) & SALES_METRICS
+    if sales:
+        from services import report_sales
+        ctx.sales = await report_sales.load(db, user_id, list(ctx.groups), presets, sales)
     if allow_sample:
         has_data = any(ctx.value(m, None, base) is not None for m in ("spend", "ghl_total_opps", "hp_total_calls"))
         if not has_data:
@@ -945,12 +991,16 @@ def catalog_for(available_sources: set[str] | None = None) -> list[dict]:
     availability flags rather than every metric marked unavailable."""
     if not available_sources:
         available_sources = None
+
+    def listed(mid):  # Sales Coach's outcomes only where the account has what they need
+        return mid not in SALES_METRICS or (available_sources is not None
+                                            and all(s in available_sources for s in _sources_of(mid)))
     return [{
         "id": mid, "label": meta["label"], "source": SOURCE_LABELS[meta["source"]],
         "has_target": "target" in meta, "lower_is_better": meta.get("lower_is_better"),
         **({"available": all(s in available_sources for s in _sources_of(mid))}
            if available_sources is not None else {}),
-    } for mid, meta in CATALOG.items()]
+    } for mid, meta in CATALOG.items() if listed(mid)]
 
 
 def periods_for_ui() -> list[dict]:
@@ -971,7 +1021,10 @@ def sources_connected(groups: list[dict]) -> set[str]:
     return out
 
 
-PLACEHOLDER_GUIDE = """Placeholders: {{name key=value key="value with spaces"}}
+PLACEHOLDER_GUIDE = """Numbers come ONLY from placeholders and birdy_data. Never type a figure into a report, not even one you just
+read with a tool: typed text is posted unchanged every day. Tables are data_table / table blocks with birdy_data, never
+Markdown pipe tables; charts are data_visualization blocks with birdy_data.
+Placeholders: {{name key=value key="value with spaces"}}
 - {{<metric>}} value for all clients. Options: client="<client name>", period=<yesterday|this_week|last_7d|last_14d|last_30d|this_month|last_month>, show=<value|change|target|vs_target>
   show=change → "▲ 12% vs the week before" (blank on the first report). show=vs_target → "on target (£12.00)". Targets only exist where has_target=true.
 - {{ranking metric=<metric> order=<best|worst> limit=<1-10> [period=…]}} → one client inline, or a numbered list on new lines
@@ -979,4 +1032,7 @@ PLACEHOLDER_GUIDE = """Placeholders: {{name key=value key="value with spaces"}}
 - {{alerts}} / {{flagged_ads}} with show=<summary|count|list> [limit=5]
 - {{birdy_take focus="…"}} → a short written read of the numbers (at most one)
 - {{period}} → "Yesterday"/"Last 7 days", {{date}} → "Mon 13 Oct", {{client_count}}
+- Sales Coach's outcomes (listed only when its setup has what they need): {{booked}}, {{closed}} (the owner's own
+  booked / closed definitions), {{speed_to_lead}} (average minutes), {{speed_within_target}} (share of calls within the
+  speed target). Calls: {{hp_total_calls}}, {{hp_answered_calls}}, {{hp_connect_rate}} ... e.g. {{booked client="Aura" show=change}}
 - Reports sent by a Birdy event only: {{event}} → "Alert: CPL above £40", {{alert_name}}, {{alert_message}}, {{account_name}}, {{metric_name}} (blank in scheduled reports)"""

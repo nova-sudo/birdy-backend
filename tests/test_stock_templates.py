@@ -453,7 +453,8 @@ async def test_template_put_reports_every_error(api, mock_db):
     r = api.put(_url(agent["_id"]), json={"blocks": [{"type": "alert", "text": "x"},
                                                    {"type": "section", "text": {"type": "mrkdwn", "text": "{{bogus}}"}}]})
     assert r.status_code == 400
-    assert len(r.json()["errors"]) == 2
+    errors = r.json()["errors"]
+    assert len(errors) == 3 and errors[-1].startswith("Valid metric names")   # two errors, then the names that work
     stored = await mock_db[AGENTS].find_one({"_id": agent["_id"]})
     assert not (stored["settings"].get("slack") or {}).get("templates")
 

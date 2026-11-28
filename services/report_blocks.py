@@ -240,7 +240,11 @@ def _check_birdy_data(kind, bd, where, errs, clients):
         bad = [m for m in metrics if m not in catalog]
         if bad:
             names = ", ".join(catalog)
-            errs.append(f"{where}.birdy_data.metrics: unknown {bad} — by={by} can plot {names}")
+            hint = ""
+            if by == "day" and any(m in CATALOG for m in bad):
+                hint = (". To compare periods use by='client' with \"compare\": \"previous\" "
+                        "(e.g. yesterday vs the day before)")
+            errs.append(f"{where}.birdy_data.metrics: unknown {bad} — by={by} can plot {names}{hint}")
             return None
         if chart == "pie" and len(metrics) != 1:
             errs.append(f"{where}.birdy_data: a pie chart shows exactly one metric")
@@ -258,6 +262,15 @@ def _check_birdy_data(kind, bd, where, errs, clients):
         out.update(chart=chart, by=by, metrics=list(dict.fromkeys(metrics)))
         if split:
             out["split"] = split
+        if bd.get("compare") not in (None, False, "previous"):
+            errs.append(f"{where}.birdy_data.compare: only \"previous\" (this period next to the one before)")
+            return None
+        if bd.get("compare"):
+            if by != "client" or chart == "pie" or bd.get("period"):
+                errs.append(f"{where}.birdy_data.compare='previous' needs by='client', a line, bar or area chart "
+                            "and no period: it compares the report's own period with the one before")
+                return None
+            out["compare"] = "previous"
         if by == "day":
             try:
                 days = int(bd.get("days") or 7)
@@ -503,7 +516,7 @@ def _check_block(b, i, errs, clients, counters):
 
 
 _BINDING_KEYS = ("chart", "by", "metrics", "metric", "days", "limit", "split", "clients", "period",
-                 "sort", "order", "total_row")
+                 "sort", "order", "total_row", "compare")
 
 
 def _binding_from(d: dict, keys=_BINDING_KEYS) -> dict:
@@ -531,7 +544,8 @@ def _repair(b):
                 bd["chart"] = chart["type"]
             elif isinstance(chart, str):
                 bd["chart"] = chart
-            bd.update(_binding_from(b, ("by", "metrics", "metric", "days", "limit", "split", "clients", "period")))
+            bd.update(_binding_from(b, ("by", "metrics", "metric", "days", "limit", "split", "clients", "period",
+                                        "compare")))
             if bd.get("metrics") or bd.get("metric"):
                 b = {k: v for k, v in b.items() if k not in _BINDING_KEYS}
                 b["birdy_data"] = bd
@@ -600,11 +614,106 @@ def fit_to_slack(raw: dict, max_blocks: int = MAX_BLOCKS) -> tuple[dict, list[st
     return {**raw, "blocks": out}, notes
 
 
-def validate(raw: dict, clients: dict[str, str] | None = None, allowed_tokens: frozenset | set = frozenset()) -> dict:
+# ── Markdown tables ───────────────────────────────────────────────────────────
+# Slack shows a Markdown pipe table in a text as its raw pipes. One with only words and placeholders in it
+# becomes a native table block; one with figures typed into it is refused, because those figures would be
+# posted unchanged every day.
+
+_TABLE_SEP_RE = re.compile(r"^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)+\|?\s*$|^\s*\|\s*:?-{3,}:?\s*\|\s*$")
+_TABLE_FIX = ('Numbers only come from {{placeholders}} and birdy_data, never typed in. For a live table by client use '
+              '{"type": "data_table", "caption": "Clients", "birdy_data": {"metrics": ["spend", "leads", "cpl"], '
+              '"sort": "spend", "total_row": true}} (any metric names from the list below), and for a single figure '
+              'a placeholder such as {{leads client="Aura"}}')
+
+
+def _cells(line: str) -> list[str]:
+    line = line.strip()
+    if line.startswith("|"):
+        line = line[1:]
+    if line.endswith("|"):
+        line = line[:-1]
+    return [re.sub(r"(\*\*|__|[*_`])(.+?)\1", r"\2", c.strip()) for c in line.split("|")]
+
+
+def _pipe_tables(text: str) -> list[tuple[int, int, list[list[str]]]]:
+    """(first line, line after, rows) of each Markdown table in the text, header row first."""
+    lines, out, i = text.split("\n"), [], 0
+    while i < len(lines) - 1:
+        if "|" in lines[i] and _TABLE_SEP_RE.match(lines[i + 1]) and len(_cells(lines[i])) >= 2:
+            j = i + 2
+            while j < len(lines) and "|" in lines[j] and lines[j].strip():
+                j += 1
+            out.append((i, j, [_cells(lines[i])] + [_cells(x) for x in lines[i + 2:j]]))
+            i = j
+        else:
+            i += 1
+    return out
+
+
+def _typed_figures(rows: list[list[str]]) -> bool:
+    """A digit in a body cell past the first column, outside any placeholder."""
+    return any(re.search(r"\d", core._LOOSE_RE.sub("", c)) for r in rows[1:] for c in r[1:])
+
+
+def _table_block(rows: list[list[str]]) -> dict:
+    width = max(len(r) for r in rows)
+    return {"type": "table", "rows": [[{"type": "raw_text", "text": c or " "} for c in r + [" "] * (width - len(r))]
+                                      for r in rows]}
+
+
+def _lift_tables(blocks: list, errs: list) -> list:
+    """Each Markdown table in a section's or markdown block's text as a native table block between the
+    text around it; one with typed figures, or anywhere else in a block, is an error."""
+    out = []
+    for i, b in enumerate(blocks):
+        where = f"block {i + 1}"
+        if not isinstance(b, dict):
+            out.append(b)
+            continue
+        text = b.get("text")
+        own = b.get("type") == "markdown" or (b.get("type") == "section" and not b.get("fields"))
+        raw = text.get("text") if isinstance(text, dict) else text
+        if own and isinstance(raw, str) and _pipe_tables(raw):
+            tables = _pipe_tables(raw)
+            if any(_typed_figures(rows) for _, _, rows in tables):
+                errs.append(f"{where}: this Markdown table has figures typed into it. Slack shows it as raw pipes, "
+                            f"and typed figures would be posted unchanged every day. {_TABLE_FIX}.")
+                out.append(b)
+                continue
+            lines, last, first = raw.split("\n"), 0, True
+            for start, end, rows in tables:
+                piece = "\n".join(lines[last:start]).strip()
+                if piece:
+                    out.append({**(b if first else {"type": b["type"]}),
+                                "text": {**text, "text": piece} if isinstance(text, dict) else piece})
+                    first = False
+                out.append(_table_block(rows))
+                last = end
+            piece = "\n".join(lines[last:]).strip()
+            if piece:
+                out.append({"type": b["type"], "text": {**text, "text": piece} if isinstance(text, dict) else piece})
+            continue
+        if any(_pipe_tables(v) for _, v in _strings(b)):
+            errs.append(f"{where}: a Markdown table (| a | b | lines) doesn't render in Slack. {_TABLE_FIX}.")
+        out.append(b)
+    return out
+
+
+def _metrics_hint(metrics) -> str:
+    """The last error line whenever a metric or placeholder was wrong: the names that work, so one retry fixes it."""
+    names = [m for m in (metrics or CATALOG) if m in CATALOG]
+    return (f"Valid metric names for this account: {', '.join(names)}. Use them as {{{{name}}}} placeholders or "
+            f"in birdy_data \"metrics\"; by='day' charts take only {', '.join(DAILY_METRICS)}.")
+
+
+def validate(raw: dict, clients: dict[str, str] | None = None, allowed_tokens: frozenset | set = frozenset(),
+             metrics: list[str] | None = None) -> dict:
     """
     A clean v4 template, or TemplateError listing everything wrong with it.
     `clients` maps the user's client ids to names (None skips that check). `allowed_tokens` adds
-    agent placeholders (report_template.AGENT_TOKENS); a report passes none.
+    agent placeholders (report_template.AGENT_TOKENS); a report passes none. `metrics` are the
+    account's metric names (metric_names), listed when a metric or placeholder is wrong; None lists
+    the whole catalog.
     """
     errors: list[str] = []
     if not isinstance(raw, dict):
@@ -632,6 +741,7 @@ def validate(raw: dict, clients: dict[str, str] | None = None, allowed_tokens: f
     if not isinstance(blocks_in, list) or not blocks_in:
         errors.append("blocks must be a non-empty list")
         blocks_in = []
+    blocks_in = _lift_tables(blocks_in, errors)
     if len(blocks_in) > MAX_BLOCKS:
         errors.append(f"{len(blocks_in)} blocks; Slack allows {MAX_BLOCKS} per message")
 
@@ -660,9 +770,24 @@ def validate(raw: dict, clients: dict[str, str] | None = None, allowed_tokens: f
                 errors.append(f"{loose}: not a valid placeholder — use {{{{name key=value}}}}")
 
     if errors:
-        raise TemplateError(list(dict.fromkeys(errors)))
+        errors = list(dict.fromkeys(errors))
+        if any(w in e for e in errors for w in ("metric", "placeholder")):
+            errors.append(_metrics_hint(metrics))
+        raise TemplateError(errors)
     return {"version": VERSION, "frequency": frequency, "time": core._clean_time(raw.get("time")),
             "day": day, "blocks": blocks}
+
+
+async def metric_names(db, user_id: str, groups: list[dict] | None = None) -> list[str]:
+    """The metric names this account's reports can use: what list_report_metrics lists as available."""
+    from services import report_sales
+    if groups is None:
+        groups = await db["client_groups"].find(
+            {"user_id": user_id, "client_status": {"$ne": "Inactive"}},
+            {"_id": 0, "meta_ad_account_id": 1, "facebook_cache": 1, "ghl_location_id": 1, "ghl_opp_cache": 1,
+             "hotprospector_group_id": 1, "hotprospector_call_cache": 1, "call_log_provider": 1}).to_list(length=1000)
+    available = sources_connected(groups) | await report_sales.sources(db, user_id)
+    return [m["id"] for m in catalog_for(available) if m.get("available", True)]
 
 
 # ── Figures ───────────────────────────────────────────────────────────────────
@@ -681,13 +806,18 @@ def _needs_daily(blocks) -> bool:
     return any((b.get("birdy_data") or {}).get("by") == "day" for b in blocks)
 
 
+def _metrics_of(blocks) -> set[str]:
+    return {m for b in blocks for m in (b.get("birdy_data") or {}).get("metrics") or [] if m in CATALOG}
+
+
 async def build_context(db, user_id: str, template: dict, now_utc: datetime, previous: dict | None = None,
                         allow_sample: bool = False, preview: bool = False) -> core.Context:
     blocks = template.get("blocks") or []
     tokens = all_tokens(blocks)
     return await core.load_context(
         db, user_id, template["frequency"], now_utc, tokens=tokens, extra_presets=_presets_of(blocks),
-        daily=_needs_daily(blocks), previous=previous, allow_sample=allow_sample, preview=preview)
+        daily=_needs_daily(blocks), previous=previous, allow_sample=allow_sample, preview=preview,
+        metrics=_metrics_of(blocks))
 
 
 # ── Rendering ─────────────────────────────────────────────────────────────────
@@ -788,11 +918,28 @@ def _chart(ctx, bd) -> dict | None:
         segs = [{"label": c, "value": round(vals[m], 2)} for c, (_, vals) in zip(cats, rows) if (vals[m] or 0) > 0]
         return {"type": "pie", "segments": segs} if segs else None
     used: set = set()
+    series = [(CATALOG[m]["label"], [vals[m] for _, vals in rows]) for m in bd["metrics"]]
+    if bd.get("compare") and _has_before(ctx, bd, rows, preset):
+        # This period next to the one before, per client: "Yesterday" and "The day before".
+        now, then = ctx.period["label"], ctx.period["prev"][:1].upper() + ctx.period["prev"][1:]
+        series = []
+        for m in bd["metrics"]:
+            label = CATALOG[m]["label"]
+            names = (now, then) if len(bd["metrics"]) == 1 else (label, label[:11].rstrip() + " (before)")
+            series.append((names[0], [vals[m] for _, vals in rows]))
+            series.append((names[1], [ctx.before(m, gid, preset) for gid, _ in rows]))
     return {"type": bd["chart"],
-            "series": [{"name": _short(CATALOG[m]["label"], used),
-                        "data": [{"label": c, "value": round(vals[m] or 0, 2)} for c, (_, vals) in zip(cats, rows)]}
-                       for m in bd["metrics"]],
+            "series": [{"name": _short(name, used),
+                        "data": [{"label": c, "value": round(v or 0, 2)} for c, v in zip(cats, values)]}
+                       for name, values in series],
             "axis_config": {"categories": cats, "x_label": "Client"}}
+
+
+def _has_before(ctx, bd, rows=None, preset=None) -> bool:
+    """Whether the last send left figures for a compare chart's clients (none before its second send)."""
+    preset = preset or ctx.preset({"period": bd.get("period")})
+    rows = rows if rows is not None else _rank_clients(ctx, {**bd, "sort": bd["metrics"][0]}, preset)[: bd["limit"]]
+    return any(ctx.before(m, gid, preset) is not None for gid, _ in rows for m in bd["metrics"])
 
 
 def _cell(metric, value, ctx):
@@ -817,7 +964,7 @@ def _table_rows(ctx, bd) -> list[list[dict]] | None:
         def total(m):
             if ctx.sample:
                 return ctx.value(m, None, preset)
-            return core._value(m, [ctx.views(preset)[g] for g in ids], preset)
+            return ctx.total(m, ids, preset)
 
         # The row adds up the clients shown. When the table is cut, say so: a bare "Total" under the
         # top ten reads as the whole portfolio.
@@ -896,6 +1043,7 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
 
     blocks = []
     for b in copy.deepcopy(template.get("blocks") or []):
+        note = None
         bd = b.pop("birdy_data", None)
         if bd is not None:
             if b["type"] == "data_visualization":
@@ -904,6 +1052,10 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
                     blocks.append(_no_data(b["title"]))
                     continue
                 b["chart"] = chart
+                if bd.get("compare") and ctx.preview and not _has_before(ctx, bd):
+                    note = {"type": "context", "elements": [{"type": "mrkdwn", "text": (
+                        f"_{b['title']}: {ctx.period['prev']} shows next to {ctx.period['label'].lower()} "
+                        "from the second report on_")}]}
             elif b["type"] in ("table", "data_table"):
                 rows = _table_rows(ctx, bd)
                 if not rows:
@@ -918,6 +1070,8 @@ def render(template: dict, ctx: core.Context, take: str | None = None) -> tuple[
                 b["elements"] = cards
         b = _map_strings(b, fill_string)
         blocks.append(_cap_text(b))
+        if note:
+            blocks.append(note)
     blocks = blocks[:MAX_BLOCKS] or [{"type": "section", "text": {"type": "mrkdwn", "text": "_Nothing to report._"}}]
     return blocks, fallback_text(blocks)
 
@@ -993,12 +1147,15 @@ carousel {elements: 1-10 cards} · table {rows} · data_table {caption, rows, pa
 data_visualization {title ≤50, chart} — native Slack charts: line, bar, area, pie. At most 2 per message.
 NOT allowed: alert and input (modals only). Buttons must be links (url); Birdy doesn't handle button clicks.
 
-Live data — two ways, never type a figure yourself:
+Live data — two ways, never type a figure yourself (a number you read with a tool goes stale tomorrow):
 1. {{placeholders}} inside any text (see below).
 2. "birdy_data" on a chart/table/carousel, and Birdy fills it at send time:
    data_visualization: {"chart": "line|bar|area|pie", "by": "client"|"day", "metrics": [...], "days": 2-20 (by=day), "limit": max clients,
-                        "split": "client" (by=day, one metric → one line per client), "clients": ["name", ...], "period": window (by=client)}
+                        "split": "client" (by=day, one metric → one line per client), "clients": ["name", ...], "period": window (by=client),
+                        "compare": "previous" (by=client, no period: each client's figure for the report's period next to the period
+                        before, e.g. yesterday vs the day before; the earlier figure shows from the report's second send)}
      by="client" metrics: any list_report_metrics id. by="day" metrics: spend, impressions, clicks, crm_leads, deals_won, deals_lost, calls, inbound_calls, talk_time.
+     Sales Coach's booked, closed, speed_to_lead and speed_within_target work by client, in tables and with compare, not by day.
      Pie = exactly one metric. Up to 12 series, up to 20 categories; negative values are fine.
    table / data_table: {"metrics": [...], "sort": metric, "order": "best"|"worst", "limit": n, "total_row": true, "clients": [...], "period": window}
    carousel: {"metrics": [1-3], "sort", "order", "limit": 1-10, "period"} → one card per client.
@@ -1009,5 +1166,11 @@ Exact shapes that work (copy them):
 {"type": "data_table", "caption": "Clients", "page_size": 10, "birdy_data": {"metrics": ["spend", "leads", "cpl"], "sort": "spend", "total_row": true}}
 {"type": "carousel", "birdy_data": {"metrics": ["spend", "leads", "cpl"], "limit": 5}}
 {"type": "section", "fields": [{"type": "mrkdwn", "text": "*Ad spend*\n{{spend}}"}, {"type": "mrkdwn", "text": "*Leads*\n{{leads}}"}]}
+Yesterday vs the day before, per client: {"type": "data_visualization", "title": "Leads: yesterday vs day before", "birdy_data": {"chart": "bar", "by": "client", "metrics": ["leads"], "compare": "previous"}}
+A daily sales-team report (Sales Coach):
+  {"type": "section", "fields": [{"type": "mrkdwn", "text": "*Booked*\n{{booked}} {{booked show=change}}"}, {"type": "mrkdwn", "text": "*Closed*\n{{closed}} {{closed show=change}}"}, {"type": "mrkdwn", "text": "*Speed to lead*\n{{speed_to_lead}} {{speed_to_lead show=change}}"}, {"type": "mrkdwn", "text": "*Calls*\n{{hp_total_calls}}"}]}
+  {"type": "data_table", "caption": "Sales team by client", "birdy_data": {"metrics": ["booked", "closed", "speed_to_lead", "speed_within_target", "hp_total_calls"], "sort": "booked", "total_row": true}}
+  {"type": "data_visualization", "title": "Booked: yesterday vs day before", "birdy_data": {"chart": "bar", "by": "client", "metrics": ["booked"], "compare": "previous"}}
 Never put metrics inside "chart" — live charts take birdy_data and no "chart" key.
+Never write a Markdown pipe table (| a | b |): Slack shows the pipes. One with typed figures is refused; use data_table.
 """

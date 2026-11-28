@@ -36,7 +36,19 @@ _TRIGGER_HELP = (
 )
 _TEMPLATE_HELP = (
     'template is {"frequency": "daily" | "weekly" (the data window), "blocks": [Slack blocks with Birdy placeholders such as {{spend}}]}. '
-    "Leave out blocks to keep the report's current content (or start from the standard brief)."
+    "Leave out blocks to keep the report's current content (or start from the standard brief). "
+    "Numbers come ONLY from {{placeholders}} and birdy_data, filled with live figures at every send: never type a figure "
+    "into the template, not even one you just read with a tool (it would be posted unchanged every day). Tables are a "
+    "data_table block with birdy_data, never a Markdown pipe table; charts are a data_visualization block with birdy_data. "
+    "Call list_report_metrics for this account's metric names and the block shapes. Examples: "
+    '{"type": "section", "fields": [{"type": "mrkdwn", "text": "*Leads*\\n{{leads}} {{leads show=change}}"}]}; '
+    '{"type": "data_table", "caption": "Clients", "birdy_data": {"metrics": ["spend", "leads", "cpl"], "sort": "spend", "total_row": true}}; '
+    'yesterday vs the day before per client: {"type": "data_visualization", "title": "Leads: yesterday vs day before", '
+    '"birdy_data": {"chart": "bar", "by": "client", "metrics": ["leads"], "compare": "previous"}}; '
+    'a calls / sales-team table (Sales Coach): {"type": "data_table", "caption": "Sales team", "birdy_data": {"metrics": '
+    '["booked", "closed", "speed_to_lead", "speed_within_target", "hp_total_calls"], "sort": "booked"}}. '
+    "If the tool refuses the template, its error lists what is wrong and the valid metric names: fix it and call again "
+    "yourself before saying anything to the owner."
 )
 
 
@@ -73,7 +85,8 @@ def _body(**fields) -> ops.ReportBody:
 def _detail(e: ops.ReportError) -> str:
     d = e.detail
     if isinstance(d, dict) and d.get("errors"):
-        return "The report content isn't valid: " + "; ".join(str(x) for x in d["errors"])
+        return ("The report content isn't valid, so nothing was saved. Fix these and call again: "
+                + "; ".join(str(x) for x in d["errors"]))
     return str(d)
 
 

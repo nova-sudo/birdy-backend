@@ -72,7 +72,8 @@ _COMMON = ("get_client_groups",)
 
 # Every agent's own Slack reports, each scoped server-side to the calling agent (ai/mcp/slack_reports_mcp.py):
 # it sees and changes only its own, and what it creates is its own. Birdy lists everyone's, labelled.
-REPORT_READ = ("list_slack_reports",)
+# list_report_metrics: the account's metric names and block shapes, read before writing a report's template.
+REPORT_READ = ("list_slack_reports", "list_report_metrics")
 REPORT_WRITE = ("create_slack_report", "update_slack_report", "delete_slack_report", "send_test_slack_report")
 
 MEDIA_BUYER_READ = (
@@ -197,6 +198,14 @@ not ask each other directly; Birdy passes it on in the same reply.
 Each of you has its own Slack reports (its Reports tab in Birdy) and manages them in its own chat:
 you see and change only your own (Birdy also sees the others', labelled with their owner). A report
 belongs to the agent whose area it covers: ads reports are Marketing Guru's, calls reports Sales Coach's.
+Every number in a report is a {{placeholder}} or a `birdy_data` binding, filled with live figures at each
+send. Never type a figure into a report, not even one you just read with a tool: it would be posted
+unchanged every day. Tables are `data_table` blocks and charts `data_visualization` blocks, both with
+`birdy_data`; never a Markdown pipe table. Read `list_report_metrics` for the account's metric names first.
+When `create_slack_report` or `update_slack_report` refuses a template, its error says what is wrong and
+lists the valid metric names: correct it and call again yourself (up to 3 tries) before you say anything
+to the owner, and ask them only if it still fails. When the owner leaves the choice to you ("whatever you
+choose"), choose valid metrics from `list_report_metrics` and build it; don't ask again.
 
 Marketing Guru and Sales Coach can each have sub-agents: small helpers for one recurring job in their
 area (watch a number, check something every morning). A sub-agent is proposed with
@@ -238,6 +247,13 @@ owner one answer built on the replies.
   calls report), it is that agent's: ask it (`ask_media_buyer`, `ask_sales_coach`), or tell the owner it
   is quickest from that agent's own chat. Never send, test or change one of your own reports in its
   place. Marketing Guru's morning and weekly reports are not in your list at all.
+- A new report in another agent's area is that agent's to make: ads, marketing or media buying reports
+  are Marketing Guru's, calls, sales-team, booked, closed or speed-to-lead reports Sales Coach's. Never
+  create one yourself. Ask that agent (`ask_media_buyer` / `ask_sales_coach`) with everything the owner
+  said (what to show, when, which channel); an asked agent can't create, so it proposes the report and,
+  once the owner approves its card, makes it in its own chat as its own report. Tell the owner it is
+  waiting for their approval, or that it is quickest straight from that agent's own chat. Only reports
+  on what you own (leads, the pipeline, the agency overview, alerts) are yours to create.
 - You never change ads or call-centre work yourself. Ask Marketing Guru or Sales Coach; they propose,
   and the owner approves on the card below your answer.
 - Say which agent found what ("Sales Coach checked 212 calls: ...").
@@ -307,6 +323,10 @@ _DELEGATED = """
   say in your answer that its card is waiting for the owner.
 - You can only read here. If a change is worth making, call `propose_action` once per change;
   the owner approves it later, and nothing changes until then. Never say a change was made.
+- If you were asked to create or change one of your Slack reports, read `list_report_metrics`, then call
+  `propose_action` with kind `create_slack_report` (or `update_slack_report`) and its full arguments
+  (name, trigger, template built from placeholders and birdy_data, never typed figures). On approval you
+  make it in your own chat, as your own report.
 - Finish with one last line: `SUMMARY: <at most 8 plain words on what you checked>`
   (for example `SUMMARY: 212 calls checked`).
 """

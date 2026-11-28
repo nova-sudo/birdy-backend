@@ -101,7 +101,7 @@ async def clean_template(db, user_id: str, raw: dict, blocks: list | None = None
     names = {g["id"]: g.get("name") or "" async for g in db["client_groups"].find(
         {"user_id": user_id}, {"_id": 0, "id": 1, "name": 1}) if g.get("id")}
     try:
-        return sr.template_of(rt.validate(raw, names))
+        return sr.template_of(rt.validate(raw, names, metrics=await rt.metric_names(db, user_id)))
     except rt.TemplateError as e:
         raise ReportError(400, {"errors": e.errors})
 
