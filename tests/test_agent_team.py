@@ -30,8 +30,8 @@ G1, G2 = "grp-aura", "grp-beaulea"
 
 ROUTE_KEYS = {"status", "seconds", "credits", "limit_hit", "steps"}
 STEP_KEYS = {"id", "agent", "name", "kind", "status", "summary", "question", "asked_by", "tools",
-             "doing", "answer", "credits", "seconds"}
-TOOL_KEYS = {"name", "label", "detail"}
+             "doing", "doing_kind", "answer", "credits", "seconds"}
+TOOL_KEYS = {"name", "label", "detail"}   # plus kind "slack" on a Slack tool
 PROPOSAL_KEYS = {"id", "agent", "title", "detail", "kind", "payload", "status"}
 
 
@@ -134,8 +134,9 @@ def assert_route_shape(route):
         assert s["kind"] in ("orchestrator", "main", "sub", "helper")
         assert s["status"] in ("working", "done", "failed", "skipped")
         assert len(s["summary"]) <= 60
+        assert s["doing_kind"] in (None, "slack")
         for t in s["tools"]:
-            assert set(t) == TOOL_KEYS
+            assert set(t) - {"kind"} == TOOL_KEYS and t.get("kind", "slack") == "slack"
 
 
 # ── 1. default behaviour unchanged ────────────────────────────────────────────

@@ -218,7 +218,7 @@ async def test_every_agent_fixes_its_own_report_errors_and_birdy_routes_reports(
         assert "list_report_metrics" in defs.tool_names(agent, nested=True)
     birdy = await defs.build_instructions(defs.BIRDY, mock_db, USER, client_group_id=None, client_name=None,
                                           asked_by=None)
-    assert "media buying reports" in birdy and "Never" in birdy and "create one yourself" in birdy
+    assert "creative level" in birdy and "Never" in birdy and "create one yourself" in birdy
     asked = await defs.build_instructions(defs.MEDIA_BUYER, mock_db, USER, client_group_id=None, client_name=None,
                                           asked_by="Birdy")
     assert "kind `create_slack_report`" in asked

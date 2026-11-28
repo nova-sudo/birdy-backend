@@ -52,7 +52,9 @@ def posts(monkeypatch):
 async def _make(**kw):
     args = {"name": "Friday wrap", "trigger": SCHEDULE, "channel_id": "C0OPS", "channel_name": "ops",
             "template": {"frequency": "daily", "blocks": BLOCKS}, **kw}
-    return (await t.create_slack_report.fn(**args))["report"]
+    # Two steps for an outside assistant: a preview and a code, then the create.
+    code = (await t.create_slack_report.fn(**args))["confirm_code"]
+    return (await t.create_slack_report.fn(**args, confirm_code=code))["report"]
 
 
 async def test_tool_tags_match_the_spec():

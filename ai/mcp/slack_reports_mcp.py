@@ -11,6 +11,11 @@ calling agent, read from the run's signed token (server.current_agent), never fr
 Sales Coach see and change only their own reports, and what they create is theirs. Birdy changes only hers but
 lists everyone's, labelled, so she can send the owner to the right agent. An outside assistant (no agent in its
 token) is the owner and sees and changes every report, as before.
+
+What an agent's report shows must be in its area (services/report_owner.py): Birdy makes client-level
+reports only, campaign / ad set / ad / creative level is Marketing Guru's, calls are Sales Coach's, and
+client-level totals may sit beside either's own figures. Outside its area create and update refuse,
+saying which agent to ask, before anything is saved or previewed. The owner's builder is not held to it.
 """
 
 from datetime import datetime, timezone
@@ -23,6 +28,9 @@ from ai.mcp.confirm import two_step
 from ai.mcp.server import mcp, current_agent as _current_agent, current_user_id as _current_user_id
 from core.database import get_db
 from core.mongo_client import get_shared_mongo_client
+from services import report_owner
+from services import report_proposals
+from services.report_drafts import preview_payload
 from services import slack_report_ops as ops
 from services import slack_reports as sr
 
@@ -52,8 +60,7 @@ _TEMPLATE_HELP = (
 )
 
 
-_NAMES = {"birdy": "Agency Ops (Birdy)", "media_buyer": "Marketing Guru", "sales_coach": "Sales Coach"}
-_ASK = {"birdy": "ask_birdy", "media_buyer": "ask_media_buyer", "sales_coach": "ask_sales_coach"}
+_NAMES, _ASK = report_owner.NAMES, report_owner.ASK
 
 
 def _db():
@@ -83,11 +90,17 @@ def _body(**fields) -> ops.ReportBody:
 
 
 def _detail(e: ops.ReportError) -> str:
-    d = e.detail
-    if isinstance(d, dict) and d.get("errors"):
-        return ("The report content isn't valid, so nothing was saved. Fix these and call again: "
-                + "; ".join(str(x) for x in d["errors"]))
-    return str(d)
+    return report_proposals.error_text(e)
+
+
+def _check_area(caller: str | None, name: str | None, template: dict | None) -> None:
+    """Refuse an agent a report outside its area (services/report_owner.py), before anything is saved or
+    previewed, so the owner is never asked to confirm a report that would be refused. An outside
+    assistant (no agent) is the owner and picks any content, as in the report builder."""
+    if caller:
+        why = report_owner.refusal(caller, report_owner.report_area(template, name))
+        if why:
+            raise ToolError(why)
 
 
 async def _find(db, user_id: str, report_id: str) -> dict:
@@ -151,8 +164,13 @@ async def list_slack_reports() -> dict:
 
 @mcp.tool(**WRITE)
 async def create_slack_report(name: str, trigger: dict, channel_id: str | None = None, channel_name: str | None = None,
-                              enabled: bool = True, template: dict | None = None) -> dict:
-    """Create a Slack report: a message Birdy posts to Slack on a schedule or when something happens. Returns the new report. Nothing is posted by creating it; use send_test_slack_report to see it in Slack. In an agent's own chat the report is that agent's (its `owner`) and appears on its Reports tab.
+                              enabled: bool = True, template: dict | None = None,
+                              confirm_code: str | None = None) -> dict:
+    """Create a Slack report: a message Birdy posts to Slack on a schedule or when something happens. Nothing is posted by creating it; use send_test_slack_report to see it in Slack. In an agent's own chat the report is that agent's (its `owner`) and appears on its Reports tab.
+
+    Two steps. Called without confirm_code it saves nothing and returns a preview (the report's name, when and where it sends, and the message text with today's figures) and a one-time confirm_code. Show the preview to the user and only call again, with the same arguments plus confirm_code, after they say yes; that call returns the new report. In an agent's chat in Birdy there is no code: the call proposes the report, with a live preview, for the owner to approve below your answer.
+
+    It must be in the calling agent's area: Agency Ops (Birdy) makes client-level reports only (a client's or the agency's spend, leads, CPL, opportunities, deals won); anything at campaign, ad set, ad or creative level is Marketing Guru's; anything about calls (booked, closed, speed to lead, call stats, recordings, setters) is Sales Coach's. Marketing Guru and Sales Coach may add client-level totals to their own. Outside your area the tool refuses and says which agent to ask.
 
     Same rules as Hub -> Reports: a name (80 characters at most), a trigger, and an optional channel. Without channel_id the report goes to the account's default Birdy channel. An account can have a limited number of reports (see `max` in list_slack_reports).
 
@@ -163,13 +181,43 @@ async def create_slack_report(name: str, trigger: dict, channel_id: str | None =
         channel_name: The channel's name, for display.
         enabled: Whether it sends (default true).
         template: What it says. {template_help}
+        confirm_code: The code from the preview, once the user has agreed.
     """
-    body = _body(name=name, trigger=trigger, channel_id=channel_id, channel_name=channel_name, enabled=enabled,
-                 template=template, owner=_caller())
+    caller = _caller()
+    fields = dict(name=name, trigger=trigger, channel_id=channel_id, channel_name=channel_name, enabled=enabled,
+                  template=template)
+    _body(**fields, owner=caller)
+    _check_area(caller, name, template)
+    db, user_id = _db(), _current_user_id()
+    if caller:
+        # An agent's chat in Birdy (the orchestrator proposes it itself, ai/orchestrator.py): never saved
+        # here, only proposed for the owner's approval.
+        try:
+            proposal = await report_proposals.build(db, user_id, caller, fields)
+        except ops.ReportError as e:
+            raise ToolError(_detail(e))
+        return {"proposed": True, "proposal": proposal, "note": report_proposals.PROPOSED_NOTE}
+    owner = sr.DEFAULT_OWNER
     try:
-        return await ops.create_report(_db(), _current_user_id(), body)
+        # Every check now, so the user is never asked to confirm a report that would be refused.
+        report = await ops.prepare_report(db, user_id, report_proposals.body_of(owner, fields))
     except ops.ReportError as e:
         raise ToolError(_detail(e))
+
+    async def preview():
+        shown = await preview_payload(db, user_id, report["template"])
+        return {"name": report["name"], "owner": owner, "owner_name": _NAMES[owner],
+                "schedule": ops.schedule_label(report["trigger"]),
+                "sends_to": await ops.sends_to(db, user_id, report.get("channel_id"), report.get("channel_name")),
+                "message": shown["text"], "sample_figures": bool(shown.get("sample"))}
+
+    async def execute():
+        try:
+            return await ops.create_report(db, user_id, report_proposals.body_of(owner, fields))
+        except ops.ReportError as e:
+            raise ToolError(_detail(e))
+
+    return await two_step(db, user_id, "create_slack_report", fields, confirm_code, preview, execute)
 
 
 create_slack_report.description = create_slack_report.description.format(trigger_help=_TRIGGER_HELP,
@@ -196,7 +244,12 @@ async def update_slack_report(report_id: str, name: str | None = None, enabled: 
     body = _body(name=name, enabled=enabled, trigger=trigger, channel_id=channel_id, channel_name=channel_name,
                  template=template)
     db, user_id = _db(), _current_user_id()
-    await _find(db, user_id, report_id)
+    report = await _find(db, user_id, report_id)
+    if name is not None or template is not None:
+        # What the report would say after the change: a template without blocks keeps the current ones.
+        new = template if template and (template.get("blocks") or template.get("body")) else None
+        _check_area(_caller(), name if name is not None else report.get("name"),
+                    new or {"blocks": (report.get("template") or {}).get("blocks")})
     try:
         return await ops.update_report(db, user_id, report_id, body)
     except ops.ReportError as e:

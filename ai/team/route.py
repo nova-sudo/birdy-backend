@@ -82,10 +82,51 @@ TOOL_LABELS = {
     "list_sub_agent_lessons": "Sub-agents' lessons",
     "render_ui": "Chart",
     "propose_action": "Proposed a change",
+    # Slack (SLACK_TOOLS): the route map shows these as a stop in Slack.
+    "list_slack_reports": "Slack reports",
+    "list_report_metrics": "Report metrics",
+    "list_report_clients": "Report clients",
+    "create_slack_report": "Creating the report",
+    "update_slack_report": "Changing the report",
+    "delete_slack_report": "Deleting the report",
+    "send_test_slack_report": "Sending a test to Slack",
+    "preview_report": "Building the preview",
+    "get_report_draft": "Report draft",
+    "propose_report": "Proposing the report",
+    "list_slack_channels": "Checking channels",
+    "set_agent_slack_channel": "Setting the Slack channel",
+    "send_test_agent_report": "Sending a test to Slack",
+    "post_weekly_report": "Posting the weekly report to Slack",
+    "get_agent_slack_template": "Slack message template",
+    "set_agent_slack_template": "Changing the Slack template",
+    "reset_agent_slack_template": "Resetting the Slack template",
 }
+# The tools that work on Slack: each route tool entry for one has kind "slack", and a step running one
+# has doing_kind "slack", so the map shows Slack as a stop after the agent.
+SLACK_TOOLS = frozenset({
+    "list_slack_reports", "list_report_metrics", "list_report_clients", "create_slack_report",
+    "update_slack_report", "delete_slack_report", "send_test_slack_report", "preview_report",
+    "get_report_draft", "propose_report", "list_slack_channels", "set_agent_slack_channel",
+    "send_test_agent_report", "post_weekly_report", "get_agent_slack_template", "set_agent_slack_template",
+    "reset_agent_slack_template",
+})
+SLACK = "slack"
 
 _DETAIL_KEYS = ("date_preset", "preset", "period", "window", "days", "level", "since", "until",
                 "start_date", "end_date", "year", "query", "code")
+
+
+def tool_kind(name: str) -> Optional[str]:
+    """"slack" for a Slack tool, else None (the entry carries no kind)."""
+    return SLACK if name in SLACK_TOOLS else None
+
+
+def tool_entry(name: str, detail: Optional[str]) -> dict:
+    """One `step.tools` entry: {name, label, detail}, plus kind "slack" for a Slack tool."""
+    entry = {"name": name, "label": tool_label(name), "detail": detail}
+    if tool_kind(name):
+        entry["kind"] = tool_kind(name)
+    return entry
 
 
 def tool_label(name: str) -> str:
@@ -223,6 +264,7 @@ class Turn:
             "asked_by": asked_by,
             "tools": [],
             "doing": None,      # the tool in hand right now, in plain words; null between tools
+            "doing_kind": None,  # "slack" while that tool is a Slack tool (SLACK_TOOLS); null otherwise
             "answer": None,
             "credits": 0.0,
             "seconds": 0.0,
