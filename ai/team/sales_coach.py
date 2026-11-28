@@ -126,10 +126,9 @@ async def _stage_count(db, user_id: str, gid: str, stage_id: str, start, end) ->
     return {"count": n}
 
 
-async def _speed(db, user_id: str, group: dict, target_minutes, start, end) -> dict:
-    location = group.get("ghl_location_id")
-    if not location:
-        return {"calls": 0, "note": f"{NO_DATA}: this client has no call centre linked"}
+async def speed_seconds(db, user_id: str, location: str, start, end) -> list[float]:
+    """The measured speed to lead, in seconds, of each call in the window. The Slack reports'
+    speed_to_lead metrics (services/report_sales.py) read it too."""
     seconds = []
     async for doc in db["hotprospector_leads"].find({"user_id": user_id, "ghl_location_id": location},
                                                      {"lead_data.call_logs": 1}):
@@ -138,6 +137,14 @@ async def _speed(db, user_id: str, group: dict, target_minutes, start, end) -> d
             if isinstance(s, (int, float)) and not isinstance(s, bool) and s > 0 \
                     and _in_window(call.get("call_time_iso") or call.get("call_time"), start, end):
                 seconds.append(float(s))
+    return seconds
+
+
+async def _speed(db, user_id: str, group: dict, target_minutes, start, end) -> dict:
+    location = group.get("ghl_location_id")
+    if not location:
+        return {"calls": 0, "note": f"{NO_DATA}: this client has no call centre linked"}
+    seconds = await speed_seconds(db, user_id, location, start, end)
     if not seconds:
         return {"calls": 0, "note": f"{NO_DATA}: no calls with a measured speed to lead in this period"}
     out = {"calls": len(seconds), "average_minutes": round(sum(seconds) / len(seconds) / 60, 1)}
@@ -149,7 +156,9 @@ async def _speed(db, user_id: str, group: dict, target_minutes, start, end) -> d
     return out
 
 
-async def _outcome(db, user_id: str, gid: str, definition: dict | None, preset: str, start, end) -> dict:
+async def outcome(db, user_id: str, gid: str, definition: dict | None, preset: str, start, end) -> dict:
+    """{"count": n} (or {"count": None, "note"}) for one client: contacts added in the window that the
+    owner's definition (a tag or a pipeline stage) counts. The Slack reports' booked and closed read it too."""
     if not definition:
         return {"count": None, "note": f"{NO_DATA}: not defined in Sales Coach's setup"}
     if definition["kind"] == "tag":
@@ -182,8 +191,8 @@ async def get_sales_outcomes(db, user_id, group_ids=None, preset=DEFAULT_PRESET,
         rows.append({
             "client_group_id": g["id"], "name": g.get("name"),
             "coached": g["id"] in coached,
-            "booked": await _outcome(db, user_id, g["id"], outcomes.get("booked"), preset, start, end),
-            "closed": await _outcome(db, user_id, g["id"], outcomes.get("closed"), preset, start, end),
+            "booked": await outcome(db, user_id, g["id"], outcomes.get("booked"), preset, start, end),
+            "closed": await outcome(db, user_id, g["id"], outcomes.get("closed"), preset, start, end),
             "speed_to_lead": await _speed(db, user_id, g, target, start, end),
         })
     return {

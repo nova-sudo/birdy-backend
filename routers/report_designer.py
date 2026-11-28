@@ -22,6 +22,7 @@ from pydantic import BaseModel
 from core.database import DB_NAME
 from dependencies import get_current_user, get_mongo_client
 from services import report_blocks as rt
+from services import report_sales
 from services.report_drafts import (  # noqa: F401  (re-exported: tests and callers patch/import these here)
     DRAFTS, _clients, client_names, load_draft, preview_payload, save_draft, saved_brief, preview_stored,
 )
@@ -55,7 +56,7 @@ async def state(current_user: str = Depends(get_current_user)):
         return {
             "brief": await saved_brief(db, current_user),
             "draft": await load_draft(db, current_user),
-            "catalog": rt.catalog_for(rt.sources_connected(clients)),
+            "catalog": rt.catalog_for(rt.sources_connected(clients) | await report_sales.sources(db, current_user)),
             "periods": rt.periods_for_ui(),
             "daily_metrics": [{"id": k, "label": v["label"]} for k, v in rt.DAILY_METRICS.items()],
             "clients": [{"id": c["id"], "name": c.get("name")} for c in clients],

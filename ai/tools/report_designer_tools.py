@@ -12,6 +12,7 @@ import logging
 
 from ai.tools.registry import registry
 from services import report_blocks as rt
+from services import report_sales
 from services.report_drafts import load_draft, save_draft, saved_brief
 
 logger = logging.getLogger(__name__)
@@ -42,7 +43,7 @@ async def list_report_clients(db, user_id, **_):
 async def list_report_metrics(db, user_id, **_):
     clients = await _clients(db, user_id)
     return {
-        "metrics": rt.catalog_for(rt.sources_connected(clients)),
+        "metrics": rt.catalog_for(rt.sources_connected(clients) | await report_sales.sources(db, user_id)),
         "periods": rt.periods_for_ui(),
         "placeholders": rt.PLACEHOLDER_GUIDE,
         "blocks": rt.BLOCKS_GUIDE,
@@ -66,7 +67,8 @@ async def propose_report(db, user_id, template=None, **_):
     clients = await _clients(db, user_id)
     template, adjusted = rt.fit_to_slack(template)
     try:
-        clean = rt.validate(template, {c["id"]: c.get("name") or "" for c in clients if c.get("id")})
+        clean = rt.validate(template, {c["id"]: c.get("name") or "" for c in clients if c.get("id")},
+                            metrics=await rt.metric_names(db, user_id, clients))
     except rt.TemplateError as e:
         return {"ok": False, "errors": e.errors,
                 "note": "NOT saved — the draft and preview are unchanged. Fix these and call propose_report again."}
