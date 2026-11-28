@@ -39,6 +39,7 @@ ASK_SALES_COACH = "ask_sales_coach"
 ASK_BIRDY = "ask_birdy"
 ASK_SUB_AGENT = "ask_sub_agent"
 PROPOSE_ACTION = "propose_action"
+REPORT_KINDS = frozenset({"create_slack_report", "update_slack_report"})   # checked against the agent's area
 
 ASK_TOOLS = {ASK_MEDIA_BUYER: defs.MEDIA_BUYER, ASK_SALES_COACH: defs.SALES_COACH, ASK_BIRDY: defs.BIRDY}
 PROPOSE_SUB_AGENT = "propose_sub_agent"
@@ -529,6 +530,14 @@ def _propose(args: dict, frame: rt.Frame) -> str:
     if not title:
         return _result(False, error="Give the proposal a short title.")
     payload = args.get("payload") if isinstance(args.get("payload"), dict) else {}
+    if kind in REPORT_KINDS:
+        # Refused now, as create/update_slack_report would refuse it on approval (services/report_owner.py),
+        # so the owner is never asked to approve a report outside the proposing agent's area.
+        from services import report_owner
+        template = payload.get("template") if isinstance(payload.get("template"), dict) else None
+        why = report_owner.refusal(owner, report_owner.report_area(template, payload.get("name")))
+        if why:
+            return _result(False, error=why)
     proposal = {
         "id": "p_" + uuid.uuid4().hex[:12],
         "agent": owner,

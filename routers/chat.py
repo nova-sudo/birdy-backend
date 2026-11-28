@@ -400,9 +400,12 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
             await put_back()
             raise
         name = None
-        # Birdy's changes are the agency's settings: its agency-wide tools are not offered in a
-        # one-client chat, so its turn runs for the whole agency (the proposal names the client).
-        scope = None if owner == team_defs.BIRDY else proposal.get("client_group_id")
+        # Birdy's changes are the agency's settings, and a Slack report is agency-wide configuration:
+        # those tools are not offered in a one-client chat, so the turn runs for the whole agency (the
+        # proposal still names the client). A report proposed from a one-client ask was otherwise
+        # approved into a chat where the owning agent had no report tool to make it with.
+        agency_wide = owner == team_defs.BIRDY or proposal.get("kind") in team_defs.AGENCY_ONLY_TOOLS
+        scope = None if agency_wide else proposal.get("client_group_id")
         if scope:
             group = await db["client_groups"].find_one(
                 {"user_id": current_user, "id": scope}, {"name": 1})

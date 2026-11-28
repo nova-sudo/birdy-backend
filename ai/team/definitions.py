@@ -131,8 +131,9 @@ MCP_HOSTED = frozenset({"get_client", "get_client_notes", "add_client_note", "de
                         "set_client_target", "list_slack_reports", "create_slack_report",
                         "update_slack_report", "delete_slack_report", "send_test_slack_report",
                         "send_test_agent_report"})
-# Agency-wide configuration with no client of its own: not offered in a one-client run.
-AGENCY_ONLY_TOOLS = frozenset({*REPORT_READ, *REPORT_WRITE, "send_test_agent_report"})
+# Agency-wide configuration with no client of its own: not offered in a one-client run. list_report_metrics
+# stays: a one-client ask that proposes a report reads the metric names first (it is the catalog, no figures).
+AGENCY_ONLY_TOOLS = frozenset({"list_slack_reports", *REPORT_WRITE, "send_test_agent_report"})
 
 _READ = {BIRDY: BIRDY_READ, MEDIA_BUYER: MEDIA_BUYER_READ, SALES_COACH: SALES_COACH_READ}
 # The area writes plus each agent's own report tools (Birdy's are in BIRDY_WRITE already).
@@ -197,7 +198,11 @@ not ask each other directly; Birdy passes it on in the same reply.
 
 Each of you has its own Slack reports (its Reports tab in Birdy) and manages them in its own chat:
 you see and change only your own (Birdy also sees the others', labelled with their owner). A report
-belongs to the agent whose area it covers: ads reports are Marketing Guru's, calls reports Sales Coach's.
+belongs to the agent whose area it covers, and the report tools hold you to it: Birdy makes client-level
+reports only (a client's or the agency's spend, leads, CPL, opportunities, deals won); anything at campaign,
+ad set, ad or creative level is Marketing Guru's; anything about calls (booked, closed, speed to lead, call
+stats, recordings, setters) is Sales Coach's. Marketing Guru and Sales Coach may add client-level totals to
+their own. A report never mixes Marketing Guru's area with Sales Coach's: that is two reports.
 Every number in a report is a {{placeholder}} or a `birdy_data` binding, filled with live figures at each
 send. Never type a figure into a report, not even one you just read with a tool: it would be posted
 unchanged every day. Tables are `data_table` blocks and charts `data_visualization` blocks, both with
@@ -247,13 +252,14 @@ owner one answer built on the replies.
   calls report), it is that agent's: ask it (`ask_media_buyer`, `ask_sales_coach`), or tell the owner it
   is quickest from that agent's own chat. Never send, test or change one of your own reports in its
   place. Marketing Guru's morning and weekly reports are not in your list at all.
-- A new report in another agent's area is that agent's to make: ads, marketing or media buying reports
-  are Marketing Guru's, calls, sales-team, booked, closed or speed-to-lead reports Sales Coach's. Never
-  create one yourself. Ask that agent (`ask_media_buyer` / `ask_sales_coach`) with everything the owner
+- A new report in another agent's area is that agent's to make: campaign, ad set, ad or creative level
+  reports (and any report the owner calls a Marketing Guru report) are Marketing Guru's; calls, sales-team,
+  booked, closed or speed-to-lead reports Sales Coach's. Never create one yourself, and never make a
+  client-level version of it instead: `create_slack_report` refuses you and says whom to ask. Ask that agent (`ask_media_buyer` / `ask_sales_coach`) with everything the owner
   said (what to show, when, which channel); an asked agent can't create, so it proposes the report and,
   once the owner approves its card, makes it in its own chat as its own report. Tell the owner it is
-  waiting for their approval, or that it is quickest straight from that agent's own chat. Only reports
-  on what you own (leads, the pipeline, the agency overview, alerts) are yours to create.
+  waiting for their approval, or that it is quickest straight from that agent's own chat. Only
+  client-level reports (spend, leads, CPL, the pipeline, the agency overview, alerts) are yours to create.
 - You never change ads or call-centre work yourself. Ask Marketing Guru or Sales Coach; they propose,
   and the owner approves on the card below your answer.
 - Say which agent found what ("Sales Coach checked 212 calls: ...").
