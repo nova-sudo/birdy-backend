@@ -109,7 +109,14 @@ def _as(monkeypatch, agent):
     monkeypatch.setattr("ai.mcp.server.get_access_token", lambda: types.SimpleNamespace(claims=claims))
 
 
-async def test_birdy_is_refused_an_ads_report_before_anything_is_saved(mock_db, monkeypatch):
+async def _proposed(**kw):
+    """An agent's create in its chat: a proposal, never a report (services/report_proposals.py)."""
+    out = await t.create_slack_report.fn(trigger=SCHEDULE, **kw)
+    assert out["proposed"] is True
+    return out["proposal"]
+
+
+async def test_birdy_is_refused_an_ads_report_before_anything_is_proposed(mock_db, monkeypatch):
     _as(monkeypatch, "birdy")
     with pytest.raises(ToolError, match="Marketing Guru report.*ask_media_buyer"):
         await t.create_slack_report.fn(name="Ads watch", trigger=SCHEDULE, template=ADS)
@@ -117,28 +124,27 @@ async def test_birdy_is_refused_an_ads_report_before_anything_is_saved(mock_db, 
         await t.create_slack_report.fn(name="Sales", trigger=SCHEDULE, template=CALLS)
     with pytest.raises(ToolError, match="Marketing Guru report"):
         await t.create_slack_report.fn(name="Marketing Guru report", trigger=SCHEDULE, template=CLIENT_LEVEL)
+    assert (await _proposed(name="Daily numbers", template=CLIENT_LEVEL))["agent"] == "birdy"
     assert await mock_db[sr.REPORTS].count_documents({}) == 0
-    made = (await t.create_slack_report.fn(name="Daily numbers", trigger=SCHEDULE, template=CLIENT_LEVEL))["report"]
-    assert made["owner"] == "birdy"
 
 
-async def test_each_main_agent_makes_its_own_with_client_totals_but_not_the_others(mock_db, monkeypatch):
+async def test_each_main_agent_proposes_its_own_with_client_totals_but_not_the_others(mock_db, monkeypatch):
     _as(monkeypatch, "media_buyer")
-    assert (await t.create_slack_report.fn(name="Ads watch", trigger=SCHEDULE, template=ADS))["report"]["owner"] == "media_buyer"
+    assert (await _proposed(name="Ads watch", template=ADS))["payload"]["owner"] == "media_buyer"
     with pytest.raises(ToolError, match="Sales Coach report.*ask_birdy"):
         await t.create_slack_report.fn(name="Sales", trigger=SCHEDULE, template=CALLS)
     _as(monkeypatch, "sales_coach")
-    assert (await t.create_slack_report.fn(name="Sales", trigger=SCHEDULE, template=CALLS))["report"]["owner"] == "sales_coach"
+    assert (await _proposed(name="Sales", template=CALLS))["payload"]["owner"] == "sales_coach"
     with pytest.raises(ToolError, match="Marketing Guru report.*ask_birdy"):
         await t.create_slack_report.fn(name="Campaigns", trigger=SCHEDULE)
     with pytest.raises(ToolError, match="mixes your area with Marketing Guru's"):
         await t.create_slack_report.fn(name="Weekly", trigger=SCHEDULE, template=MIXED)
-    assert sorted(r["owner"] for r in await mock_db[sr.REPORTS].find().to_list(10)) == ["media_buyer", "sales_coach"]
 
 
 async def test_an_update_is_checked_on_what_the_report_would_say(mock_db, monkeypatch):
+    from services import report_proposals
     _as(monkeypatch, "birdy")
-    mine = (await t.create_slack_report.fn(name="Daily numbers", trigger=SCHEDULE, template=CLIENT_LEVEL))["report"]
+    mine = (await report_proposals.apply(mock_db, U, await _proposed(name="Daily numbers", template=CLIENT_LEVEL)))["report"]
     with pytest.raises(ToolError, match="Sales Coach report"):
         await t.update_slack_report.fn(report_id=mine["id"], template=CALLS)
     with pytest.raises(ToolError, match="Marketing Guru report"):
@@ -152,7 +158,9 @@ async def test_an_update_is_checked_on_what_the_report_would_say(mock_db, monkey
 
 async def test_the_owner_outside_an_agent_picks_any_content(mock_db, monkeypatch):
     _as(monkeypatch, None)
-    made = (await t.create_slack_report.fn(name="Everything", trigger=SCHEDULE, template=MIXED))["report"]
+    args = dict(name="Everything", trigger=SCHEDULE, template=MIXED)
+    code = (await t.create_slack_report.fn(**args))["confirm_code"]
+    made = (await t.create_slack_report.fn(**args, confirm_code=code))["report"]
     assert made["owner"] == "birdy"
 
 
@@ -203,7 +211,7 @@ def _payload(template, name="Aura ads watch"):
     return {"name": name, "trigger": SCHEDULE, "template": template}
 
 
-def test_birdy_delegates_and_marketing_guru_makes_it_as_its_own(api, monkeypatch, registry, mock_db, groups, fake_mcp):
+def test_birdy_delegates_and_marketing_guru_proposes_it_as_its_own(api, monkeypatch, registry, mock_db, groups, fake_mcp):
     chat_router, app = api
     p = TeamProvider({
         "birdy": [_tool_call("create_slack_report", _payload(ADS)),           # refused: not hers
@@ -221,17 +229,21 @@ def test_birdy_delegates_and_marketing_guru_makes_it_as_its_own(api, monkeypatch
     assert "ask_media_buyer" in next(x["content"] for x in refused if x.get("role") == "tool")
     assert len(first["proposals"]) == 1
     prop = first["proposals"][0]
-    assert prop["agent"] == "media_buyer" and prop["kind"] == "create_slack_report" and prop["client_group_id"] == G1
+    # The same proposal an agent's own create makes, with its preview fields; not a free-text one.
+    assert prop["kind"] == "slack_report" and prop["agent"] == "media_buyer" and prop["proposed_by"] == "media_buyer"
+    assert prop["payload"]["owner"] == "media_buyer" and prop["client_group_id"] == G1
+    assert prop["schedule_label"] == "Every day · 09:00" and prop["sends_to"]["default_channel"] is True
+    assert await_list(mock_db) == [] and fake_mcp == []     # nothing saved, the MCP never hit
 
-    p.scripts["media_buyer"] = [_tool_call("create_slack_report", _payload(ADS)), say("Made it: Aura ads watch.")]
+    calls_before = len(p.calls)
     out = client.post(f"/api/chat/proposals/{prop['id']}/apply")
     assert out.status_code == 200
-    owner_turn = [c for c in p.calls if c[0] == "media_buyer"][-1]
-    # Run agency-wide, so the report tools are offered even though the ask was about one client.
-    assert "create_slack_report" in owner_turn[1] and "propose_action" not in owner_turn[1]
+    body = out.json()
+    assert body["ok"] is True and body["report"]["owner"] == "media_buyer" and body["report"]["name"] == "Aura ads watch"
+    assert len(p.calls) == calls_before        # created directly: no agent run
     reports = await_list(mock_db)
-    assert [(r["name"], r["owner"]) for r in reports] == [("Aura ads watch", "media_buyer")]
-    assert [(a, n) for a, n, _ in fake_mcp] == [("birdy", "create_slack_report"), ("media_buyer", "create_slack_report")]
+    assert [(r["id"], r["name"], r["owner"]) for r in reports] == [(body["report"]["id"], "Aura ads watch", "media_buyer")]
+    assert client.post(f"/api/chat/proposals/{prop['id']}/apply").status_code == 404
 
 
 def await_list(db):
@@ -255,7 +267,7 @@ async def test_a_proposal_outside_the_agents_area_is_refused_at_once(mock_db, re
                         say("done")],
     })
     out = await chat(p, registry, mock_db, agent="birdy")
-    assert [x["title"] for x in out["proposals"]] == ["Sales report"]
+    assert [(x["title"], x["kind"]) for x in out["proposals"]] == [("Sales", "slack_report")]
     tool_msgs = [m for r, _, msgs in p.calls if r == "sales_coach" for m in msgs if m.get("role") == "tool"]
     assert any("Marketing Guru report" in m["content"] and "ask_birdy" in m["content"] for m in tool_msgs)
 

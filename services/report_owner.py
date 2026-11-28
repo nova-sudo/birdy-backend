@@ -180,7 +180,8 @@ def refusal(caller: str, area: ReportArea) -> str | None:
         return (f"{head} You make only client-level reports (a client's or the agency's spend, leads, CPL, "
                 f"opportunities, deals won). Ask {NAMES[owner]} with {ASK[owner]}: pass on everything the owner "
                 f"said (the report's name, what to show, when it sends, which channel). {NAMES[owner]} proposes the "
-                f"report, and once the owner approves its card it makes it as its own report. Tell the owner it is "
-                f"waiting for their approval, or that it is quickest from {NAMES[owner]}'s own chat. {keep}")
+                f"report, and once the owner approves its card (with its preview) it is created as "
+                f"{NAMES[owner]}'s report. Tell the owner it is waiting for their approval, or that it is "
+                f"quickest from {NAMES[owner]}'s own chat. {keep}")
     return (f"{head} Leave out the {AREA[owner]} part (client-level totals can stay), or ask Birdy with ask_birdy "
             f"to pass the request to {NAMES[owner]}, or tell the owner it is quickest from {NAMES[owner]}'s own chat.")

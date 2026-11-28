@@ -130,7 +130,12 @@ async def test_an_agent_lists_and_creates_only_its_own(mock_db, monkeypatch):
     await _report(mock_db, "Calls", owner="sales_coach")
     _as(monkeypatch, "media_buyer")
     assert (await t.list_slack_reports.fn())["reports"] == []
-    made = (await t.create_slack_report.fn(name="Ads daily", trigger=SCHEDULE))["report"]
+    # In an agent's chat a create only proposes; the owner's approval makes it (services/report_proposals.py).
+    proposed = await t.create_slack_report.fn(name="Ads daily", trigger=SCHEDULE)
+    assert proposed["proposed"] and proposed["proposal"]["agent"] == "media_buyer"
+    assert await mock_db[sr.REPORTS].count_documents({"name": "Ads daily"}) == 0
+    from services import report_proposals
+    made = (await report_proposals.apply(mock_db, USER, proposed["proposal"]))["report"]
     assert made["owner"] == "media_buyer"
     listed = (await t.list_slack_reports.fn())["reports"]
     assert [(r["name"], r["owner_name"]) for r in listed] == [("Ads daily", "Marketing Guru")]
@@ -150,7 +155,7 @@ async def test_birdy_lists_everyones_labelled_but_changes_only_hers(mock_db, mon
             await call()
     assert (await mock_db[sr.REPORTS].find_one({"id": theirs["id"]}))["name"] == "Ads"
     assert (await t.update_slack_report.fn(report_id=mine["id"], name="Morning"))["report"]["name"] == "Morning"
-    assert (await t.create_slack_report.fn(name="Ops", trigger=SCHEDULE))["report"]["owner"] == "birdy"
+    assert (await t.create_slack_report.fn(name="Ops", trigger=SCHEDULE))["proposal"]["payload"]["owner"] == "birdy"
 
 
 async def test_sales_coach_is_sent_to_birdy_for_hers(mock_db, monkeypatch):

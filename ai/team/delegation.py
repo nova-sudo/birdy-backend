@@ -282,7 +282,7 @@ async def handle(name: str, args: dict, frame: rt.Frame, ctx: dict) -> str:
     if name == USE_HELPER:
         return await _use_helper(args, frame, ctx)
     if name == PROPOSE_ACTION:
-        return _propose(args, frame)
+        return await _propose(args, frame, ctx)
     if name == PROPOSE_SUB_AGENT:
         return await _propose_sub_agent(args, frame, ctx)
     if name == RECALL:
@@ -519,7 +519,22 @@ async def _propose_sub_agent(args: dict, frame: rt.Frame, ctx: dict) -> str:
     return json.dumps({"ok": True, "id": sub["id"], "note": res["note"]})
 
 
-def _propose(args: dict, frame: rt.Frame) -> str:
+async def propose_slack_report(frame: rt.Frame, db, user_id: str, owner: str, fields: dict) -> str:
+    """A new Slack report as a `kind: "slack_report"` proposal with every create check passed
+    (services/report_proposals.py), for the owner to approve with its preview. Used by an agent's own
+    create_slack_report in its chat (ai/orchestrator.py) and by a delegated propose_action."""
+    from services import report_proposals, slack_report_ops
+    try:
+        proposal = await report_proposals.build(db, user_id, owner, fields, proposed_by=frame.agent,
+                                                client_group_id=frame.client_group_id)
+    except slack_report_ops.ReportError as e:
+        return _result(False, error=report_proposals.error_text(e))
+    frame.turn.proposals.append(proposal)
+    frame.turn.changed()
+    return _result(True, proposed=True, id=proposal["id"], note=report_proposals.PROPOSED_NOTE)
+
+
+async def _propose(args: dict, frame: rt.Frame, ctx: dict) -> str:
     owner = owner_of(frame)
     if not restricted(frame) or owner is None:
         return _result(False, error="propose_action is only for agents asked by another agent.")
@@ -530,6 +545,10 @@ def _propose(args: dict, frame: rt.Frame) -> str:
     if not title:
         return _result(False, error="Give the proposal a short title.")
     payload = args.get("payload") if isinstance(args.get("payload"), dict) else {}
+    if kind == "create_slack_report":
+        # The same proposal the agent's own create makes: checked now, approved with its preview, and
+        # created without an agent run.
+        return await propose_slack_report(frame, ctx["db"], ctx["user_id"], owner, payload)
     if kind in REPORT_KINDS:
         # Refused now, as create/update_slack_report would refuse it on approval (services/report_owner.py),
         # so the owner is never asked to approve a report outside the proposing agent's area.

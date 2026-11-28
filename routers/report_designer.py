@@ -14,7 +14,7 @@ as the real Slack message, with the user's own numbers.
 """
 
 import logging
-from typing import Optional
+from typing import Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
@@ -39,11 +39,15 @@ class DraftBody(BaseModel):
 class PreviewBody(BaseModel):
     template: Optional[dict] = None   # None → the stored template named by `source`
     source: str = "draft"             # "draft" (copilot) | "saved" (the live report, Settings)
+    # The agent whose report it is (a chat proposal's card sends it). Figures don't depend on it: Sales
+    # Coach's booked / closed / speed metrics and compare="previous" fill for every owner, from the
+    # owner's own Sales Coach setup. Accepted so the card can send what it has.
+    owner: Optional[Literal["birdy", "media_buyer", "sales_coach"]] = None
 
 
-def _validate(template: dict, names: dict[str, str]) -> dict:
+def _validate(template: dict, names: dict[str, str], metrics: list[str] | None = None) -> dict:
     try:
-        return rt.validate(template, names)
+        return rt.validate(template, names, metrics=metrics)
     except rt.TemplateError as e:
         raise HTTPException(status_code=400, detail={"errors": e.errors})
 
@@ -81,5 +85,6 @@ async def preview(body: PreviewBody, current_user: str = Depends(get_current_use
         db = mongo_client[DB_NAME]
         if body.template is None:
             return await preview_stored(db, current_user, body.source)
-        template = _validate(body.template, await client_names(db, current_user))
+        template = _validate(body.template, await client_names(db, current_user),
+                             await rt.metric_names(db, current_user))
         return await preview_payload(db, current_user, template)

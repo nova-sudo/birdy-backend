@@ -713,6 +713,9 @@ async def _agent_system_prompt(frame, db, user_id: str, client_group_id, client_
     return prompt
 
 
+SLACK_REPORT_CREATE = "create_slack_report"
+
+
 def _mcp_caller(frame) -> dict:
     """Who an agent run's MCP calls come from (mcp_client_for's `agent`): the agent, or a sub-agent's
     main agent. Tools scoped per agent (the Slack reports) enforce it from the token. The general chat
@@ -1181,6 +1184,7 @@ async def run_chat(
                 bad_args = False
                 if frame is not None and tc.name not in delegation.TOOL_NAMES:
                     frame.step["doing"] = team_route.tool_label(tc.name)
+                    frame.step["doing_kind"] = team_route.tool_kind(tc.name)
                     frame.turn.changed()
                 try:
                     args = json.loads(tc.arguments) if tc.arguments else {}
@@ -1249,6 +1253,12 @@ async def run_chat(
                     result = await team_pinning.run_pinned(tc.name, args, db=db, user_id=user_id,
                                                            client_group_id=client_group_id,
                                                            mongo_client=mongo_client)
+                elif frame is not None and tc.name == SLACK_REPORT_CREATE and _mcp_caller(frame):
+                    # In the app a new report is proposed, never saved: the owner approves it with its preview
+                    # (services/report_proposals.py). Every create check runs now.
+                    fields = {k: v for k, v in args.items() if k != "confirm_code"}
+                    result = await delegation.propose_slack_report(frame, db, user_id, _mcp_caller(frame)["agent"],
+                                                                   fields)
                 elif (tc.name in mcp_client.MCP_TOOL_NAMES or tc.name in mcp_only) and mcp is not None:
                     result = await mcp_client.call_mcp_tool(mcp, tc.name, args)
                 else:
@@ -1285,9 +1295,9 @@ async def run_chat(
                 if frame is not None:
                     detail = (team_route.clip(str(args.get("question") or args.get("name") or ""), team_route.SUMMARY_MAX) or None
                               if tc.name in delegation.TOOL_NAMES else team_route.tool_detail(args))
-                    frame.step["tools"].append({"name": tc.name, "label": team_route.tool_label(tc.name),
-                                                "detail": detail})
+                    frame.step["tools"].append(team_route.tool_entry(tc.name, detail))
                     frame.step["doing"] = None
+                    frame.step["doing_kind"] = None
                     frame.turn.changed()
 
                 changes_before = len(agent_changes)

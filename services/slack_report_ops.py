@@ -142,7 +142,9 @@ async def list_reports(db, user_id: str, owner: str | None = None) -> dict:
     return {"reports": [present(r) for r in reports], "max": sr.MAX_REPORTS}
 
 
-async def create_report(db, user_id: str, body: ReportBody) -> dict:
+async def prepare_report(db, user_id: str, body: ReportBody) -> dict:
+    """The report a create would store, every check passed, nothing written. A proposal (services/
+    report_proposals.py) holds this until the owner approves it; create_report stores it."""
     if not (body.name or "").strip():
         raise ReportError(400, "Give the report a name")
     if body.trigger is None:
@@ -157,8 +159,37 @@ async def create_report(db, user_id: str, body: ReportBody) -> dict:
                            channel_id=body.channel_id, channel_name=body.channel_name,
                            enabled=True if body.enabled is None else body.enabled,
                            owner=body.owner or sr.DEFAULT_OWNER)
+    return report
+
+
+async def create_report(db, user_id: str, body: ReportBody) -> dict:
+    report = await prepare_report(db, user_id, body)
     await db[sr.REPORTS].insert_one(dict(report))
     return {"report": present(report)}
+
+
+async def sends_to(db, user_id: str, channel_id: str | None, channel_name: str | None) -> dict:
+    """Where a report goes: its own channel, else the account's default Birdy channel (empty channel_id)."""
+    user = await db["users"].find_one({"user_id": user_id}, {"integrations.slack_bot.notify_channel_id": 1,
+                                                             "integrations.slack_bot.notify_channel_name": 1}) or {}
+    bot = (user.get("integrations") or {}).get("slack_bot") or {}
+    return {"channel_id": channel_id or bot.get("notify_channel_id"),
+            "channel_name": channel_name if channel_id else bot.get("notify_channel_name"),
+            "default_channel": not channel_id}
+
+
+_EVENT_LABELS = {"alert_fired": "When an alert fires", "metric_created": "When a custom metric is created",
+                 "account_created": "When a new account is added"}
+
+
+def schedule_label(trigger: dict | None) -> str:
+    """When a report sends, in plain words: "Every day · 09:00", "Mondays · 09:00", "When an alert fires"."""
+    t = trigger or {}
+    if t.get("type") == "event":
+        return _EVENT_LABELS.get(t.get("event"), "When something happens")
+    when = f"{t.get('day')}s" if t.get("frequency") == "weekly" and t.get("day") else "Every day"
+    label = f"{when} · {t.get('time') or '09:00'}"
+    return f"{label} ({t['timezone']})" if t.get("timezone") else label
 
 
 async def update_report(db, user_id: str, report_id: str, body: ReportBody) -> dict:

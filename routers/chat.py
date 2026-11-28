@@ -34,6 +34,7 @@ from ai.tools.attribution_tools import register_attribution_tools
 from ai.orchestrator import run_chat
 from ai.team import definitions as team_defs
 from ai.team import proposals as team_proposals
+from services import report_proposals, slack_report_ops
 from ai.team import setup as team_setup
 from ai.team.sales_coach import register_sales_coach_tools
 from ai.team.setup_chat import PAGE as TEAM_SETUP_PAGE, register_setup_chat_tools
@@ -377,11 +378,14 @@ async def list_proposals(status: str = PROPOSAL_PENDING, agent: str | None = Non
         return {"proposals": await team_proposals.list_proposals(db, current_user, status=status, agent=agent)}
 
 
-@router.post("/api/chat/proposals/{proposal_id}/apply", response_model=ChatResponse)
+@router.post("/api/chat/proposals/{proposal_id}/apply", response_model=None)
 async def apply_proposal(proposal_id: str, current_user: str = Depends(get_current_user)):
-    """Approve a pending proposal: its owning agent makes the change in a new turn of its own chat.
-    A Marketing Guru proposal that names a stock agent card is applied through that card's own guarded
-    path (stock_card_tools.apply_card_lines -> stock.apply.apply_card: claims, modes, guardrails)."""
+    """Approve a pending proposal: its owning agent makes the change in a new turn of its own chat
+    (a ChatResponse). A Marketing Guru proposal that names a stock agent card is applied through that
+    card's own guarded path (stock_card_tools.apply_card_lines -> stock.apply.apply_card: claims, modes,
+    guardrails). A new Slack report (kind "slack_report") is created directly, with no agent run, after its
+    checks run again: {"ok": true, "report": {id, owner, name}, "proposal_id"}; a refusal is 409
+    {code: "report_refused", message} and the proposal stays pending."""
     async with get_mongo_client() as mongo_client:
         db = get_db(mongo_client)
         proposal = await _claim_proposal(db, current_user, proposal_id, PROPOSAL_APPROVED)
@@ -389,6 +393,19 @@ async def apply_proposal(proposal_id: str, current_user: str = Depends(get_curre
         async def put_back():
             # The change was not handed over: put the proposal back so it can be approved again.
             await team_proposals.claim(db, current_user, proposal_id, PROPOSAL_APPROVED, PROPOSAL_PENDING)
+
+        if proposal.get("kind") == report_proposals.KIND:
+            try:
+                made = await report_proposals.apply(db, current_user, proposal)
+            except slack_report_ops.ReportError as e:
+                await put_back()
+                if e.status_code == 422:
+                    raise HTTPException(status_code=422, detail="proposal_has_no_owner")
+                raise HTTPException(status_code=409, detail={"code": "report_refused",
+                                                             "message": report_proposals.error_text(e)})
+            await team_proposals.set_fields(db, current_user, proposal_id, {
+                "applied": {"type": report_proposals.KIND, "report_id": made["report"]["id"]}})
+            return {**made, "proposal_id": proposal_id}
 
         owner = proposal.get("agent")
         if owner not in team_defs.AGENT_KEYS:
